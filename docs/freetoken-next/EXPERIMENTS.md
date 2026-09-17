@@ -458,6 +458,12 @@ the aggregate and per-layer decode window at shutdown. The parser test passes an
 --help` shows the option (`56774dc`).
 
 The intended 16K functional run was retried twice with explicit serial expert loading. Both
-workers exited while building expert bank `174/192`, before serving a request. The logs contain
-no traceback, explicit OOM, or residual GPU process, so no throughput or routing statistics are
-claimed. The blocker is the host load path, not the new parser/shutdown wiring.
+workers exited while building expert bank `174/192`, before serving a request. The supervisor
+initially hid the process status; `b4b200f` now reports it. A detached-server reproduction
+ended at `176/192` with `exitcode=-9` (SIGKILL), while foreground benchmark cleanup produced
+`exitcode=-15` (SIGTERM). The Flash-Next geometry prices the 48 x 512 NVFP4 bank at **63.46
+GiB** before model/runtime overhead; the host had **62 GiB available and no swap**. This is
+consistent with host-memory pressure, not a Python exception in the new instrumentation.
+The unpinned diagnostic did not reach readiness either. No throughput or routing statistics are
+claimed; logs are `/models/desenvolvimento/tmp/ftnext/flash_load_detached_3.log` and
+`flash_load_unpinned.log`.
