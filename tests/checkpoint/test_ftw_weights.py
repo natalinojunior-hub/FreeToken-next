@@ -1,5 +1,7 @@
 """FTW replay: dropping entries by name before their bytes are read, and the vision-tower presence check."""
 
+import os
+
 import torch
 
 from freetoken.checkpoint.ftw import FTWReader, FTWWriter, ftw_tensor_names, iter_ftw_weights
@@ -54,3 +56,19 @@ def test_ftw_lacks_vision(tmp_path):
     assert not ftw_lacks_vision(str(tmp_path / "vl"))
     assert not ftw_lacks_vision(str(tmp_path))
     assert ftw_tensor_names(str(tmp_path / "vl"), "weight") == ["model.a.weight", "visual.b.weight"]
+
+
+def test_ftw_writer_drops_completed_shards_from_page_cache(tmp_path, monkeypatch):
+    calls = []
+
+    def fadvise(fd, offset, length, advice):
+        calls.append((fd, offset, length, advice))
+
+    monkeypatch.setattr(os, "posix_fadvise", fadvise)
+    writer = FTWWriter(str(tmp_path), shard_limit=4096)
+    writer.add_tensor("a", torch.zeros(2048, dtype=torch.uint8))
+    writer.add_tensor("b", torch.zeros(2048, dtype=torch.uint8))
+    writer.finalize({})
+
+    assert len(calls) == 2
+    assert all(offset == 0 and length == 0 for _, offset, length, _ in calls)

@@ -149,11 +149,31 @@ class FTWWriter:
         if self._f is not None:
             self._shards.append({"file": _SHARD_FMT.format(self._shard_idx),
                                  "global_off": self._shard_start, "nbytes": self._cur})
-            self._f.close()
+            self._close_shard()
         self._shard_idx += 1
         self._shard_start = self._global
         self._cur = 0
         self._f = open(os.path.join(self.out_dir, _SHARD_FMT.format(self._shard_idx)), "wb")
+
+    def _close_shard(self) -> None:
+        """Commit one shard and release its clean pages from the host page cache.
+
+        Conversion can write tens of GiB while the source banks are mmap-backed. Without the
+        explicit eviction, buffered writes accumulate alongside the source working set and can
+        trigger the OOM killer even though the converter releases each completed bank layer.
+        """
+        assert self._f is not None
+        fd = self._f.fileno()
+        self._f.flush()
+        os.fsync(fd)
+        advise = getattr(os, "posix_fadvise", None)
+        dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+        if advise is not None and dontneed is not None:
+            try:
+                advise(fd, 0, 0, dontneed)
+            except OSError:
+                pass  # cache eviction is a pressure mitigation, not a format invariant
+        self._f.close()
 
     def _write_raw(self, data: memoryview) -> None:
         """Write ``data`` into the FTW byte stream, splitting across shards at the limit."""
@@ -192,7 +212,7 @@ class FTWWriter:
         if self._f is not None:
             self._shards.append({"file": _SHARD_FMT.format(self._shard_idx),
                                  "global_off": self._shard_start, "nbytes": self._cur})
-            self._f.close()
+            self._close_shard()
             self._f = None
         index = {"format": FORMAT_TAG, "version": FORMAT_VERSION, "align": ALIGN,
                  "shard_limit": self.shard_limit, "total_bytes": self._global,
