@@ -60,6 +60,22 @@ vs anchors (PP ~1532 / TG ~28.96 / VRAM 15.16 / RAM 66.5): **+21 % PP, −1.0 % 
 | Qwen3.8-Flash-Next NVFP4 16K (mr 0.86) | 1857.7 | 28.685 | 8819 ms | 14.86 GiB | 67.82 GiB | ≥1850 / ≥28.5 |
 
 
+## EXP-003 — First native GGUF load attempt (port in flight, uncommitted tree)
+**Date:** 2026-09-17 · **Verdict:** INFORMATIONAL, load path works; capacity config does not
+`ft serve --model /models/Qwen3.8-27B-GSQ-RCO-IQ3_S-MTP-Q4XS-Q3S.gguf --memory-ratio 0.86
+--num-tokens 8192 --max-seq-len-override 8300 --cache-type naive` reached serving with
+14.96 GiB PyTorch-allocated and accepted requests — the IQ3_S/IQ4_XS/Q4_K/Q2_S packed tables
+map and load. Then `torch.OutOfMemoryError: Tried to allocate 142.00 MiB … 131.38 MiB is
+free` inside `kernel/fla/chunk_fwd.py` → `chunk_gated_delta_rule_fwd_h` →
+`k.new_empty(B, NT, H, V, K)`: the **GDN prefill transient** for an 8192-token chunk, on a
+dense model whose packed weights are fully resident. Same class as EXP-001b: the planner
+reserves nothing for the transient (`ARCHITECTURE.md` §5). Corrected probe:
+`--memory-ratio 0.8 --num-tokens 4096 --max-seq-len-override 4300 --max-prefill-length 1024`.
+Suite against this tree: 3 failed / 1809 passed / 206 skipped — missing
+`kernel/aot_models.py` arch entries for the new GGUF arches, an incomplete `__init__.py`
+export union, and `test_nvfp4_backends::test_b12x_decode_matches_dequant_reference` which
+must first be shown to be a regression rather than flashinfer JIT flake.
+
 ## EXP-002 — GGUF / MTP / TurboQuant corpus and source audits
 **Date:** 2026-09-16 · **Verdict:** INFORMATIONAL (complete; reports archived in
 `audits/A1…A6`, conclusions in ARCHITECTURE.md §2–§6)
