@@ -558,6 +558,13 @@ def _extend_attention_kernel(
     stride_vh,
     stride_ot,
     stride_oh,
+    kn_ptr,
+    vn_ptr,
+    cent_ptr,
+    stride_knt,
+    stride_knh,
+    stride_vnt,
+    stride_vnh,
     GROUP: tl.constexpr,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -567,6 +574,8 @@ def _extend_attention_kernel(
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
     HAS_BLOCKS: tl.constexpr,
+    COMPRESSED: tl.constexpr = False,
+    BOOK3: tl.constexpr = False,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -626,14 +635,20 @@ def _extend_attention_kernel(
         skip_tile = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
         if not skip_tile:
             slots = tl.load(kv_indices_ptr + kv_start + kv_offsets, mask=mask_n, other=0)
-            k = tl.load(
-                k_ptr
-                + slots[None, :] * stride_ks
-                + kv_head * stride_kh
-                + offs_d[:, None],
-                mask=mask_n[None, :] & mask_d[:, None],
-                other=0.0,
-            )
+            if COMPRESSED:
+                k = turbo_k_tile(
+                    k_ptr, kn_ptr, cent_ptr, slots, kv_head, stride_ks, stride_kh,
+                    stride_knt, stride_knh, offs_d, mask_n, BOOK3, tl.bfloat16,
+                )
+            else:
+                k = tl.load(
+                    k_ptr
+                    + slots[None, :] * stride_ks
+                    + kv_head * stride_kh
+                    + offs_d[:, None],
+                    mask=mask_n[None, :] & mask_d[:, None],
+                    other=0.0,
+                )
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
 
@@ -643,14 +658,20 @@ def _extend_attention_kernel(
             alpha = tl.exp(m_i - m_new)
             p = tl.exp(scores - m_new[:, None])
 
-            v = tl.load(
-                v_ptr
-                + slots[:, None] * stride_vs
-                + kv_head * stride_vh
-                + offs_dv[None, :],
-                mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
-            )
+            if COMPRESSED:
+                v = turbo_v_tile(
+                    v_ptr, vn_ptr, cent_ptr, slots, kv_head, stride_vs, stride_vh,
+                    stride_vnt, stride_vnh, offs_dv, mask_n, BOOK3, tl.bfloat16,
+                )
+            else:
+                v = tl.load(
+                    v_ptr
+                    + slots[:, None] * stride_vs
+                    + kv_head * stride_vh
+                    + offs_dv[None, :],
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
@@ -693,6 +714,13 @@ def _extend_attention_split_kernel(
     stride_vch,
     stride_ot,
     stride_oh,
+    kn_ptr,
+    vn_ptr,
+    cent_ptr,
+    stride_knt,
+    stride_knh,
+    stride_vnt,
+    stride_vnh,
     GROUP: tl.constexpr,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -702,6 +730,8 @@ def _extend_attention_split_kernel(
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
     HAS_BLOCKS: tl.constexpr,
+    COMPRESSED: tl.constexpr = False,
+    BOOK3: tl.constexpr = False,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -755,14 +785,20 @@ def _extend_attention_split_kernel(
 
         if not skip_tile:
             slots = tl.load(kv_indices_ptr + kv_start + kv_offsets, mask=mask_n, other=0)
-            k = tl.load(
-                k_cache_ptr
-                + slots[None, :] * stride_kcs
-                + kv_head * stride_kch
-                + offs_d[:, None],
-                mask=mask_n[None, :] & mask_d[:, None],
-                other=0.0,
-            )
+            if COMPRESSED:
+                k = turbo_k_tile(
+                    k_cache_ptr, kn_ptr, cent_ptr, slots, kv_head, stride_kcs, stride_kch,
+                    stride_knt, stride_knh, offs_d, mask_n, BOOK3, tl.bfloat16,
+                )
+            else:
+                k = tl.load(
+                    k_cache_ptr
+                    + slots[None, :] * stride_kcs
+                    + kv_head * stride_kch
+                    + offs_d[:, None],
+                    mask=mask_n[None, :] & mask_d[:, None],
+                    other=0.0,
+                )
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
 
@@ -772,14 +808,20 @@ def _extend_attention_split_kernel(
             alpha = tl.exp(m_i - m_new)
             p = tl.exp(scores - m_new[:, None])
 
-            v = tl.load(
-                v_cache_ptr
-                + slots[:, None] * stride_vcs
-                + kv_head * stride_vch
-                + offs_dv[None, :],
-                mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
-            )
+            if COMPRESSED:
+                v = turbo_v_tile(
+                    v_cache_ptr, vn_ptr, cent_ptr, slots, kv_head, stride_vcs, stride_vch,
+                    stride_vnt, stride_vnh, offs_dv, mask_n, BOOK3, tl.bfloat16,
+                )
+            else:
+                v = tl.load(
+                    v_cache_ptr
+                    + slots[:, None] * stride_vcs
+                    + kv_head * stride_vch
+                    + offs_dv[None, :],
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
@@ -865,6 +907,7 @@ def extend_paged_attention(
     k_extend: torch.Tensor | None = None,
     v_extend: torch.Tensor | None = None,
     block_ends: torch.Tensor | None = None,
+    turbo: dict | None = None,
 ) -> torch.Tensor:
     """Block-tiled causal prefill/extend attention over paged KV cache; block_ends holds per query token the end of the multimodal span it sits in (0 for none), whose later keys the row also attends."""
 
@@ -875,7 +918,8 @@ def extend_paged_attention(
     assert qo_indptr.numel() == kv_indptr.numel()
     assert prefix_lens.numel() == qo_indptr.numel() - 1
     assert v_cache.shape[1] == num_kv_heads
-    assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
+    if turbo is None:
+        assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
     assert num_q_heads % num_kv_heads == 0
     if sinks is not None:
         assert sinks.is_cuda
@@ -888,6 +932,14 @@ def extend_paged_attention(
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
     block_ends_arg = block_ends if block_ends is not None else qo_indptr
+    compressed = turbo is not None
+    kn_ptr = turbo["k_norm"] if compressed else k_cache
+    vn_ptr = turbo["v_norm"] if compressed else v_cache
+    cent_ptr = turbo["cent"] if compressed else k_cache
+    turbo_kw = {
+        "COMPRESSED": compressed,
+        "BOOK3": bool(turbo["book3"]) if compressed else False,
+    }
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
     # Tile size is shared-memory bound: keep the fast (large) tiles on GPUs whose opt-in
@@ -931,6 +983,13 @@ def extend_paged_attention(
             v_cache.stride(1),
             o.stride(0),
             o.stride(1),
+            kn_ptr,
+            vn_ptr,
+            cent_ptr,
+            kn_ptr.stride(0),
+            kn_ptr.stride(1),
+            vn_ptr.stride(0),
+            vn_ptr.stride(1),
             GROUP=num_q_heads // num_kv_heads,
             D=head_dim,
             BLOCK_D=block_d,
@@ -940,6 +999,7 @@ def extend_paged_attention(
             SLIDING_WINDOW=sliding_window or 0,
             HAS_SINKS=sinks is not None,
             HAS_BLOCKS=block_ends is not None,
+            **turbo_kw,
             num_warps=8,
             num_stages=1,
         )
@@ -965,6 +1025,13 @@ def extend_paged_attention(
         v_cache.stride(1),
         o.stride(0),
         o.stride(1),
+        kn_ptr,
+        vn_ptr,
+        cent_ptr,
+        kn_ptr.stride(0),
+        kn_ptr.stride(1),
+        vn_ptr.stride(0),
+        vn_ptr.stride(1),
         GROUP=num_q_heads // num_kv_heads,
         D=head_dim,
         BLOCK_D=block_d,
@@ -974,6 +1041,7 @@ def extend_paged_attention(
         SLIDING_WINDOW=sliding_window or 0,
         HAS_SINKS=sinks is not None,
         HAS_BLOCKS=block_ends is not None,
+        **turbo_kw,
         num_warps=8,
         num_stages=1,
     )

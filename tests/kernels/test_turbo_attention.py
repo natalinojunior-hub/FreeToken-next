@@ -79,3 +79,84 @@ def test_decode_on_codes_matches_decode_on_decoded_kv(book, q_heads, kv_heads):
         got.float().flatten(), want.float().flatten(), dim=0
     ).item()
     assert cos > 0.9999, f"{book}: fused decode is a different attention ({cos})"
+
+
+def test_extend_on_codes_matches_extend_on_decoded_kv():
+    """Prefill reads the cached prefix *and* the new tokens' K/V, so the two sources must be kept
+    in the same domain: rotate Q and the new K/V, read the prefix from codes, rotate the output
+    back once."""
+    from freetoken.kernel.triton.attention import extend_paged_attention
+
+    device = torch.device("cuda")
+    torch.manual_seed(5)
+    book = "turbo4"
+    head_dim = tk.QK_TURBO
+    q_heads, kv_heads = 12, 4
+    q_lens = [8, 3]
+    prefix_lens = [40, 96]
+    seq_lens = [p + q for p, q in zip(prefix_lens, q_lens)]
+    total = sum(seq_lens)
+    num_q = sum(q_lens)
+    sm_scale = head_dim**-0.5
+
+    q = torch.randn(num_q, q_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(total, kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v = torch.randn(total, kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    starts = [0] + list(torch.tensor(seq_lens).cumsum(0))[:-1]
+    qo_indptr = torch.tensor([0] + list(torch.tensor(q_lens).cumsum(0)), dtype=torch.int32, device=device)
+    kv_indptr = torch.tensor([0] + list(torch.tensor(seq_lens).cumsum(0)), dtype=torch.int32, device=device)
+    kv_indices = torch.arange(total, dtype=torch.int32, device=device)
+    prefix = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
+    new_rows = lambda t: torch.cat([t[a + p : a + s] for a, p, s in zip(starts, prefix_lens, seq_lens)]).contiguous()
+    k_extend, v_extend = new_rows(k), new_rows(v)
+    assert k_extend.shape[0] == num_q
+
+    kc, kn = tk.quantize(k.reshape(-1, head_dim), book)
+    vc, vn = tk.quantize(v.reshape(-1, head_dim), book)
+    k_hat = tk.decode(kc, kn, book).reshape(total, kv_heads, head_dim).to(torch.bfloat16)
+    v_hat = tk.decode(vc, vn, book).reshape(total, kv_heads, head_dim).to(torch.bfloat16)
+
+    want = extend_paged_attention(
+        q, k_hat, v_hat, qo_indptr, kv_indptr, kv_indices, prefix, max(q_lens), sm_scale,
+        k_extend=k_extend, v_extend=v_extend,
+    )
+
+    def rot(t):
+        return tk.rotate(t.reshape(-1, head_dim)).reshape(t.shape).to(torch.bfloat16)
+
+    got_rot = extend_paged_attention(
+        rot(q),
+        kc.reshape(total, kv_heads, -1).contiguous(),
+        vc.reshape(total, kv_heads, -1).contiguous(),
+        qo_indptr, kv_indptr, kv_indices, prefix, max(q_lens), sm_scale,
+        k_extend=rot(k_extend), v_extend=rot(v_extend),
+        turbo={
+            "k_norm": kn.reshape(total, kv_heads, 1).contiguous(),
+            "v_norm": vn.reshape(total, kv_heads, 1).contiguous(),
+            "cent": torch.tensor(tk.CENTROIDS_4, device=device, dtype=torch.float32),
+            "book3": False,
+        },
+    )
+    got = tk.inv_rotate(got_rot.reshape(-1, head_dim)).reshape(got_rot.shape).to(torch.bfloat16)
+    assert torch.isfinite(got.float()).all()
+    assert (got.float() - want.float()).abs().max().item() < 3e-2
+    cos = torch.nn.functional.cosine_similarity(got.float().flatten(), want.float().flatten(), dim=0).item()
+    assert cos > 0.9999, f"prefill on codes is a different attention ({cos})"
+
+
+def test_bf16_extend_is_untouched_by_the_branch():
+    """Same call twice must be bit-identical: the constexpr default has to leave the bf16 path exactly
+    where it was, which is what lets the 16K guard keep protecting it."""
+    from freetoken.kernel.triton.attention import extend_paged_attention
+
+    device = torch.device("cuda")
+    head_dim = tk.QK_TURBO
+    q = torch.randn(6, 8, head_dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(6, 4, head_dim, device=device, dtype=torch.bfloat16)
+    v = torch.randn(6, 4, head_dim, device=device, dtype=torch.bfloat16)
+    qo = torch.tensor([0, 3, 6], dtype=torch.int32, device=device)
+    idx = torch.arange(6, dtype=torch.int32, device=device)
+    pre = torch.zeros(2, dtype=torch.int32, device=device)
+    a = extend_paged_attention(q, k, v, qo, qo, idx, pre, 3, head_dim**-0.5)
+    b = extend_paged_attention(q, k, v, qo, qo, idx, pre, 3, head_dim**-0.5)
+    assert torch.equal(a, b)
