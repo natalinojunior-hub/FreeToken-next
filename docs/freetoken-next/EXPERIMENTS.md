@@ -635,3 +635,49 @@ new code path) that today's engine does not have anywhere, plus the accept/rollb
 interaction the goal's preflight explicitly calls out. Escalated to Opus 5 for an architecture
 read before further implementation, per CLAUDE.md's ESCALATE rule (subagent given exact files
 above, self-contained, no live-path edits made yet).
+
+## EXP-024 — Native MTP: verify-batch seam + rollback primitive (Opus 5 review acted on)
+**Date:** 2026-09-17 · **Verdict:** **PARTIAL / KEEP**
+
+Consulted Opus 5 on where the item E draft/verify/rollback step should live (EXP-023's
+blocker). Two premises in that scoping were wrong and shrank the real problem: `_make_write_tuple`
+only scatters the *sampled* token into the host token pool, not KV -- KV write locations already
+come from `batch.out_loc`, which is `extend_len`-generic. The actual one-token-per-step lock-in
+is `batch.is_decode` gating hardcoded branches in `build_fla_metadata`, `build_ple_metadata`, and
+`ParallelLMHead.forward`. Recommended seam: run a verify step as a `phase="prefill"` `Batch` with
+`extend_len==2` for the single running request, entered directly (not through `PrefillAdder`,
+which is tied to fixed `input_ids` known at admission) -- this reuses the already-correct
+extend-aware FLA/PLE prefill paths and never touches CUDA graph capture
+(`can_use_cuda_graph` is decode-only, so a prefill-phase batch is eager for free).
+
+Landed the two pieces this enables safely on their own, both strictly opt-in and no-op today:
+
+- `Batch.spec_logits_indices` (core.py): when set, `ParallelLMHead.forward` selects it instead
+  of `get_last_indices(bs)` (one logit row per drafted position, not per request), and
+  `Engine.forward_batch` skips the automatic `req.complete_one()` and stops truncating logits to
+  `batch.size` -- a real bug the review found: that truncation would have silently dropped a
+  verify batch's second logit row (silent wrong-accept, not a crash).
+- `CacheManager.free_spec_reject` (scheduler/cache.py): consumes `pages_to_free` (its arithmetic
+  was already correct, just never called) to return a rejected verify window's whole unused
+  pages, without touching the prefix cache (a rejected window was never `cache_req`'d). No-op
+  when `keep_len`/`alloc_len` round up to the same page -- the common case once page_size exceeds
+  the draft depth. 3 focused tests (`tests/scheduler/test_spec_reject_frees_pages.py`).
+
+Review also found two of the five `engine/spec.py` helpers are superseded rather than needed:
+`rebuild_conv_state` only rebuilds the GDN conv (width-window) state, but the GDN delta-rule
+*recurrent* state also advanced and can't be reconstructed from a width-window, and the GDN op
+overwrites its live state in place during forward (no `prev_state` available after the fact
+anyway). `ngram_context_after`'s convention is unpinned and redundant. Both are superseded by
+`LinearStatePool.copy_from(src, dst)`, which already snapshots/restores GDN conv + GDN recurrent
++ every `slot_states` entry together -- and Qwen4Exp's PLE n-gram context (`PLE_NGRAM_STATE`) is
+one of those slot states, so one `copy_from` covers all three. `accept_drafts` was traced and
+confirmed correct as-is.
+
+Full checkpoint/kvcache/moe/qwen4_exp/scheduler/layers/dsv4 focused set: 720 passed, 61 skipped
+(same 2 pre-existing flashinfer/nvcc-13.3 failures).
+
+Still open for item E: the spec loop itself (own module, driving draft-token injection into the
+token pool, the verify Batch construction, `accept_drafts` call, and `LinearStatePool`
+snapshot/restore around it), the greedy-only/single-request/non-overlap gate, and the
+target-equivalence test (`spec_mtp=1` byte-identical token stream vs `spec_mtp=0`, swept across
+prompt lengths crossing an `index_ratio` boundary per the review's QSA pending-ring warning).
