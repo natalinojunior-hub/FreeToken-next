@@ -762,10 +762,10 @@ class Engine:
         logger.info_rank0(
             "KV context feasibility ("
             + f"{cache_per_page / (1 << 20):.2f} MiB per {page_tokens}-token page, "
-            f"{mem_GB(budget)} GiB left for KV after the expert cache): "
+            f"{mem_GB(budget)} left for KV after the expert cache): "
             + ", ".join(
                 f"{row.tokens // 1024}K "
-                + ("fits" if row.fits else f"+{mem_GB(row.shortfall_bytes)} short")
+                + ("fits" if row.fits else f"{mem_GB(row.shortfall_bytes)} short")
                 for row in rows
             )
         )
