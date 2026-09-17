@@ -733,3 +733,17 @@ blind, without that integration-test capability, was judged too high-risk for th
 Everything up to and including this design is real and durable; the scheduler loop itself,
 the prefill-window MTP warm-up pass, `_expand_sample_args`, and the single-request startup
 refusal are the exact, ready-to-implement next unit for item E.
+
+## EXP-026 — Native MTP scheduler loop implemented (untested live)
+**Date:** 2026-09-17 · **Verdict:** **IMPLEMENTED / UNVALIDATED-LIVE**
+
+`scheduler/spec.py` (`SchedulerSpecMixin.run_spec_step`) implements EXP-025's design in full,
+generalized over `k = config.spec_mtp`. Wired into `normal_loop`; refuses loudly at `Scheduler.
+__init__` if `--spec-mtp>0` with overlap scheduling enabled or `max_running_req != 1`. Inert
+(0 regressions) at the default `--spec-mtp 0`: 720 passed, 61 skipped, same 2 pre-existing
+flashinfer/nvcc-13.3 failures. No test in this repo wires Scheduler+CacheManager+TableManager+
+a real model together, so the actual draft/verify/accept/reject/EOS-truncation logic is
+unverified by execution -- correctness rests on the file:line-verified design only. Operator
+decision: implement now rather than wait for a live checkpoint (recorded per their explicit
+choice). First real validation must happen at a live 16K serve per the goal's preflight gates
+(MTP acceptance/target-equivalence), before any 256K attempt.
