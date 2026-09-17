@@ -1323,6 +1323,12 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        if self.config.moe_collect_stats and self.moe_offload_cache is not None:
+            logger.info_rank0(
+                "MoE decode stats: "
+                f"{self.moe_offload_cache.decode_miss_stats()} "
+                f"per_layer={self.moe_offload_cache.decode_miss_stats_per_layer()}"
+            )
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()

@@ -94,3 +94,12 @@ def test_an_explicit_choice_beats_inference():
         pinned, _ = parse_args(["--model", ANON_PATH, "--reasoning-parser", "qwen3"])
     assert off.reasoning_parser is None
     assert pinned.reasoning_parser == "qwen3"
+
+
+def test_moe_collect_stats_is_opt_in():
+    config = _Config({"architectures": ["Qwen3ForCausalLM"], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        disabled, _ = parse_args(["--model", ANON_PATH])
+        enabled, _ = parse_args(["--model", ANON_PATH, "--moe-collect-stats"])
+    assert disabled.moe_collect_stats is False
+    assert enabled.moe_collect_stats is True
