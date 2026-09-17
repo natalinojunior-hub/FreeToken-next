@@ -294,25 +294,26 @@ to fix, only a capability to add. The dense `Qwen3.8-27B` IQ3_S file serves and 
 that passes the guard because it is uniform.
 What Phase 6 therefore actually needs, in order: (1) expert slot pools keyed by
 (bank, ggml type, row geometry) rather than by bank, because a mixed bank is two allocations by
-construction; (2) row readers for the types this corpus uses that FreeToken has none for (`_read_row`
-covers F16/BF16/Q4_0/Q8_0/Q6_K/Q2_S/Q3_K; the corpus's expert banks are Q4_K, IQ4_XS and Q3_K);
-(3) the per-role split, since `gguf_expert_types` records one type per layer for the fused
-`gate_up` bank and `gguf_expert_specs:123` then prices both halves with the gate's row bytes.
-(1) alone serves nothing: a mixed bank whose second type has no reader still cannot execute.
-**Unresolved, and it has to be resolved before any kernel is wired:** the two byte measurements in
-this section disagree. This tree's table (`dequant.py BLOCK_SHAPE`, read directly) prices ids
-10-14 as 84/110/144/176/210 bytes per 256 elements -- exactly llama.cpp's Q2_K/Q3_K/Q4_K/Q5_K/Q6_K
-sizes, under ids shifted by one from llama.cpp's (this table has no `bf16` at 2). But A7 §1.1
-measured the same files' expert rows at 276 B per 256-element row for `Q3_K` and 308 B for
-`Q4_K`, and concluded they are a re-quantizer's private layouts. Those cannot both be true: either
-the audit's row arithmetic folded in the gate+up concatenation (a `gate_up` slot is 2 rows, and
-276 B is ~2x138 of an IQ3_S-class layout), or the ids really do carry a different codec under
-llama.cpp's byte counts. Until it is settled against a reference dequant -- read one tensor's
-blocks, dequantize them with both readers, compare the result to the same expert in the native
-checkpoint -- Phase 6 must not execute a row it cannot name. The file metadata offers no help:
-`load_gguf_metadata` on the Ornith, Tiel, 27B and both dflash files exposes only `GGUF.version`,
+construction; (2) the per-role split, since `gguf_expert_types` records one type per layer for the
+fused `gate_up` bank and `gguf_expert_specs:123` then prices both halves with the gate's row bytes.
+An earlier draft of this list put "row readers for Q4_K / IQ4_XS / Q3_K" between them; that is
+**retracted** -- the GPU path dequantizes every type `BLOCK_SHAPE` names (`--moe-strategy offload`),
+so no reader is missing there. The only format gap is CPU-side: `_cpu_moe` dispatches weight formats
+for ggml ids 2/12/14 (`cpu_moe_ext.cpp:1367`, `WF_Q4_0/WF_Q4_K/WF_Q6_K`) and
+`_resolve_gguf_format` (`cpu_executor.py:86-119`) takes **one** format for both banks, so these
+checkpoints run on offload until Q3_K/IQ3_S/IQ4_XS get CPU dot kernels.
+**Settled the same day (A7 §8, and it was the audit's own error):** the two byte measurements in this
+section disagreed. A7 §8 measured the physical stride of all 1194 expert/weight tensors from their
+data offsets (`.qwen/tmp/a7_truth.py`, alignment 32, measured pad 0 on every row) against this tree's
+`dequant.py BLOCK_SHAPE`, gguf-py's `GGML_QUANT_SIZES` and llama.cpp's struct arithmetic: **1194/1194
+match**, so the ids are *not* renumbered (`Q2_K=10, Q3_K=11, Q4_K=12, Q5_K=13, Q6_K=14, IQ4_NL=20,
+IQ3_S=21, IQ2_S=22, IQ4_XS=23` -- id for id what `ggml.h:400-413` declares) and the first pass's
+276 B / 308 B rows were the gate+up concatenation folded into a single row (a `gate_up` slot is two
+rows; Q3_K is 110 B per 256 elements, so its 512-element `ffn_down` row is 220 B, and `276 B` appears
+in no file in the corpus). Nothing has to be settled against a reference dequant before Phase 7 keys
+the pools; the metadata dead-end stands (`load_gguf_metadata` exposes only `GGUF.version`,
 `general.quantization_version` and `general.architecture`, and the `tokenizer.ggml.quant_layout`
-key A7 §8 reported is not present.
+key A7 §8 first reported is not present).
 **Consequence for the matrix:** these are recorded as BLOCKED rows that name their blocker, which
 D-012 requires, and they are not counted as regressions.
 

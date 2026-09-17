@@ -1,13 +1,15 @@
 # STATE — freetoken-next
 
-Snapshot date: 2026-09-16. This is the current truth; history goes to
+Snapshot date: 2026-09-17. This is the current truth; history goes to
 EXPERIMENTS.md / DECISIONS.md, not here.
 
 ## Where we are
 
-**Phase 1 (clean fast base) DONE. Phase 2 (native GGUF) in flight. Phase 6 (the VRAM
-ledger) has its first brick landed: the account exists, prints, and is honest enough to
-show its own holes.**
+**Phase 1 (clean fast base) DONE. Phase 6 (the VRAM ledger + governor) DONE: one account
+owns the ceiling, the reserve, the expert/KV split and the context rows, and a measured peak
+now ratchets its own floor. 128K and 256K work on the 35B-A3B. Phase 2 (native GGUF) is
+committed and has its first measured row; its MoE rows are gated by Phase 7, which is now
+known to be a pool-keying change and not a missing kernel.**
 
 | Step | Status | Evidence |
 |---|---|---|
@@ -24,8 +26,8 @@ show its own holes.**
 | **First GGUF matrix row measured** | **PASS** | Qwen3.8-27B IQ3_S dense: PP 2416.6 / TG 25.29 / TTFT 1.69 s / VRAM 14.43 GiB and **RSS 2.17 GiB** (the native offload anchors need 21.9-67.8 GiB); its own account says 128K KV is 8.00 GiB short of what 13.2 GiB of resident weights leave behind (PERFORMANCE.md §9) |
 | CPU MoE ABI gate | **done** | `_cpu_moe.max_weight_format_id()` + `compiled_extension_supports_format()`: a `.so` predating the GGUF K-quants now refuses `q4_0/q4_k/q6_k` with the rebuild instruction instead of faulting inside a worker thread that already holds the bank table (the activation probe's twin) |
 | Benchmark a bare `.gguf` | **done** | `benchmarks/bench_pp_tg.py` now tokenizes through `utils/hf.load_tokenizer` (the engine's own GGUF vocab path) instead of `AutoTokenizer`, which can only read an HF directory |
-| Source audits (9, parallel) | **done** | `docs/freetoken-next/audits/A1…A9.md`; A7 = GGUF MoE geometry + refused-today matrix, A8 = turbo codec byte layout, A9 = unaccounted VRAM consumers |
-| Phase 2 GGUF loader | **first model serves correctly** (port itself still uncommitted) | EXP-004: the IQ3_S 27B GGUF generated coherent, factually correct text and the NextN/MTP drop warned as designed; owed before commit: `kernel/aot_models.py` arch entries, the `models/*/__init__.py` export union, `kernel/gguf.py` `libcudart` load order, and refusing K-quant CPU formats at registration |
+| Source audits (9, parallel) | **done** | `docs/freetoken-next/audits/A1…A9.md`; A7 = GGUF MoE geometry + refused-today matrix + the stride-vs-file table that closed the byte-layout question, A8 = turbo codec byte layout (turbo3 112 B / turbo4 132 B per 256-element row), A9 = unaccounted VRAM consumers |
+| Phase 2 GGUF loader | **committed** (`86af2d3`); dense row measured, MoE rows gated | EXP-004: the IQ3_S 27B GGUF generated coherent, factually correct text and the NextN/MTP drop warned as designed; EXP-010 measured it (PP 2416.6 / TG 25.29 / RSS 2.17 GiB). The two MoE GGUFs that geometry blocks are gated by Phase 7 pool-keying, not by a missing kernel |
 | Final gate declared | done | `benchmarks/cert_matrix.py` (D-012, PERFORMANCE.md §6): native `-FT` rows must clear their guard and every same-arch GGUF row reports parity against them |
 
 ## Findings that already changed the plan
@@ -55,6 +57,14 @@ show its own holes.**
 7. `qwen4_exp` MTP tensors exist in the local checkpoints (both configs list `mtp.*` in the
    quantization *ignore* set) but upstream's loader **drops `mtp.*`** (issue #421). Phase 9 is
    greenfield on our base; `refs/pr/69` is the reference loop shape.
+8. **The GGUF MoE unblock is smaller than the audits first claimed, and the difference is the
+   kind of mistake worth remembering.** A7's first pass reported expert rows of 276/308 B and
+   concluded the checkpoints carry a re-quantizer's private layouts; §8's offset-derived table
+   (1194/1194 tensors) shows llama.cpp's byte counts under llama.cpp's own ids, and the "missing
+   row readers" turned out to be missing *CPU dot kernels* only — `--moe-strategy offload` already
+   dequantizes every `BLOCK_SHAPE` type. Two numbers that disagreed and nobody settling them
+   against the host would have sent Phase 7 to write kernels for a layout that does not exist.
+   Every quantity that gates a phase now gets re-measured before it enters a plan (EXP-011).
 
 ## Running
 
