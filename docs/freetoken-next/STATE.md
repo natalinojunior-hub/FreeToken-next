@@ -5,17 +5,20 @@ EXPERIMENTS.md / DECISIONS.md, not here.
 
 ## Where we are
 
-**Phase 1 (clean fast base) is DONE.** Phase 2 (native GGUF) is next and the source
-audits that decide its design are in flight.
+**Phase 1 (clean fast base) DONE. Phase 2 (native GGUF) in flight. Phase 6 (the VRAM
+ledger) has its first brick landed: the account exists, prints, and is honest enough to
+show its own holes.**
 
 | Step | Status | Evidence |
 |---|---|---|
 | Base = current upstream FreeToken `cac247a` (v0.1.3), branch `next` | done | `git fetch upstream` → 0 behind; PROVENANCE.md §1 |
-| Durable docs created | done | `docs/freetoken-next/` (7 files) |
+| Durable docs created | done | `docs/freetoken-next/` (7 files + audits A1…A9) |
 | Builds cleanly on host | done | editable `.[accel]` install in `.venv` (py 3.12.14, torch 2.11.0+cu130, triton 3.6.0); `_pinned_tensor`, `_cpu_moe`, `_ple_store` all compiled; `ft --version` → 0.1.3 |
-| Test suite green | done | `pytest tests -m "not slow"` → **1746 passed, 206 skipped, 1 failed**, and that one (`kernels/test_mrope.py`) is a flashinfer JIT first-build race — re-run alone: **6 passed** |
+| Test suite green | done | `pytest tests -m "not slow"` → **1813 passed, 206 skipped, 1 failed**, and that one (`moe/test_nvfp4_backends.py::test_b12x_*`) is a flashinfer JIT race — re-run alone: **2 passed** (EXP-005) |
 | Baseline reproduces anchors | **PASS on both models** | 35B-A3B @16K: PP 4611 / TG 158.8 / VRAM 14.98 GiB / 99.8 % util; Flash-Next @16K: PP 1857.7 / TG 28.685 / VRAM 14.86 GiB / RSS 67.82 GiB / 99.99 % util (PERFORMANCE.md §3, EXPERIMENTS.md EXP-001/001b) |
-| Source audits (6, parallel) | **done** | `docs/freetoken-next/audits/A1…A6.md`; conclusions merged into ARCHITECTURE.md §2–§6 |
+| Dummy-page brick (`1c81064`) | **done, guards hold** | the pool allocates `num_pages + 1` and both budget formulas now price it, including `kvcache/base.py::solve_num_pages`; 35B @16K re-measured PP 4610.1 / TG 158.75, **output sha1 identical** (EXP-005) |
+| VRAM ledger, brick 1 | **done, guards hold at the default ratio** | `engine/vram_ledger.py` + `cache_budget.ceiling_bytes`; one account, printed at startup, `--memory-ratio` a cap and the modelled peak a floor with only the shortfall charged. **Flash-Next now serves at `--memory-ratio 0.9`** (EXP-001b's OOM is gone) and at 1.0 lands on the same geometry as the hand-found 0.86: PP 1861.9 / TG 28.68 / sha1 identical (EXP-006) |
+| Source audits (9, parallel) | **done** | `docs/freetoken-next/audits/A1…A9.md`; A7 = GGUF MoE geometry + refused-today matrix, A8 = turbo codec byte layout, A9 = unaccounted VRAM consumers |
 | Phase 2 GGUF loader | **first model serves correctly** (port itself still uncommitted) | EXP-004: the IQ3_S 27B GGUF generated coherent, factually correct text and the NextN/MTP drop warned as designed; owed before commit: `kernel/aot_models.py` arch entries, the `models/*/__init__.py` export union, `kernel/gguf.py` `libcudart` load order, and refusing K-quant CPU formats at registration |
 | Final gate declared | done | `benchmarks/cert_matrix.py` (D-012, PERFORMANCE.md §6): native `-FT` rows must clear their guard and every same-arch GGUF row reports parity against them |
 

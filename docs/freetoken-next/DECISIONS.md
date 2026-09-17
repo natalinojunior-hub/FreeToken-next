@@ -148,4 +148,29 @@ sanity generation — **not** token-for-token equality. Equality needs a same-we
 (convert a native checkpoint to GGUF and back, or fetch official Qwen3.8-27B native), which
 is recorded as a matrix gap, not silently dropped.
 
+## D-014 — The VRAM ledger owns the reserve; `--memory-ratio` is a cap, not the policy
+**Date:** 2026-09-17 · **Status:** accepted (`engine/vram_ledger.py`, `cache_budget.ceiling_bytes`)
+One object opens the byte account after the weights load and owns every number the planner
+consumes. Each consumer is a named line item with a `Kind`; `reserve_bytes` is what must stay
+empty (Triton's 256 MiB autotune arena, the CUDA-graph capture peak, the gated-delta-net
+per-layer prefill workspace over one scheduler chunk, the live activation stream, the named
+fragmentation reserve) and `engine_overhead_bytes()` is what the engine holds but no pool or
+expert cost model prices (page table, graph pool, backend workspaces, PLE). The ceiling is
+`ratio x baseline` minus only the **shortfall** between the modelled reserve and the hole the
+ratio already leaves, so: (a) every shipped default ratio reproduces the pre-ledger budget
+byte-for-byte, which is what keeps the two performance guards intact; (b) raising the ratio
+toward 1.0 stops being a gamble, because the plan funds the peak it used to hope for; (c) the
+KV solve, `--moe-cache-auto` and `validate_rebuild` all take the same two numbers from the same
+place, so they cannot disagree about what "fits" means. `unit_bytes`/measured lines are
+compared against the account at the end of init and a gap is warned, never asserted.
+**Why:** before this, the only thing between a filled pool and a CUDA OOM was an unmodelled
+`(1 - memory_ratio)` hole whose size nobody could state -- EXP-001b had to bisect
+`--memory-ratio` by hand (0.9 OOM, 0.86 works) and the same hidden margin is what caps the
+context the mission needs. EXP-006 shows the account catching two real holes the formula could
+not see (an aliased-view double count, and 2.2 GiB of expert-cache side tables the per-slot
+price omits).
+**Consequence for D-007:** `--memory-ratio 0.86` is no longer the only working Flash-Next
+config; the default 0.9 serves with the reserve modelled (EXP-006). 0.86 stays in the guard
+table as the recorded anchor condition so the comparison remains matched.
+
 

@@ -132,7 +132,6 @@ Consequences that steer the design:
    evidence for Phase 6 (one ledger) and for the KV-reserve floor.
 
 ## 5. Comparison rules
-
 Constant across an A/B: model, quant, prompt, context, generation length, sampling,
 MTP state, KV type, cache config, build, profiler state. Discovery uses 4K/16K/32K only;
 128K/256K are promotion-stage, 512K/1M are certification-stage (2–3 runs, report
@@ -157,3 +156,35 @@ native row**; an unservable row reports BLOCKED with its blocker rather than van
 Parity is throughput and capacity, not output identity (D-013): these GGUF files carry
 different weights or a different quant recipe than their native counterpart, so
 token-for-token equality requires a same-weights pair.
+
+## 7. The VRAM account, and what it costs to stop guessing the ratio
+
+Every row here is `benchmarks/bench_pp_tg.py` on the real host, 16 384-token prompt, 128
+generated, bs=1, greedy, `--cache-type naive`, 3 repeats; the only column that varies is
+`--memory-ratio`. "serves" is the gate that matters first: before `engine/vram_ledger.py`
+(D-014, EXP-006) Flash-Next **CUDA-OOM'd at 0.9** and only ran at the bisected 0.86.
+
+| model | `--memory-ratio` | serves? | PP | TG | VRAM | expert slots | KV pages |
+|---|---|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B NVFP4 | 0.9 (default) | yes | 4607.6 | 158.49 | 14.59 GiB | 6043 | 16576 x 1 |
+| Qwen3.8-Flash-Next NVFP4 | 0.86 | yes (pre-ledger anchor) | 1857.7 | 28.685 | 14.86 GiB | 1399 | 259 x 64 |
+| Qwen3.8-Flash-Next NVFP4 | 0.9 | **yes (was OOM)** | 1861.9 | 28.68 | 14.80 GiB | 1274 | 259 x 64 |
+| Qwen3.8-Flash-Next NVFP4 | 1.0 | **yes (was OOM)** | 1861.5 | 28.66 | 14.79 GiB | 1113 | 259 x 64 |
+| Qwen3.8-Flash-Next NVFP4 | 0.95 | same ceiling as 1.0 | 1862.5 | 28.67 | 14.79 GiB | 1113 | 259 x 64 |
+
+Two things that number sequence is telling. First, the guards are not pay-for-anything
+decisions: the pre-ledger 0.86 row and the post-ledger 0.9/1.0 rows are the same throughput to
+within 0.2 % with the same output hash (`f8bbaeb7e214`), so accounting for the peak costs
+nothing that was ever actually available. Second, 0.95 and 1.0 now resolve to the *same* plan
+(1113 expert slots, 259 pages) because `ceiling_bytes` floors the ratio at the modelled peak:
+past the point where the reserve binds, raising `--memory-ratio` stops being a gamble and
+stops being a way to win context, which is exactly what the hand-found 0.86 was pretending to
+be. The expert-slot column is where the reserve is paid for, and the ledger names the lines it
+paid (256 MiB autotune arena, 256 + 160 MiB/shape graph capture, 200 + 150 MiB/shape graph
+pool, ~880 MiB GDN prefill workspace, ~240 MiB activations, 192 MiB per-image vision
+transient, 128 MiB fragmentation).
+
+The calibration line printed with each report is the honesty check on those numbers: the
+account's held bytes against `torch.cuda.memory_allocated`. It read "over-modelled by
+~0.2-0.4 GiB" on both anchors after the two measurement bugs EXP-006 lists were fixed, which
+is the safe direction (context left unspent) and the quantity Phase 2 has to negotiate down.

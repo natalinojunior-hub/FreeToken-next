@@ -234,8 +234,14 @@ worth +10.5 % TG bit-exact).
 
 ## 5. Authoritative VRAM accounting (Phase 6)
 
-**There is no ledger today** (A1 §6). Consumers re-derive from a handful of `mem_get_info`
-snapshots taken in a fixed order — `engine/engine.py:778 _sync_get_memory` (sync +
+**STATUS: brick 1 landed (`engine/vram_ledger.py`, D-014).** The ledger exists, owns the
+ceiling, prints the account at the end of `Engine.__init__`, and is consumed by all three
+sizing decisions (startup KV, `--moe-cache-auto`, `validate_rebuild`). What is *not* yet in
+place is the negotiation policy (Phase 2) and the calibration tightening the first run
+measured; both are described below and remain the plan.
+
+**There was no ledger before it** (A1 §6). Consumers re-derived from a handful of
+`mem_get_info` snapshots taken in a fixed order — `engine/engine.py:778 _sync_get_memory` (sync +
 `empty_cache` + `reset_peak_memory_stats`) → `_baseline_free` (:318) → post-weights
 `_weights_bytes` (:345) / `_post_weights_free` (:352) — and then `net_cache_budget_bytes`
 (`engine/cache_budget.py:29`) is shared by *two independent* decisions: `_startup_kv_budget`
@@ -257,6 +263,31 @@ Three measured consequences on this host, all from EXP-001/001b:
 3. Per-sequence GDN state (966 MiB / 1737 MiB, PERFORMANCE.md §4) is pooled at
    `linear_state_cache_ratio=2.0` and is priced against nothing.
 
+**What the landed brick does.** `VramLedger` holds `baseline_free` + `memory_ratio` + a dict
+of named `Charge(name, bytes, Kind, note)` lines and answers four questions: `reserve_bytes`
+(TRANSIENT + RESERVE -- memory that must stay empty), `engine_overhead_bytes` (PERSISTENT +
+SEMI_PERSISTENT that no pool or expert cost model prices: page table, CUDA-graph pool, backend
+workspaces, PLE), `ceiling_bytes` = `ceiling_bytes(baseline, ratio, reserve)` =
+`ratio x baseline` minus only the **shortfall** between the reserve and the hole the ratio
+already leaves (so a shipped default ratio reproduces the pre-ledger arithmetic exactly,
+which is what keeps the guards untouched), and `pool_budget_bytes(extra_fixed)` = ceiling minus
+everything non-negotiable. `modelled_reserves()` prices the autotune arena (256 MiB measured),
+the graph capture peak and pool (256 MiB + 160 MiB/shape, and 200 MiB + 150 MiB/shape from
+A9's measurement), the activation stream (`LIVE_ACTIVATION_TENSORS x T x hidden x itemsize`),
+one gated-delta-net layer's prefill workspace over `max_extend_tokens` (the formula in
+`gdn_prefill_bytes`, which is the 96-512 MiB allocation EXP-001b/EXP-003 died on), the per-image
+vision transient (only when a model registers encoders), and a named 128 MiB fragmentation
+reserve. The KV pool, the expert cache, the GDN state pool, the page table and PLE are charged
+as they are built, the expert line is split into "priced by the plan" plus the residue the plan
+did not price, and `_calibrate_vram_ledger()` compares the account with
+`torch.cuda.memory_allocated` and warns (never asserts) when the two disagree.
+
+Two bugs the account found on its first runs, both now fixed and both invisible to the old
+formula: `tensor_bytes` billed the offload cache's `prefill_bank_buffers` (views into the
+first `2 x num_experts` slots of its own bank caches) a second time, which made the expert
+line read ~2x big; and `kv_reserve_bytes` priced the reserve in usable pages while the pool
+allocates one more, so a plan could miss its own fit assert by a single page (EXP-006).
+
 **Design**: one `VramLedger` object owned by the engine, created from the `_baseline_free`
 snapshot, with named consumers that `reserve(name, bytes, kind=permanent|transient|resizable)`
 before allocating and `commit`/`release` after, plus `reserve_headroom()` for
@@ -269,6 +300,16 @@ line item*, following LTO's `(row_k+row_v) × cells` form. Then the governor cho
 {KV tier/format, KV→pinned-RAM tier, expert-cache size, GDN state slots, MTP budget, PLE
 placement, workspace size} by measured marginal effective-TG per MiB, with the runtime
 flight-recorder (§7) as its input. `--memory-ratio` stays as a cap, not as the policy.
+
+**Open gaps this account exposes but does not yet close** (each is a Phase-2 work item, with
+the number attached): the auto plan still derives the expert split from `expert_bytes_per_slot`,
+so the side tables land in the account only *after* allocation (self-correcting on the second
+plan, not the first); `_weights_bytes` is a `mem_get_info` delta and therefore includes
+non-torch overhead, which is why the calibration reads "over-modelled" by ~0.4 GiB instead of
+zero; the mm encoder line is priced per image while the encoder cache has no byte cap
+(`mm/encoder_cache.py:38`); and `max_memory_allocated` is unusable as a steady-state number
+because `_sync_get_memory()` resets the peak counter mid-init.
+
 
 ## 6. MTP / speculative decoding map (Phases 9–10)
 

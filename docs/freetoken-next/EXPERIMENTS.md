@@ -100,6 +100,106 @@ pre-existing at HEAD, not a port regression), and the K-quant CPU path must refu
 *registration* instead of registering `weight_format=q8_0` and raising `unknown
 weight_format` at call time.
 
+## EXP-005 — Close the dirty dummy-page brick (Phase 0)
+**Date:** 2026-09-17 · **Verdict:** **KEEP** · commit `1c81064`
+Question: the working tree carried a half-finished fix for the fact that every KV pool
+allocates `num_pages + 1` (the dummy page padded writes go into) while both budget formulas
+priced only usable pages. Was the fix complete, and did it cost anything?
+Method: finish the accounting at the one shared seam (`pool_pages()` / `required_bytes()`) and
+extend it to the second copy of the bug in `kvcache/base.py::solve_num_pages` (DSV4's own
+solver already subtracted the dummy page — the generic template did not); pin the invariant in
+tests both ways (`required_bytes(plan) <= budget` and `required_bytes(plan + 1 page) > budget`)
+for the planner, the generic solver and `validate_rebuild`; then re-run the 35B-A3B 16K guard.
+Result: focused suites green, full `not slow` suite **1813 passed / 206 skipped / 1 failed**
+with the failure being the known flashinfer b12x JIT race (`moe/test_nvfp4_backends.py`,
+2 passed when run alone — EXP-001 saw the same class on `test_mrope.py`). Guard:
+**PP 4610.1 (min 4606.8) / TG 158.75 (min 158.72) / VRAM 14.98 GiB / output sha1
+`2a6dca88ffdc`**, i.e. byte-identical generation and both numbers inside the guard
+(≥ 4600 / ≥ 158) against the 4611.1 / 158.83 baseline.
+Note for every future A/B: the size of the miss was one page, so this brick changes nothing you
+can see in throughput -- what it buys is that a plan can no longer promise memory it did not
+fund, which is the precondition for the ledger's `pool_budget_bytes` being worth trusting.
+
+## EXP-006 — Authoritative VRAM ledger, brick 1 (Phase 1)
+**Date:** 2026-09-17 · **Verdict:** **KEEP** (guards hold; the hidden margin is now an account)
+Question: can the engine stop guessing `--memory-ratio`, and does the account it prints
+actually add up on real hardware?
+Method: `engine/vram_ledger.py` (D-014) — named `Charge(name, bytes, Kind)` lines,
+`reserve_bytes` = what must stay empty (Triton autotune arena 256 MiB, CUDA-graph capture peak
+256+160/shape MiB, one GDN layer's prefill workspace over `max_extend_tokens`, the live
+activation stream, a per-image vision transient, 128 MiB named fragmentation reserve),
+`engine_overhead_bytes` = held bytes no pool/expert cost model prices (page table, graph pool,
+backend workspaces, PLE), and `ceiling_bytes = ratio x baseline - max(0, reserve - the hole the
+ratio already leaves)`. The KV solve, `--moe-cache-auto` and `validate_rebuild` all take those
+two numbers; `_calibrate_vram_ledger()` closes the account against
+`torch.cuda.memory_allocated` and warns instead of asserting. Inputs from audit A9 (per-consumer
+file:line inventory) and the two anchor models.
+Result — guards at the default `--memory-ratio 0.9`, three repeats each, same harness:
+
+| Model | PP | TG | TTFT | VRAM | sha1 | guard |
+|---|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B NVFP4 16K | 4607.6 (min 4606.8) | 158.49 | 3555.9 ms | 14.59 GiB | `2a6dca88ffdc` | ≥4600 / ≥158 **PASS** |
+| Qwen3.8-Flash-Next NVFP4 16K | 1861.9 (min 1860.5) | 28.68 | 8799.9 ms | 14.80 GiB | `f8bbaeb7e214` | ≥1850 / ≥28.5 **PASS** |
+
+Both hashes are the pre-ledger anchors' hashes; the deltas (-0.08 % PP on the 35B, +0.2 % on
+Flash) are inside the harness's own repeat spread. **The capability result is that Flash-Next
+now serves at 0.9, the default** — EXP-001b's exact failure ("Tried to allocate 256.00 MiB …
+209.44 MiB free" inside `get_empty_cache_for_benchmark`) is gone, because the autotune arena,
+the graph pool and the GDN prefill workspace are funded lines instead of a hope. At
+`--memory-ratio 1.0` the ceiling lands on 12.923 GiB and the plan is the *same geometry* the
+hand-found 0.86 gave (1113 expert slots, 259 KV pages, PP 1861.5 / TG 28.66): the account
+derives the margin the user used to bisect for.
+
+What the account caught, none of it visible before:
+1. `tensor_bytes` billed the offload cache's `prefill_bank_buffers` — views into the first
+   `2 x num_experts` slots of its own bank caches — a second time, inflating the expert line
+   ~1.9x and making the plan look like it under-priced slots by 2.4x. Fixed by merging
+   overlapping byte ranges; the expert line went 5.518 → 3.287 GiB on Flash-Next at 0.9.
+2. The GDN prefill workspace is ~0.86 GiB per layer over the default 8192-token chunk on
+   Flash-Next (39 % of the whole card), and `chunk_o.py:146`'s `o = torch.zeros_like(v)` is a
+   96 MiB slice of it — the allocation that OOM'd. Priced from `LinearGatedDeltaGroupConfig`.
+3. The CUDA-graph pool (A9: ~0.2 GB for one captured shape, +0.15 GB per extra shape) and the
+   page table were charged *after* the pools were sized, so they came out of the ratio's hole.
+   Both are now estimated from config at ledger-open and re-priced from the measurement, which
+   is what `engine_overhead_bytes()` exists to carry.
+4. `plan_cache_budget` priced the KV reserve in usable pages while the pool allocates one more,
+   so a plan could miss its own fit assert by exactly one page (a 1.5 MiB rejection of
+   Flash-Next at 0.9); the reserve is now priced as `pool_pages(kv_reserve_pages)`, and the
+   greedy expert side hands bytes back when the page floor binds instead of failing startup.
+5. After all of that the calibration reads "over-modelled by 0.44 GiB" on Flash-Next at 0.9 —
+   the safe direction, and the number Phase 2 starts from: the reserve is currently a
+   conservative sum, not a negotiated figure, and `_weights_bytes` is a `mem_get_info` delta
+   that includes non-torch overhead (A9 §5.1: measured free is not held bytes).
+Residual open items, with owners: price the expert side tables *before* the first plan (they
+are only in the account after allocation today); give the encoder cache a byte cap so the mm
+line can be a promise instead of a guess; move the ceiling to `engine_allocated_post_weights`
+semantics so the account is held-bytes-based end to end.
+
+## EXP-007 — What the account said after each correction (ratio sweep, both anchors)
+**Date:** 2026-09-17 · **Verdict:** INFORMATIONAL — the constants are measured now, and two
+apparent "plan bugs" turned out to be the account being right and the measurement being wrong
+Same 16K harness, same `--num-tokens 16576 --cache-type naive` guard config on both
+checkpoints, `--memory-ratio` swept 0.86 / 0.9 / 0.95 / 1.0, reading the printed account each
+time. The corrections and what each one moved:
+
+| correction | line it moved | consequence |
+|---|---|---|
+| merge overlapping byte ranges in `tensor_bytes` | `cache:expert` 10.840 → 10.109 GiB (35B), 5.518 → 3.290 (Flash) | `prefill_bank_buffers` are the first `2 x num_experts` rows of `bank_caches`; billing them twice made a correct plan look like it under-priced a slot by ~2x |
+| price `kv_reserve` as `pool_pages(kv_reserve_pages)` | Flash-Next stopped rejecting its own fit assert at 0.9 | the reserve floor is in pages, the greedy fill is in bytes; the miss was exactly the dummy page (1.5 MiB) |
+| hand the excess back to the greedy expert side when the floor binds | same | a startup rejection became a slightly smaller expert cache |
+| fund `graph:pool` and the page table from formulas before the solve | `pool budget` -0.32 GiB on both anchors | those were the bytes `--memory-ratio 0.86` had been silently reserving |
+| price the vision transient per image (192 MiB), not per plausible burst | `reserve` 2.256 → 1.600 GiB | gave back the ~0.3 % of 35B-A3B prefill throughput an over-wide reserve had taken |
+
+Final rows at the default `--memory-ratio 0.9`, three repeats each: 35B-A3B PP 4607.6 /
+TG 158.49, account holds 13.739 GiB against the allocator's 13.520 (over-modelled 0.22 GiB),
+`uncommitted -0.159 GiB`; Flash-Next PP 1859.3 / TG 28.68, over-modelled 0.44 GiB. Both output
+hashes unchanged. Read two caveats before reusing these numbers: `uncommitted` is negative
+because `_weights_bytes` is a `mem_get_info` delta that carries non-torch overhead with it, and
+Flash-Next's reserve is dominated by one line (`transient:gdn-prefill`, 0.60-0.86 GiB) whose
+64-token chunk width is a kernel constant rather than a config knob -- at `max_extend_tokens`
+above 8192 that line grows linearly and will start to fight the KV pool, which is Phase 12's
+problem with a number already attached to it.
+
 ## EXP-002 — GGUF / MTP / TurboQuant corpus and source audits
 **Date:** 2026-09-16 · **Verdict:** INFORMATIONAL (complete; reports archived in
 `audits/A1…A6`, conclusions in ARCHITECTURE.md §2–§6)

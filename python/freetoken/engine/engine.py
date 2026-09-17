@@ -431,7 +431,7 @@ class Engine:
         self.vram_ledger.charge(
             "cache:kv", pool_pages(self.num_pages) * _per_page + _fixed, Kind.PERSISTENT,
             f"{self.num_pages} usable pages x {_page_tokens} tokens (+1 dummy page), "
-            f"{_per_page // (1 << 20)} MiB per page",
+            f"{_per_page / (1 << 20):.2f} MiB per page",
         )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
@@ -684,7 +684,7 @@ class Engine:
         promised = min(measured, cache.cache_size * per_slot)
         self.vram_ledger.charge(
             "cache:expert", promised, Kind.PERSISTENT,
-            f"{cache.cache_size} slots x {per_slot // (1 << 20)} MiB priced by the plan",
+            f"{cache.cache_size} slots x {per_slot / (1 << 20):.2f} MiB priced by the plan",
         )
         side = measured - promised
         if side > 0:

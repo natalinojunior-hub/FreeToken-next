@@ -115,6 +115,29 @@ def test_plan_prices_the_page_the_pool_allocates():
     assert required_bytes(size, pages + 1, 100, 10) > 2000
 
 
+def test_plan_gives_expert_slots_back_when_the_kv_page_floor_binds():
+    # Experts fill greedily against the reserve in BYTES, but the reserve is a floor in PAGES.
+    # With the pool's dummy page priced, a budget one page short of that floor used to reject
+    # startup outright (assert in arithmetic); the greedy side must hand the excess back.
+    per_expert, cache_per_page = 2 * (1 << 20), 4 * (1 << 20)
+    budget = 20 * per_expert + (5 + 1) * cache_per_page + 1  # one byte past a clean fit
+    size, pages, _ = plan_cache_budget(
+        budget_bytes=budget, per_expert_bytes=per_expert, cache_per_page=cache_per_page,
+        num_experts=8, total_experts=2560, prefill_overlap=False,
+        kv_reserve_pages=5, max_slots=64,
+    )
+    assert pages >= 5 and required_bytes(size, pages, per_expert, cache_per_page) <= budget
+
+
+def test_plan_still_rejects_a_budget_below_its_own_minimum():
+    with pytest.raises(AssertionError, match="cache budget too small"):
+        plan_cache_budget(
+            budget_bytes=8 * 100, per_expert_bytes=100, cache_per_page=10,
+            num_experts=4, total_experts=8, prefill_overlap=False,
+            kv_reserve_pages=64, max_slots=8,
+        )
+
+
 def test_expert_bytes_per_slot_sums_row_bytes_over_banks():
     sources = {
         "gate_up": [torch.zeros(4, 32, 8, dtype=torch.float16)],  # row = 32*8*2 = 512
