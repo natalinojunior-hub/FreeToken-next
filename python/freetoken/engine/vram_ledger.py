@@ -230,6 +230,11 @@ NEGOTIABLE = ("cache:expert", "cache:kv")
 # excluded from every total the planner acts on (ceiling, reserve, committed) and only ever
 # compared against them.
 MEASURED_LINE = "measured:allocator-held"
+# The peak the runtime actually produced after the pools were sized, charged by the engine's
+# calibration pass. Like the held reading it is a report about the account, not a consumer --
+# with one exception, encoded in :attr:`VramLedger.reserve_bytes`: a measured peak larger than
+# the modelled one wins, because the model is a guess and the allocator is not.
+MEASURED_PEAK_LINE = "measured:transient-peak"
 # What the allocator can be holding live at a quiet moment: everything the engine sized and
 # keeps. TRANSIENT lines are excluded because they are gone by calibration time, RESERVE because
 # it is by definition unallocated, MEASURED because it is the reading itself.
@@ -587,7 +592,17 @@ class VramLedger:
         putting them in the reserve made the plan subtract them twice and report a zero pool
         budget on a card with 5.7 GiB unspent. What is left here is the memory that exists
         only as a peak: what ``--memory-ratio`` used to hide.
+
+        A measured post-sizing peak can only RAISE this floor, never lower it: the modelled
+        lines are estimates, an under-modelled peak is exactly the OOM the account exists to
+        prevent, and a model that runs wide is reported (see ``measured:transient-peak``) rather
+        than quietly spent on context it cannot pay for.
         """
+        return max(self.modelled_reserve_bytes, self.bytes_of(MEASURED_PEAK_LINE))
+
+    @property
+    def modelled_reserve_bytes(self) -> int:
+        """The reserve as the startup model priced it, before any measurement."""
         return self.total((Kind.TRANSIENT, Kind.RESERVE))
 
     @property
@@ -607,9 +622,9 @@ class VramLedger:
 
     def engine_committed_bytes(self) -> int:
         """What the engine itself will have allocated once every consumer is sized -- the
-        reserve lines are excluded because they are the headroom that stays EMPTY, not memory
-        the engine holds, and the calibration reading because it is not a consumer."""
-        return self.total(exclude=(*NEGOTIABLE, MEASURED_LINE)) - self.reserve_bytes
+        *modelled* reserve lines are excluded because they are the headroom that stays EMPTY,
+        the measured readings because they are reports, not consumers."""
+        return self.total(exclude=(*NEGOTIABLE, MEASURED_LINE)) - self.modelled_reserve_bytes
 
     def held_bytes(self) -> int:
         """What the account claims the allocator must be holding at a quiet moment."""

@@ -21,6 +21,9 @@ from freetoken.engine.vram_ledger import (
     FRAGMENTATION_RESERVE,
     GRAPH_CAPTURE_EXTRA_SHAPE,
     GRAPH_CAPTURE_PEAK,
+    MEASURED_LINE,
+    MEASURED_PEAK_LINE,
+    NEGOTIABLE,
     TRITON_AUTOTUNE_ARENA,
     Kind,
     VramLedger,
@@ -371,9 +374,19 @@ def test_calibration_reading_is_never_a_consumer():
     before = (ledger.ceiling_bytes, ledger.pool_budget_bytes(), ledger.headroom_bytes(),
               ledger.reserve_bytes, ledger.total())
     ledger.charge("measured:allocator-held", 14 * _GIB, Kind.MEASURED, "torch holds this")
-    ledger.charge("measured:transient-peak", 3 * _GIB, Kind.MEASURED, "peak since the probe")
     assert (ledger.ceiling_bytes, ledger.pool_budget_bytes(), ledger.headroom_bytes(),
             ledger.reserve_bytes, ledger.total()) == before
+    # A measured peak only ratchets the floor UP. A quiet window never claws the modelled
+    # reserve back -- the model is allowed to be conservative -- and committed bytes are always
+    # priced against the modelled reserve, so the two can never double-count the same byte.
+    ledger.charge(MEASURED_PEAK_LINE, 1 * _MIB, Kind.MEASURED, "quiet window")
+    assert ledger.reserve_bytes == ledger.modelled_reserve_bytes
+    assert ledger.ceiling_bytes == before[0]
+    ledger.charge(MEASURED_PEAK_LINE, 4 * _GIB, Kind.MEASURED, "peak since the probe")
+    assert ledger.reserve_bytes == 4 * _GIB
+    assert ledger.ceiling_bytes < before[0]
+    assert (ledger.engine_committed_bytes() + ledger.modelled_reserve_bytes
+            == ledger.total(exclude=NEGOTIABLE))
     assert ledger.held_bytes() == ledger.total((Kind.IMMUTABLE, Kind.PERSISTENT,
                                                 Kind.SEMI_PERSISTENT))
     assert ledger.bytes_of("measured:allocator-held") == 14 * _GIB
