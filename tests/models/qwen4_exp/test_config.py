@@ -105,6 +105,26 @@ def test_mtp_registration_rejects_target_slot_and_ambiguous_full_groups():
         with_mtp_layer(cfg, 48)
 
 
+def test_mtp_registration_gives_the_draft_layer_its_own_kv_storage(monkeypatch):
+    """The registered MTP layer rides the target's QSA group; the pool factory must widen
+    its layer-id remap past the target depth or construction raises (KV layer id N outside
+    [0, N)) as soon as with_mtp_layer is applied, regardless of --spec-mtp."""
+    import torch
+    from freetoken.distributed.info import DistributedInfo
+    from freetoken.kvcache import create_kvcache_pool
+
+    monkeypatch.setattr(
+        "freetoken.kvcache.mha_pool.get_tp_info", lambda: DistributedInfo(rank=0, size=1)
+    )
+    cfg = with_mtp_layer(parse_config(_hf_config()), 48)
+    pool = create_kvcache_pool(
+        cfg, num_pages=8, page_size=16, dtype=torch.bfloat16,
+        device=torch.device("cpu"), num_req_slots=4,
+    )
+    assert pool.num_layers == 49
+    assert pool.k_cache(48).data_ptr() != pool.k_cache(47).data_ptr()
+
+
 def test_groups_and_layer_split():
     cfg = parse_config(_hf_config())
     full = [g for g in cfg.attention_groups if isinstance(g, FullAttentionGroupConfig)]
