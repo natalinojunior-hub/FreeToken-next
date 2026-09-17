@@ -202,6 +202,12 @@ repeat measures a prefill and not a cached prefix.
 | 131 072 (128K) | 3188.5 | 89.30 | 41.1 s | 10.99 / 12.81 ms | 14.45 GiB | 22.0 GiB | 4694 (plan said 4695) |
 | 261 900 (256K) | 2353.7 | 63.83 | 111.3 s | 15.36 / 18.85 ms | 14.41 GiB | 22.0 GiB | 3185 (plan said 3183) |
 
+The last two rows were first produced by hand (`--kv-reserve-tokens 131136`), and then
+re-produced by `--kv-reserve-context`, which now makes the plan buy the context itself: 131 072
+tokens served with PP 3189.0 / TG 107.18 / TTFT 41.1 s / VRAM 14.45 GiB at 32 generated tokens
+(TG rises over the row above only because that row generated 64, and ITL grows with the
+context the decode has to re-read).
+
 Three things to read out of this table:
 
 1. **TG degrades gracefully with context** (158.5 → 89.3 → 63.8) with GPU utilisation pinned at
