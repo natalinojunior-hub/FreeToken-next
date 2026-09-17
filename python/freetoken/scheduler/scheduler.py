@@ -34,6 +34,7 @@ from .decode import DecodeManager
 from .io import SchedulerIOMixin
 from .mm import cut_image_spans, plan_mm_batch
 from .prefill import ChunkedReq, PrefillManager
+from .spec import SchedulerSpecMixin
 from .status import SchedulerStatusReporter
 from .table import TableManager
 
@@ -61,7 +62,7 @@ class ForwardInput(NamedTuple):
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
-class Scheduler(SchedulerIOMixin):
+class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
 
@@ -141,6 +142,19 @@ class Scheduler(SchedulerIOMixin):
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
         self.config = config
+        self.spec_mtp = config.spec_mtp
+        self._spec_snapshot_slots: dict[int, int] = {}
+        if self.spec_mtp > 0:
+            if not ENV.DISABLE_OVERLAP_SCHEDULING:
+                raise ValueError(
+                    "--spec-mtp > 0 requires overlap scheduling disabled "
+                    "(FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1): the verify step's accept "
+                    "decision is host-side and must land before the next forward launches."
+                )
+            if config.max_running_req != 1:
+                raise ValueError("--spec-mtp > 0 supports single-request serving only for now.")
+            if getattr(self.engine.model, "mtp", None) is None:
+                raise ValueError("--spec-mtp > 0 requires a checkpoint with a registered MTP layer.")
         self._model_is_mrope = config.model_config.model_is_mrope
         self._warned_cut_image = False
         self.status_reporter = SchedulerStatusReporter(
@@ -276,6 +290,10 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._execute_pending_rebuild()
+
+        if getattr(self, "spec_mtp", 0) > 0 and self.run_spec_step():
+            self._flush_abort_acks()
+            return
 
         forward_input = self._schedule_next_batch()
         ongoing_data = None
