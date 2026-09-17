@@ -136,6 +136,8 @@ def _raw_checkpoint(dense_fp8: bool = False) -> dict[str, torch.Tensor]:
     raw.update({
         "mtp.hyper_connection_mixer.hc_norm.weight": _bf16(HCH),
         "mtp.layers.0.self_attn.q_proj.weight": _bf16(2 * QH * AHD, H),
+        "mtp.layers.0.self_attn.k_proj.weight": _bf16(KVH * AHD, H),
+        "mtp.layers.0.self_attn.v_proj.weight": _bf16(KVH * AHD, H),
         "mtp.layers.0.mlp.experts.gate_up_proj": _bf16(E, 2 * I, H),
         "mtp.layers.0.mlp.experts.down_proj": _bf16(E, H, I),
         "model.visual.blocks.0.attn.qkv.weight": _bf16(3 * H, H),
@@ -243,12 +245,12 @@ def test_mtp_experts_and_table_never_loaded(loaded):
 
 
 def test_mtp_reader_keeps_native_namespace_separate(checkpoint):
+    """The draft's dense weights are fused exactly like the target's (here: q/k/v -> qkv_proj);
+    its own packed expert-bank tensors are excluded -- _MTPQuantConfig reuses the target's."""
     names = {name for name, _ in iter_mtp_weights(checkpoint[0], torch.device("cpu"))}
     assert names == {
         "mtp.hyper_connection_mixer.hc_norm.weight",
-        "mtp.layers.0.self_attn.q_proj.weight",
-        "mtp.layers.0.mlp.experts.gate_up_proj",
-        "mtp.layers.0.mlp.experts.down_proj",
+        "mtp.layers.0.self_attn.qkv_proj.weight",
     }
 
 

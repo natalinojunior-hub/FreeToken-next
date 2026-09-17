@@ -243,19 +243,35 @@ def iter_mtp_weights(
     model_path: str,
     device: torch.device,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield native ``mtp.*`` tensors without mixing them into the target state dict.
+    """Yield the draft head's own dense weights, fused exactly like ``iter_weights`` (qkv,
+    GDN in_proj, HC block-inject), under the checkpoint's native ``mtp.`` prefix -- which is
+    also the prefix ``Qwen4ExpMTP`` registers its submodules with, so no renaming is needed.
 
-    The released Flash-Next block includes packed BF16 expert tensors alongside its dense
-    projections. The future draft module owns their layout, so this seam deliberately performs
-    no target fusions and preserves the checkpoint names exactly.
+    The draft's own packed per-layer expert-bank tensors (``mtp.layers.0.mlp.experts.*`` --
+    already stacked, unlike the target's per-expert-indexed routed tensors) are skipped:
+    ``_MTPQuantConfig`` routes the draft's MoE layer onto the TARGET's own expert bank
+    instead of loading a second one.
     """
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen4_exp MTP loading supports TP=1 only")
+    hf_config = cached_load_hf_config(model_path)
+    spec = get_model_spec(hf_config.architectures[0])
+    fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping)
     for file in iter_weight_files(model_path):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
-                if raw_name.startswith("mtp."):
-                    yield raw_name, f.get_tensor(raw_name)
+                if not raw_name.startswith("mtp."):
+                    continue
+                if ".mlp.experts." in raw_name or raw_name.endswith(_SCALE_SUFFIXES):
+                    continue
+                tensor = f.get_tensor(raw_name)
+                fused = fuser.fuse(raw_name, tensor)
+                if fused is None:
+                    fuser.check_unfused(raw_name, tensor)
+                    yield raw_name, tensor
+                else:
+                    yield from fused
+    assert not fuser.buf, f"Incomplete MTP projection fusions: {sorted(k[0] + k[1] for k in fuser.buf)}"
 
 
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:

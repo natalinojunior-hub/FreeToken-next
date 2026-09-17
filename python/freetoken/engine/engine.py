@@ -576,19 +576,26 @@ class Engine:
                 "family served images. Reconvert it with `ft checkpoint`, add the encoder in place with "
                 "scripts/ftw_hotfix.py (docs/ftw-hotfix.md), or start with --text-model-only"
             )
+        weights = load_weight(
+            config.model_path,
+            self.device,
+            include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
+            include_vision=bool(config.active_encoders),
+        )
+        if getattr(config.model_config, "mtp_layer_id", None) is not None:
+            # with_mtp_layer registered the draft layer; its own dense weights ride the
+            # checkpoint's native mtp.* namespace and are not part of the generic reader.
+            import itertools
+
+            from freetoken.models.register import _load_attr, get_model_spec
+
+            spec = get_model_spec(config.model_config.architectures[0])
+            iter_mtp = _load_attr(spec.module, "iter_mtp_weights")
+            weights = itertools.chain(weights, iter_mtp(config.model_path, self.device))
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).
-        return _materialize_loaded_weight_state_dict(
-            model_state,
-            load_weight(
-                config.model_path,
-                self.device,
-                include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
-                include_vision=bool(config.active_encoders),
-            ),
-            device=self.device,
-        )
+        return _materialize_loaded_weight_state_dict(model_state, weights, device=self.device)
 
     @torch.inference_mode()
     def _warmup_encoders(self) -> None:
