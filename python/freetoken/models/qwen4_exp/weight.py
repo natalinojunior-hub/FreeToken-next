@@ -3,6 +3,8 @@
 Three separate paths, because the checkpoint's three weight classes live in different places:
 
 * :func:`iter_weights` -- every dense (non-expert) tensor, with the ``model.language_model.`` prefix stripped and fused where the model expects one buffer. See ``_DenseFuser``.
+* :func:`iter_mtp_weights` -- the native NextN/MTP tensors in their checkpoint namespace,
+  kept separate until the draft module is wired.
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`nvfp4_expert_spec` -- how the routed NVFP4 experts are named, for the offload cache's expert reader.
 
@@ -234,6 +236,25 @@ def iter_weights(
     assert not fuser.buf, f"Incomplete projection fusions: {sorted(k[0] + k[1] for k in fuser.buf)}"
 
 
+def iter_mtp_weights(
+    model_path: str,
+    device: torch.device,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield native ``mtp.*`` tensors without mixing them into the target state dict.
+
+    The released Flash-Next block includes packed BF16 expert tensors alongside its dense
+    projections. The future draft module owns their layout, so this seam deliberately performs
+    no target fusions and preserves the checkpoint names exactly.
+    """
+    if get_tp_info().size > 1:
+        raise NotImplementedError("qwen4_exp MTP loading supports TP=1 only")
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for raw_name in f.keys():
+                if raw_name.startswith("mtp."):
+                    yield raw_name, f.get_tensor(raw_name)
+
+
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
     """The vision tower alone, named as iter_weights names it."""
     for file in iter_weight_files(model_path):
@@ -390,5 +411,6 @@ __all__ = [
     "nvfp4_expert_spec",
     "PleTable",
     "iter_weights",
+    "iter_mtp_weights",
     "load_ple_table",
 ]

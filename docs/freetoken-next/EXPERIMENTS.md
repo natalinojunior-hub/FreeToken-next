@@ -475,3 +475,7 @@ claimed; logs are `/models/desenvolvimento/tmp/ftnext/flash_load_detached_3.log`
 one-layer hybrid shape, and rejects `num_hidden_layers > 1` until the runtime supports it.
 The parser remains runtime-neutral: no `mtp.*` tensors are loaded, no draft model is built,
 and no speculative token is emitted. Focused config and model-skeleton tests pass **29/29**.
+
+The loader now also exposes `iter_mtp_weights()`, which yields the native `mtp.*` namespace,
+including the packed MTP expert tensors, without adding them to the target state dict. This is a
+reader seam only: no draft module consumes it yet. The qwen4_exp weight suite passes **31/31**.

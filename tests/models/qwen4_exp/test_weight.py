@@ -19,6 +19,7 @@ from freetoken.kernel.aot_models import SUPPORTED_MODELS, expert_bank_row_bytes
 from freetoken.models.qwen4_exp.weight import (
     _ZERO_CENTERED_NORM_SUFFIXES,
     _DenseFuser,
+    iter_mtp_weights,
     iter_weights,
     load_ple_table,
 )
@@ -234,9 +235,21 @@ def test_tower_keys_come_out_under_the_prefix_load_weight_filters(loaded):
 def test_mtp_experts_and_table_never_loaded(loaded):
     for name in loaded:
         assert not name.startswith("mtp.")
+
+
         assert ".mlp.experts." not in name
         assert "ngram_embedding" not in name
         assert not name.endswith((".weight_scale", ".weight_scale_2", ".input_scale", ".weight_scale_inv"))
+
+
+def test_mtp_reader_keeps_native_namespace_separate(checkpoint):
+    names = {name for name, _ in iter_mtp_weights(checkpoint[0], torch.device("cpu"))}
+    assert names == {
+        "mtp.hyper_connection_mixer.hc_norm.weight",
+        "mtp.layers.0.self_attn.q_proj.weight",
+        "mtp.layers.0.mlp.experts.gate_up_proj",
+        "mtp.layers.0.mlp.experts.down_proj",
+    }
 
 
 def test_hc_merge_is_down_then_inject_then_zero_pad(loaded, checkpoint):
