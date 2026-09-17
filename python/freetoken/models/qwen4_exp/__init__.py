@@ -14,6 +14,7 @@ from .model import Qwen4ExpForCausalLM, Qwen4ExpForConditionalGeneration
 from .weight import (
     ftw_side_files,
     nvfp4_expert_spec,
+    iter_mtp_weights,
     iter_vision_weights,
     iter_weights,
     load_ple_table,
@@ -28,6 +29,7 @@ __all__ = [
     "nvfp4_expert_spec",
     "Qwen4ExpForCausalLM",
     "Qwen4ExpForConditionalGeneration",
+    "iter_mtp_weights",
     "iter_vision_weights",
     "iter_weights",
     "load_ple_table",
