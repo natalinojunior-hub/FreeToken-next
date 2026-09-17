@@ -74,7 +74,11 @@ Caveat for comparability: the anchor's `--num-tokens` / `--cache-type` were not 
 the +12 % may partly be configuration, not code; the delta that matters going forward is
 measured against *this* row, same command.
 
-Qwen3.8-Flash-Next 16K baseline: running (66 GiB RAM load), recorded as EXP-001b when done.
+**New immutable guards from this run: 35B-A3B ≥ 4600 PP / ≥ 158 TG @16K**
+(`--memory-ratio 0.9`), and **Flash-Next ≥ 1850 PP / ≥ 28.5 TG @16K** at
+`--memory-ratio 0.86` — at 0.9 Flash-Next **CUDA-OOMs** in unbudgeted transients (Triton
+autotune wants 256 MiB when 209 MiB are free; see EXPERIMENTS.md EXP-001b). Raw rows and the
+full per-repeat detail: `docs/freetoken-next/pp_tg.jsonl`, EXPERIMENTS.md EXP-001/001b.
 
 ## 4. Context memory physics (computed from the local checkpoints, 2026-09-16)
 

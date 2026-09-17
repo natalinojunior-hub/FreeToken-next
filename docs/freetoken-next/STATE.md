@@ -14,11 +14,9 @@ audits that decide its design are in flight.
 | Durable docs created | done | `docs/freetoken-next/` (7 files) |
 | Builds cleanly on host | done | editable `.[accel]` install in `.venv` (py 3.12.14, torch 2.11.0+cu130, triton 3.6.0); `_pinned_tensor`, `_cpu_moe`, `_ple_store` all compiled; `ft --version` → 0.1.3 |
 | Test suite green | done | `pytest tests -m "not slow"` → **1746 passed, 206 skipped, 1 failed**, and that one (`kernels/test_mrope.py`) is a flashinfer JIT first-build race — re-run alone: **6 passed** |
-| Baseline reproduces anchors | **PASS (+12 % PP / +8 % TG)** | 35B-A3B @16K: PP 4611, TG 158.8, VRAM 14.98 GiB, GPU util 99.8 % (PERFORMANCE.md §3) |
-| Flash-Next @16K baseline | running | EXP-001b; first attempt died at 71 % of bank build because `/tmp` is a 46 GiB tmpfs and 17 GiB of pytest temp + 16 GiB of prior-project artifacts had Shmem at 34 GiB (engine itself warned "low free RAM → serial build"). Freed the pytest temp, MemAvailable 53 → 71 GiB, retrying with `TMPDIR` on NVMe |
-| Regression harness | done | `benchmarks/bench_pp_tg.py` (new): PP/TG/TTFT/ITL p50-p95/VRAM/RSS/GPU-util/KV-pages, 3 repeats, JSONL rows with the exact serve command; repeat spread 0.12 % PP |
-| Memory physics table for 128K–1M | done | PERFORMANCE.md §4, computed from both checkpoints' `config.json` |
-| Phase 2 GGUF loader | not started (audits running) | — |
+| Baseline reproduces anchors | **PASS on both models** | 35B-A3B @16K: PP 4611 / TG 158.8 / VRAM 14.98 GiB / 99.8 % util; Flash-Next @16K: PP 1857.7 / TG 28.685 / VRAM 14.86 GiB / RSS 67.82 GiB / 99.99 % util (PERFORMANCE.md §3, EXPERIMENTS.md EXP-001/001b) |
+| Source audits (6, parallel) | **done** | `docs/freetoken-next/audits/A1…A6.md`; conclusions merged into ARCHITECTURE.md §2–§6 |
+| Phase 2 GGUF loader | not started; design done | ARCHITECTURE.md §3 — increment I1 is a `qwen3_5_moe` GGUF adapter + widened Python type tables, target `/models/Ornith-1.5-35B-A3B-APEX-MTP-I-Compact.gguf` |
 
 ## Findings that already changed the plan
 
