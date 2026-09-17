@@ -572,3 +572,34 @@ failures are the pre-existing flashinfer/nvcc-13.3 fp4 build issue, unrelated to
 Still missing before any MTP throughput claim: a separate draft KV namespace/expert-bank
 append, the draft/verify/rollback scheduler loop, and the target-equivalence gate (greedy
 token-stream match against the same target configuration without MTP), per goal item E.
+
+## EXP-022 — Native MTP: KV namespace for the draft layer's QSA slot
+**Date:** 2026-09-17 · **Verdict:** **PARTIAL / KEEP**
+
+Two real bugs found and fixed while scoping item E's "KV and verification scratch before
+allocation":
+
+1. `create_kvcache_pool`'s QSA branch passed `model_config.num_layers` to `QSAKVCache`'s
+   layer-id remap, which only covers `[0, num_layers)`. `with_mtp_layer` registers the draft
+   head at `layer_id == num_layers` in the same full-attention group, so pool construction
+   raised `ValueError: KV layer id N outside [0, N)` as soon as an MTP layer was registered
+   -- independent of `--spec-mtp`, before serving could start. Fixed by widening the remap to
+   `max(num_layers, mtp_layer_id + 1)`; the draft layer now gets its own K/V storage slot,
+   distinct from every target layer (`tests/models/qwen4_exp/test_config.py::
+   test_mtp_registration_gives_the_draft_layer_its_own_kv_storage`).
+2. `QSAKVCache.ring_capacity_for(index_ratio, num_speculative_tokens)` already existed
+   ("spec decode widens by the draft depth") but nothing ever called it with a real value --
+   both the constructor default and `kv_cost`'s fixed-size term always priced 0 speculative
+   tokens. `create_kv_pool` -> `create_kvcache_pool` now threads `config.spec_mtp` through to
+   both the live allocation and its pre-allocation budget, so the two cannot disagree once a
+   draft depth is set (`tests/kvcache/test_qsa_pool.py::test_kv_cost_widens_the_ring_for_spec_mtp`).
+
+`--spec-mtp` still defaults to 0, so neither fix changes any existing serving behavior; they
+close correctness gaps that would otherwise surface as a crash or a silent under-allocation
+the moment item E's scheduler work turns MTP on. Full checkpoint/kvcache/moe/qwen4_exp focused
+set: 601 passed, 61 skipped (same 2 pre-existing flashinfer/nvcc-13.3 failures, unrelated).
+
+Still open for item E: the draft KV/expert-bank append itself (writing draft-step K/V into
+this now-correctly-sized slot), the scheduler draft/verify/rollback loop, and the
+target-equivalence gate (greedy token-stream match against the same target configuration
+without MTP).
