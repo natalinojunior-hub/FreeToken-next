@@ -603,3 +603,35 @@ Still open for item E: the draft KV/expert-bank append itself (writing draft-ste
 this now-correctly-sized slot), the scheduler draft/verify/rollback loop, and the
 target-equivalence gate (greedy token-stream match against the same target configuration
 without MTP).
+
+## EXP-023 — Native MTP scheduler loop: where the draft/verify step actually has to live
+**Date:** 2026-09-17 · **Verdict:** **INFORMATIONAL / BLOCKED (needs architecture decision)**
+
+Scoped item E's remaining piece (draft/verify/rollback scheduler loop) by reading the live
+decode/prefill/CUDA-graph paths before touching any of them. Findings:
+
+1. **Decode is hard-wired to exactly one new token per request per step.** `_make_write_tuple`
+   (scheduler.py:963) writes one KV slot per request (`req.device_len if req.can_decode else
+   -1`); `_make_positions`/`_make_mrope_positions` size their output as
+   `sum(r.extend_len for r in batch.padded_reqs)` but every decode `Req` in practice carries
+   `extend_len == 1` (see the `test_decoder_stack_prefill_and_decode` decode batch). A verify
+   step needs 2+ new positions (the accepted correction token plus each draft) written and
+   read back in one forward -- decode's write path does not support that today.
+2. **Prefill's admission path does not fit either.** `PrefillAdder`/`ChunkedReq`
+   (scheduler/prefill.py) extend a request from its known, fixed `input_ids` established at
+   admission (prefix-cache matching, per-request budget/hit-rate accounting, mm-item
+   chunking). A draft token is generated on the fly mid-decode; there is no clean seam to
+   inject one unplanned token into that machinery without either faking a re-admission or
+   duplicating a chunk of PrefillAdder's bookkeeping.
+3. **CUDA graph decode replay** (`engine.py:1246 can_use_cuda_graph`/`graph_runner.replay`) is
+   captured for fixed decode shapes; it already has an eager fallback path
+   (`self.model.forward()` when `use_graph` is False), so an MTP verify step can plausibly
+   avoid graph capture entirely by routing through the eager path -- but this still needs the
+   decode-shape write/position machinery in (1) to support >1 new token per request first.
+
+Net: implementing item E's scheduler loop is not a bounded bug-fix-sized change like EXP-022;
+it requires a genuine multi-token-per-step decode write/position primitive (or an equivalent
+new code path) that today's engine does not have anywhere, plus the accept/rollback/CUDA-graph
+interaction the goal's preflight explicitly calls out. Escalated to Opus 5 for an architecture
+read before further implementation, per CLAUDE.md's ESCALATE rule (subagent given exact files
+above, self-contained, no live-path edits made yet).
