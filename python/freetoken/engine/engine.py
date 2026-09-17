@@ -471,6 +471,11 @@ class Engine:
             self.page_table.numel() * self.page_table.element_size(), Kind.PERSISTENT,
             f"{config.max_running_req + 1} rows x {aligned_max_seq_len} columns",
         )
+        # Peak probe, start. Everything allocated after this line -- graph capture, the autotune
+        # warmup forward, the first real prefill -- is where the base's unmodelled memory used
+        # to live, and the closing read in _calibrate_vram_ledger is what turns the reserve from
+        # a sum of estimates into a measured quantity a later plan can trust.
+        self._transient_probe_base = int(torch.cuda.memory_allocated(self.device))
 
         # ======================= Attention backend initialization ========================
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
@@ -712,6 +717,14 @@ class Engine:
             return
         ledger.charge("measured:allocator-held", held, Kind.MEASURED,
                       "what the allocator holds; the account must explain it")
+        base = getattr(self, "_transient_probe_base", None)
+        if base is not None:
+            # peak minus the steady state at the probe = the biggest transient the runtime has
+            # actually produced since the pools were built (graphs, autotune, warmup prefill).
+            transient = max(0, int(torch.cuda.max_memory_allocated(self.device)) - base)
+            ledger.charge("measured:transient-peak", transient, Kind.MEASURED,
+                          f"modelled reserve {mem_GB(ledger.reserve_bytes)} vs measured "
+                          f"{mem_GB(transient)}")
         ledger.log()
         self._log_context_feasibility(self.config, ledger)
         unexplained = held - ledger.held_bytes()

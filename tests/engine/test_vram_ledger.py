@@ -25,6 +25,8 @@ from freetoken.engine.vram_ledger import (
     Kind,
     VramLedger,
     activation_peak_bytes,
+    context_demand,
+    context_feasibility,
     gdn_prefill_bytes,
     graph_capture_peak_bytes,
     graph_capture_shapes,
@@ -261,6 +263,37 @@ def test_a_compressed_kv_format_is_the_only_thing_that_makes_long_context_fit():
     assert not bf16.contexts[0].fits
     assert compressed.contexts[0].fits
     assert compressed.moe_cache_size == bf16.moe_cache_size  # the KV half changed, not experts
+
+
+def test_context_demand_prices_the_trade_the_other_way_round():
+    # Feasibility says 128K does not fit what the MoE-first plan left; the demand row says what
+    # it would cost to buy it instead -- the expert cache that survives funding the context.
+    ledger = _ledger(baseline=16 * _GIB, ratio=1.0, weights=8 * _GIB)
+    ledger.charge("cache:gdn-state", 1 * _GIB, Kind.PERSISTENT)
+    plan = ledger.decide(
+        cache_per_page=1 * _MIB, page_tokens=64, per_expert_bytes=2 * _MIB,
+        num_experts=64, total_experts=2560, prefill_overlap=False, kv_reserve_tokens=4096,
+        contexts=(131072,),
+    )
+    assert not plan.contexts[0].fits  # the MoE-first split starved KV
+    demand = plan.demands[0]
+    assert demand.tokens == 131072 and demand.pages == 2048
+    assert demand.kv_bytes == 2049 * _MIB
+    assert demand.feasible and demand.expert_slots > 0
+    assert demand.expert_bytes + demand.kv_bytes <= plan.pool_budget_bytes
+    # The MoE-first plan spent 5 GiB on experts; funding the context first has to cost slots.
+    assert demand.expert_bytes < plan.expert_bytes
+    assert "bought instead" in plan.report()
+
+
+def test_context_demand_says_no_when_no_expert_cache_survives():
+    # 1M of KV leaves nothing for experts: infeasible, not "0 slots and hope it is fast".
+    demand = context_demand(
+        pool_budget_bytes=8 * _GIB, cache_per_page=4 * _MIB, page_tokens=64,
+        per_expert_bytes=2 * _MIB, tokens=1048576, expert_floor=64,
+    )
+    assert not demand.feasible and demand.expert_slots == 0
+    assert "not fundable" in demand.describe()
 
 
 def test_auto_plan_shrinks_only_once_the_reserve_beats_the_ratio_cap():

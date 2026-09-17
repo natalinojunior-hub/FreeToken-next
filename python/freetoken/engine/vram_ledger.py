@@ -386,6 +386,9 @@ class MemoryPlan:
     usable_tokens: int
     expert_bytes: int
     contexts: tuple[ContextFeasibility, ...]
+    # The same targets priced the other way round: fund the context first and see what the
+    # expert cache becomes. Empty for a plan that had no expert side (a dense model).
+    demands: tuple[ContextDemand, ...] = ()
 
     @property
     def kv_budget_bytes(self) -> int:
@@ -425,7 +428,72 @@ class MemoryPlan:
                     f"(+{c.shortfall_bytes / _GIB:.3f} GiB over what the plan left for KV) -> "
                     f"compressed KV, a smaller expert cache, or a RAM tier"
                 )
+        # The trade, priced the other way: what each target costs if the context is funded
+        # first. Two adjacent rows are the interesting pair -- the last one that keeps enough
+        # experts to be worth serving, and the first one that does not.
+        for d in self.demands:
+            if d.feasible or d.expert_slots:
+                lines.append(f"  bought instead: {d.describe()}")
         return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class ContextDemand:
+    """What one requested context costs, and what is left for experts once it is funded.
+
+    The inverse of :class:`ContextFeasibility`: feasibility answers "does this fit the money
+    the plan already spent", this answers "what does the plan become if you ASK for this
+    context" -- which is the question ``--context auto`` and every long-context certification
+    have to be able to answer before the pool is sized.
+    """
+
+    tokens: int
+    pages: int
+    kv_bytes: int
+    expert_slots: int
+    expert_bytes: int
+    feasible: bool
+
+    def describe(self) -> str:
+        if not self.feasible:
+            return (
+                f"{self.tokens // 1024}K: not fundable -- its KV alone needs "
+                f"{self.kv_bytes / _GIB:.3f} GiB"
+            )
+        return (
+            f"{self.tokens // 1024}K: KV {self.kv_bytes / _GIB:.3f} GiB ({self.pages} pages)"
+            f" leaves {self.expert_slots} expert slots ({self.expert_bytes / _GIB:.3f} GiB)"
+        )
+
+
+def context_demand(
+    pool_budget_bytes: int,
+    cache_per_page: int,
+    page_tokens: int,
+    per_expert_bytes: int,
+    tokens: int,
+    *,
+    expert_floor: int = 0,
+    expert_ceiling: int | None = None,
+) -> ContextDemand:
+    """Fund ``tokens`` of context first, then give the expert cache whatever is left.
+
+    ``expert_floor`` is the smallest cache that still works (the offload cache needs at least
+    one full expert layer, and prefill overlap needs two); below it the answer is infeasible
+    rather than a silently useless configuration.
+    """
+    pages = div_ceil(int(tokens), max(1, int(page_tokens)))
+    kv_bytes = pool_pages(pages) * int(cache_per_page)
+    left = int(pool_budget_bytes) - kv_bytes
+    slots = left // int(per_expert_bytes)
+    if expert_ceiling is not None:
+        slots = min(slots, int(expert_ceiling))
+    slots = max(0, slots)
+    return ContextDemand(
+        tokens=int(tokens), pages=pages, kv_bytes=kv_bytes, expert_slots=slots,
+        expert_bytes=slots * int(per_expert_bytes),
+        feasible=left >= 0 and slots >= int(expert_floor),
+    )
 
 
 # The contexts the mission targets; asked of every plan so the answer is in the log, not in a
@@ -491,17 +559,18 @@ class VramLedger:
         return 0 if charge is None else charge.nbytes
 
     def total(self, kinds: Iterable[Kind] | None = None, exclude: Iterable[str] = ()) -> int:
-        """Sum of the account. The calibration reading is never part of a total unless it is
-        asked for by name: it reports what the allocator holds, so counting it would bill the
-        engine for its own bookkeeping (and made ``headroom`` read -14 GiB on a healthy run)."""
-        wanted = frozenset(kinds) if kinds is not None else None
+        """Sum of the account. No MEASURED-kind line is ever part of a total unless it is asked
+        for by name: those lines report what the allocator holds, so counting them would bill
+        the engine for its own bookkeeping (and made ``headroom`` read -14 GiB on a healthy
+        run)."""
+        wanted = frozenset(kinds) if kinds is not None else frozenset(Kind)
         skip = set(exclude)
-        if wanted is None or Kind.MEASURED not in wanted:
-            skip.add(MEASURED_LINE)
+        if Kind.MEASURED not in wanted:
+            skip |= {c.name for c in self.charges.values() if c.kind is Kind.MEASURED}
         return sum(
             c.nbytes
             for c in self.charges.values()
-            if c.name not in skip and (wanted is None or c.kind in wanted)
+            if c.name not in skip and c.kind in wanted
         )
 
     # ---- the policy -------------------------------------------------------------
@@ -628,6 +697,14 @@ class VramLedger:
                 context_feasibility(
                     max(0, budget - moe_cache_size * per_expert_bytes),
                     cache_per_page, page_tokens, tokens,
+                )
+                for tokens in contexts
+            ),
+            demands=tuple(
+                context_demand(
+                    budget, cache_per_page, page_tokens, per_expert_bytes, tokens,
+                    expert_floor=2 * num_experts if overlap else num_experts,
+                    expert_ceiling=total_experts,
                 )
                 for tokens in contexts
             ),
