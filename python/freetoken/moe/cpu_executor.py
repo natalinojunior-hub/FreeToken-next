@@ -137,6 +137,34 @@ def compiled_extension_supports(activation: str) -> bool:
     return _ACT_IDS[activation] <= getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
 
 
+# Weight-format ids at or below this one are dispatched by every build of the extension this
+# file has ever shipped with; above it, the id arrived with the GGUF K-quants and an older .so
+# has no branch for it. _GGUF_KQUANT_MIN_PROBED_ID is therefore the point where the capability
+# probe becomes mandatory -- a stale extension indexing a K-quant row by the wrong block
+# geometry does not throw, it faults inside a worker thread that already holds the table.
+_GGUF_KQUANT_MIN_PROBED_ID = _WFMT_IDS["q4_0"]
+
+
+def compiled_extension_supports_format(fmt: str) -> bool:
+    """Whether the loaded ``_cpu_moe`` can dispatch weight layout ``fmt``.
+
+    Mirrors :func:`compiled_extension_supports` for activations. A missing
+    ``max_weight_format_id`` is itself the answer for the newer ids: the symbol shipped with
+    them, so an extension without them must not be handed one.
+    """
+    if fmt not in _WFMT_IDS:
+        return False
+    fmt_id = _WFMT_IDS[fmt]
+    if fmt_id < _GGUF_KQUANT_MIN_PROBED_ID:
+        return True
+    try:
+        from freetoken.kernel import _cpu_moe
+    except ImportError:
+        return False
+    # The default is the highest id that predates the probe, not "unknown means allowed".
+    return fmt_id <= getattr(_cpu_moe, "max_weight_format_id", lambda: _GGUF_KQUANT_MIN_PROBED_ID - 1)()
+
+
 def physical_core_cpus() -> list[int]:
     """One logical CPU per physical core, restricted to this process's affinity.
 
@@ -221,6 +249,16 @@ class CpuMoeExecutor:
                 f"--moe-strategy cpu/hybrid computes experts on the CPU and supports "
                 f"{sorted(_WFMT_IDS)} formats, but this checkpoint's experts are "
                 f"{fmt!r}; use --moe-strategy offload (GPU-side dequant) instead."
+            )
+        # ABI probe for weight layouts, the sibling of the activation one below: handing a
+        # stale .so a K-quant id is not a clean throw, it is a fault inside a worker thread
+        # that already received the bank pointer table.
+        if not compiled_extension_supports_format(fmt):
+            raise RuntimeError(
+                f"the compiled _cpu_moe extension cannot dispatch weight format {fmt!r} "
+                f"(id {_WFMT_IDS[fmt]}); it predates the GGUF K-quant layouts. rebuild it "
+                "with `python setup.py build_ext --inplace` (or reinstall the wheel) before "
+                "serving this checkpoint on the cpu/hybrid backend."
             )
         if activation not in _ACT_IDS:
             raise NotImplementedError(f"CPU MoE backend: unsupported activation {activation!r}")

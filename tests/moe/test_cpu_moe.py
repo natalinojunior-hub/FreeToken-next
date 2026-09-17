@@ -224,6 +224,41 @@ def test_cpu_decode_nvfp4_swigluoai_matches_dequant_reference(bs):
     assert rel < 3e-2, f"nvfp4 swigluoai bs={bs} rel err {rel.item()}"
 
 
+def test_stale_extension_rejected_for_kquant_weight_formats(monkeypatch):
+    """The weight-layout twin of the activation probe above. q4_0/q4_k/q6_k arrived with the
+    GGUF experts, and a .so that predates them has no branch for the id: the K-quant kernels
+    index a row by the format's block geometry, so the failure is a fault inside a worker that
+    already holds the bank pointer table, not a clean throw. The absent
+    ``max_weight_format_id`` symbol is itself the evidence, so it must fail closed."""
+    from freetoken.kernel import _cpu_moe
+    from freetoken.moe.cpu_executor import (
+        CpuMoeExecutor, compiled_extension_supports_format,
+    )
+
+    monkeypatch.delattr(_cpu_moe, "max_weight_format_id", raising=False)
+    assert not compiled_extension_supports_format("q4_0")
+    assert not compiled_extension_supports_format("q4_k")
+    assert not compiled_extension_supports_format("q6_k")
+    # The layouts every build dispatches stay usable on a stale extension, and an unknown name
+    # is still not a format the CPU backend claims.
+    assert compiled_extension_supports_format("nvfp4")
+    assert compiled_extension_supports_format("bf16")
+    assert not compiled_extension_supports_format("iq4_xs")
+
+    cache = _make_nvfp4_cache(1, 4, 256, 128)
+    with pytest.raises(RuntimeError, match="rebuild"):
+        CpuMoeExecutor(
+            cache, top_k=2, activation="silu", apply_router_weight_on_input=False,
+            num_threads=0, max_tokens=1, device=torch.device("cuda"), fmt="q4_k",
+        )
+
+    # A probe that reports a lower ceiling than the Python id table must be honoured too: the
+    # point is the loaded binary, not the source tree it was installed next to.
+    monkeypatch.setattr(_cpu_moe, "max_weight_format_id", lambda: 5, raising=False)
+    assert compiled_extension_supports_format("q4_k")
+    assert not compiled_extension_supports_format("q6_k")
+
+
 def test_stale_extension_rejected_for_swigluoai(monkeypatch):
     """A prebuilt _cpu_moe.so from before ACT_SWIGLUOAI accepts act id 3 without
     error and silently computes the wrong activation in the generic epilogue.

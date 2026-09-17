@@ -1366,6 +1366,14 @@ float q6_k_dot_f32_scalar(const uint8_t* w, const bf16_t* x, int K) {
 
 enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4, WF_Q4_K = 5, WF_Q6_K = 6 };
 
+// The highest weight layout this build actually dispatches. Exposed as max_weight_format_id
+// below so the Python side can ask before handing the ctor an id: the ctor and the dot kernels
+// branch on the integer, so a .so built before the GGUF K-quants receives a 5 or a 6 with no
+// branch of its own, and on the paths that index a row by the format's block geometry that is
+// not a clean throw -- it is a segfault after the worker threads already hold the pointer
+// table. Fail closed on the version instead of failing loudly on the hardware.
+constexpr int WF_MAX_SUPPORTED = WF_Q6_K;
+
 // Each ctor pointer arg is the address of a CPU int64 array of length
 // num_layers (one base address per layer, built by cpu_executor.py's
 // _make_table), not a single flat bank. tbl_at resolves
@@ -2336,4 +2344,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // (act_apply falls through to gelu_tanh); the probe turns a stale extension
   // into a loud rebuild instruction instead of wrong model outputs.
   m.def("max_generic_act_id", []() { return static_cast<int>(ACT_SWIGLU_CLAMP); });
+  // Companion to the activation probe above, for weight layouts: see WF_MAX_SUPPORTED.
+  m.def("max_weight_format_id", []() { return WF_MAX_SUPPORTED; });
 }
