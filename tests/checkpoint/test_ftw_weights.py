@@ -70,7 +70,7 @@ def test_ftw_writer_drops_completed_shards_from_page_cache(tmp_path, monkeypatch
     writer.add_tensor("b", torch.zeros(2048, dtype=torch.uint8))
     writer.finalize({})
 
-    assert len(calls) == 2
+    assert len(calls) == 4
     assert all(offset == 0 and length == 0 for _, offset, length, _ in calls)
 
 

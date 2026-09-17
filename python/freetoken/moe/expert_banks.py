@@ -96,6 +96,62 @@ def build_expert_banks(
     layout = method.layout()
     E = method.cfg.num_experts
     specs = {role: ((E, *spec.shape), spec.dtype) for role, spec in layout.items() if not spec.resident}
+
+    if layer_sink is not None and not dummy:
+        # Conversion does not need a resident bank table after a layer has been written. The
+        # regular path allocates every layer up front, which makes the source checkpoint,
+        # output page cache, and all partially filled banks compete for RAM before release()
+        # can help. Keep only layers that currently have pieces in flight.
+        active: dict[int, dict[str, list]] = {}
+        counts: dict[int, int] = {}
+        written = torch.zeros(num_layers, E, dtype=torch.int32)
+        alphas = {
+            role: torch.empty(num_layers * E, dtype=spec.dtype, device=device)
+            for role, spec in layout.items() if spec.resident
+        }
+
+        for layer_id, e0, e1, piece in pieces:
+            if not (0 <= layer_id < num_layers and 0 <= e0 < e1 <= E):
+                raise ValueError(
+                    f"expert piece out of range: layer {layer_id}, experts {e0}:{e1} "
+                    f"of {num_layers} x {E}"
+                )
+            if written[layer_id, e0:e1].any():
+                raise ValueError(
+                    f"expert rows written more than once: layer {layer_id}, experts {e0}:{e1}"
+                )
+            if layer_id not in active:
+                active[layer_id] = alloc_layer_banks(specs, 1)
+                counts[layer_id] = 0
+            written[layer_id, e0:e1] = 1
+            row_banks = active[layer_id]
+            out = {role: row_banks[role][0].tensor[e0:e1] for role in specs}
+            got = method.pack(piece, out)
+            for role, values in got.items():
+                alphas[role][layer_id * E + e0 : layer_id * E + e1] = values.to(alphas[role].dtype)
+            counts[layer_id] += e1 - e0
+            if counts[layer_id] == E:
+                layer_sink(layer_id, {role: row_banks[role][0] for role in specs})
+                del active[layer_id]
+
+        missing = (written == 0).nonzero().tolist()
+        if missing:
+            raise ValueError(
+                f"expert banks were not filled: {len(missing)} (layer, expert) rows missing "
+                f"(first {missing[:4]})"
+            )
+        assert not active, f"incomplete streamed expert layers: {sorted(active)}"
+        return ExpertBanks(
+            legacy_format_for(method.kind, kernel.name),
+            {role: [] for role in specs},
+            gate_up_alpha=alphas.get("gate_up_alpha"),
+            down_alpha=alphas.get("down_alpha"),
+            streamed=True,
+            kind=method.kind,
+            kernel=kernel.name,
+            layout=layout,
+        )
+
     hb = alloc_layer_banks(specs, num_layers)
     banks = {role: [b.tensor for b in hb[role]] for role in specs}
     alphas = {

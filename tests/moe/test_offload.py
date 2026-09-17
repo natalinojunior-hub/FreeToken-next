@@ -1,10 +1,30 @@
 from contextlib import contextmanager
+import mmap
 
 import pytest
 import torch
 
 from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.layers.quantization import QuantKind
+
+
+def test_conversion_host_banks_use_discardable_private_mmaps(monkeypatch):
+    from freetoken.moe import host_banks
+
+    seen = {}
+    original = host_banks.mmap.mmap
+
+    def capture(*args, **kwargs):
+        seen["flags"] = kwargs["flags"]
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(host_banks.mmap, "mmap", capture)
+    bank = host_banks.HostBank((4096,), torch.uint8, backing="mmap")
+    bank.tensor.fill_(1)
+    bank.release()
+
+    assert seen["flags"] & mmap.MAP_PRIVATE
+    assert not seen["flags"] & mmap.MAP_SHARED
 
 
 def _init_tp():
@@ -74,6 +94,41 @@ def test_dummy_expert_banks_follow_the_kernel_layout(monkeypatch):
     assert {t.shape[0] for layers in banks.sources.values() for t in layers} == {E}
     assert torch.all(banks.sources["gate_up_scale"][0].float() == 1.0)
     assert torch.all(banks.sources["gate_up_global"][0].float() > 0)
+
+
+def test_streamed_expert_banks_keep_only_inflight_layers():
+    from types import SimpleNamespace
+
+    from freetoken.moe.expert_banks import build_expert_banks
+
+    spec = SimpleNamespace(shape=(2,), dtype=torch.float32, resident=False)
+
+    class FakeMethod:
+        kind = QuantKind.NONE
+        kernel = SimpleNamespace(name="fused")
+        cfg = SimpleNamespace(num_experts=2)
+
+        def layout(self):
+            return {"gate_up": spec, "down": spec}
+
+        def pack(self, piece, out):
+            out["gate_up"].copy_(piece["gate_up"])
+            out["down"].copy_(piece["down"])
+            return {}
+
+    seen = []
+    pieces = []
+    for layer_id in range(3):
+        values = torch.full((2, 2), layer_id + 1.0)
+        pieces.append((layer_id, 0, 2, {"gate_up": values, "down": values + 10}))
+
+    banks = build_expert_banks(
+        FakeMethod(), 3, pieces, device=torch.device("cpu"),
+        layer_sink=lambda layer_id, layer_banks: seen.append((layer_id, sorted(layer_banks))),
+    )
+    assert banks.streamed
+    assert seen == [(0, ["down", "gate_up"]), (1, ["down", "gate_up"]), (2, ["down", "gate_up"])]
+    assert banks.sources == {"gate_up": [], "down": []}
 
 
 def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypatch):

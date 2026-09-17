@@ -109,7 +109,9 @@ class HostBank:
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
         else:
-            self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
+            # MAP_PRIVATE is required for MADV_DONTNEED to discard converted layers. The
+            # default MAP_SHARED anonymous mapping keeps discarded pages in shmem.
+            self._buf = mmap.mmap(-1, asize, flags=mmap.MAP_PRIVATE)
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False

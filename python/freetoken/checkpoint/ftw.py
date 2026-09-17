@@ -271,7 +271,19 @@ class FTWWriter:
                 advise(fd, 0, 0, dontneed)
             except OSError:
                 pass  # cache eviction is a pressure mitigation, not a format invariant
+        path = self._f.name
         self._f.close()
+        # Re-open after close as well: some filesystems only apply DONTNEED reliably to a
+        # read-only descriptor after dirty writeback has completed.
+        if advise is not None and dontneed is not None:
+            try:
+                evict_fd = os.open(path, os.O_RDONLY)
+                try:
+                    advise(evict_fd, 0, 0, dontneed)
+                finally:
+                    os.close(evict_fd)
+            except OSError:
+                pass
 
     def _write_raw(self, data: memoryview) -> None:
         """Write ``data`` into the FTW byte stream, splitting across shards at the limit."""

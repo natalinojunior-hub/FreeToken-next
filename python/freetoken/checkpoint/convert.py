@@ -246,14 +246,16 @@ def convert_checkpoint(
         dense_bytes += tensor.numel() * tensor.element_size()
         _progress("dense", dense_bytes, 0)
 
-    # files the model reads directly from the checkpoint dir, not through FTW entries (Qwen3.8-Flash-Next PLE table)
+    # Files the model reads directly from the checkpoint dir, not through FTW entries (the
+    # Qwen3.8-Flash-Next PLE table). Create them after expert conversion below: their multi-GiB
+    # page cache is irrelevant to repacking and otherwise competes with the source banks.
     from freetoken.models.register import _load_attr, get_model_spec
 
     try:
         side_hook = _load_attr(get_model_spec(mc.architectures[0]).module, "ftw_side_files")
     except (AttributeError, KeyError, ValueError):
         side_hook = None
-    side_files = side_hook(model_path, out_dir) if side_hook is not None else []
+    side_files: list[str] = []
 
     # 2) offload expert banks (post-repack) + alpha scales (slow path auto-picks parallel/serial)
     quant_format = None
@@ -270,9 +272,21 @@ def convert_checkpoint(
         quant_format = banks.quant_format
         if banks.streamed:
             sink.close()
-            num_layers = sink.num_layers  # however many distinct layers the sink actually saw
+            num_layers = int(mc.num_moe_layers)
             n_bank = sink.n_written
-            assert num_layers > 0, (
+            completed_layers = {
+                int(entry["name"].rsplit("#L", 1)[1])
+                for entry in writer.entries
+                if entry["kind"] == "experts_bank" and "#L" in entry["name"]
+            }
+            if completed_layers != set(range(num_layers)):
+                missing = sorted(set(range(num_layers)) - completed_layers)
+                extra = sorted(completed_layers - set(range(num_layers)))
+                raise RuntimeError(
+                    "streamed expert-bank conversion is incomplete: "
+                    f"missing layers={missing[:8]}, extra layers={extra[:8]}"
+                )
+            assert sink.num_layers > 0 or completed_layers, (
                 "provider reported streamed=True but the sink never fired -- the FTW "
                 "would silently have no expert banks"
             )
@@ -317,6 +331,9 @@ def convert_checkpoint(
                 n_bank += name not in ("gate_up_alpha", "down_alpha")
                 n_alpha += name in ("gate_up_alpha", "down_alpha")
             bar.close()
+
+    if side_hook is not None:
+        side_files = side_hook(model_path, out_dir)
 
     _progress("finalize")  # writing shard index + copying config/tokenizer
     copied = _copy_metadata(model_path, out_dir)

@@ -481,6 +481,21 @@ The loader now also exposes `iter_mtp_weights()`, which yields the native `mtp.*
 including the packed MTP expert tensors, without adding them to the target state dict. This is a
 reader seam only: no draft module consumes it yet. The qwen4_exp weight suite passes **31/31**.
 
+## EXP-020 — Flash-Next FTW conversion survives host-memory pressure
+**Date:** 2026-09-17 · **Verdict:** **PASS / IMPLEMENTED**
+
+The failed conversion was not a Python exception: `earlyoom` terminated the process while the
+streamed expert banks accumulated in shared anonymous `mmap` storage. `MADV_DONTNEED` did not
+reclaim those pages. Host banks now use private anonymous mappings, which makes the discard
+operation effective while preserving the serving allocation path.
+
+The fix was resumed against the existing partial output. The native command completed with
+`EXIT:0` in 54.4 s after reaching all 192 expert source shards. The resulting FTW index has
+1,415 tensors (1,127 dense and 288 bank entries), all 48 MoE layers, and 10 shards bounded by
+8 GiB, and was opened successfully by `FTWReader`. Focused coverage is 45 passed, 6 skipped
+for the host-bank and checkpoint suites; the broader Qwen4/FTW/MoE focused set is 75 passed,
+6 skipped.
+
 ## EXP-017 — FTW streaming conversion reduces RSS but did not produce a valid artifact
 **Date:** 2026-09-17 · **Verdict:** **PARTIAL / INCONCLUSIVE**
 
