@@ -1,0 +1,410 @@
+"""Prefill + decode regression harness for a served model, at a chosen context size.
+
+`bench_decode_moe.py` answers "which MoE backend decodes fastest on an AIME prompt".
+This answers the phase-1 question instead: *what does the whole serving path cost at a
+given context length, and did a patch move it?* One server, one config, N repeats:
+
+    PP   = prompt_tokens / time-to-first-token        (prefill throughput, what FreeToken
+                                                       is unusually good at — the guard)
+    TG   = (completion_tokens - 1) / (t_last - t_first)  (bs=1 decode throughput)
+    ITL  = inter-token latency p50/p95, TTFT, engine-side throughput from /v1/stats,
+           VRAM (server + nvidia-smi), GPU utilisation, host RSS and MemAvailable.
+
+The prompt is a slice of a local corpus (--prompt-file) that has been fixed-pointed with
+the checkpoint's own tokenizer to exactly --tokens ids, so `prompt_tokens` is exact and
+repeats are byte-identical; nothing is downloaded per run. Sampling is
+greedy unless --sample: the workload is throughput, not quality, and temperature adds
+run-to-run routing noise.
+
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=python python benchmarks/bench_pp_tg.py \
+        --model /models/Qwen3.6-35B-A3B-NVFP4-FT --tokens 16384 --decode 128 --repeats 3 \
+        --label v0.1.3-baseline --json /tmp/pp_tg.jsonl
+
+Extra engine flags pass through verbatim (--serve-arg '--kv-reserve-tokens 4096'), which
+is how an A/B changes exactly one knob. JSONL rows keep every measured field plus the
+resolved serve command, so a row is enough to reproduce the number.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+DEFAULT_CORPUS = "/models/servers/prompt-235k.txt"
+CHARS_PER_TOKEN = 4  # only used to size the text slice that gets tokenized
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--model", required=True, help="checkpoint dir / .ftw dir / .gguf path")
+    p.add_argument("--tokens", type=int, default=16384, help="prompt tokens (the context under test)")
+    p.add_argument("--decode", type=int, default=128, help="generated tokens per request")
+    p.add_argument("--repeats", type=int, default=3, help="measured requests after warmup")
+    p.add_argument("--warmups", type=int, default=2, help="untimed requests at full context")
+    p.add_argument("--prompt-file", default=os.environ.get("FREETOKEN_NEXT_PROMPT", DEFAULT_CORPUS))
+    p.add_argument("--prompt-offset", type=int, default=0, help="token offset into the corpus slice")
+    p.add_argument("--mem-ratio", type=float, default=0.9)
+    p.add_argument("--gpu", default=None, help="UUID or nvidia-smi index, as ft serve --gpu")
+    p.add_argument("--no-graph", action="store_true", help="eager decode instead of CUDA graph")
+    p.add_argument("--sample", action="store_true", help="use the checkpoint's sampling instead of greedy")
+    p.add_argument("--serve-arg", dest="serve_args", action="append", default=[],
+                   help="extra flag for ft serve, verbatim (repeatable)")
+    p.add_argument("--label", default="run", help="tag written into the output rows")
+    p.add_argument("--server-timeout", type=float, default=2400)
+    p.add_argument("--json", dest="json_out", default=None, help="append result rows here")
+    p.add_argument("--keep-alive", action="store_true", help="leave the server running (manual probing)")
+    return p.parse_args(argv)
+
+
+def get_json(url: str, timeout: float = 10) -> dict:
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def build_prompt_text(model: str, path: str, tokens: int, offset: int) -> str:
+    """A corpus slice that re-tokenizes to exactly `tokens` ids with the checkpoint's tokenizer.
+
+    Sent as text because the server rejects token-id prompt inputs; the fixed point below is
+    what makes `prompt_tokens` exact and repeats identical, without a probe request per run.
+    """
+    text = Path(path).read_text(errors="replace")
+    start = offset * tokens * CHARS_PER_TOKEN
+    chunk = text[start:start + tokens * CHARS_PER_TOKEN * 2] or text
+    if not chunk.strip():
+        sys.exit(f"[bench] corpus {path} exhausted at --prompt-offset {offset}")
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    ids = tok(chunk, add_special_tokens=False)["input_ids"]
+    if len(ids) < tokens:
+        sys.exit(f"[bench] corpus slice gave {len(ids)} < {tokens} tokens; use a bigger corpus")
+    k = tokens
+    for _ in range(12):
+        s = tok.decode(ids[:k], skip_special_tokens=True)
+        n = len(tok(s, add_special_tokens=False)["input_ids"])
+        if n == tokens:
+            return s
+        k = max(1, min(len(ids), k + (tokens - n)))
+    sys.exit(f"[bench] could not fixpoint a {tokens}-token prompt (last length {n})")
+
+
+def serve_cmd(args: argparse.Namespace, port: int) -> list[str]:
+    cmd = [
+        sys.executable, "-m", "freetoken.cli", "serve",
+        "--model", args.model,
+        "--host", "127.0.0.1", "--port", str(port),
+        "--max-running-requests", "1",
+        "--max-seq-len-override", str(args.tokens + args.decode + 64),
+        "--memory-ratio", str(args.mem_ratio),
+        "--cuda-graph-max-bs", "0" if args.no_graph else "1",
+    ]
+    for extra in args.serve_args:
+        cmd += extra.split()
+    if args.gpu:
+        cmd += ["--gpu", args.gpu]
+    return cmd
+
+
+class GpuSampler(threading.Thread):
+    """Polls nvidia-smi for util + used memory while measuring; keeps the samples."""
+
+    def __init__(self, interval: float = 0.25):
+        super().__init__(daemon=True)
+        self.interval = interval
+        self.util: list[int] = []
+        self.mem_mib: list[int] = []
+        self._stop_evt = threading.Event()
+
+    def run(self) -> None:
+        while not self._stop_evt.is_set():
+            try:
+                out = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.strip().splitlines()[0]
+                u, m = (int(float(x)) for x in out.split(","))
+                self.util.append(u)
+                self.mem_mib.append(m)
+            except Exception:
+                pass
+            self._stop_evt.wait(self.interval)
+
+    def stop(self) -> dict:
+        self._stop_evt.set()
+        self.join(timeout=5)
+        util, mem = sorted(self.util), sorted(self.mem_mib)
+        if not util:
+            return {}
+        return {
+            "gpu_util_mean": sum(util) / len(util),
+            "gpu_util_p95": util[min(len(util) - 1, int(len(util) * 0.95))],
+            "gpu_mem_used_mib_max": mem[-1],
+            "gpu_samples": len(util),
+        }
+
+
+def _tree_pids(pid: int) -> list[int]:
+    pids, stack = [pid], [pid]
+    while stack:
+        cur = stack.pop()
+        try:
+            out = subprocess.run(["ps", "-o", "pid=", "--ppid", str(cur)],
+                                 capture_output=True, text=True, timeout=5).stdout.split()
+        except Exception:
+            out = []
+        for q in out:
+            if int(q) not in pids:
+                pids.append(int(q))
+                stack.append(int(q))
+    return pids
+
+
+def proc_rss_kib(pid: int) -> int:
+    """Sum VmRSS over the process tree (frontend + scheduler/tokenizer workers)."""
+    total = 0
+    for p in _tree_pids(pid):
+        try:
+            for line in Path(f"/proc/{p}/status").read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    total += int(line.split()[1])
+                    break
+        except OSError:
+            continue
+    return total
+
+
+def mem_available_gib() -> float:
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) / 2**20
+    return 0.0
+
+
+def stream_completion(origin: str, model_id: str, prompt: str, args: argparse.Namespace) -> dict:
+    body = {
+        "model": model_id,
+        "prompt": prompt,
+        "max_tokens": args.decode,
+        "ignore_eos": True,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    if not args.sample:
+        body.update({"temperature": 0.0, "top_p": 1.0, "top_k": -1})
+    req = urllib.request.Request(
+        f"{origin}/v1/completions", data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    stamps: list[float] = []
+    pieces: list[str] = []
+    usage: dict | None = None
+    t0 = time.perf_counter()
+    try:
+        resp = urllib.request.urlopen(req, timeout=1800)
+    except urllib.error.HTTPError as e:
+        sys.exit(f"[bench] request failed: HTTP {e.code}: {e.read()[:500]!r}")
+    with resp:
+        for raw in resp:
+            line = raw.strip()
+            if not line or not line.startswith(b"data:"):
+                continue
+            payload = line[len(b"data:"):].strip()
+            if payload == b"[DONE]":
+                break
+            now = time.perf_counter()
+            chunk = json.loads(payload)
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+            for choice in chunk.get("choices", []):
+                text = choice.get("text") or (choice.get("delta") or {}).get("content")
+                if text:
+                    stamps.append(now)
+                    pieces.append(text)
+    if usage is None:
+        sys.exit("[bench] stream ended without a usage chunk; is this a FreeToken server?")
+    return {"t0": t0, "stamps": stamps, "text": "".join(pieces), "usage": usage}
+
+
+def one_run(origin: str, model_id: str, prompt: str, args: argparse.Namespace, proc) -> dict:
+    sampler = GpuSampler()
+    sampler.start()
+    t_send = time.perf_counter()
+    r = stream_completion(origin, model_id, prompt, args)
+    stats = get_json(f"{origin}/v1/stats")
+    gpu = sampler.stop()
+    stamps, usage = r["stamps"], r["usage"]
+    if len(stamps) < 2:
+        sys.exit(f"[bench] need >=2 token events, got {len(stamps)}")
+    prompt_tokens = usage["prompt_tokens"]
+    completion = usage["completion_tokens"]
+    if completion != args.decode:
+        print(f"[bench] WARNING: completion_tokens={completion} != --decode {args.decode}", flush=True)
+    steps = completion - 1
+    decode_time = stamps[-1] - stamps[0]
+    ttft = stamps[0] - r["t0"]
+    gaps = sorted((b - a) * 1e3 for a, b in zip(stamps, stamps[1:]))
+    tp = stats.get("throughput", {}) or {}
+    kv = stats.get("kv", {}) or {}
+    return {
+        "label": args.label,
+        "model": args.model,
+        "serve_args": list(args.serve_args),
+        "prompt_tokens": prompt_tokens,
+        "prefill_tok_s": prompt_tokens / ttft if ttft > 0 else 0.0,
+        "decode_tok_s": steps / decode_time if decode_time > 0 else 0.0,
+        "ms_per_token": decode_time / steps * 1e3 if steps > 0 else 0.0,
+        "ttft_ms": ttft * 1e3,
+        "e2e_ms": (stamps[-1] - t_send) * 1e3,
+        "itl_ms_p50": gaps[len(gaps) // 2],
+        "itl_ms_p95": gaps[min(len(gaps) - 1, int(len(gaps) * 0.95))],
+        "completion_tokens": completion,
+        "engine_prefill_tps": tp.get("prefill_tps"),
+        "engine_decode_tps": tp.get("decode_tps"),
+        "kv_used_pages": kv.get("used_pages"),
+        "kv_total_pages": kv.get("total_pages"),
+        "kv_page_size": kv.get("page_size"),
+        "vram_gib": stats.get("vram_bytes", 0) / 2**30,
+        "server_rss_gib": proc_rss_kib(proc.pid) / 2**20,
+        "mem_available_gib": mem_available_gib(),
+        "output_sha1": hashlib.sha1(r["text"].encode()).hexdigest()[:12],
+        **gpu,
+    }
+
+
+def mean(rows: list[dict], key: str) -> float:
+    vals = [r[key] for r in rows if isinstance(r.get(key), (int, float))]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def die_with_log(msg: str, log_path: str) -> None:
+    tail = "".join(Path(log_path).read_text().splitlines(keepends=True)[-40:])
+    sys.exit(f"[bench] {msg}\n[bench] server log tail ({log_path}):\n{tail}")
+
+
+def wait_ready(origin: str, proc, log_path: str, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            die_with_log(f"server exited with code {proc.returncode} during startup", log_path)
+        try:
+            health = get_json(f"{origin}/health", timeout=5)
+        except (OSError, ValueError):
+            time.sleep(1.0)
+            continue
+        if health.get("status") == "error":
+            die_with_log(f"server reported startup error: {health}", log_path)
+        if health.get("maintenance") == "serving":
+            return
+        time.sleep(1.0)
+    die_with_log(f"server not ready after {timeout:.0f}s", log_path)
+
+
+def pump_output(src, log_f) -> None:
+    for chunk in iter(lambda: src.read1(65536), b""):
+        log_f.write(chunk)
+        log_f.flush()
+        sys.stdout.buffer.write(chunk)
+        sys.stdout.flush()
+
+
+def stop_server(proc) -> None:
+    for sig, wait_s in ((signal.SIGTERM, 90), (signal.SIGKILL, 30)):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=wait_s)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    time.sleep(3)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    prompt = build_prompt_text(args.model, args.prompt_file, args.tokens, args.prompt_offset)
+    port = free_port()
+    origin = f"http://127.0.0.1:{port}"
+    fd, log_path = tempfile.mkstemp(prefix="bench-pp-tg-", suffix=".log")
+    cmd = serve_cmd(args, port)
+    print(f"[bench] serve: {' '.join(cmd)}\n[bench] prompt: {args.tokens} tokens, log: {log_path}", flush=True)
+
+    rows: list[dict] = []
+    with os.fdopen(fd, "wb") as log_f:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+        pump = threading.Thread(target=pump_output, args=(proc.stdout, log_f), daemon=True)
+        pump.start()
+        try:
+            wait_ready(origin, proc, log_path, args.server_timeout)
+            model_id = get_json(f"{origin}/v1/models")["data"][0]["id"]
+            card = get_json(f"{origin}/v1/stats").get("model", {})
+            print(f"[bench] model_id={model_id} ctx={card.get('ctx')} attn={card.get('attn')} "
+                  f"moe={card.get('moe')}", flush=True)
+            for _ in range(args.warmups):
+                stream_completion(origin, model_id, prompt, args)
+            for i in range(args.repeats):
+                row = one_run(origin, model_id, prompt, args, proc)
+                rows.append(row)
+                print(f"[bench] run {i + 1}/{args.repeats}: PP {row['prefill_tok_s']:.1f}  "
+                      f"TG {row['decode_tok_s']:.2f}  TTFT {row['ttft_ms']:.0f} ms  "
+                      f"VRAM {row['vram_gib']:.2f} GiB", flush=True)
+            if args.keep_alive:
+                input("[bench] server up, press enter to stop: ")
+        finally:
+            if not args.keep_alive:
+                stop_server(proc)
+            pump.join(timeout=10)
+
+    if not rows:
+        return 1
+    summary = {
+        "label": args.label, "model": args.model, "n": len(rows),
+        "prompt_tokens": rows[0]["prompt_tokens"],
+        "PP_mean": mean(rows, "prefill_tok_s"), "PP_min": min(r["prefill_tok_s"] for r in rows),
+        "TG_mean": mean(rows, "decode_tok_s"), "TG_min": min(r["decode_tok_s"] for r in rows),
+        "TTFT_mean": mean(rows, "ttft_ms"),
+        "itl_p50_mean": mean(rows, "itl_ms_p50"), "itl_p95_mean": mean(rows, "itl_ms_p95"),
+        "vram_gib_mean": mean(rows, "vram_gib"),
+        "gpu_util_mean": mean(rows, "gpu_util_mean"),
+        "server_rss_gib_mean": mean(rows, "server_rss_gib"),
+        "kv_total_pages": rows[-1]["kv_total_pages"],
+        "output_sha1": rows[-1]["output_sha1"],
+        "runs": rows,
+    }
+    print(f"\n==== [{args.label}] {summary['prompt_tokens']} tok / {args.decode} gen ====")
+    print(f"  PP     mean {summary['PP_mean']:9.1f} tok/s   (min {summary['PP_min']:.1f})")
+    print(f"  TG     mean {summary['TG_mean']:9.2f} tok/s   (min {summary['TG_min']:.2f})")
+    print(f"  TTFT   mean {summary['TTFT_mean']:9.1f} ms    ITL p50 {summary['itl_p50_mean']:.2f} "
+          f"/ p95 {summary['itl_p95_mean']:.2f} ms")
+    print(f"  VRAM   mean {summary['vram_gib_mean']:9.2f} GiB   GPU util {summary['gpu_util_mean']:.0f}%"
+          f"   RSS {summary['server_rss_gib_mean']:.1f} GiB")
+    print(f"  KV pages {summary['kv_total_pages']}  output sha1 {summary['output_sha1']}")
+    if args.json_out:
+        with open(args.json_out, "a") as f:
+            f.write(json.dumps(summary) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
