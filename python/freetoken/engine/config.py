@@ -150,7 +150,18 @@ class EngineConfig:
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
-        return replace(model_config, quant=quant)
+        model_config = replace(model_config, quant=quant)
+        if self.spec_mtp > 0:
+            mtp = getattr(getattr(model_config, "qwen4_args", None), "mtp", None)
+            if mtp is None or not mtp.enabled:
+                raise ValueError(
+                    "--spec-mtp > 0 requires a checkpoint that carries native MTP metadata "
+                    "(text_config.mtp), which this one does not."
+                )
+            from freetoken.models.config import with_mtp_layer
+
+            model_config = with_mtp_layer(model_config, model_config.num_layers)
+        return model_config
 
     @property
     def max_seq_len(self) -> int:
