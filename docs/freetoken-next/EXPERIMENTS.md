@@ -448,3 +448,16 @@ found no caller or matching allocation. The parameter and dead charge were remov
 claiming bytes for an unmeasured consumer. The focused ledger suite passes **22/22**. This closes
 the accounting gap only; actual compressed-KV reader scratch remains pending until its allocator
 reports measured peak bytes.
+
+## EXP-015 — Flash-Next routing counters are exposed, but the 16K run is BLOCKED
+**Date:** 2026-09-17 · **Verdict:** **PARTIAL / BLOCKED**
+
+Decision B needed per-layer MoE active/miss counters without changing the decode graph. The
+existing graph-safe counters are now exposed through `--moe-collect-stats`; the worker prints
+the aggregate and per-layer decode window at shutdown. The parser test passes and `ft serve
+--help` shows the option (`56774dc`).
+
+The intended 16K functional run was retried twice with explicit serial expert loading. Both
+workers exited while building expert bank `174/192`, before serving a request. The logs contain
+no traceback, explicit OOM, or residual GPU process, so no throughput or routing statistics are
+claimed. The blocker is the host load path, not the new parser/shutdown wiring.
