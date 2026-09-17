@@ -18,6 +18,22 @@ from freetoken.models.qwen3_vl.config import parse_vision_config
 
 
 @dataclass(frozen=True)
+class Qwen4ExpMTPConfig:
+    """Checkpoint metadata for the native NextN/MTP block.
+
+    The runtime does not consume this block yet; keeping the metadata in the parsed model
+    config prevents a future loader from rediscovering it from raw checkpoint keys.
+    """
+
+    enabled: bool = False
+    hybrid: bool = False
+    num_hidden_layers: int = 0
+    layer_types: Tuple[str, ...] = ()
+    use_hidden_state_from_layer: int | None = None
+    rope_theta: float | None = None
+
+
+@dataclass(frozen=True)
 class Qwen4ExpArgs:
     """Qwen3.8-Flash-Next geometry beyond the generic ModelConfig fields (ModelConfig.qwen4_args)."""
 
@@ -43,6 +59,7 @@ class Qwen4ExpArgs:
     index_budget: int
     index_ratio: int
     image_token_id: int | None = None
+    mtp: Qwen4ExpMTPConfig = Qwen4ExpMTPConfig()
 
     @property
     def index_topk_blocks(self) -> int:
@@ -110,6 +127,31 @@ def _layer_types(text: Any) -> list[str]:
         "full_attention" if (i + 1) % interval == 0 else "linear_attention"
         for i in range(n)
     ]
+
+
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _parse_mtp(text: Any) -> Qwen4ExpMTPConfig:
+    raw = getattr(text, "mtp", None)
+    if raw is None:
+        return Qwen4ExpMTPConfig()
+    count = int(_field(raw, "num_hidden_layers", 0) or 0)
+    if count < 0 or count > 1:
+        raise ValueError(f"Qwen4Exp native MTP supports at most one layer, got {count}")
+    layer_types = tuple(str(t) for t in (_field(raw, "layer_types", ()) or ()))
+    hidden_layer = _field(raw, "mtp_use_hidden_state_from_layer", None)
+    return Qwen4ExpMTPConfig(
+        enabled=count > 0,
+        hybrid=bool(_field(raw, "hybrid", False)),
+        num_hidden_layers=count,
+        layer_types=layer_types,
+        use_hidden_state_from_layer=(None if hidden_layer is None else int(hidden_layer)),
+        rope_theta=(None if _field(raw, "rope_theta", None) is None else float(_field(raw, "rope_theta"))),
+    )
 
 
 def parse_config(hf_config: Any) -> ModelConfig:
@@ -225,6 +267,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         index_budget=int(text.indexer_budget),
         index_ratio=int(text.indexer_compress_ratio),
         image_token_id=getattr(hf_config, "image_token_id", None),
+        mtp=_parse_mtp(text),
     )
 
     return ModelConfig(
@@ -261,4 +304,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["PLE_CONV_STATE", "PLE_NGRAM_STATE", "Qwen4ExpArgs", "parse_config", "ple_slot_states"]
+__all__ = [
+    "PLE_CONV_STATE",
+    "PLE_NGRAM_STATE",
+    "Qwen4ExpArgs",
+    "Qwen4ExpMTPConfig",
+    "parse_config",
+    "ple_slot_states",
+]

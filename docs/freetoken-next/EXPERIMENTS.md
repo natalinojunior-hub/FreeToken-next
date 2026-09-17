@@ -467,3 +467,11 @@ consistent with host-memory pressure, not a Python exception in the new instrume
 The unpinned diagnostic did not reach readiness either. No throughput or routing statistics are
 claimed; logs are `/models/desenvolvimento/tmp/ftnext/flash_load_detached_3.log` and
 `flash_load_unpinned.log`.
+
+## EXP-016 — Preserve native MTP metadata at the config seam
+**Date:** 2026-09-17 · **Verdict:** **PARTIAL / KEEP**
+
+`Qwen4ExpArgs` now carries the checkpoint's `text_config.mtp` metadata, accepts the released
+one-layer hybrid shape, and rejects `num_hidden_layers > 1` until the runtime supports it.
+The parser remains runtime-neutral: no `mtp.*` tensors are loaded, no draft model is built,
+and no speculative token is emitted. Focused config and model-skeleton tests pass **29/29**.

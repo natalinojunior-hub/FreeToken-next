@@ -135,6 +135,29 @@ def test_qwen4_args_payload():
     assert args.ngram_boundary_token_id == 248044
 
 
+def test_native_mtp_metadata_is_parsed_without_enabling_runtime():
+    hf = _hf_config()
+    hf.text_config.mtp = {
+        "hybrid": True,
+        "layer_types": ["full_attention"],
+        "mtp_use_hidden_state_from_layer": None,
+        "num_hidden_layers": 1,
+        "rope_theta": 10000000,
+    }
+    mtp = parse_config(hf).qwen4_args.mtp
+    assert mtp.enabled and mtp.hybrid
+    assert mtp.num_hidden_layers == 1
+    assert mtp.layer_types == ("full_attention",)
+    assert mtp.rope_theta == 10000000.0
+
+
+def test_native_mtp_rejects_multiple_layers_until_runtime_supports_them():
+    hf = _hf_config()
+    hf.text_config.mtp = {"num_hidden_layers": 2}
+    with pytest.raises(ValueError, match="at most one layer"):
+        parse_config(hf)
+
+
 def test_ple_on_full_attention_layer_rejected():
     hf = _hf_config()
     hf.text_config.ple_layer_ids = [4]  # one-indexed 4 == zero-based 3, a full_attention layer
