@@ -559,11 +559,14 @@ class VramLedger:
         return 0 if charge is None else charge.nbytes
 
     def total(self, kinds: Iterable[Kind] | None = None, exclude: Iterable[str] = ()) -> int:
-        """Sum of the account. No MEASURED-kind line is ever part of a total unless it is asked
-        for by name: those lines report what the allocator holds, so counting them would bill
-        the engine for its own bookkeeping (and made ``headroom`` read -14 GiB on a healthy
-        run)."""
-        wanted = frozenset(kinds) if kinds is not None else frozenset(Kind)
+        """Sum of the account. A MEASURED line is never part of a total unless it is named as
+        the kind being asked for: those lines report what the allocator holds, so summing them
+        with the consumers bills the engine for its own bookkeeping (it made the printed
+        ``committed`` read 29 GiB on a 15 GiB card)."""
+        if kinds is None:
+            wanted = frozenset(k for k in Kind if k is not Kind.MEASURED)
+        else:
+            wanted = frozenset(kinds)
         skip = set(exclude)
         if Kind.MEASURED not in wanted:
             skip |= {c.name for c in self.charges.values() if c.kind is Kind.MEASURED}

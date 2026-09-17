@@ -228,3 +228,35 @@ Three things to read out of this table:
 These rows are the certification baseline for Phases 3-5 and 11: a compressed or tiered KV
 format has to beat them at equal context, and the ledger prints the comparison instead of a
 fresh guess.
+
+## 9. First GGUF row measured (Qwen3.8-27B IQ3_S, dense, 4K/128)
+
+`bench_pp_tg.py --model /models/Qwen3.8-27B-GSQ-RCO-IQ3_S-MTP-Q4XS-Q3S.gguf --tokens 4096
+--decode 128 --repeats 2 --memory-ratio 0.9 --cache-type naive --max-prefill-length 1024
+--num-tokens 4096` (eager decode, as EXP-004 established):
+
+| model | PP | TG | TTFT | ITL p50 / p95 | VRAM | RSS |
+|---|---|---|---|---|---|---|
+| Qwen3.8-27B IQ3_S GGUF | 2416.6 | 25.29 | 1693 ms | 39.39 / 43.45 ms | 14.43 GiB | **2.17 GiB** |
+
+Output was coherent and the KV geometry is 4096 pages x 1 token. The account the run printed is
+the interesting part: `weights:model 13.211`, `cache:gdn-state 0.287`, `cache:kv 0.250`,
+reserve 0.788 against a ceiling of 13.661 (ratio 0.9 x baseline 15.179) -- a 27B dense IQ3_S
+checkpoint leaves effectively nothing spare on this card, and the feasibility row says so for
+each target: `128K 8.00 GiB short, 256K 16.00 GiB short, 512K 32.00 GiB short,
+1M 64.00 GiB short`, at 0.06 MiB of BF16 KV per token. Long context on the dense 27B is
+therefore not a scheduling question: it is 13.2 GiB of resident weights against a 15.51 GiB
+card, and only a compressed KV format (which turns 8.00 GiB of 128K KV into ~2.1 GiB) plus a
+smaller resident weight footprint would move it.
+
+Two things this row establishes for the matrix:
+
+1. **A GGUF checkpoint can be benchmarked at all** -- the harness had to be changed to tokenize
+   through the engine's own `load_tokenizer` (§STATE), which is why this is the first one.
+2. **2.17 GiB of RSS against the native NVFP4 anchors' 21.9-67.8 GiB.** A quantized single-file
+   checkpoint streams its weights from page cache instead of pinning a host expert bank, so on
+   this 91 GiB box the GGUF path leaves ~65 GiB of RAM free that the native offload path
+   consumes. That is the trade the certification matrix has to weigh against the throughput
+   delta, and it is the reason a 93 GB GGUF can be the better deployment even at lower TG
+   (FINAL PERFORMANCE POLICY). Native comparison for this row is
+   `NO_NATIVE_REFERENCE_AVAILABLE`: there is no native FreeToken 27B dense checkpoint on the host.

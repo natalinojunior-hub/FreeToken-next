@@ -364,17 +364,23 @@ def test_ledger_lines_add_up_to_the_physical_card():
 
 
 def test_calibration_reading_is_never_a_consumer():
-    # The measured line reports what the allocator holds. If it entered a planner total, the
-    # engine would bill itself for its own bookkeeping and every later budget would collapse.
+    # The measured lines report what the allocator holds. If one entered a planner total the
+    # engine would bill itself for its own bookkeeping: on the first dense-GGUF run that made
+    # the account claim 29 GiB committed on a 15.51 GiB card, and a zero pool budget.
     ledger = _ledger(ratio=1.0)
     before = (ledger.ceiling_bytes, ledger.pool_budget_bytes(), ledger.headroom_bytes(),
-              ledger.reserve_bytes)
+              ledger.reserve_bytes, ledger.total())
     ledger.charge("measured:allocator-held", 14 * _GIB, Kind.MEASURED, "torch holds this")
+    ledger.charge("measured:transient-peak", 3 * _GIB, Kind.MEASURED, "peak since the probe")
     assert (ledger.ceiling_bytes, ledger.pool_budget_bytes(), ledger.headroom_bytes(),
-            ledger.reserve_bytes) == before
+            ledger.reserve_bytes, ledger.total()) == before
     assert ledger.held_bytes() == ledger.total((Kind.IMMUTABLE, Kind.PERSISTENT,
                                                 Kind.SEMI_PERSISTENT))
-    assert "measured:allocator-held" in ledger.report()
+    assert ledger.bytes_of("measured:allocator-held") == 14 * _GIB
+    text = ledger.report()
+    assert "measured:allocator-held" in text and "measured:transient-peak" in text
+    assert f"{14 * _GIB / _GIB:.3f}" in text  # shown as its own row, never folded into totals
+    assert f"committed {(before[4]) / _GIB:.3f} GiB" in text
 
 
 def test_report_prints_every_line_and_the_two_tightening_bounds():
