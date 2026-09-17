@@ -188,3 +188,37 @@ The calibration line printed with each report is the honesty check on those numb
 account's held bytes against `torch.cuda.memory_allocated`. It read "over-modelled by
 ~0.2-0.4 GiB" on both anchors after the two measurement bugs EXP-006 lists were fixed, which
 is the safe direction (context left unspent) and the quantity Phase 2 has to negotiate down.
+
+## 8. Long context, measured (Qwen3.6-35B-A3B NVFP4, bs=1, greedy, real host)
+
+The plan said a context length is bought out of the expert cache, so that is what was done.
+`--kv-reserve-tokens <context>` is the only knob: BF16 KV, `--cache-type naive`,
+`--memory-ratio 0.9`, prompt taken from a fixed 9 MB corpus slice with `--prompt-file` so a
+repeat measures a prefill and not a cached prefix.
+
+| context | PP (tok/s) | TG (tok/s) | TTFT | ITL p50 / p95 | VRAM | RSS | expert slots kept |
+|---|---|---|---|---|---|---|---|
+| 16 384 (guard) | 4611.3 | 158.54 | 3.55 s | 6.17 / 6.45 ms | 14.59 GiB | 21.9 GiB | 6113 |
+| 131 072 (128K) | 3188.5 | 89.30 | 41.1 s | 10.99 / 12.81 ms | 14.45 GiB | 22.0 GiB | 4694 (plan said 4695) |
+| 261 900 (256K) | 2353.7 | 63.83 | 111.3 s | 15.36 / 18.85 ms | 14.41 GiB | 22.0 GiB | 3185 (plan said 3183) |
+
+Three things to read out of this table:
+
+1. **TG degrades gracefully with context** (158.5 → 89.3 → 63.8) with GPU utilisation pinned at
+   100 %: at 16K decode is expert-bandwidth-bound, and by 256K it is also paying for 262 000
+   tokens of attention reads -- the two costs add, they do not substitute for each other.
+2. **Prefill is where long context actually costs**: TTFT 41 s at 128K and 111 s at 256K, while
+   PP itself falls to 2354 tok/s because the expert cache shrank to pay for the KV. Chunked
+   prefill and overlap work is measured against those numbers, not against TG.
+3. **512K and 1M are blocked before memory is the question.** The checkpoint's RoPE table is
+   262 144 positions, so `--max-seq-len-override 524384` is refused outright by the engine. And
+   the plan prices 512K of BF16 KV at 10.000 GiB -- the entire pool budget, zero resident
+   experts -- with 1M at 20.000 GiB. Past 256K the order is therefore fixed: a rope-scaled
+   checkpoint, then a ~4x compressed KV format (turbo4 at 4.125 bpv puts 512K back near
+   2.6 GiB and 1M near 5.1 GiB, both affordable alongside a real expert cache), and only then
+   RAM tiering, which the measured 57.76 GB/s PCIe ceiling (§2) makes a decode-latency problem
+   rather than a capacity one.
+
+These rows are the certification baseline for Phases 3-5 and 11: a compressed or tiered KV
+format has to beat them at equal context, and the ledger prints the comparison instead of a
+fresh guess.
