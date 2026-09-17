@@ -72,6 +72,13 @@ def _first_dead(processes: List[Any]) -> Any | None:
     return None
 
 
+def _worker_exit_message(process: Any, phase: str) -> str:
+    name = getattr(process, "name", "?")
+    exitcode = getattr(process, "exitcode", None)
+    suffix = f" (exitcode={exitcode})" if exitcode is not None else ""
+    return f"backend worker {name} exited {phase}{suffix}"
+
+
 def _as_error(msg: Any) -> str | None:
     """The reason a dying worker pushed as ("error", reason), or None for any other ack — lets
     the supervisor report the real cause (e.g. a config ValueError) rather than the generic
@@ -124,7 +131,7 @@ def drain_ready(
                 # The worker may have pushed its real failure reason just before exiting; give
                 # the queue a brief window to surface it, else fall back to the generic message.
                 reason = _drain_pending_error(get)
-                raise WorkerDied(reason or f"backend worker {getattr(dead, 'name', '?')} exited during load")
+                raise WorkerDied(reason or _worker_exit_message(dead, "during load"))
             continue
         err = _as_error(msg)
         if err is not None:
@@ -181,6 +188,6 @@ def run_backend_supervisor(
                 # Orderly stop in progress: the worker exit is expected — stay quiet.
                 return
             if on_failure is not None:
-                on_failure(f"backend worker {getattr(dead, 'name', '?')} exited")
+                on_failure(_worker_exit_message(dead, ""))
             return
         time.sleep(poll)

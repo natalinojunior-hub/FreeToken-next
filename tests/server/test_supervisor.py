@@ -63,13 +63,14 @@ def test_drain_ready_detects_worker_death_during_load():
 
     class DeadProc:
         name = "freetoken-TP0-scheduler"
+        exitcode = -9
 
         def is_alive(self) -> bool:
             return False
 
     q: "queue.Queue" = queue.Queue()  # never receives a ready ack
     handle = BackendHandle(ack_queue=q, processes=[DeadProc()], expected_acks=1)
-    with pytest.raises(WorkerDied):
+    with pytest.raises(WorkerDied, match="exitcode=-9"):
         drain_ready(handle, LoadProgress(), get=lambda _t: (_ for _ in ()).throw(_Empty()))
 
 
