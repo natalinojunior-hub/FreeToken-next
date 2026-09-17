@@ -26,6 +26,11 @@ from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_fa
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
+from .cache_budget import ceiling_bytes, pool_pages
+from .vram_ledger import (
+    CALIBRATION_TOLERANCE, Kind, modelled_reserves, open_ledger, page_table_bytes,
+    tensor_breakdown, tensor_bytes,
+)
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
@@ -67,11 +72,19 @@ def _sgl_flash_attn_available() -> bool:
     return True
 
 
-def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memory: int) -> int:
+def _startup_kv_budget(
+    memory_ratio: float,
+    init_free_memory: int,
+    new_free_memory: int,
+    reserve_bytes: int = 0,
+) -> int:
     """Bytes available to the KV pool at startup: ratio-scaled pre-load free memory minus
-    what the resident model consumed. Kept as a pure function so the composition with the
-    pool families' ``solve_num_pages`` stays CPU-testable."""
-    return int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
+    what the resident model consumed, and never more than what is left once the VRAM ledger's
+    modelled peak is held back. Kept as a pure function so the composition with the pool
+    families' ``solve_num_pages`` stays CPU-testable."""
+    return ceiling_bytes(init_free_memory, memory_ratio, reserve_bytes) - (
+        init_free_memory - new_free_memory
+    )
 
 
 def _page_table_width(max_seq_len: int, page_size: int) -> int:
@@ -358,8 +371,17 @@ class Engine:
         self._host_tables_bytes = 0
         if hasattr(self.model, "load_host_tables"):
             self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
+        # ======================= VRAM ledger ========================
+        # One account for every byte this device will hold, opened while the only thing on the
+        # card is the weights: every later sizing decision (expert slots, KV pages, rebuild
+        # fit-checks) asks it for a budget instead of re-deriving one from free memory, and
+        # --memory-ratio becomes a cap on the account rather than the safety policy itself.
+        self.vram_ledger = self._open_vram_ledger(config)
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
+            if self.moe_offload_cache is not None:
+                cache = self.moe_offload_cache
+                self._charge_expert_cache(cache)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
         self.encoder_cache = None
@@ -388,12 +410,28 @@ class Engine:
         new_free = self._sync_get_memory()[1]
         # The engine measures the budget and settles the sibling GDN state pool's bytes
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
-        available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
+        available_memory = _startup_kv_budget(
+            config.memory_ratio, init_free_memory, new_free, self._ledger_reserve_bytes()
+        )
+        # The sibling pools the account knows about but this solve does not: the GDN state
+        # pool, and everything the ledger prices that no cost model owns (page table estimate,
+        # CUDA-graph pool, backend workspaces). Without the second term the KV pool is sized as
+        # if those bytes were free, which is how a plan that "fit" still OOMed at 0.9.
         available_memory -= state_pool_bytes(config)
+        available_memory -= self.vram_ledger.engine_overhead_bytes()
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config, self.num_pages, device=self.device, dtype=self.dtype
+        )
+        # Price what the pool actually allocated (usable pages + its dummy page + its fixed
+        # tiers) rather than what the solver was handed, so a pool whose unit_bytes drifts
+        # from its own cost model shows up as a wrong account instead of a silent OOM.
+        _per_page, _fixed, _page_tokens, _ = self._pool_cls.kv_cost(config)
+        self.vram_ledger.charge(
+            "cache:kv", pool_pages(self.num_pages) * _per_page + _fixed, Kind.PERSISTENT,
+            f"{self.num_pages} usable pages x {_page_tokens} tokens (+1 dummy page), "
+            f"{_per_page // (1 << 20)} MiB per page",
         )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
@@ -426,6 +464,13 @@ class Engine:
         # re-point here (and again on any table realloc). The graph-input snapshot that reads
         # through them belongs to the attention backend, built later in init_capture_graph.
         self.kv_cache.attach_page_table(self.page_table)
+        # Charged because it is real VRAM that no budget term ever priced: one row per
+        # concurrent request (plus the dummy row) across the whole context.
+        self.vram_ledger.charge(
+            "workspace:page-table",
+            self.page_table.numel() * self.page_table.element_size(), Kind.PERSISTENT,
+            f"{config.max_running_req + 1} rows x {aligned_max_seq_len} columns",
+        )
 
         # ======================= Attention backend initialization ========================
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
@@ -469,6 +514,17 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        # Graph capture is the last consumer that allocates, so the account closes here: the
+        # runner's own buffers are measured, and the graph line keeps whichever is larger --
+        # the formula that funded the plan or the measurement that proves it.
+        measured_graph = tensor_bytes(self.graph_runner)
+        self.vram_ledger.charge(
+            "graph:pool",
+            max(measured_graph, self.vram_ledger.bytes_of("graph:pool")), Kind.SEMI_PERSISTENT,
+            f"captured shapes {list(self.graph_runner.graph_bs_list)}, static inputs "
+            f"{mem_GB(measured_graph)} measured",
+        )
+        self._calibrate_vram_ledger()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -554,6 +610,123 @@ class Engine:
         if parts:
             batch.mm_embeds = torch.cat([p.to(self.dtype) for p in parts], dim=0)
 
+    def _open_vram_ledger(self, config: EngineConfig):
+        """Start the VRAM account while the weights are the only thing on the card.
+
+        Charges the consumers knowable before any pool exists -- the resident parameters and
+        the sibling GDN state pool (the KV families price their own tiers) -- plus the modelled
+        peak of everything the base allocates blind: the Triton autotune arena, the CUDA-graph
+        capture, backend workspaces, and for a hybrid-GDN model the per-layer prefill workspace
+        over one scheduler chunk. The KV pool and the expert cache are charged once they are
+        sized, so the report printed at the end of startup is a complete account and any memory
+        the two disagree by is somebody's bug.
+        """
+        try:
+            device_total = int(torch.cuda.get_device_properties(self.device).total_memory)
+        except Exception:  # no CUDA (unit fakes): the account still has to be constructible
+            device_total = self._baseline_free
+        # The runtime bounds one forward by the scheduler's chunk cap; an engine-only config
+        # has no such cap, so its worst case is the whole context.
+        prefill_tokens = int(getattr(config, "max_extend_tokens", 0) or config.max_forward_len)
+        reserves = modelled_reserves(
+            linear_group=config.model_config.linear_attention_group(),
+            prefill_tokens=prefill_tokens,
+            hidden_size=config.model_config.hidden_size,
+            dtype_itemsize=config.dtype.itemsize,
+            cuda_graph_max_bs=config.cuda_graph_max_bs,
+            backend_workspace=True,
+            mm_encoder=bool(getattr(config, "active_encoders", None)),
+        )
+        ledger = open_ledger(
+            device_total_bytes=device_total,
+            baseline_free=self._baseline_free,
+            memory_ratio=config.memory_ratio,
+            weights_bytes=self._weights_bytes,
+            reserves=reserves,
+        )
+        state_bytes = state_pool_bytes(config)
+        if state_bytes:
+            ledger.charge(
+                "cache:gdn-state", state_bytes, Kind.PERSISTENT,
+                f"{_linear_pool_num_slots(config)} physical slots x "
+                f"{mem_GB(state_pool_bytes(config, 1))} per sequence",
+            )
+        ple_host = int(getattr(self, "_host_tables_bytes", 0) or 0)
+        ledger.charge(
+            "ple:gpu", 0, Kind.PERSISTENT,
+            f"PLE backend {getattr(config, 'ple_backend', 'n/a')} holds no VRAM"
+            + (f" ({mem_GB(ple_host)} pinned host)" if ple_host else ""),
+        )
+        # The page table is built after the KV solve, so the solve has to fund it from the
+        # formula (its real bytes re-price this line right after the allocation).
+        ledger.charge(
+            "workspace:page-table",
+            page_table_bytes(config.max_running_req, config.max_seq_len, config.page_size),
+            Kind.PERSISTENT, f"{config.max_running_req + 1} rows x --max-seq-len upper bound",
+        )
+        return ledger
+
+    def _charge_expert_cache(self, cache) -> None:
+        """Split the expert cache into what the plan priced and what the kernel also needs.
+
+        ``expert_bytes_per_slot`` covers the bank rows; the quant methods additionally pin
+        per-layer side tables on the device (fp32 alphas, nvfp4 ``s2_deltas``, e8m0 block
+        scales -- ``_load_extra_gpu_tensors``) which no slot term prices. On this host that
+        residue is ~2.5 GiB on Flash-Next, i.e. the auto plan under-prices the expert cache it
+        is about to build, which is precisely the memory ``(1 - memory_ratio)`` was eating. As
+        a named non-negotiable line it is now subtracted from every LATER plan (a rebuild, a
+        second auto resolve) and shows up in the report instead of in an OOM.
+        """
+        from freetoken.engine.cache_budget import expert_bytes_per_slot
+
+        measured = tensor_bytes(cache)
+        per_slot = expert_bytes_per_slot(cache.bank_sources)
+        promised = min(measured, cache.cache_size * per_slot)
+        self.vram_ledger.charge(
+            "cache:expert", promised, Kind.PERSISTENT,
+            f"{cache.cache_size} slots x {per_slot // (1 << 20)} MiB priced by the plan",
+        )
+        side = measured - promised
+        if side > 0:
+            self.vram_ledger.charge(
+                "cache:expert-side-tables", side, Kind.PERSISTENT,
+                "per-layer method tables outside the bank rows (alphas, s2_deltas, block "
+                f"scales); largest holders {tensor_breakdown(cache)}",
+            )
+
+    def _calibrate_vram_ledger(self) -> None:
+        """Print the account next to what the allocator actually holds.
+
+        ``_sync_get_memory`` resets the peak counter on the way through init, so a peak is only
+        ever one window's peak; the honest steady-state comparison is what the allocator holds
+        right now. A positive gap is an unmodelled consumer -- exactly what this account exists
+        to expose -- so it is warned about, never asserted: an assertion would take a serving
+        process down over an accounting detail, and a live forward can outrun the model without
+        the startup plan having been wrong."""
+        ledger = getattr(self, "vram_ledger", None)
+        if ledger is None:
+            return
+        try:
+            held = int(torch.cuda.memory_allocated(self.device))
+        except Exception:  # device without a CUDA allocator (unit fakes)
+            return
+        ledger.charge("measured:allocator-held", held, Kind.MEASURED,
+                      "what the allocator holds; the account must explain it")
+        ledger.log()
+        unexplained = held - ledger.held_bytes()
+        if unexplained > CALIBRATION_TOLERANCE:
+            logger.warning_rank0(
+                f"VRAM ledger under-modelled the account by {mem_GB(unexplained)}: the allocator "
+                f"holds {mem_GB(held)} and the account claims {mem_GB(ledger.held_bytes())}. "
+                "Something allocates outside the model (a per-slot expert cost that omits the "
+                "kernel's side tables is the known case) -- find it or leave ratio headroom."
+            )
+        elif -unexplained > CALIBRATION_TOLERANCE:
+            logger.info_rank0(
+                f"VRAM ledger over-modelled the account by {mem_GB(-unexplained)}: the pools it "
+                "priced are smaller than the account claimed, so context is being left unspent."
+            )
+
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks, method=None) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -564,6 +737,7 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        fixed_cache_size += self._ledger_overhead_bytes()  # page table, graph pool, workspaces
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
         return resolve_moe_cache_auto(
@@ -579,7 +753,24 @@ class Engine:
             kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
             page_size=page_tokens,
             max_slots=method.slot_limit() if method is not None else None,
+            reserve_bytes=self._ledger_reserve_bytes(),
         )
+
+    def _ledger_reserve_bytes(self) -> int:
+        """The ledger's modelled peak, 0 before the account exists (and for fakes).
+
+        Every sizing decision takes the same number from the same place, so the startup plan
+        and a runtime rebuild cannot disagree about how much memory must stay uncommitted."""
+        ledger = getattr(self, "vram_ledger", None)
+        return int(ledger.reserve_bytes) if ledger is not None else 0
+
+    def _ledger_overhead_bytes(self) -> int:
+        """Committed bytes the pool and expert cost models do not price, 0 without a ledger.
+
+        Subtracted alongside the sibling GDN state pool wherever a budget is formed, so the KV
+        solve and --moe-cache-auto split the same memory the account says is there."""
+        ledger = getattr(self, "vram_ledger", None)
+        return int(ledger.engine_overhead_bytes()) if ledger is not None else 0
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         method = shared_offload_method(self.model)
@@ -920,9 +1111,10 @@ class Engine:
             num_swa_pages=num_swa_pages, target_moe=target_moe,
             per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
+            reserve_bytes=self._ledger_reserve_bytes(),
             extra_fixed_bytes=(
                 state_pool_bytes(config, target_mamba) if target_mamba is not None else 0
-            ),
+            ) + self._ledger_overhead_bytes(),
             extra_note=(
                 f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
             ),

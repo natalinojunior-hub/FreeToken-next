@@ -90,7 +90,7 @@ class BaseKVCachePool(ABC):
     def validate_rebuild(
         self, config, *, num_pages: int | None, target_moe: int, per_expert_bytes: int,
         baseline_free: int, weights_bytes: int, current_num_pages: int,
-        extra_fixed_bytes: int = 0, extra_note: str = "", **targets,
+        extra_fixed_bytes: int = 0, reserve_bytes: int = 0, extra_note: str = "", **targets,
     ) -> None:
         """Budget fit-check for a runtime rebuild target, BEFORE any destructive free.
         The engine supplies the memory account (baseline/weights, the MoE terms, and any
@@ -114,7 +114,7 @@ class BaseKVCachePool(ABC):
         cache_per_page, fixed_cache_size, _, _ = type(self).kv_cost(config, **cost_kwargs)
         budget = net_cache_budget_bytes(
             config.memory_ratio, baseline_free, weights_bytes,
-            fixed_cache_size + extra_fixed_bytes,
+            fixed_cache_size + extra_fixed_bytes, reserve_bytes,
         )
         need = required_bytes(target_moe, target_pages, per_expert_bytes, cache_per_page)
         if need > budget:

@@ -28,14 +28,35 @@ def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
     return sum(t[0][0].numel() * t[0].element_size() for t in sources.values())
 
 
+def ceiling_bytes(baseline_free: int, memory_ratio: float, reserve_bytes: int = 0) -> int:
+    """The most VRAM the engine may hold, given that ``reserve_bytes`` must stay free for the
+    runtime's peaks (see engine/vram_ledger.py).
+
+    ``(1 - memory_ratio) x baseline`` was always the de-facto reserve -- it is the hole between
+    the promise and the card -- so the ledger only charges the SHORTFALL between the modelled
+    peak and that hole. A low ratio is therefore untouched (byte-identical to the pre-ledger
+    formula, which is what keeps this brick from resizing every existing checkpoint), a high
+    ratio is clamped down to exactly what the peak needs, and ratio 1.0 becomes usable: the
+    plan funds the transient instead of praying the allocator has room for it. That removes the
+    hidden safety margin EXP-001b had to guess its way around (Flash-Next OOM'd at 0.9 and
+    "worked" at 0.86)."""
+    cap = int(memory_ratio * baseline_free)
+    implicit_reserve = baseline_free - cap
+    return cap - max(0, int(reserve_bytes) - implicit_reserve)
+
+
 def net_cache_budget_bytes(
-    memory_ratio: float, baseline_free: int, weights_bytes: int, fixed_cache_size: int
+    memory_ratio: float,
+    baseline_free: int,
+    weights_bytes: int,
+    fixed_cache_size: int,
+    reserve_bytes: int = 0,
 ) -> int:
-    """Net GPU bytes available for the MoE + KV pools: ``memory_ratio`` of the pre-model
-    baseline minus weights and fixed (non-paged) cache. The ``(1-memory_ratio)`` remainder
-    is the CUDA-graph/activation headroom. Single source of truth for startup auto-sizing
-    and the runtime-rebuild fit check."""
-    return int(memory_ratio * baseline_free) - weights_bytes - fixed_cache_size
+    """Net GPU bytes available for the MoE + KV pools: the ceiling minus weights and fixed
+    (non-paged) cache. Single source of truth for startup auto-sizing and the runtime-rebuild
+    fit check; ``reserve_bytes`` is the ledger's modelled peak, 0 for callers that have no
+    ledger (and therefore keep the pre-ledger formula exactly)."""
+    return ceiling_bytes(baseline_free, memory_ratio, reserve_bytes) - weights_bytes - fixed_cache_size
 
 
 # Every KV pool allocates one page past the usable ones for padded / dummy rows to write
@@ -86,7 +107,10 @@ def plan_cache_budget(
     lo = 2 * num_experts if overlap else num_experts
     assert hi >= lo, f"slot cap {hi} below the minimum {lo} slots"
 
-    kv_reserve_bytes = kv_reserve_pages * cache_per_page
+    # The reserve is a promise about USABLE pages, so it costs the pool's dummy page too: the
+    # greedy expert fill below must leave that many bytes behind or the num_pages floor will
+    # over-commit the budget it was solved against (a 1.5 MiB miss that used to fail the plan).
+    kv_reserve_bytes = pool_pages(kv_reserve_pages) * cache_per_page
     # MoE-priority: reserve KV first, then experts greedily take the remaining budget.
     raw = (budget_bytes - kv_reserve_bytes) // per_expert_bytes
     moe_cache_size = max(lo, min(raw, hi))
@@ -94,13 +118,24 @@ def plan_cache_budget(
     overlap = overlap and moe_cache_size >= 2 * num_experts
 
     remaining = budget_bytes - moe_cache_size * per_expert_bytes
-    # One page of what ``remaining`` buys is spent on the pool's dummy page, so the plan
-    # hands back usable pages and never promises bytes it did not price.
+    # One page of what ``remaining`` buys is spent on the pool's dummy page, so the plan hands
+    # back usable pages and never promises bytes it did not price.
     num_pages = max(remaining // cache_per_page - DUMMY_PAGES, kv_reserve_pages)
+    total = required_bytes(moe_cache_size, num_pages, per_expert_bytes, cache_per_page)
+    # Experts filled greedily against the KV reserve in BYTES, but the reserve is a floor in
+    # PAGES: when the byte fit leaves less than the floor, num_pages snaps up to it and the
+    # plan is over-committed -- on this host by as little as 1.5 MiB, which used to be a hard
+    # startup failure. Hand the excess back as expert slots (the greedy side) and re-solve.
+    if total > budget_bytes and moe_cache_size > lo:
+        give_back = -(-(total - budget_bytes) // per_expert_bytes)
+        moe_cache_size = max(lo, moe_cache_size - give_back)
+        remaining = budget_bytes - moe_cache_size * per_expert_bytes
+        num_pages = max(remaining // cache_per_page - DUMMY_PAGES, kv_reserve_pages)
+        total = required_bytes(moe_cache_size, num_pages, per_expert_bytes, cache_per_page)
+        overlap = overlap and moe_cache_size >= 2 * num_experts
     # A tiny budget can floor num_pages at kv_reserve_pages even when ``remaining`` is below
     # the reserve (or negative), yielding a plan that exceeds budget_bytes. Reject here so
     # --moe-cache-auto fails in arithmetic instead of OOMing in a later CUDA allocation.
-    total = required_bytes(moe_cache_size, num_pages, per_expert_bytes, cache_per_page)
     assert total <= budget_bytes, (
         f"cache budget too small: minimum plan (moe={moe_cache_size} slots, "
         f"kv={num_pages} pages) needs {total} B > budget {budget_bytes} B "
@@ -124,16 +159,20 @@ def resolve_moe_cache_auto(
     kv_reserve_tokens: int,
     page_size: int,
     max_slots: int | None = None,
+    reserve_bytes: int = 0,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
     ``max_slots`` is the expert kernel's addressable slot limit; the plan never exceeds it.
+    ``reserve_bytes`` is the VRAM ledger's modelled peak: the plan may not promise it.
 
     Applies memory_ratio to the persisted pre-model baseline exactly once, then defers
     the MoE-vs-KV split to plan_cache_budget. The (1-memory_ratio) remainder is the
     CUDA-graph/activation headroom (not subtracted here).
     """
-    budget_bytes = net_cache_budget_bytes(memory_ratio, baseline_free, weights_bytes, fixed_cache_size)
+    budget_bytes = net_cache_budget_bytes(
+        memory_ratio, baseline_free, weights_bytes, fixed_cache_size, reserve_bytes
+    )
     max_slots = total_experts if max_slots is None else min(max_slots, total_experts)
     kv_reserve_pages = div_ceil(kv_reserve_tokens, page_size)
     return plan_cache_budget(
