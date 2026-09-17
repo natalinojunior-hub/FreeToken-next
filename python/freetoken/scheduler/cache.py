@@ -496,6 +496,22 @@ class CacheManager:
         end = div_ceil(req.cached_len, self.page_size) * self.page_size
         return self.page_table[req.table_idx, start:end]
 
+    def free_spec_reject(self, req: Req, keep_len: int, alloc_len: int) -> None:
+        """Return the whole pages a speculative verify window allocated beyond ``keep_len``
+        tokens, the ones actually accepted. Never touches the prefix cache: a rejected
+        window was never committed via cache_req/insert_prefix, so there is nothing to evict
+        there -- this only returns pages to the free list. A no-op whenever ``keep_len`` and
+        ``alloc_len`` round up to the same page (the common case at page_size > spec depth)."""
+        from freetoken.engine.spec import pages_to_free
+
+        first, last = pages_to_free(keep_len, alloc_len, self.page_size)
+        if last <= first:
+            return
+        indices = self.page_table[req.table_idx, first * self.page_size : last * self.page_size]
+        if self.swa_paged:
+            self._free_swa(indices)
+        self._free(indices)
+
     def _free_req_slots(self, req: Req, keep_live: bool = False) -> None:
         """Return a finished request's GDN pool slots: both ping-pong slots, plus the live slot
         unless it was donated to the tree. Idempotent -- clears the refs so a re-entry frees
