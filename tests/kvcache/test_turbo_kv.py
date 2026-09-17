@@ -64,6 +64,18 @@ def test_rotate_is_orthogonal_and_preserves_norm():
     assert torch.allclose(tk.inv_rotate(tk.rotate(x)), x, atol=1e-5)
 
 
+def test_rotate_treats_each_group_of_a_wide_row_independently():
+    """head_dim 256 is two rotation groups per row -- the 35B-A3B's real full-attention geometry,
+    and the first thing the engine tripped on once rotate was called on a live Q tensor."""
+    a = _groups(64, seed=51)
+    b = _groups(64, seed=52)
+    wide = torch.cat((a, b), dim=-1)
+    assert torch.equal(tk.rotate(wide), torch.cat((tk.rotate(a), tk.rotate(b)), dim=-1))
+    assert torch.allclose(tk.inv_rotate(tk.rotate(wide)), wide, atol=1e-5)
+    ranks = torch.randn(4, 3, 256, generator=torch.Generator(device=DEVICE).manual_seed(4), device=DEVICE)
+    assert tk.rotate(ranks).shape == ranks.shape == tk.inv_rotate(tk.rotate(ranks)).shape
+
+
 def test_rotated_dot_equals_original_dot():
     """The fused read path never de-rotates a KV tile: it pre-rotates Q and dots against the
     stored values. This is that identity."""

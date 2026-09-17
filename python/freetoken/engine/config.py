@@ -25,6 +25,10 @@ class EngineConfig:
     dtype: torch.dtype
     max_running_req: int = 4
     attention_backend: str = "auto"
+    # KV slab format: auto/bf16 is the paged bf16 cache; turbo3/turbo4 store the full-attention
+    # group as rotated 3/4-bit codes, so the KV a long context buys out of the expert cache is
+    # ~4x smaller. Only the triton backend can read coded tiles.
+    kv_format: str = "auto"
     moe_strategy: str = "auto"
     # old name of moe_strategy; __post_init__ folds it in
     moe_backend: str | None = field(default=None, repr=False)

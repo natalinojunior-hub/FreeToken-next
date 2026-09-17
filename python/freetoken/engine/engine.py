@@ -329,7 +329,15 @@ class Engine:
         # KV pool family fixed at construction from the model config: its classmethods own the
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
-        self._pool_cls = resolve_pool_class(config.model_config)
+        self._pool_cls = resolve_pool_class(config.model_config, getattr(config, "kv_format", "auto"))
+        if self._pool_cls.__name__ == "TurboMHAKVCache":
+            parts = [p.strip() for p in str(config.attention_backend).split(",")]
+            if any(p != "triton" for p in parts):
+                raise NotImplementedError(
+                    f"--kv-format {config.kv_format} needs --attention-backend triton: the coded "
+                    "tiles are read by our own kernels, and every other backend takes a bf16 KV "
+                    f"slab (backend is {config.attention_backend!r})."
+                )
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 
@@ -1779,6 +1787,13 @@ def _adjust_config(config: EngineConfig):
         raise ValueError(
             "--dtype float16 with MXFP8 resident weights is unsupported (the "
             "W8A16 fold is only validated exact in bfloat16); use bfloat16."
+        )
+    if getattr(config, "kv_format", "auto") in ("turbo3", "turbo4") and config.attention_backend == "auto":
+        # Coded tiles are readable only by our own kernels; auto-selecting fi here would produce a
+        # plan the first forward cannot execute.
+        override("attention_backend", "triton")
+        logger.info_rank0(
+            f"--kv-format {config.kv_format}: selecting the triton backend (coded KV tiles)"
         )
     if config.attention_backend == "auto":
         override(

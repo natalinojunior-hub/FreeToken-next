@@ -134,10 +134,14 @@ def butterfly(x: torch.Tensor) -> torch.Tensor:
 
 
 def rotate(x: torch.Tensor) -> torch.Tensor:
-    """Forward RWHT: ``x * s1 -> butterfly -> /sqrt(128) -> * s2`` (``turbo_rotate_forward_cuda``)."""
+    """Forward RWHT: ``x * s1 -> butterfly -> /sqrt(128) -> * s2`` (``turbo_rotate_forward_cuda``).
+
+    Rows may hold several rotation groups (head_dim 256 is two): each 128-element group rotates on
+    its own, which is what the encoder does per group and what the tile readers assume."""
     s1, s2 = _signs(x.device)
-    xf = x.float() * s1
-    out = butterfly(xf) * FWHT_SCALE * s2
+    grouped = x.reshape(*x.shape[:-1], -1, QK_TURBO).float()
+    out = butterfly(grouped * s1) * FWHT_SCALE * s2
+    out = out.reshape(x.shape)
     return out.to(x.dtype) if x.dtype != torch.float32 else out
 
 
@@ -145,8 +149,9 @@ def inv_rotate(y: torch.Tensor) -> torch.Tensor:
     """Inverse RWHT: ``y * s2 -> butterfly -> /sqrt(128) -> * s1`` (the butterfly is an involution
     up to the scale, which is why the same 1/sqrt(128) is applied again)."""
     s1, s2 = _signs(y.device)
-    yf = y.float() * s2
-    out = butterfly(yf) * FWHT_SCALE * s1
+    grouped = y.reshape(*y.shape[:-1], -1, QK_TURBO).float()
+    out = butterfly(grouped * s2) * FWHT_SCALE * s1
+    out = out.reshape(y.shape)
     return out.to(y.dtype) if y.dtype != torch.float32 else out
 
 

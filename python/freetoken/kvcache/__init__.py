@@ -24,11 +24,20 @@ class CacheManagerCreator(Protocol):
 SUPPORTED_CACHE_MANAGER = Registry[CacheManagerCreator]("Cache Manager")
 
 
-def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
+TURBO_BOOKS = ("turbo3", "turbo4")
+
+
+def resolve_pool_class(model_config: ModelConfig, kv_format: str = "auto") -> type[BaseKVCachePool]:
     """attn_type -> KV pool family, the dispatch shared by ``create_kv_pool`` and the
     engine's pre-pool sizing calls (the classmethod cost/solve surface). Driven by the
     group-spec walk (same source as the backend capability matrix); getattr fallbacks
-    cover duck-typed test configs that don't implement it."""
+    cover duck-typed test configs that don't implement it.
+
+    ``kv_format`` asks for a compressed full-attention slab. It is honored only where the
+    bytes are ours to lay out: the other families carry latent/index/window tiers with their
+    own addressing, so asking for turbo there is a refusal, not a silent bf16 fallback -- the
+    plan would price one thing and the allocator would hold another.
+    """
     from freetoken.attention import AttnType
 
     specs_fn = getattr(model_config, "kv_cache_group_specs", None)
@@ -42,6 +51,12 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
         return MHAKVCache
     specs = list(specs_fn())
     types = {spec.attn_type for spec in specs}
+    if kv_format in TURBO_BOOKS and types != {AttnType.FULL}:
+        raise NotImplementedError(
+            f"--kv-format {kv_format} compresses the full-attention KV slab only; this model's "
+            f"KV groups are {sorted(t.value for t in types)}, whose pool families address latent, "
+            "index and window tiers of their own. Use --kv-format auto."
+        )
     if AttnType.DSV4 in types:
         from .dsv4_paged_pool import DSV4PagedKVCache
 
@@ -73,6 +88,10 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
         return BSAKVCache
     from .mha_pool import MHAKVCache
 
+    if kv_format in TURBO_BOOKS:
+        from .turbo_pool import TurboMHAKVCache
+
+        return TurboMHAKVCache
     return MHAKVCache
 
 
@@ -117,6 +136,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        kv_format=getattr(config, "kv_format", "auto"),
     )
 
 
@@ -128,6 +148,7 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
+    kv_format: str = "auto",
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -143,6 +164,7 @@ def create_kvcache_pool(
         )
 
     from .mha_pool import MHAKVCache
+    from .turbo_pool import TurboMHAKVCache
 
     # Hybrid linear-attention models only store paged KV for their non-linear
     # layers; the linear layers keep a separate recurrent state (LinearStatePool).
@@ -247,12 +269,26 @@ def create_kvcache_pool(
         )
 
     spec = kv_specs[0] if len(kv_specs) == 1 else None
+    heads = spec.num_kv_heads if spec is not None else model_config.num_kv_heads
+    dim = spec.head_dim if spec is not None else model_config.head_dim
+    if resolve_pool_class(model_config, kv_format) is TurboMHAKVCache:
+        return TurboMHAKVCache(
+            num_kv_heads=heads,
+            num_layers=model_config.num_layers,
+            head_dim=dim,
+            num_pages=num_pages,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            layer_ids=layer_ids,
+            book=kv_format,
+        )
     return MHAKVCache(
-        num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
+        num_kv_heads=heads,
         num_pages=num_pages,
         page_size=page_size,
         num_layers=model_config.num_layers,
-        head_dim=spec.head_dim if spec is not None else model_config.head_dim,
+        head_dim=dim,
         device=device,
         dtype=dtype,
         layer_ids=layer_ids,

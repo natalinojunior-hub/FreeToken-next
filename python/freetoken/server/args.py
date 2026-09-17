@@ -424,6 +424,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-format",
+        type=str,
+        choices=["auto", "bf16", "turbo3", "turbo4"],
+        default=ServerArgs.kv_format,
+        help="KV slab format. turbo3/turbo4 store the full-attention group as rotated 3/4-bit "
+        "codes (~4x fewer bytes per token), which is what makes a long context affordable "
+        "alongside the expert cache; requires --attention-backend triton.",
+    )
+
+    parser.add_argument(
         "--model-source",
         type=str,
         default="huggingface",

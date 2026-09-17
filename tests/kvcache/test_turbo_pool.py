@@ -56,7 +56,9 @@ def test_rows_land_in_the_named_slot_regardless_of_write_order():
     order = torch.tensor([4, 0, 8, 2, 7, 1, 5, 3, 6], device=DEVICE)
     scattered = _pool()
     for i, row in enumerate(order.tolist()):
-        scattered.store_kv(k[i : i + 1], v[i : i + 1], order[i : i + 1], layer_id=1)
+        # int32 on purpose: the engine's page table is int32 while index_copy_ demands long, so a
+        # store that only works with a long index is a startup crash, not a test artifact.
+        scattered.store_kv(k[i : i + 1], v[i : i + 1], order[i : i + 1].to(torch.int32), layer_id=1)
     batched = _pool()
     batched.store_kv(k, v, torch.arange(9, device=DEVICE), layer_id=1)
     assert torch.equal(scattered._k_codes[1][order], batched._k_codes[1])
@@ -147,7 +149,7 @@ def test_kv_cost_prices_the_same_bytes_the_pool_allocates():
     )
     config = SimpleNamespace(
         page_size=PAGE,
-        kv_book="turbo4",
+        kv_format="turbo4",
         tp_info=SimpleNamespace(size=1),
         model_config=SimpleNamespace(kv_cache_group_specs=lambda: (full, swa)),
     )
@@ -162,7 +164,7 @@ def test_kv_cost_prices_the_same_bytes_the_pool_allocates():
 class _FakeConfig:
     def __init__(self, page_size):
         self.page_size = page_size
-        self.kv_book = "turbo4"
+        self.kv_format = "turbo4"
 
 
 @pytest.mark.parametrize(

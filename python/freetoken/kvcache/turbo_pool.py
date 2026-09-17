@@ -86,6 +86,24 @@ class TurboMHAKVCache(BaseKVCachePool):
             self._layer_map = layer_map
         self._num_storage_layers = num_storage_layers
         self._alloc(num_pages)
+        from freetoken.kernel.triton.turbo_kv import CENTROIDS_3, CENTROIDS_4
+
+        self._cent = torch.tensor(
+            CENTROIDS_3 if book == "turbo3" else CENTROIDS_4, device=device, dtype=torch.float32
+        )
+
+    @property
+    def head_dim(self) -> int:
+        return self._head_dim
+
+    @property
+    def book3(self) -> bool:
+        return self.book == "turbo3"
+
+    @property
+    def cent_tensor(self) -> torch.Tensor:
+        """The lookup book the tile readers index; a device constant, not per-call state."""
+        return self._cent
 
     def _alloc(self, num_pages: int) -> None:
         tokens = num_pages * self._page_size
@@ -130,15 +148,17 @@ class TurboMHAKVCache(BaseKVCachePool):
 
         dense = self._dense(layer_id)
         rows = out_loc.numel()
+        # the page table hands us int32 slots and index_copy_ demands int64
+        slots = out_loc if out_loc.dtype is torch.long else out_loc.long()
         stride = self._code_bytes * self._groups
         k2 = k.reshape(rows, self._num_kv_heads, self._head_dim)
         v2 = v.reshape(rows, self._num_kv_heads, self._head_dim)
         kq, kn = quantize(k2.reshape(-1, self._head_dim).to(self._dtype), self.book)
         vq, vn = quantize(v2.reshape(-1, self._head_dim).to(self._dtype), self.book)
-        self._k_codes[dense].index_copy_(0, out_loc, kq.reshape(rows, self._num_kv_heads, stride))
-        self._k_norm[dense].index_copy_(0, out_loc, kn.reshape(rows, self._num_kv_heads, self._groups))
-        self._v_codes[dense].index_copy_(0, out_loc, vq.reshape(rows, self._num_kv_heads, stride))
-        self._v_norm[dense].index_copy_(0, out_loc, vn.reshape(rows, self._num_kv_heads, self._groups))
+        self._k_codes[dense].index_copy_(0, slots, kq.reshape(rows, self._num_kv_heads, stride))
+        self._k_norm[dense].index_copy_(0, slots, kn.reshape(rows, self._num_kv_heads, self._groups))
+        self._v_codes[dense].index_copy_(0, slots, vq.reshape(rows, self._num_kv_heads, stride))
+        self._v_norm[dense].index_copy_(0, slots, vn.reshape(rows, self._num_kv_heads, self._groups))
 
     def decode_rows(self, layer_id: int, which: str = "k") -> torch.Tensor:
         """Materialize the whole slab. Only for tests and the measurement arm that quantifies how
@@ -157,7 +177,9 @@ class TurboMHAKVCache(BaseKVCachePool):
 
     @classmethod
     def kv_cost(cls, config, **kwargs) -> tuple[int, int, int, int]:
-        book = getattr(config, "kv_book", None) or kwargs.get("book") or "turbo4"
+        book = kwargs.get("book") or getattr(config, "kv_format", "auto")
+        if book not in ("turbo3", "turbo4"):
+            raise ValueError(f"TurboMHAKVCache priced with book {book!r}")
         per_token = 0
         for spec in config.model_config.kv_cache_group_specs():
             if spec.is_swa:

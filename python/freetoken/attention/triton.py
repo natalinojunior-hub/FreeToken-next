@@ -139,6 +139,33 @@ class TritonAttentionBackend(BaseAttnBackend):
         batch: Batch,
         attn_spec: AttentionSpec | None = None,
     ) -> torch.Tensor:
+        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        if not getattr(self.kvcache, "compressed", False):
+            return self._forward(q, k, v, layer_id, batch, attn_spec)
+        # The slab holds rotated codes, so what enters the kernel rotates in and the accumulated
+        # output rotates out. rotate is orthogonal, which makes that exact bookkeeping rather than
+        # an approximation, and it keeps the per-tile work down to a byte gather and a multiply.
+        from freetoken.kernel.triton.turbo_kv import inv_rotate, rotate
+
+        dim = self.kvcache.head_dim
+
+        def rot(t: torch.Tensor) -> torch.Tensor:
+            return rotate(t.reshape(-1, dim)).reshape(t.shape)
+
+        out = self._forward(rot(q), rot(k), rot(v), layer_id, batch, attn_spec)
+        return inv_rotate(out.reshape(-1, dim)).reshape(out.shape)
+
+    def _forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_id: int,
+        batch: Batch,
+        attn_spec: AttentionSpec | None = None,
+    ) -> torch.Tensor:
+        """Attention against the cache. ``forward`` owns the store and the rotation, so the slab
+        handed to the kernels and the q/k/v they read are always in the same domain."""
         from freetoken.kernel.triton.attention import (
             decode_paged_attention,
             extend_paged_attention,
@@ -147,14 +174,26 @@ class TritonAttentionBackend(BaseAttnBackend):
 
         metadata = batch.attn_metadata
         assert isinstance(metadata, TritonMetadata)
-        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
 
-        k_raw = self.kvcache.k_cache(layer_id)
-        v_raw = self.kvcache.v_cache(layer_id)
-        kv_heads, head_dim = k_raw.shape[-2], k_raw.shape[-1]
+        turbo = None
+        if getattr(self.kvcache, "compressed", False):
+            k_raw, k_norm = self.kvcache.k_slab(layer_id)
+            v_raw, v_norm = self.kvcache.v_slab(layer_id)
+            turbo = {
+                "k_norm": k_norm,
+                "v_norm": v_norm,
+                "cent": self.kvcache.cent_tensor,
+                "book3": self.kvcache.book3,
+            }
+            kv_heads, head_dim = k_raw.shape[1], self.kvcache.head_dim
+            k_cache, v_cache = k_raw, v_raw  # element strides are the codes', not a bf16 slab's
+        else:
+            k_raw = self.kvcache.k_cache(layer_id)
+            v_raw = self.kvcache.v_cache(layer_id)
+            kv_heads, head_dim = k_raw.shape[-2], k_raw.shape[-1]
+            k_cache = k_raw.view(-1, kv_heads, head_dim)
+            v_cache = v_raw.view(-1, kv_heads, head_dim)
         assert head_dim == q.shape[-1]
-        k_cache = k_raw.view(-1, kv_heads, head_dim)
-        v_cache = v_raw.view(-1, kv_heads, head_dim)
 
         spec = attn_spec or AttentionSpec()
         block_ends = batch.mm_block_ends if spec.bidirectional_mm_blocks else None
@@ -182,6 +221,7 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
+                turbo=turbo,
             )
         if (
             (not metadata.is_decode)
@@ -203,9 +243,15 @@ class TritonAttentionBackend(BaseAttnBackend):
                 k_extend=k.view(q.shape[0], kv_heads, head_dim),
                 v_extend=v.view(q.shape[0], kv_heads, head_dim),
                 block_ends=block_ends,
+                turbo=turbo,
             )
         if block_ends is not None:
             raise NotImplementedError("bidirectional multimodal blocks need the extend kernel path")
+        if turbo is not None:
+            raise NotImplementedError(
+                "the non-grouped paged_attention kernel has no coded arm; a turbo KV slab needs "
+                "the grouped decode or the extend path"
+            )
         return paged_attention(
             q=q,
             k_cache=k_cache,
