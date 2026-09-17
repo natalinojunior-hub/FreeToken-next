@@ -90,9 +90,13 @@ def build_prompt_text(model: str, path: str, tokens: int, offset: int) -> str:
     chunk = text[start:start + tokens * CHARS_PER_TOKEN * 2] or text
     if not chunk.strip():
         sys.exit(f"[bench] corpus {path} exhausted at --prompt-offset {offset}")
-    from transformers import AutoTokenizer
+    from freetoken.utils.hf import load_tokenizer
 
-    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    # The engine's own loader, not AutoTokenizer: a GGUF checkpoint carries its vocab inside
+    # the file, and transformers' loader only knows how to find a directory of HF artifacts.
+    # Without this the harness cannot build an exact-token prompt for a .gguf model at all,
+    # which is the whole point of the GGUF rows of the certification matrix.
+    tok = load_tokenizer(model)
     ids = tok(chunk, add_special_tokens=False)["input_ids"]
     if len(ids) < tokens:
         sys.exit(f"[bench] corpus slice gave {len(ids)} < {tokens} tokens; use a bigger corpus")

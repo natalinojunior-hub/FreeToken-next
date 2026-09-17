@@ -200,6 +200,77 @@ Flash-Next's reserve is dominated by one line (`transient:gdn-prefill`, 0.60-0.8
 above 8192 that line grows linearly and will start to fight the KV pool, which is Phase 12's
 problem with a number already attached to it.
 
+## EXP-008 — The ledger decides the split and prices the context targets (Phase 2)
+**Date:** 2026-09-17 · **Verdict:** **KEEP** (guards hold; the split now has one owner and an
+answer to "how much context does this buy")
+Question: with the account in place, does routing the expert/KV decision *through* it change
+any measured behaviour, and what does the same account say about 128K/256K/512K/1M before any
+of that work exists?
+Method: `VramLedger.decide()` computes `pool_budget_bytes(fixed_cache_bytes)` and hands the
+existing split rule (`resolve_moe_cache_auto` → `plan_cache_budget`) exactly that money, so no
+term is subtracted twice and no second budget formula survives; the returned `MemoryPlan`
+carries the decision plus a `ContextFeasibility` row per target context, and the engine logs it
+at startup. A unit test pins the parity that matters: with no reserve and no overhead lines,
+`decide()` must return what the pre-ledger formula returns.
+Guards at the default `--memory-ratio 0.9`, same harness, 3 repeats:
+
+| model | PP | TG | TTFT | VRAM | sha1 |
+|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B NVFP4 16K | 4613.1 (min 4612.1) | 158.53 | 3551.6 ms | 14.59 GiB | `2a6dca88ffdc` (unchanged) |
+| Qwen3.8-Flash-Next NVFP4 16K | 1859.8 (min 1857.9) | 28.70 | 8809.4 ms | 14.80 GiB | `f8bbaeb7e214` (unchanged) |
+
+And the plan it printed -- BF16 KV, no compression, no tiering, priced against **what the split
+left for KV** (an earlier revision of these rows priced them against the whole pool budget and
+so reported "128K fits" on a model whose expert cache had already eaten the budget; that
+correction is f6dddb5 and it is the number that matters):
+
+```
+35B-A3B    pool budget 10.266 GiB -> 6113 expert slots (10.109 GiB), 0.157 GiB left for KV
+           128K needs 2.500 GiB (+2.343)   256K needs 5.000 (+4.843)
+           512K needs 10.000 (+9.843)      1M   needs 20.000 (+19.843)
+Flash-Next pool budget  3.123 GiB -> 1133 expert slots (2.925 GiB), 0.197 GiB left for KV
+           128K needs 3.097 GiB (+2.900)   256K needs 6.192 (+5.995)
+           512K needs 12.382 (+12.185)    1M   needs 24.763 (+24.566)
+```
+
+Three consequences, and they are the reason this brick exists before TurboKV rather than after
+it:
+1. The MoE-priority fill (`plan_cache_budget`, which hands the expert cache everything above
+   `--kv-reserve-tokens`) is why the anchors never reached 16K under `--moe-cache-auto` without
+   `--num-tokens`: it leaves them ~8K tokens of KV. The rows turn that from an anecdote into an
+   account line, and EXP-009 turns it into 128K.
+2. Flash-Next's 128K cannot be bought that way at all (its whole pool budget is one 128K KV
+   pool), so on the hybrid model long context is gated on compressed KV, not on RAM bandwidth --
+   the "compress before paging" rule earns its place with a number.
+3. 1M BF16 KV at 24.8 GiB matches PERFORMANCE.md §4's independent arithmetic (20-24 GiB), so
+   the account and the closed-form model agree on the same model from different directions.
+Cost: none measurable. Both hashes are the pre-plan hashes and both PP numbers sit inside the
+run-to-run spread of the last four revisions of the same config.
+
+## EXP-009 — 128K is reachable today by buying it with the expert cache (Phase 12 evidence)
+**Date:** 2026-09-17 · **Verdict:** **PASS (capability)** — 128K works on Qwen3.6-35B-A3B NVFP4
+Question: the plan said a 128K context needs 2.500 GiB of KV while the MoE-first split leaves
+0.157 GiB. If the trade is real, asking for the context explicitly must produce a working
+server at a measurable TG, predicted in advance.
+Method: the same harness, `--kv-reserve-tokens 131136` (the reserve is the only knob; no code
+path changed), BF16 KV, `--cache-type naive`, bs=1, 131 072-token prompt, 32 generated, one
+repeat, `--memory-ratio 0.9`.
+Result: **PP 3188.5 tok/s, TG 89.30 tok/s, TTFT 41 108 ms, ITL p50 10.99 / p95 12.81 ms,
+VRAM 14.45 GiB, RSS 22.0 GiB, 131 221 KV pages, output sha1 `d4b5b385a3cf`.** The printed plan
+agreed with the run line by line: `pool budget 10.265 GiB -> 4694 expert slots (7.762 GiB) +
+131 221 usable KV pages … of the 2.503 GiB left for KV`, and the demand row's prediction of
+~4695 surviving expert slots is what the greedy fill produced.
+What it means:
+1. 128K on a 16 GiB card is not a future feature on the 35B-A3B -- it is one flag, and the flag
+   costs 1419 expert slots (6113 -> 4694) while decode stays at 89 tok/s.
+2. The reserve-to-context identity (`--kv-reserve-tokens = the context you want`) is the whole
+   mechanism `--context auto` needs; what is missing is only the policy for choosing it per
+   request mix, and the ledger already answers "what does that context leave for experts".
+3. The same arithmetic says Flash-Next cannot buy 128K this way: its pool budget is 3.123 GiB
+   and 128K of KV is 3.097 GiB, so funding the context leaves ~0.03 GiB of experts -- which is
+   the quantified reason Phase 3 (turbo4 at 4.125 bpv) is on the critical path rather than
+   optional: at 4x compression the same 128K costs 0.77 GiB and the expert cache survives.
+
 ## EXP-002 — GGUF / MTP / TurboQuant corpus and source audits
 **Date:** 2026-09-16 · **Verdict:** INFORMATIONAL (complete; reports archived in
 `audits/A1…A6`, conclusions in ARCHITECTURE.md §2–§6)

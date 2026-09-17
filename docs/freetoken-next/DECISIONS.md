@@ -173,4 +173,23 @@ price omits).
 config; the default 0.9 serves with the reserve modelled (EXP-006). 0.86 stays in the guard
 table as the recorded anchor condition so the comparison remains matched.
 
+## D-015 — MoE-priority stays the default; context is bought, not assumed
+**Date:** 2026-09-17 · **Status:** accepted (`VramLedger.decide`, `MemoryPlan.kv_budget_bytes`)
+The auto plan fills the expert cache first and lets KV keep the floor (`plan_cache_budget`'s
+`--kv-reserve-tokens`), because on this machine resident experts are what TG is made of. The
+ledger keeps that policy but stops letting it be silent: every engine now prints, per context
+target, the bytes KV would need *against what the split actually left for KV* -- and on a 16 GiB
+card with an 8 GiB dense slice that number is brutal (the 35B-A3B auto plan leaves 0.157 GiB for
+KV, so 128K needs +2.343 GiB of somebody else's memory). Two consequences, both deliberate:
+1. Long context is bought with an explicit trade the operator can see and choose: raise
+   `--kv-reserve-tokens` (expert cache down, context up), compress the KV format (§4's
+   turbo4: 4.125 bpv, ~4x smaller), or tier to RAM (§10's PCIe-bound economics). The plan
+   prints the shortfall for each so the choice is arithmetic, not experiment.
+2. No "auto context" flag is exposed until the plan is the thing that made the choice; the
+   feasibility rows are the prerequisite for §11's `--context auto` and are already in the log.
+**Why:** EXP-008 measured that a pool-budget-priced feasibility table reads as "128K fits" on a
+model whose expert cache has already eaten the whole budget. Pricing the same rows against what
+the split leaves is the difference between a plan and a fantasy, and it is the number the
+compressed-KV phases have to beat.
+
 
