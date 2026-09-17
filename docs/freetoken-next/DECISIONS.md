@@ -253,4 +253,12 @@ separately (9.1 % backend, then whatever the codec costs) is what makes each one
 first one is only fixable by teaching flashinfer a new dtype or by optimizing our own kernel, both of
 which are their own decisions, not this one.
 
+## D-018 — Do not charge an unowned dequant scratch buffer
+
+**Date:** 2026-09-17 · **Status:** accepted · **Evidence:** `tests/engine/test_vram_ledger.py` (22 passed)
+
+`modelled_reserves()` exposed a `dequant_scratch` argument and a reserve line, but the current
+engine had no caller and no allocation matching it. Keeping that line made the 256K expert-slot
+plan depend on an invented consumer. The dead parameter and charge are removed; any future
+compressed-KV or expert-dequant workspace must be measured and charged by its owning allocator.
 

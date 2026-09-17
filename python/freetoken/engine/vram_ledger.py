@@ -296,7 +296,6 @@ def modelled_reserves(
     cuda_graph_max_bs: int | None = 1,
     backend_workspace: bool = True,
     mm_encoder: bool = False,
-    dequant_scratch: int = 0,
     staging: int = 0,
 ) -> list[tuple[str, int, Kind, str]]:
     """The semi-persistent / transient / reserve lines the base allocates but never budgeted.
@@ -345,9 +344,6 @@ def modelled_reserves(
             f"one GDN layer over a {prefill_tokens}-token chunk (heads={linear_group.num_value_heads}"
             f", k={linear_group.key_head_dim}, v={linear_group.value_head_dim})",
         ))
-    if dequant_scratch:
-        out.append(("transient:dequant-scratch", int(dequant_scratch), Kind.TRANSIENT,
-                    "compressed-KV / expert dequant tile scratch"))
     if staging:
         out.append(("workspace:staging", int(staging), Kind.SEMI_PERSISTENT,
                     "H2D staging buffers"))

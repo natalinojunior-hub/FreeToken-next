@@ -197,6 +197,8 @@ def test_modelled_reserves_only_price_what_the_model_actually_has():
     assert "transient:mm-encoder" not in hybrid
     assert "transient:mm-encoder" in names(
         prefill_tokens=8192, hidden_size=2048, mm_encoder=True)
+    assert "transient:dequant-scratch" not in names(
+        prefill_tokens=8192, hidden_size=2048)
     # Every line is conditional except the named fragmentation reserve: an account with no
     # reserve at all is not an account, it is a promise the allocator cannot keep.
     assert names(prefill_tokens=0, hidden_size=0, cuda_graph_max_bs=None,

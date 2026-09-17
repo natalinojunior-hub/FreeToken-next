@@ -272,7 +272,8 @@ as the baseline to beat, not as the current cost.
 |---|---|---|---|---|---|
 | flashinfer + bf16 (the anchor, D-012 guard) | 4610.8 | 158.53 | — | 14.98 | `2a6dca88ffdc` |
 | triton + bf16 (backend cost alone) | 4344.8 | 144.11 | 6.79 ms | 14.34 | `b7c70b36d276` |
-| triton + turbo4 (per-element readers) | 3560.5 | 61.79 | 15.98 ms | 14.20 | `49e9819649ba` |
+| triton + turbo4 (pre-rewrite readers) | 3560.5 | 61.79 | 15.98 ms | 14.20 | `49e9819649ba` |
+| triton + turbo4 (contiguous rewrite, REVERTED) | 3524.7 | 45.74 | 21.69 ms | 14.20 | `49e9819649ba` |
 
 Read this as three separate costs, which is the whole point of the table. **The backend costs 9.1 %
 TG** (158.53 -> 144.11) before any codec exists. **The readers cost a further 57 %** (144.11 ->

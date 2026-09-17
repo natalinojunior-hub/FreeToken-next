@@ -368,8 +368,8 @@ Next: the extend (prefill) branch, then engine wiring (config key, pool factory,
 output rotation in `attention/triton.py`), then the 16K and 256K A/B. No KEEP is claimed here:
 there is no serving number yet.
 
-## EXP-013 — The coded readers were instruction-bound; rewrite state when this stopped
-**Date:** 2026-09-17 · **Verdict:** **IN PROGRESS, uncommitted** (correctness green, performance unmeasured)
+## EXP-013 — The coded readers were instruction-bound; contiguous rewrite REVERTED
+**Date:** 2026-09-17 · **Verdict:** **REVERT** (correctness green, performance regressed)
 
 Question EXP-012 left open: what does the coded read path actually cost when it is serving?
 Setup: 35B-A3B NVFP4, 16K prompt / 128 generated, `--repeats 2`, `--mem-ratio 0.9`,
@@ -397,37 +397,18 @@ aborted before it produced throughput, during which a `pkill -f "<bench cmdline>
 command line** and killed the driver while the server kept 14 986 MiB -- the trap JOB_REGISTRY already
 documents, re-confirmed the hard way, cleaned by PID with the GPU verified at 2 MiB afterwards.
 
-Rewrite state, exactly as it stands (bricks already committed: `7fc7d7f` codec, `1573235` pool,
-`224aa25` readers, `77229c2` fused decode, `35e4245` fused prefill, `08e44c6` `--kv-format` wiring).
-`kernel/triton/turbo_attn.py` now loads each token's packed row
-contiguously and splits it in registers via a broadcast shift over an explicit lane axis
-(`raw[:, :, None] >> shifts`), so the element axis is `byte * lanes + lane` by construction; the book
-is read as sign + half-table (`_book_values`), one lookup per two elements. Three bugs came out of
-that work, each caught by a test rather than by reading: `tl.join` appends its new axis as the
-**fastest-varying**, so a naive join tree reorders nibbles to (w0,w2,w1,w3); the first "fix" flipped the
-tile to `[bytes, N]` and would have reshaped it wrongly (the load must stay `[N, bytes]` with the lane
-axis trailing); and the plumbing needed the row geometry (`CB`, `GROUPS`) as kernel constexprs instead
-of deriving offsets from `offs_d`.
+The attempted rewrite loaded each token's packed row contiguously and expanded it in registers. Its
+tests were correct, but the larger live tile caused register pressure and lost throughput.
 
 Where it stopped, and what is verified versus not:
 
-* **Verified after the rewrite:** `tests/kvcache/test_turbo_attn.py` **6 passed** (both books,
-  head_dim 128 and 256, bit-equal to what the codec says is stored, masked lanes read zero); and
-  `test_turbo_attention.py + test_triton_attention.py + test_turbo_kv.py + test_turbo_pool.py`
-  **94 passed** in 10.4 s -- the fused decode *and* prefill reproduce attention-over-decoded-KV, and
-  the 38 bf16 pins are unchanged.
-* **Not verified:** the new readers' *throughput*. The 61.79 TG above belongs to the superseded
-  per-element version. **The first action on resume is one matched 16K run** (`--label t4b-16k`, same
-  command as `t4-16k`) for the new PP/TG/ITL against `triton + bf16` = 144.11, then the `fi` guard
-  (`--mem-ratio 0.9`, default backend, expect `2a6dca88ffdc`), which has not been re-run since the
-  wiring commit. Per D-017 the decision rule is parity with `triton + bf16`, not with the flashinfer
-  anchor; if parity fails, KEEP only on the long-context capability or REVERT.
-* **Uncommitted working tree** (7 files, consistent and tested): `kernel/triton/turbo_attn.py` (the
-  rewrite), `kernel/triton/attention.py` (constexpr plumbing for `CODE_BYTES`/`KV_GROUPS`),
-  `attention/triton.py` (the dict carries the row geometry), `kvcache/turbo_pool.py` (`code_bytes` /
-  `groups` properties), `kernel/triton/turbo_kv.py` (`bucketize` encode),
-  `tests/kernels/test_turbo_attention.py`, `tests/kvcache/test_turbo_attn.py`. Nothing here changes the
-  default bf16 path's behaviour, but it is uncommitted: a resume must not `git checkout` it away.
+* **Correctness:** the rewrite passed `6 + 94` focused pins, with bf16 pins unchanged.
+* **Matched A/B:** `t4b-16k` measured **PP 3524.7 / TG 45.74 / ITL p50 21.69 ms**, versus the
+  prior **3560.5 / 61.79 / 15.98 ms**. VRAM stayed 14.20 GiB and the greedy hash stayed
+  `49e9819649ba`; the 26% TG loss is a performance regression, not a correctness change.
+* **Action:** the seven uncommitted rewrite files were restored to their pre-rewrite state. The next
+  reader experiment needs a bounded-tile design that reduces byte address work without materializing
+  a full `[N, D]` register tile.
 * **Not done at all:** a full-suite run after the wiring; coherence text for a turbo4 generation (only
   throughput hashes so far -- `49e9819649ba` is a deterministic continuation, not a validated one);
   turbo3 end-to-end at any context; CUDA-graph capture evidence for the rotation allocations; a
@@ -459,3 +440,11 @@ with a 9-bit decode window, per-(layer,side) VBR tiers over a VMM reservation th
 relocates), with `head_dim % 128 == 0` satisfied by our 256 and three ported determinism
 oracles.
 
+## EXP-014 — Remove the unowned dequant scratch reserve
+**Date:** 2026-09-17 · **Verdict:** **KEEP**
+
+`modelled_reserves()` had a `dequant_scratch` parameter and reserve line, but repository search
+found no caller or matching allocation. The parameter and dead charge were removed rather than
+claiming bytes for an unmeasured consumer. The focused ledger suite passes **22/22**. This closes
+the accounting gap only; actual compressed-KV reader scratch remains pending until its allocator
+reports measured peak bytes.
