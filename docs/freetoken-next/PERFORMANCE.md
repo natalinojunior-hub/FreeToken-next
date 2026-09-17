@@ -260,3 +260,43 @@ Two things this row establishes for the matrix:
    delta, and it is the reason a 93 GB GGUF can be the better deployment even at lower TG
    (FINAL PERFORMANCE POLICY). Native comparison for this row is
    `NO_NATIVE_REFERENCE_AVAILABLE`: there is no native FreeToken 27B dense checkpoint on the host.
+
+## 10. Compressed KV, measured (Qwen3.6-35B-A3B NVFP4, bs=1, greedy, 16K, `--cache-type naive`)
+
+2026-09-17. Same checkpoint, same context, same budget; the only variables are the KV format and
+the backend that can read it. The turbo4 row used the **first** tile readers -- one byte-gather and
+one L1 lookup *per element* -- which is the number that triggered the rewrite in EXP-013. It is kept
+as the baseline to beat, not as the current cost.
+
+| arm | PP tok/s | TG tok/s | ITL p50 | VRAM | output sha1 |
+|---|---|---|---|---|---|
+| flashinfer + bf16 (the anchor, D-012 guard) | 4610.8 | 158.53 | — | 14.98 | `2a6dca88ffdc` |
+| triton + bf16 (backend cost alone) | 4344.8 | 144.11 | 6.79 ms | 14.34 | `b7c70b36d276` |
+| triton + turbo4 (per-element readers) | 3560.5 | 61.79 | 15.98 ms | 14.20 | `49e9819649ba` |
+
+Read this as three separate costs, which is the whole point of the table. **The backend costs 9.1 %
+TG** (158.53 -> 144.11) before any codec exists. **The readers cost a further 57 %** (144.11 ->
+61.79) because they were instruction-bound, not bandwidth-bound: 4x fewer bytes arriving while ITL
+doubled says the work was per-element address arithmetic, not memory. The codec's *accuracy* cost is
+pinned separately in EXP-012 (V-side output NMSE equals the book's Lloyd-Max distortion, independent
+of attention sharpness). D-017 states what the guard can and cannot mean on this path.
+
+The hash column matters: a different backend is a different greedy continuation, so
+`2a6dca88ffdc` is the *fi* guard and `b7c70b36d276` the *triton* one. Any compressed-KV guard has to
+name its backend, and "output unchanged" is only a claim within one.
+
+### What the account does with the freed bytes
+
+The reason to compress on this host is not 16K throughput. It is that context stops costing the
+expert cache its memory. Same checkpoint, `--kv-reserve-context`, 256K requested:
+
+| KV format | KV for 256K | expert slots left | 512K | 1M |
+|---|---|---|---|---|
+| bf16 (EXP-009) | 5.000 GiB (the whole pool budget) | 3183 | unfundable | unfundable |
+| turbo4 | 1.289 GiB | **5427 (+70 %)** | 4647 slots / +1.288 GiB over plan | 3088 slots / +3.867 GiB |
+
+turbo4's own plan rows read `128K: fits`, `256K: fits` where bf16 said `256K: needs 5.000 GiB
+(+0.003 over)`. 512K/1M stay blocked *by the checkpoint* (its RoPE table is 262 144 positions), but
+the physics changed character: at bf16 a 1M context was "the entire pool budget, zero experts", and
+at turbo4 it is "a smaller expert cache". That is the difference D-016 was about -- compressed KV
+buys context outright, where paging would have bought it at 2.2 tok/s.

@@ -217,4 +217,40 @@ outright and removes the fetch entirely) and, inside VRAM, the expert cache (D-0
 a paging subsystem built on that premise would have cost the phases that actually deliver
 context (3-5, 12) their remaining budget.
 
+## D-017 — Compressed KV is a long-context lever; the 16K native guard stays on the flashinfer path
+
+**Date:** 2026-09-17 · **Status:** binding · **Evidence:** PERFORMANCE.md §10, EXP-012, EXP-013
+
+**Context.** The campaign's TurboKV gate was written as "TG within a few percent of the 16K anchor,
+with >=3.5x fewer KV bytes/token". Landing the codec made the first half measurable, and it is not
+reachable: only our Triton kernels can read a coded tile (flashinfer takes a fixed dtype and a fixed
+slab layout), and Triton with *uncompressed* KV already costs 9.1 % of TG at 16K (158.53 -> 144.11).
+At that context the KV is a few percent of the decode step's bytes, so no quantizer -- not turbo4,
+not a hypothetical lossless one -- can recover a 9.1 % backend penalty there. The measurement, not a
+preference, is what splits the gate.
+
+**Decision.** `--kv-format turbo3|turbo4` is opt-in and is certified on two axes: against the
+**same-backend** bf16 arm (`triton + bf16`), and against the bytes the account gets back at long
+context. It is never certified by the flashinfer 16K guard, and the flashinfer guard itself keeps its
+exact form: the compressed work must not move `PP >= 4600 / TG >= 158 / sha1 2a6dca88ffdc`, which is
+why the kernel change is a compile-time-dead `COMPRESSED` constexpr branch rather than a second
+attention implementation, and why "the bf16 call is bit-identical to itself" is a pinned test.
+
+Consequences, binding:
+1. A compressed arm reports its own baseline and its own output hash. A different backend is a
+   different greedy continuation (`b7c70b36d276` for triton vs `2a6dca88ffdc` for fi), so
+   "output unchanged" is only meaningful within one backend, and every row must name it.
+2. The phase's success metric is what the freed bytes buy: 256K with **+70 % expert slots**
+   (3183 -> 5427) and `128K/256K: fits` where bf16 could not fund 256K, then TG measured *there*.
+3. The no-hidden-materialization rule survives unchanged: fused tile reads with bounded scratch, never
+   a context-sized dequant buffer, and whatever scratch exists is a ledger line.
+4. If the readers cannot reach parity with `triton + bf16`, the format ships opt-in for long context
+   or is reverted. It does not become default to make a table look good.
+
+**Why:** the alternative was to spend the phase chasing a deficit that belongs to the backend, and to
+report a compressed-KV number against a baseline it cannot physically touch. Naming the two costs
+separately (9.1 % backend, then whatever the codec costs) is what makes each one fixable -- and the
+first one is only fixable by teaching flashinfer a new dtype or by optimizing our own kernel, both of
+which are their own decisions, not this one.
+
 

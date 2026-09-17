@@ -28,7 +28,7 @@ known to be a pool-keying change and not a missing kernel.**
 | Benchmark a bare `.gguf` | **done** | `benchmarks/bench_pp_tg.py` now tokenizes through `utils/hf.load_tokenizer` (the engine's own GGUF vocab path) instead of `AutoTokenizer`, which can only read an HF directory |
 | Source audits (9, parallel) | **done** | `docs/freetoken-next/audits/A1…A9.md`; A7 = GGUF MoE geometry + refused-today matrix + the stride-vs-file table that closed the byte-layout question, A8 = turbo codec byte layout (turbo3 112 B / turbo4 132 B per 256-element row), A9 = unaccounted VRAM consumers |
 | Phase 2 GGUF loader | **committed** (`86af2d3`); dense row measured, MoE rows gated | EXP-004: the IQ3_S 27B GGUF generated coherent, factually correct text and the NextN/MTP drop warned as designed; EXP-010 measured it (PP 2416.6 / TG 25.29 / RSS 2.17 GiB). The two MoE GGUFs that geometry blocks are gated by Phase 7 pool-keying, not by a missing kernel |
-| Phase 3 Turbo KV | **codec + pool + fused decode landed; no serving number yet** | `turbo_kv` (codec, at Lloyd-Max theory: NMSE 0.0339 turbo3 / 0.0092 turbo4), `turbo_pool` (50 B / 66 B per token-head-slab vs 256 B bf16 = 5.12x / 3.88x, `kv_cost`/`unit_bytes` parity pinned), `turbo_attn` tile readers, and the `COMPRESSED` branch in the split-k decode kernel: 59 pins, and the 38 bf16 attention pins still pass because the branch is compile-time dead. What is *not* open-ended: only Triton can consume a custom KV layout, and Triton-bf16 already costs 9.1 % TG at 16K, so the win is long context (256K: 5.00 GiB of KV becomes 1.29 GiB), not the 16K guard (EXP-012) |
+| Phase 3 Turbo KV | **codec + pool + both fused paths landed; readers mid-rewrite, uncommitted** | `turbo_kv` (NMSE at Lloyd-Max theory: 0.0339 turbo3 / 0.0092 turbo4), `turbo_pool` (50 B / 66 B per token-head-slab vs 256 B bf16 = 5.12x / 3.88x, `kv_cost`/`unit_bytes` parity pinned), `turbo_attn` readers, `COMPRESSED` branches in the decode *and* prefill kernels, and `--kv-format` wired through config/factory/ledger. Serves on the host: plan gives **6183 slots + 8440 pages** where bf16 gave 6113 + 8238, and at **256K: 5427 slots vs 3183** (PERFORMANCE §10, EXP-012/013). The 16K A/B says the first readers were instruction-bound (TG 61.79 vs 144.11 on the same backend); the contiguous-load rewrite is correctness-green (6 + 94 pins, bf16 pins unchanged) but **not yet re-measured** — EXP-013 holds the exact stop state and the dirty file list |
 | Final gate declared | done | `benchmarks/cert_matrix.py` (D-012, PERFORMANCE.md §6): native `-FT` rows must clear their guard and every same-arch GGUF row reports parity against them |
 
 ## Findings that already changed the plan
@@ -66,6 +66,18 @@ known to be a pool-keying change and not a missing kernel.**
    dequantizes every `BLOCK_SHAPE` type. Two numbers that disagreed and nobody settling them
    against the host would have sent Phase 7 to write kernels for a layout that does not exist.
    Every quantity that gates a phase now gets re-measured before it enters a plan (EXP-011).
+9. **Compressed KV is a capacity lever here, not a 16K speed lever -- and the two costs must be kept
+   apart.** Only our Triton kernels can read a coded tile, and Triton with *uncompressed* KV already
+   costs 9.1 % of TG at 16K (158.53 -> 144.11), where the KV is a few percent of the decode step's
+   bytes; no quantizer can recover that there, so the phase's own 16K gate was unreachable by
+   construction rather than by poor work (D-017). What compression does buy is measured: 256K leaves
+   5427 expert slots against bf16's 3183, and 512K/1M stop being "the whole pool budget, zero
+   experts". Keep the backend penalty and the codec penalty in separate columns, or both look like the
+   codec's fault (PERFORMANCE §10).
+10. **A packed layout only wins if the reader stays out of the address business.** The first coded
+    readers fetched a byte per element and gathered the centroid book per element: 4x fewer bytes
+    arrived while decode ITL doubled (6.79 -> 15.98 ms). The fix is loading each token's packed row
+    once and splitting it in registers, which is correctness-green but not yet re-measured (EXP-013).
 
 ## Running
 

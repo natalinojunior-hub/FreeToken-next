@@ -368,6 +368,70 @@ Next: the extend (prefill) branch, then engine wiring (config key, pool factory,
 output rotation in `attention/triton.py`), then the 16K and 256K A/B. No KEEP is claimed here:
 there is no serving number yet.
 
+## EXP-013 — The coded readers were instruction-bound; rewrite state when this stopped
+**Date:** 2026-09-17 · **Verdict:** **IN PROGRESS, uncommitted** (correctness green, performance unmeasured)
+
+Question EXP-012 left open: what does the coded read path actually cost when it is serving?
+Setup: 35B-A3B NVFP4, 16K prompt / 128 generated, `--repeats 2`, `--mem-ratio 0.9`,
+`--cache-type naive`, `--kv-format turbo4` (which forces `--attention-backend triton`, see D-017).
+Logs `/models/desenvolvimento/tmp/ftnext/{w1_triton,t4_16k,w1_smoke,t4_256k}.log`.
+
+Result, and it was not the result expected: **PP 3560.5 / TG 61.79 / ITL p50 15.98 ms** against
+`triton + bf16` at PP 4344.8 / TG 144.11 / ITL 6.79 ms. **4x fewer bytes arriving while ITL doubled**
+is the signature of an instruction-bound loop, not a memory-bound one: the first readers indexed a
+byte *per element* (`codes + j//2`) and did one L1 gather into the centroid book per element, so a
+tile's 256 lanes computed 256 addresses where 128 contiguous loads would do, and the packed layout's
+whole advantage was spent on address arithmetic.
+
+Also measured, because it was the obvious suspect and it was not: **the encode is not the
+bottleneck.** After replacing the midpoint search's broadcast (`(y >= mid).sum(-1)`, which materializes
+`[rows, dim, 16]` per layer -- 67M booleans per 8192-token chunk) with `torch.bucketize(y, mid,
+right=True)` -- which *is* the reference's tie rule, "count of boundaries <= value", so the pins did not
+move -- a layer-chunk of 32768 groups costs quantize 0.48 ms, rotate 0.30, indices 0.03 (the former
+dominant term), pack 0.01, decode 0.85. The prefill crawl at 256K was the readers; the `bucketize`
+change is a large constant-factor win on the write path regardless.
+
+Two side findings worth keeping: at 256K the *plan* with turbo4 leaves **5427 expert slots vs 3183**
+in bf16 (PERFORMANCE §10) -- the capability half of the phase is proven; and the 256K benchmark was
+aborted before it produced throughput, during which a `pkill -f "<bench cmdline>"` matched **its own
+command line** and killed the driver while the server kept 14 986 MiB -- the trap JOB_REGISTRY already
+documents, re-confirmed the hard way, cleaned by PID with the GPU verified at 2 MiB afterwards.
+
+Rewrite state, exactly as it stands. `kernel/triton/turbo_attn.py` now loads each token's packed row
+contiguously and splits it in registers via a broadcast shift over an explicit lane axis
+(`raw[:, :, None] >> shifts`), so the element axis is `byte * lanes + lane` by construction; the book
+is read as sign + half-table (`_book_values`), one lookup per two elements. Three bugs came out of
+that work, each caught by a test rather than by reading: `tl.join` appends its new axis as the
+**fastest-varying**, so a naive join tree reorders nibbles to (w0,w2,w1,w3); the first "fix" flipped the
+tile to `[bytes, N]` and would have reshaped it wrongly (the load must stay `[N, bytes]` with the lane
+axis trailing); and the plumbing needed the row geometry (`CB`, `GROUPS`) as kernel constexprs instead
+of deriving offsets from `offs_d`.
+
+Where it stopped, and what is verified versus not:
+
+* **Verified after the rewrite:** `tests/kvcache/test_turbo_attn.py` **6 passed** (both books,
+  head_dim 128 and 256, bit-equal to what the codec says is stored, masked lanes read zero); and
+  `test_turbo_attention.py + test_triton_attention.py + test_turbo_kv.py + test_turbo_pool.py`
+  **94 passed** in 10.4 s -- the fused decode *and* prefill reproduce attention-over-decoded-KV, and
+  the 38 bf16 pins are unchanged.
+* **Not verified:** the new readers' *throughput*. The 61.79 TG above belongs to the superseded
+  per-element version. **The first action on resume is one matched 16K run** (`--label t4b-16k`, same
+  command as `t4-16k`) for the new PP/TG/ITL against `triton + bf16` = 144.11, then the `fi` guard
+  (`--mem-ratio 0.9`, default backend, expect `2a6dca88ffdc`), which has not been re-run since the
+  wiring commit. Per D-017 the decision rule is parity with `triton + bf16`, not with the flashinfer
+  anchor; if parity fails, KEEP only on the long-context capability or REVERT.
+* **Uncommitted working tree** (7 files, consistent and tested): `kernel/triton/turbo_attn.py` (the
+  rewrite), `kernel/triton/attention.py` (constexpr plumbing for `CODE_BYTES`/`KV_GROUPS`),
+  `attention/triton.py` (the dict carries the row geometry), `kvcache/turbo_pool.py` (`code_bytes` /
+  `groups` properties), `kernel/triton/turbo_kv.py` (`bucketize` encode),
+  `tests/kernels/test_turbo_attention.py`, `tests/kvcache/test_turbo_attn.py`. Nothing here changes the
+  default bf16 path's behaviour, but it is uncommitted: a resume must not `git checkout` it away.
+* **Not done at all:** a full-suite run after the wiring; coherence text for a turbo4 generation (only
+  throughput hashes so far -- `49e9819649ba` is a deterministic continuation, not a validated one);
+  turbo3 end-to-end at any context; CUDA-graph capture evidence for the rotation allocations; a
+  vectorized *store* kernel (torch encode is 0.48 ms/layer-chunk, so not urgent); and the VBR tier
+  policy that the V-side floor (EXP-012) is meant to drive.
+
 ## EXP-002 — GGUF / MTP / TurboQuant corpus and source audits
 **Date:** 2026-09-16 · **Verdict:** INFORMATIONAL (complete; reports archived in
 `audits/A1…A6`, conclusions in ARCHITECTURE.md §2–§6)
