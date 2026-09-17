@@ -59,7 +59,7 @@ def test_mtp_construction_and_forward_contract(monkeypatch, enabled):
     from freetoken.models.qwen4_exp import model as mod
 
     class DecoderStub(BaseOP):
-        def __init__(self, config, layer_id, *, prefix):
+        def __init__(self, config, layer_id, *, prefix, moe_layer_id=None):
             self.ple = None
             self._layer_id = layer_id
             self._prefix = prefix

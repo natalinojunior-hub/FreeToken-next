@@ -59,14 +59,19 @@ def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseO
 class Qwen4ExpDecoderLayer(BaseOP):
     """One decoder layer over the hyper-connection streams (see the module docstring for the flow)."""
 
-    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = "") -> None:
+    def __init__(
+        self, config: ModelConfig, layer_id: int, *, prefix: str = "", moe_layer_id: int | None = None
+    ) -> None:
         self._layer_id = layer_id
         self._is_linear = config.is_linear_layer(layer_id)
         if self._is_linear:
             self.linear_attn = build_linear_mixer(config, layer_id, f"{prefix}.linear_attn")
         else:
             self.self_attn = Qwen4ExpAttention(config, layer_id, prefix=f"{prefix}.self_attn")
-        self.mlp = Qwen4ExpMoE(config, layer_id, prefix=f"{prefix}.mlp")
+        # The MTP draft layer shares the target's expert bank (_MTPQuantConfig), so its MoE
+        # block must index the offload cache at the TARGET layer's id, not its own KV/attention
+        # layer_id (one past the target stack) -- moe_layer_id lets the caller alias the two.
+        self.mlp = Qwen4ExpMoE(config, moe_layer_id if moe_layer_id is not None else layer_id, prefix=f"{prefix}.mlp")
         self.attn_hyper_connection = GatedResidual(config, prefix=f"{prefix}.attn_hyper_connection")
         self.mlp_hyper_connection = GatedResidual(config, prefix=f"{prefix}.mlp_hyper_connection")
         self.ple = (
@@ -151,7 +156,11 @@ class Qwen4ExpMTP(BaseOP):
             hidden, hidden, has_bias=False, quant_config=config.quant, prefix="mtp.fc_embedding"
         )
         head_config = replace(config, quant=_MTPQuantConfig(config)) if config.quant is not None else config
-        self.layers = OPList([Qwen4ExpDecoderLayer(head_config, layer_id, prefix="mtp.layers.0")])
+        self.layers = OPList([
+            Qwen4ExpDecoderLayer(
+                head_config, layer_id, prefix="mtp.layers.0", moe_layer_id=config.first_k_dense_replace
+            )
+        ])
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False, prefix="mtp.hyper_connection_mixer")
 
     def forward(self, residual: torch.Tensor, next_ids: torch.Tensor, batch: Batch) -> torch.Tensor:

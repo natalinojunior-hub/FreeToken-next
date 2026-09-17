@@ -962,7 +962,12 @@ class Engine:
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
         layers = attach_offload_moe_cache(self.model, cache)
-        assert len(layers) == config.model_config.num_moe_layers
+        # The registered MTP draft layer's MoE block aliases the target's own expert bank
+        # (_MTPQuantConfig / moe_layer_id) but is a distinct module the generic walk also finds.
+        expected_moe_layers = config.model_config.num_moe_layers
+        if getattr(config.model_config, "mtp_layer_id", None) is not None:
+            expected_moe_layers += 1
+        assert len(layers) == expected_moe_layers
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
