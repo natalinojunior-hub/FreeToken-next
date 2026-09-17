@@ -540,3 +540,35 @@ draft acceptance, fixed-size pipeline messages, paged-cache rollback, GDN convol
 rebuild, and PLE n-gram context rebuild. These are pure helpers only; the Qwen4Exp draft
 module, separate KV namespace, expert-bank append, scheduler loop, and target-equivalence
 runtime gate are still absent. Focused tests pass together with the checkpoint suite.
+
+## EXP-021 — Native MTP draft-layer construction/forward contract, GPU-verified
+**Date:** 2026-09-17 · **Verdict:** **PARTIAL / KEEP**
+
+`Qwen4ExpMTP` now builds the released one-layer hybrid draft head: `pre_fc_norm_hidden` /
+`pre_fc_norm_embedding` (`GroupedPlusOneRMSNorm`) feed `fc_hidden` / `fc_embedding`
+(`LinearReplicated`) into one `Qwen4ExpDecoderLayer` registered at `layer_id = num_layers`,
+whose expert bank is redirected to the target's routed experts via `_MTPQuantConfig`.
+`with_mtp_layer` extends the model's single full-attention group with that layer id (KV/index
+slot only) without changing target depth or `num_moe_layers`. `--spec-mtp` /
+`EngineConfig.spec_mtp` are wired end to end but default to 0 (inert).
+
+The first version of `test_mtp_construction_and_forward_contract` crashed the Python
+interpreter (`malloc(): unsorted double linked list corrupted`, then a raw `Fatal Python
+error: Aborted` under pytest) because it built and ran the model on CPU tensors while
+`VocabParallelEmbedding.forward` unconditionally launches a CUDA-only JIT kernel
+(`kernel/index.py` -> `index.cu`) with no device guard -- the same crash the sibling
+`test_decoder_stack_prefill_and_decode` already avoids with `@requires_cuda` and a
+`torch.device("cuda")` construction context. Fixed by building/filling the model and its
+generators on `cuda`, matching that pattern; this is a test bug, not a model bug -- the
+forward contract itself was never exercised until this fix. `_MTPQuantConfig`'s registration
+rejection paths (missing hybrid flag, wrong layer types, foreign RoPE base, target-slot reuse,
+ambiguous full-attention groups) are covered without a GPU.
+
+Result: 8/8 MTP-focused tests pass on the host GPU (construction, forward-contract numerics
+against a torch reference, quantization routing, geometry rejection) plus 21/21 config tests
+and the full checkpoint/moe/qwen4_exp focused set (281 passed, 60 skipped -- the only 2
+failures are the pre-existing flashinfer/nvcc-13.3 fp4 build issue, unrelated to this change).
+
+Still missing before any MTP throughput claim: a separate draft KV namespace/expert-bank
+append, the draft/verify/rollback scheduler loop, and the target-equivalence gate (greedy
+token-stream match against the same target configuration without MTP), per goal item E.
