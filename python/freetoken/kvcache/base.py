@@ -66,12 +66,16 @@ class BaseKVCachePool(ABC):
         """Largest usable page count fitting ``available_memory`` (bytes measured by the
         engine: memory_ratio x baseline free minus resident weights and any sibling pool's
         fixed cost), honoring ``config.num_page_override``."""
+        from freetoken.engine.cache_budget import DUMMY_PAGES, pool_pages
+
         cache_per_page, fixed_cache_size, _, _ = cls.kv_cost(config)
         num_pages = config.num_page_override
         if num_pages is None:
-            num_pages = (available_memory - fixed_cache_size) // cache_per_page
+            # The pool allocates one page past the usable ones (create_kv_pool passes
+            # num_pages + 1), so the dummy page is bought out of the same budget.
+            num_pages = (available_memory - fixed_cache_size) // cache_per_page - DUMMY_PAGES
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
-        real_kv_size = num_pages * cache_per_page + fixed_cache_size
+        real_kv_size = pool_pages(num_pages) * cache_per_page + fixed_cache_size
         logger.info(
             f"Allocating {num_pages * config.page_size} tokens for KV cache, "
             f"K + V = {mem_GB(real_kv_size)}"

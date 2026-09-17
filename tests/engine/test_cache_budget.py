@@ -7,7 +7,13 @@ import torch
 
 import os
 
-from freetoken.engine.cache_budget import expert_bytes_per_slot, plan_cache_budget, resolve_moe_cache_auto
+from freetoken.engine.cache_budget import (
+    expert_bytes_per_slot,
+    plan_cache_budget,
+    pool_pages,
+    required_bytes,
+    resolve_moe_cache_auto,
+)
 from freetoken.engine.engine import _pin_budget_bytes
 
 
@@ -20,20 +26,23 @@ def test_moe_priority_fills_experts_up_to_total():
         kv_reserve_pages=5, max_slots=8,
     )
     assert size == 8  # capped at full residency
-    assert pages == (2000 - 8 * 100) // 10  # == 120, remainder to KV
+    assert pages == (2000 - 8 * 100) // 10 - 1  # == 119 usable; one page buys the dummy row
     assert overlap is True
 
 
 def test_offload_case_experts_take_most_kv_gets_reserve_floor():
     # budget too small for full residency: experts take what they can, KV keeps its floor.
+    # 1010 not 1000: the floored plan is 9 slots + 10 usable pages + the pool's dummy page,
+    # and 1000 B cannot buy that -- the old arithmetic claimed it could and the CUDA
+    # allocation then disagreed.
     size, pages, overlap = plan_cache_budget(
-        budget_bytes=1000, per_expert_bytes=100, cache_per_page=10,
+        budget_bytes=1010, per_expert_bytes=100, cache_per_page=10,
         num_experts=2, total_experts=50, prefill_overlap=True,
         kv_reserve_pages=10, max_slots=50,
     )
-    # raw = (1000 - 10*10) // 100 = 9 ; clamped to [4, 50] -> 9
+    # raw = (1010 - 10*10) // 100 = 9 ; clamped to [4, 50] -> 9
     assert size == 9
-    assert pages == max((1000 - 9 * 100) // 10, 10)  # remainder 10 pages, == floor
+    assert pages == max((1010 - 9 * 100) // 10 - 1, 10)  # 11 pages bought, 10 usable == floor
     assert overlap is True
 
 
@@ -45,7 +54,7 @@ def test_marlin_cap_clamps_count_and_rolls_bytes_to_kv():
         kv_reserve_pages=0, max_slots=992,
     )
     assert size == 992
-    assert pages == (200_000 - 992 * 100) // 10
+    assert pages == (200_000 - 992 * 100) // 10 - 1
 
 
 def test_small_cache_disables_prefill_overlap():
@@ -89,7 +98,21 @@ def test_prefill_overlap_false_is_honored():
     )
     assert size == 8
     assert overlap is False
-    assert pages == (2000 - 8 * 100) // 10
+    assert pages == (2000 - 8 * 100) // 10 - 1
+
+
+def test_plan_prices_the_page_the_pool_allocates():
+    # create_kv_pool and every pool's rebuild take num_pages + 1, so a plan that prices only
+    # the usable pages over-commits the budget it was solved against: the geometry it
+    # returns must fit, and one page more must not.
+    size, pages, _ = plan_cache_budget(
+        budget_bytes=2000, per_expert_bytes=100, cache_per_page=10,
+        num_experts=4, total_experts=8, prefill_overlap=True,
+        kv_reserve_pages=5, max_slots=8,
+    )
+    assert pool_pages(pages) == pages + 1
+    assert required_bytes(size, pages, 100, 10) <= 2000
+    assert required_bytes(size, pages + 1, 100, 10) > 2000
 
 
 def test_expert_bytes_per_slot_sums_row_bytes_over_banks():
@@ -108,8 +131,8 @@ def test_resolve_auto_applies_ratio_once():
         num_experts=4, total_experts=8, prefill_overlap=True,
         kv_reserve_tokens=0, page_size=1,
     )
-    # budget 800: experts cap at 8 -> 400 bytes; KV = 400//10 = 40 pages
-    assert size == 8 and pages == 40 and overlap is True
+    # budget 800: experts cap at 8 -> 400 bytes; KV = 400//10 - 1 = 39 usable pages
+    assert size == 8 and pages == 39 and overlap is True
 
 
 def test_resolve_auto_caps_slots_at_the_kernel_limit():

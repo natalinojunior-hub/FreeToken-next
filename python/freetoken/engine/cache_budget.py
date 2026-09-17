@@ -38,11 +38,24 @@ def net_cache_budget_bytes(
     return int(memory_ratio * baseline_free) - weights_bytes - fixed_cache_size
 
 
+# Every KV pool allocates one page past the usable ones for padded / dummy rows to write
+# into: create_kv_pool and every pool's rebuild pass ``num_pages + 1`` (mha, hybrid SWA,
+# DSV4, dsa). The arithmetic below plans in USABLE pages, so it has to price the extra one
+# or the plan over-commits the budget it was solved against.
+DUMMY_PAGES = 1
+
+
+def pool_pages(num_pages: int) -> int:
+    """Pages a pool holding ``num_pages`` usable pages actually allocates."""
+    return num_pages + DUMMY_PAGES
+
+
 def required_bytes(
     moe_cache_size: int, num_pages: int, per_expert_bytes: int, cache_per_page: int
 ) -> int:
-    """GPU bytes a ``(moe_cache_size, num_pages)`` geometry occupies (MoE slots + KV pages)."""
-    return moe_cache_size * per_expert_bytes + num_pages * cache_per_page
+    """GPU bytes a ``(moe_cache_size, num_pages)`` geometry occupies: MoE slots plus the
+    ``num_pages`` usable KV pages and the pool's dummy page."""
+    return moe_cache_size * per_expert_bytes + pool_pages(num_pages) * cache_per_page
 
 
 def plan_cache_budget(
@@ -81,11 +94,13 @@ def plan_cache_budget(
     overlap = overlap and moe_cache_size >= 2 * num_experts
 
     remaining = budget_bytes - moe_cache_size * per_expert_bytes
-    num_pages = max(remaining // cache_per_page, kv_reserve_pages)
+    # One page of what ``remaining`` buys is spent on the pool's dummy page, so the plan
+    # hands back usable pages and never promises bytes it did not price.
+    num_pages = max(remaining // cache_per_page - DUMMY_PAGES, kv_reserve_pages)
     # A tiny budget can floor num_pages at kv_reserve_pages even when ``remaining`` is below
     # the reserve (or negative), yielding a plan that exceeds budget_bytes. Reject here so
     # --moe-cache-auto fails in arithmetic instead of OOMing in a later CUDA allocation.
-    total = moe_cache_size * per_expert_bytes + num_pages * cache_per_page
+    total = required_bytes(moe_cache_size, num_pages, per_expert_bytes, cache_per_page)
     assert total <= budget_bytes, (
         f"cache budget too small: minimum plan (moe={moe_cache_size} slots, "
         f"kv={num_pages} pages) needs {total} B > budget {budget_bytes} B "
