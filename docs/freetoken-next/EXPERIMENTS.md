@@ -317,6 +317,57 @@ key A7 §8 first reported is not present).
 **Consequence for the matrix:** these are recorded as BLOCKED rows that name their blocker, which
 D-012 requires, and they are not counted as regressions.
 
+## EXP-012 — Turbo KV: the codec, the pool, and a decode that never de-rotates a tile
+**Date:** 2026-09-17 · **Verdict:** IN FLIGHT (landed: codec + pool + fused decode; open: prefill, engine wiring)
+Question: can FreeToken *consume* compressed KV without paying the materialize tax the reference
+measured (-10.8 % TG @16K, -28.7 % @64K)?
+
+The architecture question came first, and it is a measurement, not an opinion: only our Triton
+backend can consume a custom KV layout (flashinfer takes a fixed dtype, and
+`_resolve_auto_attention_backend` picks `fi` on this host), so what does Triton cost by itself?
+**PP 4344.8 / TG 144.11 at 16K on the 35B-A3B vs the fi anchor 4610.8 / 158.53 -- a 9.1 % backend
+gap before any codec exists** (`w1_triton.log`; its sha1 `b7c70b36d276` differs from
+`2a6dca88ffdc`, so the output-hash guard is per-backend, not global). Stated plainly because it
+bounds the work: at 16K the KV is a few percent of the decode step's bytes, so *no* quantizer pays
+a 9.1 % backend penalty, and "TG within -3 % of 158.53 at 16K" is not reachable on this path. Where
+the codec pays is long context, where KV is precisely the thing being bought out of the expert
+cache (256K today costs 5.00 GiB of KV; at turbo4 that is 1.29 GiB).
+
+The trick that makes the read cheap: store in the **rotated** domain, pre-rotate Q (rotate is
+orthogonal, so `(Wq)·(Wk)ᵀ == q·kᵀ`), accumulate V rotated, and rotate the output row back once.
+Per KV tile that leaves a byte gather, an 8/16-entry lookup and one multiply -- no transform per
+tile, which is what LTO's fused prefill lost 6-11 % on.
+
+Landed, four commits (`7fc7d7f..77229c2`), 59 green pins: `kernel/triton/turbo_kv.py` (codec:
+layout, corrected-norm semantics, tie rule, 128-element rotation group), `kvcache/turbo_pool.py`
+(a paged codes+norm pool that refuses to hand a bf16 view to a bf16 reader),
+`kernel/triton/turbo_attn.py` (the tile readers), and one `COMPRESSED` constexpr branch in the
+split-k grouped decode kernel -- a branch, not a second kernel, so the compressed path inherits
+split-K, head tiling, sinks and graph capture instead of reimplementing them badly, and the 38
+existing bf16 pins still pass unchanged.
+
+Three real bugs, each invisible to the obvious test: (1) `SIGNS2` transcribed 127 elements from a
+truncated doc dump -- rotations still "worked", because a dropped lane only shifts indices, so the
+array is now pinned by length *and* sum; (2) `pack` masked nothing before `<< 6`, so turbo3's third
+bit leaked into the neighbouring lane and 7<<6 wrapped uint8; (3) `unpack` sliced turbo3 "all
+words, then all bits" where `pack` writes group-major -- exact at head_dim 128, wrong at 256, and
+caught only by the GPU tile probe with two groups per row. The wiring test compares against
+attention over the *decoded* KV, not the original, so it can only fail on the bookkeeping and never
+on quantization error.
+
+Accuracy is at theory, which is the useful surprise: per-vector NMSE 0.0339 (turbo3) and 0.0092
+(turbo4) against the Lloyd-Max table for 8/16-level Gaussian quantization (0.0345 / 0.0095) --
+slightly better, because the corrected norm projects the reconstruction back onto the input's
+sphere. The V-side error of attention equals that number and does **not** move with softmax
+sharpness (pinned at three scales), so it is a floor a `(layer, side)` tier schedule has to design
+around; the K-side error is the part that grows with logit scale. Bytes: 50 B (turbo3) / 66 B
+(turbo4) per token per head per slab per layer vs 256 B bf16 -- 5.12x / 3.88x on a head_dim-128
+model -- with `kv_cost`/`unit_bytes` parity pinned so the plan and the allocator cannot disagree.
+
+Next: the extend (prefill) branch, then engine wiring (config key, pool factory, Q rotation and
+output rotation in `attention/triton.py`), then the 16K and 256K A/B. No KEEP is claimed here:
+there is no serving number yet.
+
 ## EXP-002 — GGUF / MTP / TurboQuant corpus and source audits
 **Date:** 2026-09-16 · **Verdict:** INFORMATIONAL (complete; reports archived in
 `audits/A1…A6`, conclusions in ARCHITECTURE.md §2–§6)
