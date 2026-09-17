@@ -310,6 +310,16 @@ zero; the mm encoder line is priced per image while the encoder cache has no byt
 (`mm/encoder_cache.py:38`); and `max_memory_allocated` is unusable as a steady-state number
 because `_sync_get_memory()` resets the peak counter mid-init.
 
+**What the measurements now feed back.** The calibration pass leaves two `Kind.MEASURED` lines
+(`measured:allocator-held`, `measured:transient-peak`) and the second one is load-bearing:
+`reserve_bytes` is `max(modelled, measured)` one-directionally, so a runtime that peaks above
+the model tightens every *subsequent* plan (a cache rebuild, a second auto resolve) instead of
+leaving the estimate to be discovered by the next OOM. Deliberately one-directional: a quiet
+window must not claw back a conservative model, because the window that measured small is not
+the window that asks for the autotune arena. Startup sizing still precedes the probe, which is
+why the anchors' plans and output hashes are unaffected by this and why the model's own width
+(~0.2-0.4 GiB over on both anchors) remains a number to tune with data rather than hide.
+
 
 ## 6. MTP / speculative decoding map (Phases 9–10)
 
