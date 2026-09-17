@@ -516,3 +516,12 @@ entries through layer 46; the next invocation validated and skipped those entrie
 reaching the final source shards. The host supervisor then sent **SIGTERM (143)** before
 the last layer, but the manifest remained valid and reusable; a full serving artifact is
 still pending.
+
+## EXP-019 — Native MTP host contract
+**Date:** 2026-09-17 · **Verdict:** **PARTIAL / CORRECTNESS FOUNDATION**
+
+Added `python/freetoken/engine/spec.py` with model-independent contracts for longest-prefix
+draft acceptance, fixed-size pipeline messages, paged-cache rollback, GDN convolution-state
+rebuild, and PLE n-gram context rebuild. These are pure helpers only; the Qwen4Exp draft
+module, separate KV namespace, expert-bank append, scheduler loop, and target-equivalence
+runtime gate are still absent. Focused tests pass together with the checkpoint suite.
