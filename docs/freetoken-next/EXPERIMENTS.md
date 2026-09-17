@@ -397,7 +397,9 @@ aborted before it produced throughput, during which a `pkill -f "<bench cmdline>
 command line** and killed the driver while the server kept 14 986 MiB -- the trap JOB_REGISTRY already
 documents, re-confirmed the hard way, cleaned by PID with the GPU verified at 2 MiB afterwards.
 
-Rewrite state, exactly as it stands. `kernel/triton/turbo_attn.py` now loads each token's packed row
+Rewrite state, exactly as it stands (bricks already committed: `7fc7d7f` codec, `1573235` pool,
+`224aa25` readers, `77229c2` fused decode, `35e4245` fused prefill, `08e44c6` `--kv-format` wiring).
+`kernel/triton/turbo_attn.py` now loads each token's packed row
 contiguously and splits it in registers via a broadcast shift over an explicit lane axis
 (`raw[:, :, None] >> shifts`), so the element axis is `byte * lanes + lane` by construction; the book
 is read as sign + half-table (`_book_values`), one lookup per two elements. Three bugs came out of
