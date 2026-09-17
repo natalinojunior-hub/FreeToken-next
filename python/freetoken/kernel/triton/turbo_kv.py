@@ -197,8 +197,11 @@ def unpack(codes: torch.Tensor, book: str) -> torch.Tensor:
         odd = q >> 4
         return torch.cat((even, odd), dim=-1).reshape(codes.shape[0], groups * QK_TURBO).to(torch.int64)
     rows = codes.shape[0]
-    words = codes[:, : groups * 32].reshape(rows, groups, QK_TURBO // 4, 1)
-    bits = codes[:, groups * 32 :].reshape(rows, groups, QK_TURBO // 8, 1)
+    # group-major: each group writes its 32 word bytes then its 16 third-bit bytes, so the slice
+    # has to be per group. Slicing "all words, then all bits" is only right when groups == 1.
+    grouped = codes.reshape(rows, groups, CODE_BYTES[book])
+    words = grouped[:, :, : 32].reshape(rows, groups, QK_TURBO // 4, 1)
+    bits = grouped[:, :, 32:].reshape(rows, groups, QK_TURBO // 8, 1)
     sh4 = torch.tensor([0, 2, 4, 6], device=codes.device, dtype=torch.uint8)
     low = (words >> sh4) & 0x3
     sh8 = torch.arange(8, device=codes.device, dtype=torch.uint8)

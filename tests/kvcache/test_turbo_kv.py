@@ -87,13 +87,31 @@ def test_v_accumulation_can_stay_in_the_rotated_domain():
 
 
 @pytest.mark.parametrize("book", BOOKS)
-def test_pack_unpack_round_trip(book):
+@pytest.mark.parametrize("groups", [1, 2, 4])
+def test_pack_unpack_round_trip(book, groups):
+    """Multi-group rows are the case that hides a layout error: packing is group-major, and an
+    inverse that slices "all words, then all bits" is exact only when groups == 1."""
     g = torch.Generator(device=DEVICE).manual_seed(11)
     levels = 8 if book == "turbo3" else 16
-    idx = torch.randint(0, levels, (97, tk.QK_TURBO), generator=g, dtype=torch.uint8, device=DEVICE)
+    idx = torch.randint(
+        0, levels, (97, groups * tk.QK_TURBO), generator=g, dtype=torch.uint8, device=DEVICE
+    )
     codes = tk.pack(idx, book)
-    assert codes.shape == (97, tk.CODE_BYTES[book])
+    assert codes.shape == (97, groups * tk.CODE_BYTES[book])
     assert torch.equal(tk.unpack(codes, book), idx.long())
+
+
+@pytest.mark.parametrize("book", BOOKS)
+def test_multi_group_row_quantizes_and_decodes_elementwise(book):
+    x = torch.cat((_groups(64, seed=43), _groups(64, seed=44)), dim=-1)  # two distinct groups
+    codes, norm = tk.quantize(x, book)
+    assert norm.shape == (64, 2)
+    back = tk.decode(codes, norm, book)
+    err = (back - x).pow(2).sum() / x.pow(2).sum()
+    assert err.item() < (0.05 if book == "turbo3" else 0.015), f"{book} NMSE {err.item():.5f}"
+    # each half must decode identically to the same data quantized on its own
+    solo = tk.decode(*tk.quantize(x[:, : tk.QK_TURBO], book), book)
+    assert torch.equal(back[:, : tk.QK_TURBO], solo)
 
 
 @pytest.mark.parametrize("book", BOOKS)
