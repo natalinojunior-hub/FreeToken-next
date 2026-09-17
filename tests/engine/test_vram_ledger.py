@@ -214,6 +214,45 @@ def test_tensor_bytes_measures_a_consumer_that_has_no_formula():
 # ---- the planner consumes the reserve ---------------------------------------------------
 
 
+def test_decide_splits_the_budget_and_prices_the_context_targets():
+    ledger = _ledger(baseline=16 * _GIB, ratio=1.0, weights=8 * _GIB)
+    ledger.charge("cache:gdn-state", 1 * _GIB, Kind.PERSISTENT)
+    plan = ledger.decide(
+        cache_per_page=4 * _MIB, page_tokens=64, per_expert_bytes=2 * _MIB,
+        num_experts=64, total_experts=2560, prefill_overlap=True, kv_reserve_tokens=4096,
+        fixed_cache_bytes=256 * _MIB, contexts=(16384, 131072, 1048576),
+    )
+    assert plan.pool_budget_bytes == ledger.pool_budget_bytes(256 * _MIB)
+    assert plan.usable_tokens == plan.num_pages * plan.page_tokens
+    assert required_bytes(plan.moe_cache_size, plan.num_pages, 2 * _MIB, 4 * _MIB) <= (
+        plan.pool_budget_bytes)
+    rows = {c.tokens: c for c in plan.contexts}
+    # 16K fits inside what the plan just spent on KV; a megabyte-scale context cannot, and the
+    # plan says by how much -- that shortfall is the number the RAM-tier decision is made from.
+    assert rows[16384].fits and rows[16384].kv_bytes <= plan.pool_budget_bytes
+    assert not rows[1048576].fits
+    assert rows[1048576].shortfall_bytes == (
+        rows[1048576].kv_bytes - plan.pool_budget_bytes)
+    assert rows[131072].pages == 131072 // 64  # page_tokens 64, exact division
+    text = plan.report()
+    assert "128K" in text and "1M" in text and "expert slots" in text
+
+
+def test_a_compressed_kv_format_is_the_only_thing_that_makes_long_context_fit():
+    # The economic gate for Phase 11, stated as arithmetic: halving cache_per_page halves the
+    # KV bytes per context token, and the plan must flip 128K from infeasible to feasible on
+    # geometry alone -- no tiering, no new allocation.
+    ledger = _ledger(baseline=16 * _GIB, ratio=1.0, weights=9 * _GIB)
+    kwargs = dict(page_tokens=64, per_expert_bytes=2 * _MIB, num_experts=64,
+                  total_experts=2560, prefill_overlap=False, kv_reserve_tokens=0,
+                  contexts=(131072,))
+    bf16 = ledger.decide(cache_per_page=8 * _MIB, **kwargs)
+    compressed = ledger.decide(cache_per_page=2 * _MIB, **kwargs)
+    assert not bf16.contexts[0].fits
+    assert compressed.contexts[0].fits
+    assert compressed.moe_cache_size >= bf16.moe_cache_size  # the freed bytes go somewhere
+
+
 def test_auto_plan_shrinks_only_once_the_reserve_beats_the_ratio_cap():
     # Modelled on a 16 GiB card holding an 8 GiB dense slice: 4 MiB per KV page, 2 MiB per
     # expert slot, and a 8192-token KV floor that is 128 pages at page_size 64.

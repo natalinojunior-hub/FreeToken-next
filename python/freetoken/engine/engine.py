@@ -728,33 +728,34 @@ class Engine:
             )
 
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks, method=None) -> tuple[int, int, bool]:
-        """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
+        """Resolve --moe-cache-auto by asking the ledger to split what it owns.
 
-        Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
-        without a GPU. Reused by the Phase-2 runtime rebuild.
+        The pool family contributes only its own geometry (per-page bytes, its fixed tier, the
+        page-token count and the minimum reserve its tiers demand); weights, the sibling GDN
+        state pool, the engine overhead lines and the modelled peak are already in the account,
+        so nothing is subtracted twice and the answer is the same number the KV solve, the
+        rebuild fit-check and the printed report are working from. Returns the plan's triple and
+        keeps the plan itself on the engine so the feasibility rows can be logged.
         """
-        from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
+        from freetoken.engine.cache_budget import expert_bytes_per_slot
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
-        fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
-        fixed_cache_size += self._ledger_overhead_bytes()  # page table, graph pool, workspaces
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
-        return resolve_moe_cache_auto(
-            baseline_free=self._baseline_free,
-            weights_bytes=self._weights_bytes,
-            memory_ratio=config.memory_ratio,
+        plan = self.vram_ledger.decide(
             cache_per_page=cache_per_page,
-            fixed_cache_size=fixed_cache_size,
+            page_tokens=page_tokens,
             per_expert_bytes=expert_bytes_per_slot(banks.sources),
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
             kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
-            page_size=page_tokens,
+            fixed_cache_bytes=fixed_cache_size,
             max_slots=method.slot_limit() if method is not None else None,
-            reserve_bytes=self._ledger_reserve_bytes(),
         )
+        self.memory_plan = plan
+        logger.info_rank0(plan.report())
+        return plan.moe_cache_size, plan.num_pages, plan.prefill_overlap
 
     def _ledger_reserve_bytes(self) -> int:
         """The ledger's modelled peak, 0 before the account exists (and for fakes).

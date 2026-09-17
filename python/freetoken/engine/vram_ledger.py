@@ -30,11 +30,11 @@ import enum
 from dataclasses import dataclass, field
 from typing import Iterable
 
+from .cache_budget import ceiling_bytes, pool_pages, resolve_moe_cache_auto
 from freetoken.utils import div_ceil, init_logger
 
 logger = init_logger(__name__)
 
-_KIB = 1 << 10
 _MIB = 1 << 20
 _GIB = 1 << 30
 
@@ -351,6 +351,94 @@ def modelled_reserves(
     return out
 
 
+@dataclass(frozen=True)
+class ContextFeasibility:
+    """Whether one context length fits the account's pool budget, and by how much it misses."""
+
+    tokens: int
+    pages: int
+    kv_bytes: int
+    budget_bytes: int
+    fits: bool
+
+    @property
+    def shortfall_bytes(self) -> int:
+        return max(0, self.kv_bytes - self.budget_bytes)
+
+
+@dataclass(frozen=True)
+class MemoryPlan:
+    """What the ledger decided for the two negotiable consumers, and what it means for context.
+
+    Produced by :meth:`VramLedger.decide`, which is the single place the expert/KV split is
+    chosen: ``pool_budget_bytes`` is the money, ``plan_cache_budget`` is the split rule, and the
+    feasibility rows answer the question the split was never asked -- how much context this
+    geometry can actually hold, and how much VRAM a longer one would need. That last number is
+    what decides whether a RAM tier is worth building at all (Phase 11's economic gate).
+    """
+
+    pool_budget_bytes: int
+    moe_cache_size: int
+    num_pages: int
+    prefill_overlap: bool
+    page_tokens: int
+    cache_per_page: int
+    usable_tokens: int
+    contexts: tuple[ContextFeasibility, ...]
+
+    def feasible_at(self, tokens: int) -> ContextFeasibility | None:
+        return next((c for c in self.contexts if c.tokens == tokens), None)
+
+    @staticmethod
+    def _label(tokens: int) -> str:
+        return f"{tokens // 1024}K" if tokens < 1024 * 1024 else f"{tokens // (1024 * 1024)}M"
+
+    def report(self) -> str:
+        lines = [
+            f"memory plan: pool budget {self.pool_budget_bytes / _GIB:.3f} GiB -> "
+            f"{self.moe_cache_size} expert slots + {self.num_pages} usable KV pages "
+            f"({self.usable_tokens} tokens at {self.page_tokens}/page), "
+            f"prefill_overlap={self.prefill_overlap}"
+        ]
+        for c in self.contexts:
+            if c.fits:
+                lines.append(
+                    f"  {self._label(c.tokens)}: fits -- {c.pages} pages = "
+                    f"{c.kv_bytes / _GIB:.3f} GiB of "
+                    f"{self.pool_budget_bytes / _GIB:.3f} GiB"
+                )
+            else:
+                lines.append(
+                    f"  {self._label(c.tokens)}: needs {c.kv_bytes / _GIB:.3f} GiB "
+                    f"(+{c.shortfall_bytes / _GIB:.3f} GiB over the budget) -> compressed KV "
+                    f"or a RAM tier"
+                )
+        return "\n".join(lines)
+
+
+# The contexts the mission targets; asked of every plan so the answer is in the log, not in a
+# spreadsheet nobody opens. 128K/256K are the practical targets, 512K/1M the feasibility ones.
+CERTIFICATION_CONTEXTS = (128 * 1024, 256 * 1024, 512 * 1024, 1024 * 1024)
+
+
+def context_feasibility(
+    budget_bytes: int, cache_per_page: int, page_tokens: int, tokens: int
+) -> ContextFeasibility:
+    """Price ``tokens`` of paged KV against ``budget_bytes`` at the current KV format.
+
+    The pool's dummy page is priced in, and the answer is deliberately about BYTES only: a
+    context that misses here is a candidate for compression or tiering, and the size of the
+    miss is what says whether either is worth building.
+    """
+    pages = div_ceil(int(tokens), int(page_tokens))
+    kv_bytes = pool_pages(pages) * int(cache_per_page)
+    return ContextFeasibility(
+        tokens=int(tokens), pages=pages, kv_bytes=kv_bytes, budget_bytes=int(budget_bytes),
+        fits=kv_bytes <= int(budget_bytes),
+    )
+
+
+
 @dataclass
 class VramLedger:
     """Byte account for one device.
@@ -431,8 +519,6 @@ class VramLedger:
         ``(1 - ratio)`` hole already IS a reserve, so only a peak larger than that hole bites.
         With nothing modelled this is the pre-ledger ``ratio x baseline`` formula exactly.
         """
-        from freetoken.engine.cache_budget import ceiling_bytes
-
         return ceiling_bytes(self.baseline_free, self.memory_ratio, self.reserve_bytes)
 
     def engine_committed_bytes(self) -> int:
@@ -473,6 +559,63 @@ class VramLedger:
         """
         committed = self.engine_committed_bytes() + int(extra_fixed_bytes)
         return max(0, self.ceiling_bytes - committed)
+
+    def decide(
+        self,
+        *,
+        cache_per_page: int,
+        page_tokens: int,
+        per_expert_bytes: int,
+        num_experts: int,
+        total_experts: int,
+        prefill_overlap: bool,
+        kv_reserve_tokens: int,
+        fixed_cache_bytes: int = 0,
+        max_slots: int | None = None,
+        contexts: tuple[int, ...] = CERTIFICATION_CONTEXTS,
+    ) -> MemoryPlan:
+        """Split the pool budget and say what context the result can actually hold.
+
+        The engine asks this instead of computing a budget and a split itself, so the two
+        negotiable consumers negotiate against one account: the money is
+        :meth:`pool_budget_bytes` (ceiling minus everything that is not up for grabs), the
+        split rule stays ``plan_cache_budget`` (MoE-priority, KV reserve floor, the pool's
+        dummy page priced), and the feasibility rows are the same geometry extrapolated to the
+        context targets -- which is how ``--context auto`` will eventually be answered, and
+        what makes "does 512K fit?" a printed number rather than a benchmark.
+        """
+        budget = self.pool_budget_bytes(fixed_cache_bytes)
+        # Reuse the split rule rather than restating it: resolve_moe_cache_auto applies its
+        # ratio to whatever ceiling it is handed, so handing it the ledger's ceiling minus its
+        # committed bytes makes the ratio and the reserve identity, and the only thing decided
+        # here is the money. One implementation of "MoE first, KV takes the rest, floors win".
+        moe_cache_size, num_pages, overlap = resolve_moe_cache_auto(
+            baseline_free=budget,
+            weights_bytes=0,
+            memory_ratio=1.0,
+            cache_per_page=cache_per_page,
+            fixed_cache_size=0,
+            per_expert_bytes=per_expert_bytes,
+            num_experts=num_experts,
+            total_experts=total_experts,
+            prefill_overlap=prefill_overlap,
+            kv_reserve_tokens=kv_reserve_tokens,
+            page_size=page_tokens,
+            max_slots=max_slots,
+        )
+        return MemoryPlan(
+            pool_budget_bytes=budget,
+            moe_cache_size=moe_cache_size,
+            num_pages=num_pages,
+            prefill_overlap=overlap,
+            page_tokens=page_tokens,
+            cache_per_page=cache_per_page,
+            usable_tokens=num_pages * page_tokens,
+            contexts=tuple(
+                context_feasibility(budget, cache_per_page, page_tokens, tokens)
+                for tokens in contexts
+            ),
+        )
 
     def headroom_bytes(self) -> int:
         """Unspent room under the ceiling: ``ceiling - held``.
@@ -554,21 +697,34 @@ def open_ledger(
 
 __all__ = [
     "BACKEND_WORKSPACE",
+    "CALIBRATION_TOLERANCE",
+    "CERTIFICATION_CONTEXTS",
     "FRAGMENTATION_RESERVE",
     "GDN_CHUNK_SIZE",
     "GRAPH_CAPTURE_EXTRA_SHAPE",
     "GRAPH_CAPTURE_PEAK",
+    "GRAPH_POOL_EXTRA_SHAPE",
+    "GRAPH_POOL_FIRST_SHAPE",
+    "HELD_KINDS",
     "LIVE_ACTIVATION_TENSORS",
+    "MEASURED_LINE",
     "MM_ENCODER_PEAK",
     "NEGOTIABLE",
     "TRITON_AUTOTUNE_ARENA",
     "Charge",
+    "ContextFeasibility",
     "Kind",
+    "MemoryPlan",
     "VramLedger",
     "activation_peak_bytes",
+    "context_feasibility",
     "gdn_prefill_bytes",
     "graph_capture_peak_bytes",
     "graph_capture_shapes",
+    "graph_pool_bytes",
     "modelled_reserves",
     "open_ledger",
+    "page_table_bytes",
+    "tensor_breakdown",
+    "tensor_bytes",
 ]

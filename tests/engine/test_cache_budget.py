@@ -360,9 +360,18 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
     engine._weights_bytes = 1_000_000
     engine._pool_cls = MHAKVCache  # __init__ skipped -> install the generic pool family
 
+    from freetoken.engine.vram_ledger import Kind, VramLedger
+
+    engine.vram_ledger = VramLedger(
+        device_total_bytes=12_000_000, baseline_free=10_000_000, memory_ratio=0.9,
+    )
+    engine.vram_ledger.charge("weights:model", 1_000_000, Kind.IMMUTABLE)
+
     size, pages, overlap = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks())
 
-    # cross-check against the same pure functions, proving the kwarg mapping is faithful
+    # cross-check against the same pure functions, proving the kwarg mapping is faithful:
+    # asking the ledger to split must give the answer the formula gives with no reserve and no
+    # overhead lines, or landing the ledger would have silently resized every model.
     from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
     from freetoken.kvcache.mha_pool import MHAKVCache
 
@@ -375,6 +384,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         kv_reserve_tokens=0, page_size=16,
     )
     assert (size, pages, overlap) == expected
+    assert engine.memory_plan.pool_budget_bytes == engine.vram_ledger.pool_budget_bytes(fixed)
 
     class StubMethod:
         def slot_limit(self):
