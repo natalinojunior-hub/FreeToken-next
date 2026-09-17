@@ -72,3 +72,21 @@ def test_ftw_writer_drops_completed_shards_from_page_cache(tmp_path, monkeypatch
 
     assert len(calls) == 2
     assert all(offset == 0 and length == 0 for _, offset, length, _ in calls)
+
+
+def test_ftw_writer_resumes_after_an_interrupted_shard(tmp_path):
+    first = FTWWriter(str(tmp_path), shard_limit=4096)
+    first.add_tensor("a", torch.ones(2048, dtype=torch.uint8))
+    first._f.flush()
+    first._f.close()
+    with open(tmp_path / "freetoken-00000.ftw", "ab") as f:
+        f.write(b"interrupted")
+
+    resumed = FTWWriter(str(tmp_path), shard_limit=4096)
+    resumed.add_tensor("b", torch.full((2048,), 2, dtype=torch.uint8))
+    resumed.finalize({})
+
+    assert ftw_tensor_names(str(tmp_path)) == ["a", "b"]
+    got = dict(iter_ftw_weights(str(tmp_path)))
+    assert torch.equal(got["a"], torch.ones(2048, dtype=torch.uint8))
+    assert torch.equal(got["b"], torch.full((2048,), 2, dtype=torch.uint8))

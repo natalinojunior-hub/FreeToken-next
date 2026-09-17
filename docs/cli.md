@@ -184,6 +184,12 @@ keeps them dense for resident serving. See the FTW caveats in
 [models.md](models.md#notes); FTW files from older builds can be repaired with
 [scripts/ftw_hotfix.py](ftw-hotfix.md) instead of reconverting.
 
+Conversion is resumable. The output directory keeps an atomic hidden progress
+manifest and validates completed shards when the command is run again with the
+same arguments. Bytes from an interrupted last shard are truncated back to the
+last committed tensor, then conversion continues without rewriting completed
+entries. A completed FTW index is returned immediately.
+
 ## ft bench bw
 
 ```bash
@@ -201,4 +207,3 @@ profile that `ft serve --moe-strategy auto` and `--moe-hybrid-max-fetch -1` then
 - What to measure: `--dtype`, `--model`, `--formats`, `--isa`.
 - `--threshold` (default 2.0) sets the call: recommend hybrid when CPU bandwidth beats PCIe
   by that factor.
-

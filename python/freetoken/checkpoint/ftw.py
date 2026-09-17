@@ -48,6 +48,7 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 INDEX_NAME = "freetoken_weight.json"
+PROGRESS_NAME = ".freetoken_weight.progress.json"
 FORMAT_TAG = "freetoken_weight"
 FORMAT_VERSION = 1
 ALIGN = 4096  # O_DIRECT block alignment (== page size on this platform)
@@ -130,6 +131,9 @@ class FTWWriter:
     ``ALIGN`` so the next starts aligned. A tensor that doesn't fit the current shard's
     remaining room is split across shards (the split point is the shard boundary, which is
     aligned). Call :meth:`add_tensor` for each tensor, then :meth:`finalize`.
+    A hidden progress manifest is updated atomically after every tensor. If the process is
+    interrupted, constructing a writer for the same directory validates the completed
+    shards, truncates the last shard to the committed boundary, and continues there.
     """
 
     def __init__(self, out_dir: str, *, shard_limit: int = DEFAULT_SHARD_LIMIT):
@@ -144,6 +148,99 @@ class FTWWriter:
         self._shard_idx = -1
         self._shard_start = 0  # FTW offset where the current shard began
         self._cur = 0  # bytes written to the current shard
+        self._resume()
+
+    @property
+    def tensor_names(self) -> set[str]:
+        return {entry["name"] for entry in self._tensors}
+
+    def tensor_entry(self, name: str) -> dict | None:
+        for entry in self._tensors:
+            if entry["name"] == name:
+                return entry
+        return None
+
+    def count_kind(self, kind: str) -> int:
+        return sum(entry["kind"] == kind for entry in self._tensors)
+
+    @property
+    def entries(self) -> tuple[dict, ...]:
+        return tuple(self._tensors)
+
+    def validate_tensor(self, name: str, tensor: torch.Tensor) -> None:
+        entry = self.tensor_entry(name)
+        if entry is None:
+            return
+        expected = tensor.detach()
+        actual = {
+            "dtype": _dtype_str(expected.dtype),
+            "shape": list(expected.shape),
+            "nbytes": expected.numel() * expected.element_size(),
+        }
+        for key in actual:
+            if entry[key] != actual[key]:
+                raise ValueError(f"FTW resume tensor changed for {name}: {key}")
+
+    def _progress_path(self) -> str:
+        return os.path.join(self.out_dir, PROGRESS_NAME)
+
+    def _save_progress(self) -> None:
+        """Persist a restart point only after the corresponding bytes are durable."""
+        if self._f is not None:
+            self._f.flush()
+            os.fsync(self._f.fileno())
+        state = {
+            "format": FORMAT_TAG,
+            "version": FORMAT_VERSION,
+            "shard_limit": self.shard_limit,
+            "total_bytes": self._global,
+            "tensors": self._tensors,
+            "shards": self._shards,
+            "current": {"index": self._shard_idx, "start": self._shard_start, "nbytes": self._cur},
+        }
+        tmp = self._progress_path() + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self._progress_path())
+
+    def _resume(self) -> None:
+        """Restore the last committed tensor and truncate an interrupted write."""
+        progress = self._progress_path()
+        if not os.path.exists(progress):
+            existing = [name for name in os.listdir(self.out_dir) if name.endswith(".ftw")]
+            if existing:
+                raise FileExistsError(
+                    f"FTW output contains shards but no resume manifest: {self.out_dir}; "
+                    "choose a new output directory"
+                )
+            return
+        with open(progress) as f:
+            state = json.load(f)
+        if state.get("format") != FORMAT_TAG or state.get("version") != FORMAT_VERSION:
+            raise ValueError(f"unsupported FTW resume manifest: {progress}")
+        if state.get("shard_limit") != self.shard_limit:
+            raise ValueError("FTW resume shard_limit differs from the existing conversion")
+        self._tensors = list(state["tensors"])
+        self._shards = list(state["shards"])
+        self._global = int(state["total_bytes"])
+        current = state["current"]
+        self._shard_idx = int(current["index"])
+        self._shard_start = int(current["start"])
+        self._cur = int(current["nbytes"])
+        for shard in self._shards:
+            path = os.path.join(self.out_dir, shard["file"])
+            if os.path.getsize(path) != shard["nbytes"]:
+                raise ValueError(f"completed FTW shard size changed: {path}")
+        if self._shard_idx >= 0:
+            path = os.path.join(self.out_dir, _SHARD_FMT.format(self._shard_idx))
+            if not os.path.exists(path) or os.path.getsize(path) < self._cur:
+                raise ValueError(f"incomplete FTW shard is shorter than its checkpoint: {path}")
+            f = open(path, "r+b")
+            f.truncate(self._cur)
+            f.seek(self._cur)
+            self._f = f
 
     def _roll(self) -> None:
         if self._f is not None:
@@ -154,6 +251,7 @@ class FTWWriter:
         self._shard_start = self._global
         self._cur = 0
         self._f = open(os.path.join(self.out_dir, _SHARD_FMT.format(self._shard_idx)), "wb")
+        self._save_progress()
 
     def _close_shard(self) -> None:
         """Commit one shard and release its clean pages from the host page cache.
@@ -207,6 +305,7 @@ class FTWWriter:
         pad = _align_up(self._global) - self._global
         if pad:
             self._write_raw(memoryview(bytes(pad)))
+        self._save_progress()
 
     def finalize(self, meta: dict) -> dict:
         if self._f is not None:
@@ -221,6 +320,9 @@ class FTWWriter:
         with open(tmp, "w") as f:
             json.dump(index, f)
         os.replace(tmp, os.path.join(self.out_dir, INDEX_NAME))
+        progress = self._progress_path()
+        if os.path.exists(progress):
+            os.unlink(progress)
         return index
 
 

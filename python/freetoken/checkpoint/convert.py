@@ -140,9 +140,10 @@ class _ConvertSink:
                 self._bar = byte_bar(0, self._desc)  # total unknown up front (streamed)
             nbytes = 0
             for bank_name, bank in banks.items():
-                self._writer.add_tensor(
-                    layer_bank_entry_name(self._names.get(bank_name, bank_name), layer_id), bank.tensor, kind="experts_bank"
-                )
+                entry_name = layer_bank_entry_name(self._names.get(bank_name, bank_name), layer_id)
+                self._writer.validate_tensor(entry_name, bank.tensor)
+                if self._writer.tensor_entry(entry_name) is None:
+                    self._writer.add_tensor(entry_name, bank.tensor, kind="experts_bank")
                 nbytes += bank.nbytes
                 bank.release()
                 self.n_written += 1
@@ -184,6 +185,15 @@ def convert_checkpoint(
 
     if is_ftw_checkpoint(model_path):
         raise SystemExit(f"{model_path} is already an FTW checkpoint")
+    existing_index = os.path.join(out_dir, "freetoken_weight.json")
+    if os.path.isfile(existing_index):
+        import json
+
+        with open(existing_index) as f:
+            index = json.load(f)
+        if os.path.abspath(index.get("source_model_path", "")) != os.path.abspath(model_path):
+            raise ValueError(f"FTW output already belongs to another source model: {out_dir}")
+        return index
     tp = try_get_tp_info()
     if tp is None:
         set_tp_info(rank=0, size=1)
@@ -213,7 +223,15 @@ def convert_checkpoint(
     from freetoken.utils.progress import byte_bar, count_bar
 
     writer = FTWWriter(out_dir, shard_limit=shard_limit)
-    n_weight = n_bank = n_alpha = 0
+    n_weight = writer.count_kind("weight")
+    n_bank = sum(
+        entry["kind"] == "experts_bank" and entry["name"] not in ("gate_up_alpha", "down_alpha")
+        for entry in writer.entries
+    )
+    n_alpha = sum(
+        entry["kind"] == "experts_bank" and entry["name"] in ("gate_up_alpha", "down_alpha")
+        for entry in writer.entries
+    )
 
     # 1) dense weights (host tensors; load straight to CPU to avoid GPU pressure)
     _progress("dense", 0, 0)  # phase start; per-tensor cumulative bytes follow (total unknown)
@@ -221,8 +239,10 @@ def convert_checkpoint(
     for name, tensor in count_bar(load_weight(model_path, torch.device("cpu"),
                                               include_moe_experts=include_moe_experts),
                                   "Converting dense weights"):
-        writer.add_tensor(name, tensor, kind="weight")
-        n_weight += 1
+        writer.validate_tensor(name, tensor)
+        if writer.tensor_entry(name) is None:
+            writer.add_tensor(name, tensor, kind="weight")
+            n_weight += 1
         dense_bytes += tensor.numel() * tensor.element_size()
         _progress("dense", dense_bytes, 0)
 
@@ -263,8 +283,10 @@ def convert_checkpoint(
             for an in ("gate_up_alpha", "down_alpha"):
                 alpha = getattr(banks, an, None)
                 if alpha is not None:
-                    writer.add_tensor(an, alpha, kind="experts_bank")
-                    n_alpha += 1
+                    writer.validate_tensor(an, alpha)
+                    if writer.tensor_entry(an) is None:
+                        writer.add_tensor(an, alpha, kind="experts_bank")
+                        n_alpha += 1
         else:
             # The on-disk format keeps one contiguous region per bank and the writer only
             # has whole-tensor add_tensor, so the per-layer sources reassemble into one
@@ -285,7 +307,9 @@ def convert_checkpoint(
             done_bytes = 0
             _progress("experts", 0, total_bytes)
             for name, tensor in items:
-                writer.add_tensor(name, tensor, kind="experts_bank")
+                writer.validate_tensor(name, tensor)
+                if writer.tensor_entry(name) is None:
+                    writer.add_tensor(name, tensor, kind="experts_bank")
                 nbytes = tensor.numel() * tensor.element_size()
                 bar.update(nbytes)
                 done_bytes += nbytes

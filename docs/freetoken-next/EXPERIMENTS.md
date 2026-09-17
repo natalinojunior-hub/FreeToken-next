@@ -499,3 +499,17 @@ dense weights and PLE side files). The process terminated before writing
 `freetoken_weight.json`, so the directory is not a usable checkpoint and no serving or
 NVMe-speed claim is made. The partial artifact and log remain under
 `/models/desenvolvimento/tmp/ftnext/` for forensic inspection only.
+
+## EXP-018 — FTW conversion restart point
+**Date:** 2026-09-17 · **Verdict:** **IMPLEMENTED / UNIT-VALIDATED**
+
+`FTWWriter` now commits an atomic `.freetoken_weight.progress.json` after every tensor.
+On restart it validates every completed shard, checks committed tensor metadata,
+truncates only the active shard back to its durable boundary, and reuses existing
+entries. The converter skips already committed dense tensors and per-layer expert-bank
+entries; a completed `freetoken_weight.json` is treated as idempotent.
+
+Coverage: `tests/checkpoint/test_ftw_weights.py` resumes after injected bytes in the
+active shard and replays both tensors; the checkpoint suite passes **19 passed, 6
+skipped**. A full Flash-Next end-to-end conversion remains pending because the earlier
+host supervisor terminated the long-running process at the final source shard.
