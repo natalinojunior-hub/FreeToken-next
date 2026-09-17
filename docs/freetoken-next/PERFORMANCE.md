@@ -138,3 +138,22 @@ MTP state, KV type, cache config, build, profiler state. Discovery uses 4K/16K/3
 128K/256K are promotion-stage, 512K/1M are certification-stage (2–3 runs, report
 mean/variation). Gates: KEEP ≥10 % reproducible end-to-end or a required capability;
 LOW_GAIN_SURVIVOR 2–10 % (kept, never discarded); REJECT ≤2 %/noise/incorrect.
+
+## 6. Certification matrix — the final no-regression gate (D-012)
+
+`python benchmarks/cert_matrix.py --contexts 4096,16384,32768` (add 128K/256K at
+certification). Guards are declared in the script and must stay in step with §3. Native rows
+must clear their guard; GGUF rows are reported as a percentage of the **same-architecture
+native row**; an unservable row reports BLOCKED with its blocker rather than vanishing.
+
+| pair | native row | GGUF row(s) | guard / current state |
+|---|---|---|---|
+| `qwen35moe` | `/models/Qwen3.6-35B-A3B-NVFP4-FT` | `Ornith-1.5-35B-A3B-APEX-MTP-I-Compact.gguf`, `Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf` | PP ≥ 4600 / TG ≥ 158. **Both GGUF rows BLOCKED**: expert banks mix Q3_K ×30 + Q4_K ×10 (and IQ4_XS UD) against a single-stride slot pool → needs the exact-geometry pool (Phase 7) |
+| `qwen4exp` | `/models/Qwen3.8-Flash-Next-NVFP4-Radix` | `…-Unsloth-IQ4_XS/UD-IQ4_XS` (3 shards) + its `MTP/` sidecars, `…-AD-4.27…-Q4_K_M-M64` (33 shards) | PP ≥ 1850 / TG ≥ 28.5 at `--memory-ratio 0.86`. **GGUF rows BLOCKED** on shard joining, a `qwen4exp` GGUF adapter, and mapping `per_layer_token_embd` (IQ4_NL / Q5_1, ~45 GiB) onto the PLE table |
+| `qwen35` dense | **none on this host** | `Qwen3.8-27B-GSQ-RCO-IQ3_S-MTP-Q4XS-Q3S.gguf` | no parity reference — the script prints that explicitly; close it with a native FP8/NVFP4 Qwen3.8-27B or a same-weights GGUF conversion. Dense has no expert banks, so only the I-quant prefill path (dequant + plain matmul) is under test here |
+| KV format A/B | the same native row | `--kv-cache-dtype bf16 / fp8 / nvfp4 / turbo3 / turbo4 / tcq / vbr` | every format measured at 16K **and** 32K against its own BF16 row; an unmeasured TG cost blocks the merge (Kai's −33 % dense @30K is the precedent this rule exists for) |
+| MTP | native row, speculation off | same row, `n_max` = 1 / 2 / 3 | effective TG is the metric; draft latency, verify latency, accepted tokens, rejection and rollback cost reported separately |
+
+Parity is throughput and capacity, not output identity (D-013): these GGUF files carry
+different weights or a different quant recipe than their native counterpart, so
+token-for-token equality requires a same-weights pair.

@@ -123,4 +123,29 @@ solved, keeps K+1 GDN states resident (~250 MB at K=3), spends a KV layer, and m
 expert traffic. So Phase 9 reads it and #69, implements against the §5 ledger rather than
 copying the graph-side bookkeeping.
 
+## D-012 — Final validation is a matrix over native `-FT`/NVFP4 and same-arch GGUF
+**Date:** 2026-09-17 · **Status:** accepted (user requirement)
+After every phase a build is shippable only if `benchmarks/cert_matrix.py` passes:
+1. **no regression** on the native FreeToken-compatible checkpoints — every native row must
+   clear its guard at 16K (35B-A3B ≥ 4600 PP / ≥ 158 TG; Flash-Next ≥ 1850 PP / ≥ 28.5 TG at
+   `--memory-ratio 0.86`);
+2. **native-vs-GGUF parity** — each GGUF row is reported as a percentage of the
+   same-architecture native row at equal context, so a GGUF path cannot hide behind "no
+   baseline";
+3. a row whose checkpoint the current code cannot serve reports **BLOCKED naming the
+   blocker**, never silently absent.
+**Why:** "loads GGUF" is not the gate; the GGUF path has to be measured against the NVFP4
+path on the same architecture, and the only way to keep both true across thirteen phases is
+one declared matrix that fails the build.
+
+## D-013 — Parity is throughput/capacity, not output identity
+**Date:** 2026-09-17 · **Status:** accepted
+The local GGUF files are not the same weights as their native counterparts (Ornith and
+Tiel-Coder are fine-tunes on the Qwen3.6-35B-A3B geometry; the Unsloth/AD Flash builds are
+different quant recipes; dense `qwen35` has no native counterpart on this host at all). The
+matrix therefore compares PP, TG, TTFT, ITL, VRAM and RSS at equal context plus a qualitative
+sanity generation — **not** token-for-token equality. Equality needs a same-weights pair
+(convert a native checkpoint to GGUF and back, or fetch official Qwen3.8-27B native), which
+is recorded as a matrix gap, not silently dropped.
+
 

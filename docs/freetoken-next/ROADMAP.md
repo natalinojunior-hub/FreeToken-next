@@ -21,6 +21,8 @@ CORRECTNESS → 16K/32K A/B → KEEP/REVERT → NEXT.
 | 14 | Phase 8 D2D expert reuse | pending | H2D bytes avoided vs sync cost, on/off A/B |
 | 15 | Adaptive MTP + context governor UX (`--context 262144|auto`) | pending | no magic flags required |
 | 16 | 128K/256K certification, then 512K/1M feasibility (memory physics first) | pending | 2–3 runs each, mean/variation reported |
+| 17 | **Certification matrix green** (`benchmarks/cert_matrix.py`) | declared (D-012) | every native `-FT`/NVFP4 row clears its guard **and** every same-arch GGUF row reports parity vs that row; BLOCKED rows must name a blocker that is then fixed, never deleted |
+| 18 | Close the matrix gaps | pending | per-layer expert geometry (unblocks Ornith + Tiel-Coder), shard joining + `qwen4exp` GGUF adapter + PLE-table mapping (unblocks both Flash GGUFs), a native dense `qwen35` counterpart for the 27B GGUF row, and a native-vs-KV-format A/B table |
 
 Regression anchors that gate every row (measured on this tree, PERFORMANCE.md §3):
 35B-A3B **PP ≥ 4600 / TG ≥ 158**; Flash-Next **PP ≥ 1850 / TG ≥ 28.5** at `--memory-ratio 0.86`.
