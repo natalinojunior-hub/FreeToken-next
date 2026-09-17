@@ -678,6 +678,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-reserve-context",
+        action="store_true",
+        default=ServerArgs.kv_reserve_context,
+        help=(
+            "Treat the serving context as a requirement rather than a floor: fund"
+            " --max-seq-len-override (or the model's own context) in KV first and size the"
+            " expert cache from what the VRAM ledger has left, refusing to start if even a"
+            " minimal expert cache would not fit. Buys long context out of the expert cache"
+            " without hand-computing --kv-reserve-tokens."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],

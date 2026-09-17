@@ -710,6 +710,52 @@ class VramLedger:
             ),
         )
 
+    def plan_for_context(
+        self,
+        tokens: int,
+        *,
+        cache_per_page: int,
+        page_tokens: int,
+        per_expert_bytes: int,
+        num_experts: int,
+        total_experts: int,
+        prefill_overlap: bool,
+        fixed_cache_bytes: int = 0,
+        max_slots: int | None = None,
+        contexts: tuple[int, ...] = CERTIFICATION_CONTEXTS,
+    ) -> MemoryPlan:
+        """Split the budget with ``tokens`` of serving context treated as a requirement.
+
+        The ordinary :meth:`decide` is MoE-priority: experts fill first and KV gets the
+        residue, which is why the auto plan could not reach the anchor's own 16K without
+        ``--num-tokens``. This inverts the priority for an operator who has asked for a
+        specific reach -- the context is funded, the expert cache is sized from what is left,
+        and if the floor of a working cache (one or two full expert layers, per
+        ``plan_cache_budget``) does not fit, it says so with the byte shortfall instead of
+        starting a server that cannot hold its own prompt.
+        """
+        budget = self.pool_budget_bytes(fixed_cache_bytes)
+        floor = num_experts * (2 if prefill_overlap else 1)
+        demand = context_demand(
+            budget, cache_per_page, page_tokens, per_expert_bytes, tokens,
+            expert_floor=floor, expert_ceiling=total_experts,
+        )
+        if not demand.feasible:
+            raise ValueError(
+                f"{tokens} tokens of context is not affordable on this account: its KV needs "
+                f"{demand.kv_bytes / _GIB:.3f} GiB of the {budget / _GIB:.3f} GiB pool budget, "
+                f"leaving {demand.expert_slots} expert slots against the {floor} a working "
+                f"offload cache needs. Either serve a shorter context, shrink --max-running-req "
+                f"and the graph set, or use a compressed KV format."
+            )
+        return self.decide(
+            cache_per_page=cache_per_page, page_tokens=page_tokens,
+            per_expert_bytes=per_expert_bytes, num_experts=num_experts,
+            total_experts=total_experts, prefill_overlap=prefill_overlap,
+            kv_reserve_tokens=tokens, fixed_cache_bytes=fixed_cache_bytes,
+            max_slots=max_slots, contexts=contexts,
+        )
+
     def kv_room_bytes(self, extra_fixed_bytes: int = 0) -> int:
         """What is left for the KV pool once the expert cache has taken its share.
 

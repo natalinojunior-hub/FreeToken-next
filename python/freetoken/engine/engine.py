@@ -785,17 +785,25 @@ class Engine:
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
-        plan = self.vram_ledger.decide(
+        geometry = dict(
             cache_per_page=cache_per_page,
             page_tokens=page_tokens,
             per_expert_bytes=expert_bytes_per_slot(banks.sources),
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
-            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
             fixed_cache_bytes=fixed_cache_size,
             max_slots=method.slot_limit() if method is not None else None,
         )
+        if config.kv_reserve_context:
+            # --kv-reserve-context: the serving context is a requirement, not a floor, so the
+            # plan funds max_seq_len of KV and sizes the expert cache from the residue (and
+            # refuses outright when that leaves less than a working cache).
+            plan = self.vram_ledger.plan_for_context(config.max_seq_len, **geometry)
+        else:
+            plan = self.vram_ledger.decide(
+                kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve), **geometry
+            )
         self.memory_plan = plan
         logger.info_rank0(plan.report())
         return plan.moe_cache_size, plan.num_pages, plan.prefill_overlap

@@ -296,6 +296,28 @@ def test_context_demand_says_no_when_no_expert_cache_survives():
     assert "not fundable" in demand.describe()
 
 
+def test_plan_for_context_inverts_the_priority_and_refuses_the_unaffordable():
+    ledger = _ledger(baseline=16 * _GIB, ratio=1.0, weights=4 * _GIB)
+    geometry = dict(
+        cache_per_page=2 * _MIB, page_tokens=64, per_expert_bytes=2 * _MIB,
+        num_experts=64, total_experts=4096, prefill_overlap=True,
+    )
+    greedy = ledger.decide(kv_reserve_tokens=4096, **geometry)
+    bought = ledger.plan_for_context(131072, **geometry)
+    # Same account, same geometry: asking for the context moves the money, it does not create
+    # any -- KV gains what the expert cache pays for it.
+    assert bought.usable_tokens >= 131072
+    assert bought.moe_cache_size < greedy.moe_cache_size
+    assert bought.expert_bytes < greedy.expert_bytes
+    assert required_bytes(bought.moe_cache_size, bought.num_pages, 2 * _MIB, 2 * _MIB) <= (
+        bought.pool_budget_bytes)
+    assert bought.demands[0].kv_bytes == (131072 // 64 + 1) * 2 * _MIB
+    # 1M of KV needs 32 GiB against this budget: refused in bytes, naming the expert floor that
+    # made it impossible rather than starting a server that cannot hold its own prompt.
+    with pytest.raises(ValueError, match="not affordable"):
+        ledger.plan_for_context(1024 * 1024, **geometry)
+
+
 def test_auto_plan_shrinks_only_once_the_reserve_beats_the_ratio_cap():
     # Modelled on a 16 GiB card holding an 8 GiB dense slice: 4 MiB per KV page, 2 MiB per
     # expert slot, and a 8192-token KV floor that is 128 pages at page_size 64.

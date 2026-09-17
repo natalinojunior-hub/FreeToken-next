@@ -339,6 +339,9 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         memory_ratio = 0.9
         moe_prefill_overlap = True
         kv_reserve_tokens = 0
+        kv_reserve_context = False
+        max_seq_len_override = None
+        max_seq_len = 2048  # what --kv-reserve-context would have to fund
         swa_full_tokens_ratio = 0.2
         swa_num_pages_override = None
         model_config = StubModelConfig()
@@ -392,6 +395,76 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
 
     size, _, _ = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks(), StubMethod())
     assert size == 5
+
+
+def test_kv_reserve_context_funds_the_context_before_experts():
+    # The engine hands the decision to the ledger; what has to be true afterwards is that the
+    # plan it returns can actually hold the context the operator asked for, and that a context
+    # the account cannot fund is refused in bytes rather than crashing later.
+    import torch
+
+    from freetoken.engine.engine import Engine
+    from freetoken.engine.vram_ledger import Kind, VramLedger
+    from freetoken.kvcache.mha_pool import MHAKVCache
+    from freetoken.models.config import KVCacheGroupSpec
+
+    class Cfg:
+        dtype = torch.float16
+        page_size = 16
+        hybrid_swa_cache_mode = "auto"
+        memory_ratio = 1.0
+        moe_prefill_overlap = False
+        kv_reserve_tokens = 0
+        kv_reserve_context = True
+        max_seq_len = 2048  # 128 pages at page_size 16
+        swa_full_tokens_ratio = 0.2
+        swa_num_pages_override = None
+
+        class model_config:
+            has_swa_attention = False
+            num_experts = 4
+            num_moe_layers = 2
+
+            @staticmethod
+            def kv_cache_group_specs():
+                return [KVCacheGroupSpec(
+                    name="full", layer_ids=(0, 1, 2), num_kv_heads=8, head_dim=64,
+                    sliding_window=None,
+                )]
+
+            @staticmethod
+            def linear_attention_group():
+                return None
+
+        class tp_info:
+            size = 1
+
+    class Banks:
+        sources = {
+            "gate_up": [torch.zeros(4, 32, 8, dtype=torch.float16)] * 2,
+            "down": [torch.zeros(4, 8, 16, dtype=torch.float16)] * 2,
+        }
+
+    def build():
+        engine = Engine.__new__(Engine)
+        engine._baseline_free = 64_000_000
+        engine._weights_bytes = 1_000_000
+        engine._pool_cls = MHAKVCache
+        engine.vram_ledger = VramLedger(
+            device_total_bytes=70_000_000, baseline_free=64_000_000, memory_ratio=1.0,
+        )
+        engine.vram_ledger.charge("weights:model", 1_000_000, Kind.IMMUTABLE)
+        return engine
+
+    engine = build()
+    _, pages, _ = engine._resolve_auto_moe_cache_size(Cfg(), Banks())
+    assert pages * Cfg.page_size >= Cfg.max_seq_len
+    assert engine.memory_plan.usable_tokens >= Cfg.max_seq_len
+
+    greedy = Cfg()
+    object.__setattr__(greedy, "max_seq_len", 9_000_000)
+    with pytest.raises(ValueError, match="not affordable"):
+        build()._resolve_auto_moe_cache_size(greedy, Banks())
 
 
 # ---------------------------------------------------------------------------
