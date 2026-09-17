@@ -127,7 +127,12 @@ class ParallelLMHead(VocabParallelEmbedding):
         batch = ctx.batch
         bs = batch.size
         if batch.is_prefill:
-            indices = batch.attn_metadata.get_last_indices(bs)
+            # A spec-decode verify step wants one logit row per drafted position, not just
+            # each request's last row (get_last_indices' usual prefill contract).
+            spec_indices = getattr(batch, "spec_logits_indices", None)
+            indices = (
+                spec_indices if spec_indices is not None else batch.attn_metadata.get_last_indices(bs)
+            )
             x = x[indices].contiguous()
             del indices
 

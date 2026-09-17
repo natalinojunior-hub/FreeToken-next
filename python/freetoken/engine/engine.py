@@ -1251,10 +1251,18 @@ class Engine:
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
 
-        for req in batch.reqs:
-            req.complete_one()
-
-        batch_logits = logits[: batch.size]
+        # A spec-decode verify step owns its own cached_len/device_len bookkeeping (it may
+        # reject part of the window), and wants one logit row per drafted position instead
+        # of one row per request.
+        if batch.spec_logits_indices is None:
+            for req in batch.reqs:
+                req.complete_one()
+            batch_logits = logits[: batch.size]
+        else:
+            # ParallelLMHead already selected exactly these rows via spec_logits_indices;
+            # `logits` is not padded to a per-request layout here, unlike the decode/prefill
+            # case `logits[: batch.size]` truncates.
+            batch_logits = logits
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()

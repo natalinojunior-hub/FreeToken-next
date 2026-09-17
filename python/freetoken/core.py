@@ -154,6 +154,10 @@ class Batch:
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+    # Row indices into this forward's flat logits, one per request, for a spec-decode verify
+    # step whose extend_len > 1 makes the usual "last row of each request" derivation wrong.
+    # None (the default) keeps every existing prefill/decode path byte-identical.
+    spec_logits_indices: torch.Tensor | None = field(default=None, init=False)
 
     @property
     def is_prefill(self) -> bool:
