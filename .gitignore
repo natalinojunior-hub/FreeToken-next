@@ -227,3 +227,6 @@ benchmarks/cross_framework
 
 # local e2e/bench artifacts (harnesses may run with repo cwd)
 /results/
+
+# Qwen Code session state (settings, scratch, subagent transcripts) is local to the machine
+.qwen/

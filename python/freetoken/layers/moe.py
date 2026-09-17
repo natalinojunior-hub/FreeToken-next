@@ -432,7 +432,26 @@ class OffloadMoELayer(MoELayer):
             return fused_experts_gguf_q4_0(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
-        raise AssertionError(f"offload experts without a quant method only serve q4_0 banks, got {fmt!r}")
+        if fmt == "gguf":
+            # Same MMVQ grouped GEMV as q4_0, but the two banks carry whatever ggml types
+            # the checkpoint chose, one type per bank for the whole model. Published mixes
+            # violate that (Ornith APEX: gate_up Q3_K x30 + Q4_K x10; Tiel-Coder UD:
+            # down Q6_K x3 + IQ4_XS x37), which is why _gguf_banks refuses them at load --
+            # see ModelConfig.gguf_expert_types for the single-stride slot pool.
+            from freetoken.moe.fused_q4_0 import fused_experts_gguf
+
+            gate_up, down = views
+            types = cache.gguf_expert_types
+            assert types is not None, (
+                "quant_format 'gguf' requires gguf_expert_types on the offload cache "
+                "(set from ModelConfig.gguf_expert_types at cache construction)"
+            )
+            t_gate_up, t_down = types
+            return fused_experts_gguf(
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation,
+                quant_type=t_gate_up, down_quant_type=t_down,
+            )
+        raise AssertionError(f"offload experts without a quant method only serve q4_0/gguf banks, got {fmt!r}")
 
 
 def make_moe_layer(

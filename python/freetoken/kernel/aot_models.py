@@ -145,7 +145,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=768,
         expert_formats=("bf16",),
         aliases=("Qwen/Qwen3-30B-A3B-Thinking-2507",),
-        arch_aliases=("Qwen3VLMoeForConditionalGeneration",),  # Qwen3-VL-30B-A3B: same text tower
+        arch_aliases=("Qwen3VLMoeForConditionalGeneration", "Qwen3MoeGGUFForCausalLM"),  # Qwen3-VL-30B-A3B: same text tower; GGUF native-quant variant
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B",
@@ -155,7 +155,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=8,
         moe_intermediate_size=512,
         expert_formats=("bf16",),
-        arch_aliases=("Qwen3_5MoeForCausalLM",),  # text-only release of the same tower
+        arch_aliases=("Qwen3_5MoeForCausalLM", "Qwen35MoeGGUFForCausalLM"),  # text-only release + GGUF native-quant variant of the same tower
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B-FP8",
@@ -331,6 +331,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=2048,
         expert_formats=("ds_fp4",),
         embed_indexing=False,  # plain nn.Embedding
+        arch_aliases=("DeepseekV4GGUFForCausalLM",),  # GGUF native-quant variant
     ),
     # ---- dense checkpoints (store/index only, no expert banks) ----
     AotModel(
@@ -339,7 +340,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         hidden_size=5120,
         kv_groups=((4, 256),),
         aliases=("Qwen/Qwen3.6-27B-FP8", "nvidia/Qwen3.6-27B-NVFP4"),
-        arch_aliases=("Qwen3_5ForCausalLM",),  # text-only release of the same tower
+        arch_aliases=("Qwen3_5ForCausalLM", "Qwen35GGUFForCausalLM"),  # text-only release + GGUF native-quant variant of the same tower
     ),
     AotModel(
         name="google/gemma-4-12B-it",

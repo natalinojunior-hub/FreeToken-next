@@ -78,10 +78,21 @@ audits in ARCHITECTURE.md and EXPERIMENTS.md.
 
 ## 4. Imported / adapted code
 
-**Status: none yet.** No code has been copied out of `llama-turbo-optimal`, FreeToken-Kai,
-or any fork into this tree as of this writing. Every future import gets a row here with:
-origin repo URL, commit SHA, PR/issue if any, files touched, the local modification
-summary, and the license of the origin.
+Every import gets a row here: origin repo, commit/PR, files touched, local modifications,
+origin license.
+
+### 4.1 Native GGUF, from upstream PR #131
+
+| Field | Value |
+|---|---|
+| Origin | `https://github.com/FlashML-org/FreeToken`, PR **#131** `feat/generic-gguf`, head **`bb432e8`**, merge-base **`bd372b6`**, Apache-2.0 (same license as this tree) |
+| Method | **not a merge** — `git merge refs/pr/131` conflicts on 7 files because the PR predates upstream `#418`/`#427`. 22 files verbatim, 8 auto-merged clean, **7 files / 10 hunks hand-resolved**; +5981 / −223 over 41 files |
+| Local modifications | re-authored against HEAD: `moe/expert_banks.py` (provider fitted to `ExpertBanks(kind, kernel, layout)`; `_dsfp4_banks` and `_model_setup_override` dropped as dead on HEAD), `engine/engine.py` (kept `_resolve_auto_moe_cache_size(config, banks, method)` and the `PinFailed` block; only `gguf_expert_types` threaded in), `layers/moe.py` (`"gguf"` branch inserted before HEAD's assertion tail), `moe/cpu_executor.py` (7 `--moe-backend` strings → `--moe-strategy`), the two `models/*/__init__.py` export unions minus three names HEAD deleted from `.weight`, `docs/models.md` resectioned |
+| Added, not in the PR | `engine/config.py` `hasattr` guard — HEAD's `model_config` writes encoder sections onto a **frozen** `GgufConfigShim`, so `FrozenInstanceError` killed *every* GGUF load (this was the real blocker); `models/register.py` class-name corrections (`Qwen3_5MoeForCausalLM` spelling, dense → `Qwen3_5ForCausalLM`); `kernel/aot_models.py` `arch_aliases` for the four new GGUF arches; `models/gguf/__init__.py::warn_dropped_tensors` so a `nextn.*`/`mtp.*` drop is logged, never silent |
+| Built | `python setup.py build_ext --inplace` for `_cpu_moe` — a stale `.so` **segfaults** on the new `q4_k`/`q6_k` weight-format ids (the extension probes activation ids but not `weight_format`; recorded hazard) |
+| Not verified | end-to-end MoE GGUF serving (every local MoE GGUF mixes expert types per layer, so the guard refuses them — exercised only by the guard plus the PR's unit tests); `qwen4exp` GGUF (no adapter; only shard + metadata parsing proven on both local sets); DeepSeek-V4 / Gemma-4 / qwen3moe GGUF (registered, unit-tested, no checkpoint here) |
+| Measured | first real load `/models/Qwen3.8-27B-GSQ-RCO-IQ3_S-MTP-Q4XS-Q3S.gguf`: 64 layers of IQ3_S/IQ4_XS/IQ3_XXS/Q4_K/Q2_K/IQ2_S/IQ2_XXS/IQ1_M + IQ2_S embedding + untied Q4_K head, 1270 tensors mapped / **0 unmapped**, VRAM 15 370 027 008 B, coherent correct generated text (EXPERIMENTS.md EXP-004) |
+| Deliberately kept | the single-stride `NotImplementedError` for per-layer-mixed expert banks (fail-closed, message names the `--pure` remedy), `_require_tp1`, and GGUF's exclusion from the `QuantKind` registry (`models/register.py`, `engine/engine.py:772` FIXME) |
 
 Upstream FreeToken commits that this tree already contains (part of the `v0.1.3` base,
 listed here because later phases build on them):
