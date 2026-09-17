@@ -511,5 +511,8 @@ entries; a completed `freetoken_weight.json` is treated as idempotent.
 
 Coverage: `tests/checkpoint/test_ftw_weights.py` resumes after injected bytes in the
 active shard and replays both tensors; the checkpoint suite passes **19 passed, 6
-skipped**. A full Flash-Next end-to-end conversion remains pending because the earlier
-host supervisor terminated the long-running process at the final source shard.
+skipped**. In the native Flash-Next run, the first interruption left **1,409** committed
+entries through layer 46; the next invocation validated and skipped those entries before
+reaching the final source shards. The host supervisor then sent **SIGTERM (143)** before
+the last layer, but the manifest remained valid and reusable; a full serving artifact is
+still pending.
