@@ -50,6 +50,8 @@ CUDA kernels are JIT-compiled with `nvcc` on first use unless the prebuilt `free
 
 Put a new test in the `tests/` directory that mirrors the module it protects, and extend an existing file before creating a new one. Bug fixes come with a test that fails before and passes after. Performance changes come with A/B numbers against `main`.
 
+**Never use RAM as storage, under any circumstance.** `/tmp` on this host is a 46 GiB tmpfs (RAM-backed): anything written there competes with the model's own host-resident memory (offload expert banks, PLE tables) and can starve or OOM-kill a serving process that has nothing to do with what filled `/tmp`. `/models` has 1.3+ TB free on real disk. Always set `TMPDIR` to a path under `/models` (e.g. `/models/desenvolvimento/tmp`) for anything that writes temp files: `ft checkpoint`/`ft serve`, `pytest --basetemp=...`, build/JIT caches, scratch downloads. Before any large model run, check `free -h` and `du -sh /tmp/*` for leftover tmpfs usage from earlier sessions -- it does not free itself and is real RAM pressure, not disk usage.
+
 ## Issues and PRs
 
 - Search existing issues and PRs before starting. Items on the [Roadmap](https://github.com/FlashML-org/FreeToken/issues/79) are discussed with maintainers before implementation; features not on it start as an issue.

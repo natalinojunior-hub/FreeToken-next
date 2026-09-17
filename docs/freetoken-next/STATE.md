@@ -94,5 +94,11 @@ cd /models/desenvolvimento/freetoken-next
 ```
 
 Environment gotchas: `UV_CACHE_DIR` must be writable (`/models/desenvolvimento/.uvcache`; the
-configured default is root-owned). `/tmp` is a 46 GiB tmpfs that competes with host banks —
-set `TMPDIR=/models/desenvolvimento/tmp` for big-model runs. There is no swap.
+configured default is root-owned). Never use RAM as storage, under any circumstance: `/tmp` is
+a 46 GiB tmpfs that competes with host banks (offload expert banks, PLE tables) and can starve
+or OOM-kill a serving process that has nothing to do with what filled it — this bit an actual
+`--spec-mtp` validation run (earlyoom killed the worker at ~150/192 experts while 21 GiB of
+stale files from unrelated past sessions sat in `/tmp`, 2026-09-17). `/models` has 1.3+ TB free
+on real disk; always set `TMPDIR=/models/desenvolvimento/tmp` (checkpoint, serve, pytest
+`--basetemp`, any scratch download) and check `free -h` / `du -sh /tmp/*` before a large run.
+There is no swap.
