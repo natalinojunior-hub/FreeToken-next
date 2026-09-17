@@ -480,3 +480,22 @@ emitted. Focused config and model-skeleton tests pass **29/29**.
 The loader now also exposes `iter_mtp_weights()`, which yields the native `mtp.*` namespace,
 including the packed MTP expert tensors, without adding them to the target state dict. This is a
 reader seam only: no draft module consumes it yet. The qwen4_exp weight suite passes **31/31**.
+
+## EXP-017 — FTW streaming conversion reduces RSS but did not produce a valid artifact
+**Date:** 2026-09-17 · **Verdict:** **PARTIAL / INCONCLUSIVE**
+
+The existing FTW converter was tested as the bounded-NVMe hypothesis. Command:
+
+```text
+PYTHONPATH=python .venv/bin/python -u -m freetoken.cli checkpoint \
+  --model /models/Qwen3.8-Flash-Next-NVFP4-Radix \
+  --out /models/desenvolvimento/tmp/ftnext/Qwen3.8-Flash-Next-NVFP4-Radix-FTW \
+  --moe-backend offload --quant-backend moe.nvfp4=triton --shard-gib 8
+```
+
+The layer sink streamed and released banks while writing; observed converter RSS was about
+**2.7 GiB**, and the output reached **191/192** expert input shards (about 121 GiB including
+dense weights and PLE side files). The process terminated before writing
+`freetoken_weight.json`, so the directory is not a usable checkpoint and no serving or
+NVMe-speed claim is made. The partial artifact and log remain under
+`/models/desenvolvimento/tmp/ftnext/` for forensic inspection only.
