@@ -232,6 +232,9 @@ def iter_weights(
                     yield name, tensor
                 else:
                     yield from fused
+        # Conversion immediately follows this pass with a large expert-bank read; do not keep
+        # dense checkpoint shards in the page cache while the bank source is being repacked.
+        drop_page_cache(file)
 
     assert not fuser.buf, f"Incomplete projection fusions: {sorted(k[0] + k[1] for k in fuser.buf)}"
 
@@ -308,6 +311,7 @@ def ftw_side_files(model_path: str, out_dir: str) -> list[str]:
 
     The table is served from safetensors files in the checkpoint dir (see load_ple_table), not from FTW entries."""
     from safetensors.torch import save_file
+    from freetoken.models.loader import drop_page_cache
 
     folder = download_hf_weight(model_path)
     written: list[str] = []
@@ -318,7 +322,11 @@ def ftw_side_files(model_path: str, out_dir: str) -> list[str]:
         nonlocal batch, size
         if batch:
             name = f"ple-table-{len(written):05d}.safetensors"
-            save_file(batch, os.path.join(out_dir, name))
+            target = os.path.join(out_dir, name)
+            save_file(batch, target)
+            # The PLE side files are several GiB each and are read again only when serving;
+            # keeping their freshly-written pages competes with the streamed expert source.
+            drop_page_cache(target)
             written.append(name)
             batch, size = {}, 0
 
@@ -332,6 +340,7 @@ def ftw_side_files(model_path: str, out_dir: str) -> list[str]:
                 size += t.numel() * t.element_size()
                 if size >= _PLE_FILE_BYTES:
                     flush()
+        drop_page_cache(path)
     flush()
     return written
 
