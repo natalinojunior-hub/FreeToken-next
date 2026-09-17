@@ -76,6 +76,30 @@ Suite against this tree: 3 failed / 1809 passed / 206 skipped — missing
 export union, and `test_nvfp4_backends::test_b12x_decode_matches_dequant_reference` which
 must first be shown to be a regression rather than flashinfer JIT flake.
 
+## EXP-004 — First native GGUF served correctly (phase 2, gate met)
+**Date:** 2026-09-17 · **Verdict:** **KEEP / PASS** (required capability)
+`.venv/bin/ft serve --model /models/Qwen3.8-27B-GSQ-RCO-IQ3_S-MTP-Q4XS-Q3S.gguf
+--max-running-requests 1 --memory-ratio 0.8 --num-tokens 4096 --max-seq-len-override 4300
+--max-prefill-length 1024 --cuda-graph-max-bs 0 --cache-type naive`
+`ft ctl generate "Q: Why is a KV cache needed during autoregressive decoding? A:"
+--max-tokens 48` → *"Because each new token must attend to all previous tokens, and
+recomputing their representations from scratch at every step would be prohibitively
+expensive. The KV cache stores the key and value projections of all previously generated
+tokens, so that at step…"* — coherent **and** factually right, so the IQ3_S / IQ4_XS / Q4_K /
+Q2_S packed tables are being read by the real kernels, not merely mapped.
+Capacity shape that made it work (EXP-003's failure mode, fixed by configuration not code):
+eager decode (`--cuda-graph-max-bs 0`) removes graph capture, and the 1024-token chunk cuts
+the GDN transient ~8x. Two side observations: the same tree also answered a 1001-token
+`/v1/completions` with HTTP 200, and `models/gguf/reader.py:264` raises a NumPy
+"not writable" UserWarning on the mmap path (harmless today, worth a `np.ascontiguousarray`
+or `flags.writeable` decision rather than a suppressed warning).
+Still owed before this is committable: `kernel/aot_models.py` entries for the new GGUF
+architectures, the `models/*/__init__.py` export union, `kernel/gguf.py::_module` load order
+(the bundled `libcudart.so.13` wins the soname race and shadows torch's runtime — proven
+pre-existing at HEAD, not a port regression), and the K-quant CPU path must refuse at
+*registration* instead of registering `weight_format=q8_0` and raising `unknown
+weight_format` at call time.
+
 ## EXP-002 — GGUF / MTP / TurboQuant corpus and source audits
 **Date:** 2026-09-16 · **Verdict:** INFORMATIONAL (complete; reports archived in
 `audits/A1…A6`, conclusions in ARCHITECTURE.md §2–§6)
