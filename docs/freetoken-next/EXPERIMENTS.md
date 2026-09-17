@@ -473,8 +473,9 @@ claimed; logs are `/models/desenvolvimento/tmp/ftnext/flash_load_detached_3.log`
 
 `Qwen4ExpArgs` now carries the checkpoint's `text_config.mtp` metadata, accepts the released
 one-layer hybrid shape, and rejects `num_hidden_layers > 1` until the runtime supports it.
-The parser remains runtime-neutral: no `mtp.*` tensors are loaded, no draft model is built,
-and no speculative token is emitted. Focused config and model-skeleton tests pass **29/29**.
+The main target loader remains runtime-neutral: the new reader can enumerate `mtp.*`, but no
+draft module consumes those tensors, no draft model is built, and no speculative token is
+emitted. Focused config and model-skeleton tests pass **29/29**.
 
 The loader now also exposes `iter_mtp_weights()`, which yields the native `mtp.*` namespace,
 including the packed MTP expert tensors, without adding them to the target state dict. This is a
