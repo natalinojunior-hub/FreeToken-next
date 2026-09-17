@@ -219,38 +219,48 @@ def test_decide_splits_the_budget_and_prices_the_context_targets():
     ledger.charge("cache:gdn-state", 1 * _GIB, Kind.PERSISTENT)
     plan = ledger.decide(
         cache_per_page=4 * _MIB, page_tokens=64, per_expert_bytes=2 * _MIB,
-        num_experts=64, total_experts=2560, prefill_overlap=True, kv_reserve_tokens=4096,
+        num_experts=64, total_experts=64, prefill_overlap=False, kv_reserve_tokens=4096,
         fixed_cache_bytes=256 * _MIB, contexts=(16384, 131072, 1048576),
     )
     assert plan.pool_budget_bytes == ledger.pool_budget_bytes(256 * _MIB)
+    assert plan.expert_bytes == plan.moe_cache_size * 2 * _MIB
+    assert plan.kv_budget_bytes == plan.pool_budget_bytes - plan.expert_bytes
     assert plan.usable_tokens == plan.num_pages * plan.page_tokens
     assert required_bytes(plan.moe_cache_size, plan.num_pages, 2 * _MIB, 4 * _MIB) <= (
         plan.pool_budget_bytes)
     rows = {c.tokens: c for c in plan.contexts}
-    # 16K fits inside what the plan just spent on KV; a megabyte-scale context cannot, and the
-    # plan says by how much -- that shortfall is the number the RAM-tier decision is made from.
-    assert rows[16384].fits and rows[16384].kv_bytes <= plan.pool_budget_bytes
+    # A context has to fit in what the split LEFT, not in the whole pool budget: the expert
+    # cache is not optional on a MoE model, it is where decode throughput lives. 16K costs
+    # (256 + 1 dummy) x 4 MiB; 128K costs 8 GiB, which is more than the account has.
+    assert rows[16384].kv_bytes == 257 * 4 * _MIB
+    assert rows[16384].fits and rows[16384].kv_bytes <= plan.kv_budget_bytes
+    assert not rows[131072].fits
     assert not rows[1048576].fits
     assert rows[1048576].shortfall_bytes == (
-        rows[1048576].kv_bytes - plan.pool_budget_bytes)
+        rows[1048576].kv_bytes - plan.kv_budget_bytes)
     assert rows[131072].pages == 131072 // 64  # page_tokens 64, exact division
     text = plan.report()
     assert "128K" in text and "1M" in text and "expert slots" in text
+    assert "left for KV" in text
+    # kv_room_bytes is the same quantity read off a charged account instead of a plan.
+    ledger.charge("cache:expert", plan.expert_bytes, Kind.PERSISTENT)
+    assert ledger.kv_room_bytes(256 * _MIB) == plan.kv_budget_bytes
 
 
 def test_a_compressed_kv_format_is_the_only_thing_that_makes_long_context_fit():
-    # The economic gate for Phase 11, stated as arithmetic: halving cache_per_page halves the
-    # KV bytes per context token, and the plan must flip 128K from infeasible to feasible on
-    # geometry alone -- no tiering, no new allocation.
+    # The economic gate for Phase 11 and Phase 3, stated as arithmetic: at 8 MiB a 4-bit page
+    # 128K needs more than the card has, and the same context at 2 MiB fits -- without
+    # tiering, without paging, and without touching the expert cache. This is why the plan
+    # prints the rows: the answer is known before the money is spent.
     ledger = _ledger(baseline=16 * _GIB, ratio=1.0, weights=9 * _GIB)
     kwargs = dict(page_tokens=64, per_expert_bytes=2 * _MIB, num_experts=64,
-                  total_experts=2560, prefill_overlap=False, kv_reserve_tokens=0,
+                  total_experts=64, prefill_overlap=False, kv_reserve_tokens=0,
                   contexts=(131072,))
     bf16 = ledger.decide(cache_per_page=8 * _MIB, **kwargs)
     compressed = ledger.decide(cache_per_page=2 * _MIB, **kwargs)
     assert not bf16.contexts[0].fits
     assert compressed.contexts[0].fits
-    assert compressed.moe_cache_size >= bf16.moe_cache_size  # the freed bytes go somewhere
+    assert compressed.moe_cache_size == bf16.moe_cache_size  # the KV half changed, not experts
 
 
 def test_auto_plan_shrinks_only_once_the_reserve_beats_the_ratio_cap():

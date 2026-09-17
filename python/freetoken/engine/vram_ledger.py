@@ -384,7 +384,18 @@ class MemoryPlan:
     page_tokens: int
     cache_per_page: int
     usable_tokens: int
+    expert_bytes: int
     contexts: tuple[ContextFeasibility, ...]
+
+    @property
+    def kv_budget_bytes(self) -> int:
+        """What the split left for KV -- the number a context length has to fit in.
+
+        Feasibility priced against ``pool_budget_bytes`` would be a lie on a MoE model: the
+        expert cache is not optional, it is what makes decode fast here, and it has already
+        taken its share of the same money.
+        """
+        return max(0, self.pool_budget_bytes - self.expert_bytes)
 
     def feasible_at(self, tokens: int) -> ContextFeasibility | None:
         return next((c for c in self.contexts if c.tokens == tokens), None)
@@ -396,22 +407,23 @@ class MemoryPlan:
     def report(self) -> str:
         lines = [
             f"memory plan: pool budget {self.pool_budget_bytes / _GIB:.3f} GiB -> "
-            f"{self.moe_cache_size} expert slots + {self.num_pages} usable KV pages "
-            f"({self.usable_tokens} tokens at {self.page_tokens}/page), "
-            f"prefill_overlap={self.prefill_overlap}"
+            f"{self.moe_cache_size} expert slots ({self.expert_bytes / _GIB:.3f} GiB) + "
+            f"{self.num_pages} usable KV pages ({self.usable_tokens} tokens at "
+            f"{self.page_tokens}/page) of the {self.kv_budget_bytes / _GIB:.3f} GiB left for "
+            f"KV, prefill_overlap={self.prefill_overlap}"
         ]
         for c in self.contexts:
             if c.fits:
                 lines.append(
                     f"  {self._label(c.tokens)}: fits -- {c.pages} pages = "
                     f"{c.kv_bytes / _GIB:.3f} GiB of "
-                    f"{self.pool_budget_bytes / _GIB:.3f} GiB"
+                    f"{self.kv_budget_bytes / _GIB:.3f} GiB left for KV"
                 )
             else:
                 lines.append(
                     f"  {self._label(c.tokens)}: needs {c.kv_bytes / _GIB:.3f} GiB "
-                    f"(+{c.shortfall_bytes / _GIB:.3f} GiB over the budget) -> compressed KV "
-                    f"or a RAM tier"
+                    f"(+{c.shortfall_bytes / _GIB:.3f} GiB over what the plan left for KV) -> "
+                    f"compressed KV, a smaller expert cache, or a RAM tier"
                 )
         return "\n".join(lines)
 
@@ -611,10 +623,27 @@ class VramLedger:
             page_tokens=page_tokens,
             cache_per_page=cache_per_page,
             usable_tokens=num_pages * page_tokens,
+            expert_bytes=moe_cache_size * per_expert_bytes,
             contexts=tuple(
-                context_feasibility(budget, cache_per_page, page_tokens, tokens)
+                context_feasibility(
+                    max(0, budget - moe_cache_size * per_expert_bytes),
+                    cache_per_page, page_tokens, tokens,
+                )
                 for tokens in contexts
             ),
+        )
+
+    def kv_room_bytes(self, extra_fixed_bytes: int = 0) -> int:
+        """What is left for the KV pool once the expert cache has taken its share.
+
+        ``pool_budget_bytes`` is the money the two negotiable consumers split; by the time the
+        account is printed the expert side has already been sized (and its side tables are a
+        non-negotiable committed line), so a context-feasibility answer built on the whole
+        budget would quietly double-spend it.
+        """
+        return max(
+            0,
+            self.pool_budget_bytes(extra_fixed_bytes) - self.bytes_of("cache:expert"),
         )
 
     def headroom_bytes(self) -> int:

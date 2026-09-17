@@ -28,8 +28,8 @@ from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from .cache_budget import ceiling_bytes, pool_pages
 from .vram_ledger import (
-    CALIBRATION_TOLERANCE, Kind, modelled_reserves, open_ledger, page_table_bytes,
-    tensor_breakdown, tensor_bytes,
+    CALIBRATION_TOLERANCE, CERTIFICATION_CONTEXTS, Kind, context_feasibility,
+    modelled_reserves, open_ledger, page_table_bytes, tensor_breakdown, tensor_bytes,
 )
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
@@ -713,6 +713,7 @@ class Engine:
         ledger.charge("measured:allocator-held", held, Kind.MEASURED,
                       "what the allocator holds; the account must explain it")
         ledger.log()
+        self._log_context_feasibility(self.config, ledger)
         unexplained = held - ledger.held_bytes()
         if unexplained > CALIBRATION_TOLERANCE:
             logger.warning_rank0(
@@ -726,6 +727,35 @@ class Engine:
                 f"VRAM ledger over-modelled the account by {mem_GB(-unexplained)}: the pools it "
                 "priced are smaller than the account claimed, so context is being left unspent."
             )
+
+    def _log_context_feasibility(self, config: EngineConfig, ledger) -> None:
+        """Print, for every engine, what the account leaves for each context target.
+
+        Dense and MoE models take different paths to a pool size (only the MoE auto plan calls
+        ``ledger.decide``), but the question "can this card hold 128K / 256K / 1M of this
+        model's KV at this format" is the same for both and is the number the long-context and
+        RAM-tier decisions are made from -- so it is asked the same way here, from the pool
+        family's own per-page cost and whatever the ceiling still allows.
+        """
+        try:
+            cache_per_page, fixed, page_tokens, _ = self._pool_cls.kv_cost(config)
+        except Exception:  # a family that cannot price itself before allocation has no say
+            return
+        budget = ledger.kv_room_bytes(fixed)
+        rows = [
+            context_feasibility(budget, cache_per_page, page_tokens, tokens)
+            for tokens in CERTIFICATION_CONTEXTS
+        ]
+        logger.info_rank0(
+            "KV context feasibility ("
+            + f"{cache_per_page / (1 << 20):.2f} MiB per {page_tokens}-token page, "
+            f"{mem_GB(budget)} GiB left for KV after the expert cache): "
+            + ", ".join(
+                f"{row.tokens // 1024}K "
+                + ("fits" if row.fits else f"+{mem_GB(row.shortfall_bytes)} short")
+                for row in rows
+            )
+        )
 
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks, method=None) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto by asking the ledger to split what it owns.
