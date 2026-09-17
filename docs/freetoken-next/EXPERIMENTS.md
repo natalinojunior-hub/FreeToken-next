@@ -271,6 +271,39 @@ What it means:
    the quantified reason Phase 3 (turbo4 at 4.125 bpv) is on the critical path rather than
    optional: at 4x compression the same 128K costs 0.77 GiB and the expert cache survives.
 
+## EXP-011 — The MoE GGUFs are refused today, with the blocker named (Phase 6/7 target list)
+**Date:** 2026-09-17 · **Verdict:** **BLOCKED, blocker identified** (not a regression; a target)
+Question: which of the local GGUF MoE checkpoints can `freetoken-next` actually load today? The
+subagent audit (A7 §7) claimed all four refuse on mixed expert geometry; claims that a mixed
+bank "decodes silently wrong" or that `expert_bytes_per_slot` misses a dimension did not survive
+the source (`gguf_experts.py:118-122` raises, and a slot is exactly one layer-expert row), so
+this was settled on the host instead of on paper.
+Method: `ft serve --model <gguf> --max-running-requests 1 --memory-ratio 0.9 --num-tokens 4096
+--max-seq-len-override 4300 --cuda-graph-max-bs 0 --max-prefill-length 1024`, read the refusal.
+Result, verbatim:
+
+- `Ornith-1.5-35B-A3B-APEX-MTP-I-Compact.gguf` → `NotImplementedError: GGUF expert bank
+  'gate_up' mixes ggml types across layers ({'Q3_K': [5..34], 'Q4_K': [0..4, 35..39]})`, after
+  the message's own reason: one slot pool, one stride, `moe_vec.cuh` addressing rows as
+  `expert * nrows * (ncols / qk)` with no padding allowance.
+- `Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf` → same guard on `down`:
+  `{'Q6_K': [34, 38, 39], 'IQ4_XS': [0..33, 35..37]}`.
+Both fail closed, in the loader, before any GPU allocation -- so there is no silent corruption
+to fix, only a capability to add. The dense `Qwen3.8-27B` IQ3_S file serves and benchmarks
+(EXP-010/PERFORMANCE.md §9), and `qwen36-35b-a3b-dflash-Q4_K_M.gguf` is the one MoE bank layout
+that passes the guard because it is uniform.
+What Phase 6 therefore actually needs, in order: (1) expert slot pools keyed by
+(bank, ggml type, row geometry) rather than by bank, because a mixed bank is two allocations by
+construction; (2) GPU row readers for `Q4_K`, `Q3_K`, `IQ4_XS` and `Q2_S` as used by this corpus,
+which the audit's §8 table shows are **not** llama.cpp's layouts at llama.cpp's ids (the ids here
+are a renumbered fork: 10-16 and 23 with their own byte counts, and `tokenizer.ggml.quant_layout
+= "unsloth-v1"` in the file metadata says so); (3) the per-role split, since
+`gguf_expert_types` records one type per layer for the fused `gate_up` bank and
+`gguf_expert_specs:123` then prices both halves with the gate's row bytes. (1) alone serves
+nothing: a mixed bank whose second type has no reader still cannot execute.
+**Consequence for the matrix:** these are recorded as BLOCKED rows that name their blocker, which
+D-012 requires, and they are not counted as regressions.
+
 ## EXP-002 — GGUF / MTP / TurboQuant corpus and source audits
 **Date:** 2026-09-16 · **Verdict:** INFORMATIONAL (complete; reports archived in
 `audits/A1…A6`, conclusions in ARCHITECTURE.md §2–§6)
