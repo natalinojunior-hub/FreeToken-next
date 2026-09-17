@@ -103,12 +103,26 @@ turbo types are **runtime-only KV codecs, never GGUF tensors** → irrelevant to
 `qwen4exp` targets (3 and 33 shards, 87–88 GiB, `per_layer_token_embd.weight [160, 3.2e8]`
 IQ4_NL/Q5_1 ≈ 45 GiB) which also need shard joining + PLE-table mapping.
 
-**Increments**: I1 widen type tables + `models/qwen3_5_moe/gguf.py` (GDN `ssm_*`/`attn_qkv`/
-`attn_gate` + full-attn + `ffn_*_exps` → host banks) so the Ornith file serves and produces
-sane tokens; I2 GGML Q4_K/Q6_K/Q8_0 expert-bank schemas (`_BANK_SCHEMAS`,
-`expert_banks.py:175 _PROVIDERS`); I3 shard joining; I4 qwen4exp + `per_layer_token_embd`
-→ PLE table; I5 prefill kernels for IQ types. Skip `mtp.*`/`nextn.*` with a logged warning
-in every adapter until §6 lands.
+**Increments**: I1 = upstream **PR #131** ported onto this base (`refs/pr/131`; 21 ggml types,
+GGUF expert banks, K-quant CPU kernels, qwen35moe/qwen3moe/deepseek_v4 adapters, shard
+joining, its own tests) — it merges with 7 conflicts because it predates `#418`/`#427`, so the
+leaf files are adopted and those seams re-authored (D-009). I2 = per-layer expert geometry in
+the slot pool (`_BANK_SCHEMAS`, `expert_banks.py:175 _PROVIDERS`), which is what actually
+unblocks the two local MoE GGUF files: `Ornith-…-APEX-MTP-I-Compact.gguf` mixes Q3_K ×30 +
+Q4_K ×10 and `Tiel-Coder-…-UD-IQ4_XS.gguf` is unsloth-dynamic, both against one stride — I1
+alone correctly refuses them. I3 = `qwen4exp` adapter + `per_layer_token_embd` → PLE table
+(needed by both sharded Flash builds). I4 = prefill kernels for the IQ types (MMQ has no IQ
+case, so I-quant prefill dequantizes today). `mtp.*`/`nextn.*` stay dropped with a logged
+warning in every adapter until §6 lands.
+
+**Discover, never assume, the per-role type** — upstream #494's pattern (`refs/pr/494`,
+`merge-tree` clean): `_gguf_quant_layout(model_path, num_layers, num_experts)` reads the
+*tensor table* only (no payloads) into a per-role, per-layer map, raises when a role disagrees
+across layers, and the result rides `ModelConfig.gguf_quant_types` into the layer and bank
+constructors, which take **independent gate_up / down types** and pad the slot stride while
+preserving packed bytes; dispatch splits `_STANDARD_AND_K` (MMVQ+MMQ) from `_IQ` (MMVQ +
+dequant fallback). `row_bytes()` stays the single source for packed sizes. This is the shape
+I2 must keep.
 
 ## 4. Turbo3 / Turbo4 / TCQ / VBR KV (Phases 3–4)
 
@@ -184,6 +198,32 @@ measured, because the LTO data says materialize costs 13–15 % TG;
 (e) TCQ only after turbo3/turbo4 are end-to-end green (LTO's own conclusion: "TCQ's extra
 compression is not a net win here" at 3.25 vs 3.5 bpv — 33.64 vs 39.29 TG).
 Preserve BF16/FP8(+#408 NVFP4) and A/B them all with `--kv-cache-dtype`.
+
+**Four rules #354/#408 already paid for — the port inherits them, it does not relitigate them**
+(A6 §1d, §1f, §1h):
+1. **Codes live in a plain `uint8` buffer on every architecture, and the fp8/fp4 type never
+   appears in a kernel signature *or* a pointer.** Two independent routes failed on real
+   hardware: the compile-time probe (`e4m3_native_cx()`) answers independently from the host
+   that allocated the buffer and disagreed on sm_100, and branching on a pointer's element
+   type is *not* statically pruned — Triton type-checks the dead arm and dies at CUDA-graph
+   capture (`cannot cast int32 to fp8e4nv`). What remains is a straight-line software decode.
+   Turbo3/Turbo4 are naturally on the same side of this (their payload is `qs` bytes + one
+   `ggml_half` norm), and TCQ's 9-bit window decode is straight-line too.
+2. **Quantize and scatter fuse into one launch** with `out_loc` kept a device tensor, so
+   capture never sees a host sync.
+3. `unit_bytes()` **must equal** what `kv_cost()` priced, in every pool family, after
+   `rebuild()` too — that invariant is what makes the §5 ledger honest, and #408 pins it with
+   tests (`test_unit_bytes_matches_the_cost_model_that_sized_the_pool`,
+   `test_rebuild_resizes_codes_and_scales_together`, `test_kv_codec_has_no_arch_or_dtype_branch`).
+4. Every new code width needs its row size registered in `kernel/aot_models.py`
+   (`aggregate_store_element_sizes()`), or the `FREETOKEN_DISABLE_JIT=1` release gate fails —
+   which is the cheapest possible enforcement that a new KV format cannot silently fall back.
+
+Two further caveats recorded there: #408's own docs state *"capacity savings do not guarantee
+faster decode"*, and its 76 B-vs-256 B figure is **per K row and per V row separately**, not a
+token figure; and #113 (closed, DSV4-only) collides on the same `--kv-cache-dtype` option
+string while doing the exact thing rule 1 forbids — read it for `_validate_kv_cache_dtype`
+and the stamp-before-pool-exists ordering, don't merge it.
 
 **Determinism oracles to port** (A2 §7): `vbr_transcode_anchor_test` LCG pattern
 (`r = i*1103515245+12345; (r&0xFFFF)/32768-1`) with byte-identical A→A and in-place-vs-copies

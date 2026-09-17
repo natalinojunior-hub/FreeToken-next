@@ -16,7 +16,8 @@ audits that decide its design are in flight.
 | Test suite green | done | `pytest tests -m "not slow"` → **1746 passed, 206 skipped, 1 failed**, and that one (`kernels/test_mrope.py`) is a flashinfer JIT first-build race — re-run alone: **6 passed** |
 | Baseline reproduces anchors | **PASS on both models** | 35B-A3B @16K: PP 4611 / TG 158.8 / VRAM 14.98 GiB / 99.8 % util; Flash-Next @16K: PP 1857.7 / TG 28.685 / VRAM 14.86 GiB / RSS 67.82 GiB / 99.99 % util (PERFORMANCE.md §3, EXPERIMENTS.md EXP-001/001b) |
 | Source audits (6, parallel) | **done** | `docs/freetoken-next/audits/A1…A6.md`; conclusions merged into ARCHITECTURE.md §2–§6 |
-| Phase 2 GGUF loader | not started; design done | ARCHITECTURE.md §3 — increment I1 is a `qwen3_5_moe` GGUF adapter + widened Python type tables, target `/models/Ornith-1.5-35B-A3B-APEX-MTP-I-Compact.gguf` |
+| Phase 2 GGUF loader | **port in flight, uncommitted** | ARCHITECTURE.md §3: I1 = upstream PR #131 ported onto this base (7 seams re-authored, D-009); its first servable target is the dense `qwen35` 27B GGUF, because the two local MoE GGUFs mix expert types per layer and stay BLOCKED until the exact-geometry pool (I2) |
+| Final gate declared | done | `benchmarks/cert_matrix.py` (D-012, PERFORMANCE.md §6): native `-FT` rows must clear their guard and every same-arch GGUF row reports parity against them |
 
 ## Findings that already changed the plan
 
