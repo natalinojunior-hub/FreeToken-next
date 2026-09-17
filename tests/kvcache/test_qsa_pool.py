@@ -185,6 +185,16 @@ def test_kv_cost_prices_ring_and_scratch_as_fixed():
     assert fixed == 4 * row * (QSAKVCache.ring_capacity_for(4) + 1)
 
 
+def test_kv_cost_widens_the_ring_for_spec_mtp():
+    spec = _spec()
+    config = _config(spec, max_running_req=3)
+    config.spec_mtp = 2
+    _, fixed_spec, _, _ = QSAKVCache.kv_cost(config)
+    row = 32 * 4 * 2
+    assert fixed_spec == 4 * row * (QSAKVCache.ring_capacity_for(4, 2) + 1)
+    assert QSAKVCache.ring_capacity_for(4, 2) > QSAKVCache.ring_capacity_for(4, 0)
+
+
 def test_unit_bytes_matches_the_cost_model():
     spec = _spec()
     config = _config(spec)
