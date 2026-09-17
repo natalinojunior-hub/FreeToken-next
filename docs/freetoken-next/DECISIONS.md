@@ -192,4 +192,29 @@ model whose expert cache has already eaten the whole budget. Pricing the same ro
 the split leaves is the difference between a plan and a fantasy, and it is the number the
 compressed-KV phases have to beat.
 
+## D-016 — No per-token RAM paging: decode re-reads the whole context, and PCIe says no
+**Date:** 2026-09-17 · **Status:** accepted (economic gate computed before any paging work)
+The Phase-11 gate asked for arithmetic before implementation, so here it is, from the KV bytes
+the ledger reports on this host and the measured 57.76 GB/s host link (PERFORMANCE.md §2).
+Attention is a full scan, so a RAM tier that holds part of the live context is re-read **once
+per generated token**, not once per request:
+
+| model | BF16 KV/token | 128K one step | 1M one step | 1M ceiling | 1M at turbo4 (4.125 bpv) |
+|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B | 20.24 KiB | 47 ms | 376 ms | **2.66 tok/s** | 5.22 GiB, 10.3 tok/s |
+| Qwen3.8-Flash-Next (paged part) | 24.86 KiB | 58 ms | 462 ms | **2.16 tok/s** | 6.41 GiB, 8.4 tok/s |
+
+At 30 tok/s the whole link buys 1.8 GiB of fetchable KV per step -- under 93 000 tokens of
+either model's BF16 context -- so every tiered configuration that keeps 128K or more of live
+context in RAM is physically guaranteed to destroy TG, which is the outcome the gate exists to
+prevent. Decision: **do not build per-token hot/warm page migration.** RAM keeps the roles it
+already earns -- the pinned expert banks, the PLE table, the host radix metadata -- and gains
+exactly one new one: streaming a *cold* prefix in once, at prefill speed, where the PCIe cost is
+paid per prompt instead of per token. Long context is bought the other two ways the ledger
+prices: compressed KV (4x turns the 35B-A3B's 1M from 20.24 GiB into 5.22 GiB, which fits VRAM
+outright and removes the fetch entirely) and, inside VRAM, the expert cache (D-015).
+**Why:** the arithmetic is not close -- 2.2-2.7 tok/s against a 28.7-158.5 tok/s baseline -- and
+a paging subsystem built on that premise would have cost the phases that actually deliver
+context (3-5, 12) their remaining budget.
+
 
