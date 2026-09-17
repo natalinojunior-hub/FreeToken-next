@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.turbo_attn import turbo_k_tile, turbo_v_tile
+
 
 _MAX_KV_SPLITS = 8
 _MIN_BLOCK_KV = 32
@@ -193,6 +195,13 @@ def _decode_grouped_stage1_kernel(
     stride_lse_b,
     stride_lse_h,
     stride_lse_s,
+    kn_ptr,
+    vn_ptr,
+    cent_ptr,
+    stride_knt,
+    stride_knh,
+    stride_vnt,
+    stride_vnh,
     GROUP: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -204,6 +213,8 @@ def _decode_grouped_stage1_kernel(
     D: tl.constexpr,
     DV: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
+    COMPRESSED: tl.constexpr = False,
+    BOOK3: tl.constexpr = False,
 ):
     batch_id = tl.program_id(0)
     head_block_id = tl.program_id(1)
@@ -249,7 +260,8 @@ def _decode_grouped_stage1_kernel(
 
     if split_end > split_start:
         q = tl.load(q_ptr + q_offsets, mask=mask_h[:, None] & mask_d[None, :], other=0.0)
-        q = q.to(k_ptr.dtype.element_ty)
+        if not COMPRESSED:
+            q = q.to(k_ptr.dtype.element_ty)
 
         for rel_start in tl.range(split_start, split_end, BLOCK_N):
             rel_offs = rel_start + tl.arange(0, BLOCK_N)
@@ -257,19 +269,33 @@ def _decode_grouped_stage1_kernel(
             logical_offs = effective_start + rel_offs
             slots = tl.load(indices_ptr + kv_start + logical_offs, mask=mask_n, other=0)
 
-            k = tl.load(
-                k_ptr + slots[None, :] * stride_ks + k_base_offsets,
-                mask=mask_n[None, :] & mask_d[:, None],
-                other=0.0,
-            )
+            if COMPRESSED:
+                # offs_d is in range (the pool only takes head_dim a multiple of 128, so
+                # BLOCK_D == D here); the tile helper derives the packed byte offsets itself.
+                k = turbo_k_tile(
+                    k_ptr, kn_ptr, cent_ptr, slots, kv_head, stride_ks, stride_kh,
+                    stride_knt, stride_knh, offs_d, mask_n, BOOK3, q.dtype,
+                )
+            else:
+                k = tl.load(
+                    k_ptr + slots[None, :] * stride_ks + k_base_offsets,
+                    mask=mask_n[None, :] & mask_d[:, None],
+                    other=0.0,
+                )
             scores = tl.dot(q, k) * sm_scale
             scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
 
-            v = tl.load(
-                v_ptr + slots[:, None] * stride_vs + v_base_offsets,
-                mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
-            )
+            if COMPRESSED:
+                v = turbo_v_tile(
+                    v_ptr, vn_ptr, cent_ptr, slots, kv_head, stride_vs, stride_vh,
+                    stride_vnt, stride_vnh, offs_dv, mask_n, BOOK3, q.dtype,
+                )
+            else:
+                v = tl.load(
+                    v_ptr + slots[:, None] * stride_vs + v_base_offsets,
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
 
             m_new = tl.maximum(tl.max(scores, axis=1), m_i)
             alpha = tl.exp(m_i - m_new)
@@ -389,8 +415,14 @@ def decode_paged_attention(
     sliding_window: int | None = None,
     sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    turbo: dict | None = None,
 ) -> torch.Tensor:
-    """SGLang-style split-k grouped decode attention for one query per request."""
+    """SGLang-style split-k grouped decode attention for one query per request.
+
+    ``turbo`` switches the KV tiles to the coded slabs: pass the *code* tensors as ``k_cache`` /
+    ``v_cache`` and ``{"k_norm", "v_norm", "cent", "book3"}`` alongside. Q must already be rotated
+    and the result comes back rotated (see ``kernel/triton/turbo_attn.py``).
+    """
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
@@ -398,7 +430,8 @@ def decode_paged_attention(
     num_kv_heads = k_cache.shape[1]
     assert batch == indptr.numel() - 1
     assert v_cache.shape[1] == num_kv_heads
-    assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
+    if turbo is None:
+        assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
     assert num_q_heads % num_kv_heads == 0
     assert attn_logits.shape[0] >= batch
     assert attn_logits.shape[1] >= num_q_heads
@@ -415,6 +448,10 @@ def decode_paged_attention(
 
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
+    compressed = turbo is not None
+    kn_ptr = turbo["k_norm"] if compressed else k_cache
+    vn_ptr = turbo["v_norm"] if compressed else v_cache
+    cent_ptr = turbo["cent"] if compressed else k_cache
     group = num_q_heads // num_kv_heads
     # valid_block_h = heads computed per program (drives the grid + head indexing); block_h =
     # power-of-two tile size for tl.arange. They differ only for non-power-of-two GQA groups
@@ -449,6 +486,13 @@ def decode_paged_attention(
         attn_lse.stride(0),
         attn_lse.stride(1),
         attn_lse.stride(2),
+        kn_ptr,
+        vn_ptr,
+        cent_ptr,
+        kn_ptr.stride(0),
+        kn_ptr.stride(1),
+        vn_ptr.stride(0),
+        vn_ptr.stride(1),
         GROUP=group,
         NUM_Q_HEADS=num_q_heads,
         BLOCK_D=block_d,
@@ -460,6 +504,8 @@ def decode_paged_attention(
         D=head_dim,
         DV=head_dim,
         SLIDING_WINDOW=sliding_window or 0,
+        COMPRESSED=compressed,
+        BOOK3=bool(turbo["book3"]) if compressed else False,
         num_warps=4,
         num_stages=2,
     )
