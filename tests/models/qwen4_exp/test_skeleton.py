@@ -44,6 +44,102 @@ def _group_norm(x, weight, eps, groups):
     return (xf.flatten(-2) * (1.0 + weight.float())).type_as(x)
 
 
+def _mtp_config():
+    from freetoken.models.config import with_mtp_layer
+
+    cfg = parse_config(toy_hf_config(mtp={
+        "num_hidden_layers": 1, "hybrid": True, "layer_types": ["full_attention"],
+    }))
+    return with_mtp_layer(cfg, cfg.num_layers)
+
+
+@requires_cuda
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mtp_construction_and_forward_contract(monkeypatch, enabled):
+    from freetoken.models.qwen4_exp import model as mod
+
+    class DecoderStub(BaseOP):
+        def __init__(self, config, layer_id, *, prefix):
+            self.ple = None
+            self._layer_id = layer_id
+            self._prefix = prefix
+            self._is_linear = config.is_linear_layer(layer_id)
+
+        def forward(self, hidden, batch):
+            return hidden + 0.125
+
+    monkeypatch.setattr(mod, "Qwen4ExpDecoderLayer", DecoderStub)
+    device = torch.device("cuda")
+    cfg = _mtp_config() if enabled else _config()
+    with torch.device(device):
+        model = mod.Qwen4ExpForCausalLM(cfg)
+    _fill(model, torch.Generator(device=device).manual_seed(171))
+    ids = torch.tensor([2, 3, 4], device=device)
+    batch = SimpleNamespace(mm_embeds=None)
+    hidden = model.model.forward(ids, batch)
+    target_residual = model.model.embed_tokens.forward(ids).repeat(1, cfg.qwen4_args.hc_count) + 0.125 * cfg.num_layers
+    torch.testing.assert_close(hidden, model.model.hyper_connection_mixer.mix(target_residual)[0])
+    if not enabled:
+        assert model.mtp is None and model.model._last_residual is None
+        assert not any(name.startswith("mtp.") for name in model.state_dict())
+        return
+
+    head = model.mtp
+    torch.testing.assert_close(model.model._last_residual, target_residual)
+    assert head._embed_ref is model.model.embed_tokens
+    assert head.layers.op_list[0]._layer_id == cfg.num_layers
+    assert head.layers.op_list[0]._prefix == "mtp.layers.0"
+    assert not head.layers.op_list[0]._is_linear
+    keys = model.state_dict()
+    assert "mtp.pre_fc_norm_hidden.weight" in keys
+    assert "mtp.fc_hidden.weight" in keys
+    assert "mtp.hyper_connection_mixer.hc_norm.weight" in keys
+    assert not any(name.startswith("mtp.embed") or "_last_residual" in name for name in keys)
+    residual = torch.randn(
+        3, cfg.hidden_size * head.hc_count, device=device,
+        generator=torch.Generator(device=device).manual_seed(172),
+    )
+    norm_r = _group_norm(residual, head.pre_fc_norm_hidden.weight, cfg.rms_norm_eps, head.hc_count)
+    projected_r = F.linear(norm_r.unflatten(-1, (head.hc_count, cfg.hidden_size)), head.fc_hidden.weight).flatten(-2)
+    embedded = F.embedding(ids, model.model.embed_tokens.weight)
+    norm_e = _group_norm(embedded, head.pre_fc_norm_embedding.weight, cfg.rms_norm_eps, 1)
+    expected = projected_r + F.linear(norm_e, head.fc_embedding.weight).repeat(1, head.hc_count) + 0.125
+    result = head.forward(residual, ids, batch)
+    torch.testing.assert_close(result, expected)
+    torch.testing.assert_close(head.to_head(result), head.hyper_connection_mixer.mix(expected)[0])
+
+
+def test_mtp_quantization_uses_target_experts_and_draft_dense_prefixes():
+    from dataclasses import replace
+
+    from freetoken.layers.quantization import LayerKind, NoQuantConfig
+    from freetoken.models.qwen4_exp.model import _MTPQuantConfig
+
+    class RecordingQuant(NoQuantConfig):
+        def get_quant_method(self, layer, prefix):
+            return prefix
+
+    cfg = replace(_mtp_config(), quant=RecordingQuant())
+    quant = _MTPQuantConfig(cfg)
+    assert quant.get_quant_method(SimpleNamespace(quant_layer_kind=LayerKind.MOE), "mtp.layers.0.mlp.experts") == "model.layers.0.mlp.experts"
+    assert quant.get_quant_method(SimpleNamespace(quant_layer_kind=LayerKind.LINEAR), "mtp.fc_hidden") == "mtp.fc_hidden"
+
+
+@pytest.mark.parametrize("changes", [
+    {"enabled": False}, {"hybrid": False}, {"layer_types": ("linear_attention",)},
+    {"use_hidden_state_from_layer": 0}, {"rope_theta": 42.0},
+])
+def test_mtp_rejects_unsupported_checkpoint_geometry(changes):
+    from dataclasses import replace
+
+    from freetoken.models.qwen4_exp.model import Qwen4ExpMTP
+
+    cfg = _mtp_config()
+    cfg = replace(cfg, qwen4_args=replace(cfg.qwen4_args, mtp=replace(cfg.qwen4_args.mtp, **changes)))
+    with pytest.raises(ValueError, match="Qwen4 MTP"):
+        Qwen4ExpMTP(cfg, cfg.num_layers, embedding=BaseOP())
+
+
 # --------------------------------------------------------------------------------------
 # hyper-connections
 # --------------------------------------------------------------------------------------

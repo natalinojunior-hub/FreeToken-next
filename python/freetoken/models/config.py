@@ -356,6 +356,8 @@ class ModelConfig:
     # n-gram embedding geometry and the QSA indexer scoring geometry the model module
     # needs. Opaque to model-agnostic engine code; None for every other model.
     qwen4_args: Any | None = None
+    # Opt-in draft-head layer; target depth and routed-bank count stay unchanged.
+    mtp_layer_id: int | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
@@ -530,3 +532,35 @@ class ModelConfig:
             for group in self.kv_cache_group_specs()
             if group.num_layers > 0
         ]
+
+
+def with_mtp_layer(config: ModelConfig, layer_id: int) -> ModelConfig:
+    """Register the draft head's KV/index slab without extending the target stack.
+
+    The caller must separately load the draft weights and append its expert bank before
+    executing the head. This helper does not enable speculative execution.
+    """
+    from dataclasses import replace
+
+    if layer_id != config.num_layers:
+        raise ValueError("the MTP layer must immediately follow the target decoder stack")
+    if config.mtp_layer_id not in (None, layer_id):
+        raise ValueError("a different MTP layer is already registered")
+    groups = config.attention_groups or (config.default_full_attention_group(),)
+    full = [g for g in groups if isinstance(g, FullAttentionGroupConfig)]
+    if len(full) != 1:
+        raise ValueError("MTP requires exactly one full-attention group")
+    if any(layer_id in g.layer_ids for g in groups if g is not full[0]):
+        raise ValueError("the MTP layer already belongs to another attention group")
+    group = full[0]
+    ids = tuple(group.layer_ids)
+    if layer_id not in ids:
+        ids += (layer_id,)
+    fields = {"layer_ids": ids}
+    if group.num_index_layers:
+        fields["num_index_layers"] = len(ids)
+    return replace(
+        config,
+        attention_groups=tuple(replace(g, **fields) if g is group else g for g in groups),
+        mtp_layer_id=layer_id,
+    )

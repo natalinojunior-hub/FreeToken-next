@@ -19,12 +19,13 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
+from freetoken.layers import BaseOP, LinearReplicated, OPList, ParallelLMHead, VocabParallelEmbedding
+from freetoken.layers.quantization import LayerKind, QuantConfig
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
-from .hc import GatedResidual
+from .hc import GatedResidual, GroupedPlusOneRMSNorm
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
 from freetoken.models.blocks import embed_input_ids
@@ -86,9 +87,98 @@ class Qwen4ExpDecoderLayer(BaseOP):
         return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
 
 
+class _MTPQuantConfig(QuantConfig):
+    """Match the target's routed-bank layout while retaining draft dense-weight rules."""
+
+    dialect = "qwen4-mtp"
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__(config.quant.name_map, ())
+        self._target = config.quant
+        self._expert_prefix = f"model.layers.{config.first_k_dense_replace}.mlp.experts"
+
+    @classmethod
+    def claims(cls, q: dict) -> bool:
+        return False
+
+    def scheme_for_name(self, name: str):
+        return self._target.scheme_for_name(name)
+
+    def scheme_for(self, prefix: str):
+        return self._target.scheme_for(prefix)
+
+    def get_quant_method(self, layer, prefix: str):
+        if layer.quant_layer_kind is LayerKind.MOE:
+            prefix = self._expert_prefix
+        return self._target.get_quant_method(layer, prefix)
+
+
+class Qwen4ExpMTP(BaseOP):
+    """One native draft layer over the target's final, unmixed residual streams.
+
+    ``forward(R, next_ids, batch)`` returns the next wide residual; ``to_head`` reduces
+    it for the shared LM head. KV metadata and the extra expert bank belong to the caller.
+    This single-rank seam shares the target embedding and does not schedule draft steps.
+    """
+
+    def __init__(self, config: ModelConfig, layer_id: int, *, embedding: BaseOP) -> None:
+        from dataclasses import replace
+
+        from freetoken.models.config import FullAttentionGroupConfig
+
+        mtp = config.qwen4_args.mtp
+        if not mtp.enabled or mtp.num_hidden_layers != 1 or not mtp.hybrid:
+            raise ValueError("Qwen4 MTP requires one native hybrid draft layer")
+        if mtp.layer_types != ("full_attention",) or mtp.use_hidden_state_from_layer is not None:
+            raise ValueError("Qwen4 MTP requires full attention and the final target residual")
+        if mtp.rope_theta not in (None, config.rotary_config.base):
+            raise ValueError("Qwen4 MTP with a separate RoPE base is not supported")
+        if config.mtp_layer_id != layer_id or layer_id != config.num_layers:
+            raise ValueError("register the MTP layer with with_mtp_layer before construction")
+        if not isinstance(config.attention_group_for_layer(layer_id), FullAttentionGroupConfig):
+            raise ValueError("Qwen4 MTP requires its own full-attention slot")
+        self.hc_count = config.qwen4_args.hc_count
+        self.hidden_size = hidden = config.hidden_size
+        self.layer_id = layer_id
+        self._embed_ref = embedding
+        self._image_token_id = config.image_token_id
+        self.pre_fc_norm_hidden = GroupedPlusOneRMSNorm(self.hc_count * hidden, config.rms_norm_eps, self.hc_count)
+        self.pre_fc_norm_embedding = GroupedPlusOneRMSNorm(hidden, config.rms_norm_eps, 1)
+        self.fc_hidden = LinearReplicated(
+            hidden, hidden, has_bias=False, quant_config=config.quant, prefix="mtp.fc_hidden"
+        )
+        self.fc_embedding = LinearReplicated(
+            hidden, hidden, has_bias=False, quant_config=config.quant, prefix="mtp.fc_embedding"
+        )
+        head_config = replace(config, quant=_MTPQuantConfig(config)) if config.quant is not None else config
+        self.layers = OPList([Qwen4ExpDecoderLayer(head_config, layer_id, prefix="mtp.layers.0")])
+        self.hyper_connection_mixer = GatedResidual(config, use_combine=False, prefix="mtp.hyper_connection_mixer")
+
+    def forward(self, residual: torch.Tensor, next_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+        from freetoken.mm import restore_placeholder
+
+        tokens = residual.shape[0]
+        rn = self.pre_fc_norm_hidden.forward(residual)
+        fh = self.fc_hidden.forward(rn.reshape(tokens * self.hc_count, self.hidden_size))
+        fh = fh.reshape(tokens, self.hc_count * self.hidden_size)
+        if self._image_token_id is not None:
+            next_ids = restore_placeholder(next_ids, self._image_token_id)
+        embedded = self._embed_ref.forward(next_ids).to(residual.dtype)
+        fe = self.fc_embedding.forward(self.pre_fc_norm_embedding.forward(embedded))
+        return self.layers.op_list[0].forward(fh + fe.repeat(1, self.hc_count), batch)
+
+    def mix(self, residual: torch.Tensor) -> torch.Tensor:
+        return self.hyper_connection_mixer.mix(residual)[0]
+
+    def to_head(self, residual: torch.Tensor) -> torch.Tensor:
+        return self.mix(residual)
+
+
 class Qwen4ExpModel(BaseOP):
     def __init__(self, config: ModelConfig, *, prefix: str = "model") -> None:
         self.hc_count = config.qwen4_args.hc_count
+        self._capture_mtp_residual = config.mtp_layer_id is not None
+        self._last_residual = None
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -124,6 +214,8 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        if self._capture_mtp_residual:
+            self._last_residual = hidden
         return self.hyper_connection_mixer.mix(hidden)[0]
 
 
@@ -131,6 +223,10 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
         self.model = Qwen4ExpModel(config)
+        self.mtp = (
+            Qwen4ExpMTP(config, config.mtp_layer_id, embedding=self.model.embed_tokens)
+            if config.mtp_layer_id is not None else None
+        )
         self.lm_head = ParallelLMHead(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -226,5 +322,6 @@ __all__ = [
     "Qwen4ExpForCausalLM",
     "Qwen4ExpForConditionalGeneration",
     "Qwen4ExpModel",
+    "Qwen4ExpMTP",
     "build_linear_mixer",
 ]

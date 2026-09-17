@@ -159,6 +159,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _nonnegative_int(value: str) -> int:
+        try:
+            n = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+        if n < 0:
+            raise argparse.ArgumentTypeError("must be >= 0")
+        return n
+
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
         from freetoken.gpu_select import gpu_arg
 
@@ -431,6 +440,13 @@ def parse_args(
         help="KV slab format. turbo3/turbo4 store the full-attention group as rotated 3/4-bit "
         "codes (~4x fewer bytes per token), which is what makes a long context affordable "
         "alongside the expert cache; requires --attention-backend triton.",
+    )
+
+    parser.add_argument(
+        "--spec-mtp",
+        type=_nonnegative_int,
+        default=ServerArgs.spec_mtp,
+        help="Native checkpoint MTP draft depth; 0 keeps speculative decoding disabled.",
     )
 
     parser.add_argument(

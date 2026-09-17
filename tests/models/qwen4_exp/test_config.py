@@ -8,6 +8,7 @@ from freetoken.attention import AttnType
 from freetoken.models.config import (
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
+    with_mtp_layer,
 )
 from freetoken.models.qwen4_exp.config import parse_config
 
@@ -74,6 +75,34 @@ def _hf_config(quantization_config=RADIXARK_NVFP4):
         text_config=_text_config(),
         quantization_config=quantization_config,
     )
+
+
+def test_mtp_registration_preserves_target_depth_and_extends_qsa_only():
+    cfg = parse_config(_hf_config())
+    head_cfg = with_mtp_layer(cfg, cfg.num_layers)
+    assert cfg.mtp_layer_id is None
+    assert head_cfg.num_layers == cfg.num_layers == 48
+    assert head_cfg.num_moe_layers == cfg.num_moe_layers
+    assert head_cfg.mtp_layer_id == 48
+    assert head_cfg.linear_attention_group() == cfg.linear_attention_group()
+    group = head_cfg.attention_group_for_layer(48)
+    assert isinstance(group, FullAttentionGroupConfig)
+    assert group.layer_ids == tuple(range(3, 48, 4)) + (48,)
+    assert group.num_index_layers == 13
+    assert head_cfg.kv_cache_group_specs()[0].num_index_layers == 13
+    assert with_mtp_layer(head_cfg, 48) == head_cfg
+
+
+def test_mtp_registration_rejects_target_slot_and_ambiguous_full_groups():
+    from dataclasses import replace
+
+    cfg = parse_config(_hf_config())
+    with pytest.raises(ValueError, match="immediately follow"):
+        with_mtp_layer(cfg, 3)
+    full = cfg.attention_group_for_layer(3)
+    cfg = replace(cfg, attention_groups=cfg.attention_groups + (replace(full, name="other"),))
+    with pytest.raises(ValueError, match="exactly one"):
+        with_mtp_layer(cfg, 48)
 
 
 def test_groups_and_layer_split():
