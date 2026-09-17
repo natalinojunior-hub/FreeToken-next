@@ -681,3 +681,55 @@ token pool, the verify Batch construction, `accept_drafts` call, and `LinearStat
 snapshot/restore around it), the greedy-only/single-request/non-overlap gate, and the
 target-equivalence test (`spec_mtp=1` byte-identical token stream vs `spec_mtp=0`, swept across
 prompt lengths crossing an `index_ratio` boundary per the review's QSA pending-ring warning).
+
+## EXP-025 — Native MTP: complete scheduler spec-loop algorithm (Opus 5 review, round 2)
+**Date:** 2026-09-17 · **Verdict:** **INFORMATIONAL / DESIGN COMPLETE, NOT YET IMPLEMENTED**
+
+Second Opus 5 consult, generalized over a configurable draft depth `k = config.spec_mtp`
+(operator requirement: n_max must be tunable, default 1, benchmarkable at 2/3 -- not hardcoded).
+Confirmed and extended EXP-024's seam with a concrete, file:line-verified algorithm:
+
+**Key findings beyond EXP-024:**
+- `Qwen4ExpMTP.forward` is NOT stateless: at `layer_id == num_layers` it runs a real
+  `Qwen4ExpAttention` forward against the paged QSA pool's own reserved slot (`attention.py:163-165`).
+  Drafting k>1 tokens is genuinely autoregressive over the draft head's own KV, not k
+  independent re-reads of `_last_residual`. The KV slot EXP-022 sized is load-bearing.
+- `scheduler._forward`'s `output_mapping` (`_make_write_tuple`) writes exactly one token per
+  request unconditionally; a `(k+1)`-row verify result would either crash (shape mismatch) or
+  (via `-1` for a finished req, a valid negative index) silently misdirect a write. The spec
+  loop must bypass `scheduler._forward` and `_process_last_data` entirely, replicating their
+  EOS/stop-string/`append_host`/`cache_req`/`DetokenizeMsg` bookkeeping itself, m times per step.
+- `pad_batch` is decode-only (`graph.py:204-221`), so a `phase="prefill"` verify batch is never
+  padded -- `spec_logits_indices = arange(k+1)` is exact, no graph-buffer offset to account for.
+- New gap found: `Sampler.sample`'s non-greedy path sizes `temperatures`/`top_k`/`top_p` by
+  request count, which breaks on a `(k+1)`-row verify batch of 1 request; needs a
+  `repeat_interleave`-based `_expand_sample_args` helper (not yet added). Greedy-only for now
+  sidesteps it (`temperatures is None` short-circuits).
+- **The throughput-critical gap**: the draft layer's KV over the ORIGINAL PROMPT is never
+  populated (prefill only runs the target stack), so the first verify window after a prefill
+  drafts against garbage context -- correct (target verify still exact) but acceptance is
+  ~random until one deliberate MTP pass over the prefill's `_last_residual` window backfills it.
+  Without this, measured acceptance rate would be misleadingly bad and TG would look like MTP
+  overhead with no offsetting benefit.
+- `--spec-mtp` has no concurrency gate today (nothing ties it to `max_running_req`); isolation
+  is purely "the spec loop builds its own single-request Batch," so other live requests are
+  physically unaffected either way, but a single-request enforcement (loud refusal otherwise,
+  per the codebase's existing "refuse clearly" pattern) is still recommended before enabling it.
+- Overlap scheduling (`ENV.DISABLE_OVERLAP_SCHEDULING=False`, the default) does not fit: the
+  accept decision is host-side and must land before the next forward launches. `--spec-mtp > 0`
+  needs a startup-time refusal unless overlap scheduling is disabled -- not yet implemented.
+
+Full per-step algorithm (draft chain -> verify Batch(phase="prefill", extend_len=k+1) ->
+`accept_drafts` -> commit-or-reject with `CacheManager.free_spec_reject` +
+`LinearStatePool.copy_from` snapshot/restore + a plain re-forward of the accepted tokens on
+reject to re-derive the next chain's seed residual) is recorded in full, file:line-referenced
+pseudocode in this session's transcript; not reproduced here to keep this entry scannable.
+
+**Not implemented this session.** This is the single highest-blast-radius piece in the
+codebase (the live decode scheduling loop shared by every request, MTP or not) and cannot be
+correctness-tested without a real serve run against the actual checkpoint -- no unit or toy-GPU
+test reaches `Scheduler`/`CacheManager`/`TableManager` wired together today. Implementing it
+blind, without that integration-test capability, was judged too high-risk for this pass.
+Everything up to and including this design is real and durable; the scheduler loop itself,
+the prefill-window MTP warm-up pass, `_expand_sample_args`, and the single-request startup
+refusal are the exact, ready-to-implement next unit for item E.
