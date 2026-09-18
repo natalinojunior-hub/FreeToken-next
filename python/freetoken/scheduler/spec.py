@@ -47,17 +47,24 @@ class SchedulerSpecMixin:
         if slot is not None:
             self.engine.linear_state_pool.free([slot])
 
-    def _commit_spec_tokens(self, req: Req, tokens: List[int]) -> int:
+    def _commit_spec_tokens(self, req: Req, tokens: List[int], start_pos: int) -> int:
         """Append tokens one at a time, applying _process_last_data's per-token EOS/stop
-        /length finish logic. Returns how many actually count (stops at, and includes, the
-        one that finishes the request -- exact-once-only completion)."""
+        /length finish logic. ``start_pos`` is tokens[0]'s device-table position (== d in
+        run_spec_step): cached_len/device_len advance ONE token at a time here, exactly like
+        complete_one(), rather than being pre-set to the whole window's end -- otherwise
+        can_decode reflects the window's final length for every token in it, not each
+        token's own position, and hit_length fires (or doesn't) at the wrong offset.
+        Returns how many actually count (stops at, and includes, the one that finishes the
+        request -- exact-once-only completion)."""
         reply: List[DetokenizeMsg] = []
         committed = 0
         finished_now = False
         with self.cache_manager.lazy_free_region():
-            for next_token in tokens:
+            for offset, next_token in enumerate(tokens):
                 req.append_host(torch.tensor([next_token], dtype=req.input_ids.dtype))
                 committed += 1
+                req.cached_len = start_pos + offset
+                req.device_len = start_pos + offset + 1
                 hit_length = not req.can_decode
                 hit_eos = not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
                 matched_stop = (
@@ -145,9 +152,7 @@ class SchedulerSpecMixin:
 
         # ---- commit: only the tokens up to (and including) any finish reason count ----
         self.token_pool[req.table_idx, d : d + m] = out.next_tokens_gpu[:m]
-        req.cached_len = d - 1 + m
-        req.device_len = d + m
-        committed = self._commit_spec_tokens(req, accepted)
+        committed = self._commit_spec_tokens(req, accepted, start_pos=d)
         finished = committed < m or (committed == m and req in self.finished_reqs)
 
         if committed < m or m <= k:
