@@ -70,14 +70,16 @@ order of priority (goal priorities 4-5 next):
    mean vs 24.6 without MTP (31-50x slower, ITL 1.2-2.4s/token) at 99.7% GPU util -- real
    compute, not idle wait, and **not simply `--cuda-graph-max-bs 0`**: the MTP-free arm used the
    SAME flag and hit 24.6 tok/s, so graph-disabled alone isn't the discriminator (ruled out by
-   review, see PERFORMANCE.md). The real cost is `spec.py` running the draft chain AND the
-   verify step as their own `Batch(reqs=[req], phase="prefill")` (`spec.py:165,193,236`), a
-   design decision from EXP-021, plus >=2 host syncs per generated token
-   (`tok_prev.item()` in the draft loop, `out.copy_done_event.synchronize()` after verify).
-   This is the SAME pending work as ROADMAP phase 10/12 ("MTP + TurboKV fused verify: no
-   materialize-path penalty") -- a real redesign (decode-shaped, graph-capturable draft/verify),
-   not a flag flip. Scope it before starting; this is multi-session work per the phase's own
-   history.
+   review, see PERFORMANCE.md). Sharper lead: the `--decode 4` determinism probe (below) showed
+   the SAME code/flags giving ITL 1294ms (requests 1-2) vs 47ms (requests 3-6) -- a 27x spread
+   with no code change, so the constant-per-step `phase="prefill"` overhead and host syncs
+   (`tok_prev.item()`, `out.copy_done_event.synchronize()`) are NOT the dominant cost; something
+   shape/compile-cache-dependent is. The 47ms regime does not persist at `--decode 64` (reverts
+   to ~1239ms) -- **the actual question is why the fast regime doesn't hold at longer decodes**,
+   not whether CUDA graph capture would help (never measured this session). This is the same
+   pending work as ROADMAP phase 10/12 ("MTP + TurboKV fused verify: no materialize-path
+   penalty") -- scope it as a real redesign, multi-session, after the discriminator above is
+   understood, not before.
 1. **Non-determinism across sequential requests in the same server session (found this session,
    NOT fixed, root cause still unknown).** `req.uid` (unique per real request) and
    `model.model._last_residual` (overwritten by every forward) were checked and ruled out.
@@ -89,11 +91,13 @@ order of priority (goal priorities 4-5 next):
    at `--decode 64 --warmups 2 --repeats 2` (4 total requests, same positions where `--decode 4`
    had already stabilized) still gave two DIFFERENT sha1 for repeat1 vs repeat2. So whatever
    causes this is sensitive to decode length / total step count in a way not yet characterized,
-   not just "how many prior requests." **More black-box benchmarking will not resolve this** --
-   next step is dumping the draft/verify logits or the QSA scored-block indices per step for two
-   diverging repeats and diffing the traces to find the first byte that differs, at whatever
-   `--decode` length actually diverges (start from `--decode 4`'s known-divergent
-   requests-1-vs-3 pair, cheapest to iterate on).
+   not just "how many prior requests." **More black-box benchmarking will not resolve this.**
+   Concrete next step: `spec.py:195`'s existing `logger.info(f"spec: k=... m=... accepted=...
+   drafts=... sampled=...")` fires every step -- add the raw logits' top-2 values (not just the
+   argmax winner) to that line, rerun `--decode 4 --repeats 6`, and diff phase-1 (requests 1-2)
+   against phase-2 (requests 3-6) logs. A flipped argmax between near-tied logits means
+   floating-point/kernel-config (numerics); the DRAFT tokens differing before the logits do
+   means a real state bug. ~20 minutes, discriminates the two live hypotheses.
    ```bash
    FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1 TMPDIR=/models/desenvolvimento/tmp \
      .venv/bin/python benchmarks/bench_pp_tg.py \

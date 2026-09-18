@@ -378,6 +378,16 @@ token, plus at least 2 host syncs per token in the hot loop (`tok_prev.item()` p
 integration was never done, only correctness. Goal priority 4 ("corrigir o bloqueio de CUDA
 Graph/overlap") is this same, substantial redesign -- not a quick flag fix.
 
+**Sharper discriminator (post-review, from the determinism probe below)**: the SAME code path,
+same flags, gave ITL 1294ms (`--decode 4` requests 1-2, "cold") and 47ms (requests 3-6, "warm")
+-- a 27x spread with zero code change, so neither the constant-per-step `phase="prefill"`
+overhead nor the two host syncs above is the dominant cost; something shape- or compile-cache-
+dependent dominates instead. If the warm 47ms/token held at `--decode 64`, TG would be ~21 tok/s
+(near the no-MTP baseline) and priority 4 would mostly evaporate. It does NOT hold there (ITL
+reverts to ~1239ms, see the steady-state row above). **The question priority 4 actually needs
+answered is why the fast regime seen at short decodes does not persist at longer ones** -- not
+"does CUDA graph help", which this session never actually measured.
+
 **Also found, NOT fixed**: the two repeats' `output_sha1` differ from each other
 (`2d8355daf32e` vs `6e43ad8484ac`) despite identical prompt/config/greedy sampling. Two isolated
 fresh-server single-request runs (no warmup) are byte-identical to each other
@@ -411,10 +421,17 @@ from each other**, at the exact same request positions where the `--decode 4` pr
 converged to a stable, repeated value. So the two-phase-then-stable pattern seen at `--decode 4`
 does not generalize to `--decode 64` -- either the "settle point" depends on decode length /
 total forward-call count in a way not yet characterized, or there is a second, independent
-source of divergence that only a longer decode has enough steps to expose. **This is not solved
-by more warmup and not solved by more black-box benchmarking** -- it needs kernel-level tracing
-(dump the draft/verify logits or the QSA scored-block indices per step, diff the two repeats'
-traces to find the first byte that differs) in a future session. Until then: no MTP+Turbo4
-PP/TG number, including every one measured this session, should be treated as more than a rough
-order of magnitude -- the underlying computation is not yet known to be deterministic at any
-warmup depth tried.
+source of divergence that only a longer decode has enough steps to expose. **This is not solved by more warmup and not solved by more black-box benchmarking** -- it needs
+kernel-level tracing in a future session. Concrete next step: `spec.py:195`'s
+`logger.info(f"spec: k={k} m={m} accepted=... drafts=... sampled=...")` already fires every
+step; add the raw logits' top-2 values (not just the argmax winner) to that same line, rerun the
+cheap `--decode 4 --repeats 6` repro, and diff phase-1 (requests 1-2) against phase-2 (requests
+3-6). If the divergence is a flipped argmax between two near-tied logits, that is a floating-
+point/kernel-config difference -- the trace shows it immediately. If the DRAFT tokens
+themselves differ before the logits do, it is a state bug, not numerics. This discriminates the
+two remaining hypotheses in about 20 minutes instead of more speculation.
+
+**PP is not affected and is reliable**: every run this session, MTP+Turbo4, agrees within 0.1%
+(1639.9-1715.5 tok/s across 7 separate runs). Only decode CONTENT (and TG, which depends on
+content-driven accept/reject) is non-deterministic. Priority 5's PP comparison against
+`triton + bf16` does not need the determinism bug fixed first; a TG/content comparison does.
