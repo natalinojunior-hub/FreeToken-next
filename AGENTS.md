@@ -103,6 +103,17 @@ nvidia-smi       # VRAM livre, 0 processos
 ps aux | grep -E '(python|tail)'  # matar órfãos/zumbis
 ```
 
+## AVISO: Proibido Ociosidade e Testes Cegos (Event-Driven Only)
+
+Testes quebrados e servidores travados podem roubar horas do projeto se você usar ferramentas de forma passiva.
+
+1. **PROIBIDO usar `sleep 10` para esperar o servidor subir.**
+   Use o script `./scripts/wait-for-server.sh <PORTA> <PID>`. Ele é *event-driven* (bloqueia o shell e libera no exato milissegundo que o servidor der ping verde, ou falha instantaneamente se o servidor morrer).
+2. **PROIBIDO rodar servidores com `background: true` sem monitoramento.**
+   Se subir um server, guarde o PID (`ft serve & PID=$!`) e passe o PID para o `wait-for-server.sh`. Se ele crashar por OOM, você saberá na hora.
+3. **Timeouts Globais Já Configurados.**
+   O `pytest` agora tem `--timeout=60` injetado no `pyproject.toml`. Testes travados no C++ vão abortar sozinhos. Não crie timeouts customizados no bash.
+
 ---
 
 ## Workflow de Execução (Command Economy)

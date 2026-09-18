@@ -74,6 +74,8 @@ ft = "freetoken.cli:main"
 [project.optional-dependencies]
 dev = [
     "pytest>=6.0",
+    "pytest-timeout>=2.3.0",
+    "pytest-xdist>=3.5.0",
     "ruff>=0.4.0",
     "mypy>=1.10.0",
     "pre-commit>=3.7.0",
@@ -126,6 +128,7 @@ where = ["python"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+addopts = "--timeout=60"
 markers = [
     "slow: takes tens of seconds (big kernel sweeps, real-checkpoint reads); deselect with -m 'not slow'",
     "needs_weights: needs a real local checkpoint, gated behind an env var (see tests/README.md)",
