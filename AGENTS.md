@@ -30,6 +30,16 @@
 | `docs/dev/QA.md` | Gates de fase, checklists benchmark, validação conteúdo, release | Verificação / qualidade |
 | `CLAUDE.md` | Ponte única: "Leia AGENTS.md primeiro" | Entrada legacy Claude Code |
 
+## AUTONOMIA E VALIDAÇÃO EXTREMA (Instrução Crítica para Agentes)
+
+**O usuário deste projeto é LEIGO (não-programador).** Ele depende 100% da sua autonomia técnica.
+Isso significa que:
+1. **O usuário não sabe se o seu código está certo.** Nunca pergunte a ele algo como *"Esse código parece correto para você?"* ou *"Devo rodar os testes?"*. Você decide, você testa.
+2. **Você é totalmente responsável pela validação.** Antes de dar qualquer tarefa como "Concluída", você OBRIGATORIAMENTE deve executar `make ci` (que roda lint, typecheck e testes rápidos).
+3. **Não confie no seu próprio código cegamente.** Se você alterou um comportamento central, crie um script de teste e verifique a saída real. Se quebrar, conserte silenciosamente antes de notificar o usuário.
+4. Se um erro ocorrer nos testes, **leia os logs**, entenda a falha, corrija o código e rode de novo. Repita até o `make ci` passar.
+5. Se uma tarefa afetar performance (MTP, QSA, TurboKV), use `make bench` e verifique se as métricas continuam batendo com os anchors de `docs/dev/PERFORMANCE.md`.
+
 ---
 
 ## Layout do Repositório (Subsistemas Principais)
@@ -127,21 +137,20 @@ PRs são squash-merged; título do PR segue mesmo formato.
 
 ---
 
-## Comandos de Verificação (Rodar Antes de Entregar)
+## Comandos de Verificação (Rodar OBRIGATORIAMENTE Antes de Entregar)
 
 ```bash
-# Lint / Typecheck (se configurado)
-# uv run ruff check .       # ou equivalente do projeto
-# uv run mypy python/freetoken  # ou equivalente
+# Validação Total Local (Ruff + MyPy + Pytest rápidos)
+make ci
 
-# Testes rápidos
-uv run pytest tests/ -m "not slow" -q --basetemp=/models/desenvolvimento/tmp
+# Testes completos
+make test-all
+
+# Formatar e corrigir estilos (Ruff)
+make format
 
 # Benchmark guard (se mudando performance)
-uv run python benchmarks/bench_pp_tg.py --model /models/Qwen3.6-35B-A3B-NVFP4-FT \
-    --tokens 16384 --decode 128 --repeats 3 --label guard \
-    --serve-arg "--num-tokens 16576" --serve-arg "--cache-type naive" \
-    --json /models/desenvolvimento/tmp/guard.jsonl
+make bench
 ```
 
 ---
