@@ -189,16 +189,27 @@ class OffloadMoELayer(MoELayer):
         )
         self.offload_cache: OffloadMoeCache | None = None
 
+    def _use_decode_path(self, hidden_states: torch.Tensor) -> bool:
+        ctx = get_global_ctx()
+        if not ctx.batch.is_prefill:
+            return True
+        cache = self.offload_cache
+        if cache is None:
+            return False
+        # Speculative micro-batches (verify windows, replay) run as phase="prefill"
+        # but only process a tiny number of tokens (k+1 <= 8). Routing them through
+        # the decode resident cache avoids materializing all num_experts across layers.
+        return hidden_states.shape[0] <= 8 and len(ctx.batch.reqs) == 1
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
     ):
-        ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
-            final_hidden_states = self.prefill_forward(hidden_states, router_logits)
-        else:
+        if self._use_decode_path(hidden_states):
             final_hidden_states = self.decode_forward(hidden_states, router_logits)
+        else:
+            final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         return self._maybe_all_reduce(final_hidden_states)
 
     def routed_forward(
@@ -217,11 +228,10 @@ class OffloadMoELayer(MoELayer):
         ``hidden_states`` may also be overwritten by the expert kernel. Compute
         shared branches that need the original input before calling this method.
         """
-        ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
-            out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
-        else:
+        if self._use_decode_path(hidden_states):
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)
+        else:
+            out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         return self._maybe_all_reduce(out)
 
     def decode_forward(
