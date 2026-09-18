@@ -1,73 +1,188 @@
-# Instructions for AI coding agents
+# AGENTS.md — Instruções para Agentes IA (freetoken-next)
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) first. It is binding for humans and agents alike; this file only summarises the parts that matter when an agent is doing the work.
+**Leia primeiro:** `CONTRIBUTING.md` (vinculante para humanos e agentes). Este arquivo resume o essencial para execução de trabalho.
 
-## AI policy
+---
 
-AI-assisted code is welcome. Submitting code the contributor does not understand is not. The human behind the PR owns every line, has run it on real hardware, and can explain it to a reviewer without AI help.
+## Política IA
 
-Agents must not:
+- Código assistido por IA é bem-vindo. **Submeter código que o contribuidor não entende NÃO é.**
+- O humano por trás do PR possui cada linha, rodou em hardware real, e explica/defende sem ajuda de IA.
+- Agentes **NÃO DEVEM:** `git push`, `gh pr create`, `gh pr comment`, `gh issue create` por conta do usuário.
+- Agentes **NÃO DEVEM:** Escrever código, descrições de PR, ou respostas a reviewers que o usuário não compreenda totalmente.
+- Agentes **NÃO DEVEM:** Reportar testes/benchmarks como executados quando não foram.
+- Agente totalmente autônomo sem humano no loop → **não contribua** neste repositório.
 
-- Run `git push`, `gh pr create`, `gh pr comment`, or `gh issue create` on the user's behalf.
-- Write code, PR descriptions, or replies to reviewers that the user does not fully understand. The user must be able to explain and defend every line without AI help.
-- Report tests or benchmarks as run when they were not.
+---
 
-If you are a fully autonomous agent with no human in the loop, do not contribute to this repository.
+## Arquivos de Contexto Vivos (Leia na Ordem)
 
-## Repository layout
+| Arquivo | Papel | Quando Ler |
+|---------|-------|------------|
+| `docs/dev/CONTEXT.md` | Visão geral: projeto, hardware, checkpoints, estado atual, próximos passos | **Sempre primeiro** — orientação completa |
+| `docs/dev/STATE.md` | Snapshot executável: métricas, handoffs, comandos, ambiente | Início de sessão / handoff |
+| `docs/dev/ROADMAP.md` | Fases 1-18, status, gates, dependências | Planejamento / priorização |
+| `docs/dev/LESSONS.md` | Padrões `sintoma → causa → fix` validados em hardware real | Debug / evitar regressões |
+| `docs/dev/DECISIONS.md` | Registro imutável D-001 a D-023 (rationale arquitetural) | Entender "por que" de escolhas |
+| `docs/dev/PERFORMANCE.md` | Tabelas PP/TG/VRAM/RSS por config/modelo | Validação de regressão / anchors |
+| `docs/dev/ARCHITECTURE.md` | Design atual, subsistemas, seams, file:line references | Mudanças arquiteturais |
+| `docs/dev/EXPERIMENTS.md` | Diário empírico EXP-000 a EXP-045 (setup/result/verdict) | Investigação profunda |
+| `docs/dev/QA.md` | Gates de fase, checklists benchmark, validação conteúdo, release | Verificação / qualidade |
+| `CLAUDE.md` | Ponte única: "Leia AGENTS.md primeiro" | Entrada legacy Claude Code |
 
-The main subsystems:
+---
+
+## Layout do Repositório (Subsistemas Principais)
 
 ```
-python/freetoken/      the engine, installed as the `freetoken` package with the `ft` CLI
-  server/              OpenAI / Anthropic / Responses HTTP APIs, streaming, tool-call parsers
-  scheduler/           chunked prefill, batching, cache manager
-  kvcache/             paged KV pools and the radix prefix caches
-  moe/                 expert offload cache, CPU / GPU / hybrid MoE backends, quantized experts
-  models/              model registry and per-architecture loaders
-  kernel/              CUDA / Triton kernels, JIT cache, C++ extensions (`csrc/`)
-  layers/, attention/  fused ops and attention backends
-  engine/              cache budget planning and config resolution
+python/freetoken/      engine, package `freetoken`, CLI `ft`
+  server/              OpenAI/Anthropic/Responses HTTP APIs, streaming, tool parsers
+  scheduler/           chunked prefill, batching, cache manager, commit/window locking
+  kvcache/             paged KV pools, radix prefix caches (radix/)
+  moe/                 expert offload cache, CPU/GPU/hybrid backends, quantized experts
+  models/              model registry, per-architecture loaders (qwen4_exp, glm*, deepseek_v4, gguf)
+  kernel/              CUDA/Triton kernels, JIT cache, C++ extensions (csrc/)
+  layers/, attention/  fused ops, attention backends (QSA, TurboKV, dense)
+  engine/              cache budget planning, config resolution, VRAM ledger
   checkpoint/          HF -> FTW fast-load conversion
-tests/                 mirrors python/freetoken/ by subsystem, see tests/README.md
-benchmarks/            end-to-end and micro benchmarks, see benchmarks/README.md
-docs/                  install, quickstart, CLI and model docs
-freetoken-kernel-cache/ companion wheel of prebuilt kernels, see its README
-scripts/               wheel build and release scripts
+tests/                 mirrors python/freetoken/ by subsystem
+benchmarks/            end-to-end (bench_pp_tg.py, bench_decode_moe.py) + micro
+docs/                  user-facing: install, quickstart, CLI, models, ftw-hotfix
+docs/dev/              developer/internal docs: architecture, state, experiments, roadmap
 ```
 
-## Development
+---
 
-Linux x86_64 with an NVIDIA GPU. Use `uv`, not bare `pip`:
+## Desenvolvimento
+
+**Ambiente:** Linux x86_64, NVIDIA GPU, `uv` (não `pip` direto).
 
 ```bash
+cd /models/desenvolvimento/freetoken-next
 uv venv && source .venv/bin/activate
 uv pip install -e ".[accel]"
-uv run pytest tests/ -m "not slow"
+export TMPDIR=/models/desenvolvimento/tmp
 ```
 
-CUDA kernels are JIT-compiled with `nvcc` on first use unless the prebuilt `freetoken-kernel-cache` wheel is installed. The C++ extensions under `python/freetoken/kernel/csrc/` are built by `setup.py`; after changing them run `python setup.py build_ext --inplace`.
+**Kernels CUDA:** JIT-compilados com `nvcc` no primeiro uso (a menos que `freetoken-kernel-cache` wheel instalado).
+**Extensões C++:** `python/freetoken/kernel/csrc/` built by `setup.py`; após mudanças: `python setup.py build_ext --inplace`.
 
-Put a new test in the `tests/` directory that mirrors the module it protects, and extend an existing file before creating a new one. Bug fixes come with a test that fails before and passes after. Performance changes come with A/B numbers against `main`.
+**Testes:** Novo teste em `tests/` espelhando módulo protegido; estender arquivo existente antes de criar novo.
+- Bug fix = teste que falha antes + passa depois.
+- Mudança de performance = números A/B contra `main`.
 
-**Never use RAM as storage, under any circumstance.** `/tmp` on this host is a 46 GiB tmpfs (RAM-backed): anything written there competes with the model's own host-resident memory (offload expert banks, PLE tables) and can starve or OOM-kill a serving process that has nothing to do with what filled `/tmp`. `/models` has 1.3+ TB free on real disk. Always set `TMPDIR` to a path under `/models` (e.g. `/models/desenvolvimento/tmp`) for anything that writes temp files: `ft checkpoint`/`ft serve`, `pytest --basetemp=...`, build/JIT caches, scratch downloads. Before any large model run, check `free -h` and `du -sh /tmp/*` for leftover tmpfs usage from earlier sessions -- it does not free itself and is real RAM pressure, not disk usage.
+---
 
-## Issues and PRs
+## Regra Crítica: NUNCA Use RAM Como Storage
 
-- Search existing issues and PRs before starting. Items on the [Roadmap](https://github.com/FlashML-org/FreeToken/issues/79) are discussed with maintainers before implementation; features not on it start as an issue.
-- When helping the user draft an issue, follow the matching template in `.github/ISSUE_TEMPLATE/` (engine bug, model checkpoint, feature request) and fill in every required field: hardware, driver, FreeToken version, checkpoint ID, exact command, and the full log.
-- One change per PR, linked to its issue, with the hardware, checkpoint ID and exact command it was tested with.
+`/tmp` = **46 GiB tmpfs (RAM-backed)**. Qualquer escrita lá compete com:
+- Host-resident expert banks (offload MoE ~63 GiB Flash-Next)
+- PLE tables (~47 GiB)
+- Pode starve/OOM-kill processo de serve não-relacionado.
 
-## Code comments
+**`/models` tem 1.3+ TB em disco real.** Sempre:
+```bash
+export TMPDIR=/models/desenvolvimento/tmp
+# para: ft checkpoint, ft serve, pytest --basetemp=..., build/JIT caches, scratch downloads
+```
+**Pre-flight obrigatório antes de qualquer run grande:**
+```bash
+free -h          # RAM livre, cache limpo
+du -sh /tmp/*    # lixo tmpfs de sessões anteriores
+nvidia-smi       # VRAM livre, 0 processos
+ps aux | grep -E '(python|tail)'  # matar órfãos/zumbis
+```
 
-Comments explain a non-obvious "why", never restate the code. Write the code first, then add a comment only where a reader would otherwise be confused. Keep them to one or two lines. Configuration files get no comments. Use ASCII: `-` not em-dash, `->` not arrows.
+---
+
+## Workflow de Execução (Command Economy)
+
+1. **Planeje o caminho mais barato silenciosamente** — não narre o plano.
+2. **Verifique info faltando / resultado passo anterior** — pergunte se faltando, nunca assuma.
+3. **Entregue exatamente o escopo pedido** — nada extra, features não solicitadas.
+4. **Nunca produza output dependendo de passo não completado.**
+5. **Agrupe todas as perguntas em uma mensagem.**
+
+**Ferramentas — Ordem de preferência (token economy):**
+1. `grep` > `read` (narrow query primeiro)
+2. `read` line ranges, nunca arquivos inteiros
+3. Nunca re-leia arquivo já lido na sessão
+4. Shell output sempre filtrado: `head/tail/wc/grep`
+5. Mínimo tool calls para certeza — pare quando certo
+
+---
 
 ## Commits
 
-[Conventional Commits](https://www.conventionalcommits.org/), one line, imperative, lowercase, no trailing period:
+[Conventional Commits](https://www.conventionalcommits.org/), uma linha, imperativo, lowercase, sem ponto final:
 
 ```
 fix(kvcache): size the SWA radix pool for chunked prefill
+feat(mtp): add carry shift for draft alignment
+perf(qsa): fuse in-sram fp4 dequant
 ```
 
-PRs are squash-merged, so the PR title follows the same format. The subject line is usually enough; add a body only when the change needs a why that the diff does not show, and keep it to a few lines. Only commit when the user asks. If the user wants attribution, use `Assisted-by: <agent name>`, not `Co-authored-by`.
+PRs são squash-merged; título do PR segue mesmo formato.
+**Só commit quando o usuário pedir.** Atribuição: `Assisted-by: <agent name>`.
+
+---
+
+## Comandos de Verificação (Rodar Antes de Entregar)
+
+```bash
+# Lint / Typecheck (se configurado)
+# uv run ruff check .       # ou equivalente do projeto
+# uv run mypy python/freetoken  # ou equivalente
+
+# Testes rápidos
+uv run pytest tests/ -m "not slow" -q --basetemp=/models/desenvolvimento/tmp
+
+# Benchmark guard (se mudando performance)
+uv run python benchmarks/bench_pp_tg.py --model /models/Qwen3.6-35B-A3B-NVFP4-FT \
+    --tokens 16384 --decode 128 --repeats 3 --label guard \
+    --serve-arg "--num-tokens 16576" --serve-arg "--cache-type naive" \
+    --json /models/desenvolvimento/tmp/guard.jsonl
+```
+
+---
+
+## Issues / PRs
+
+- Busque issues/PRs existentes antes de começar. [Roadmap](https://github.com/FlashML-org/FreeToken/issues/79) discutido com maintainers antes de implementar.
+- Draft issue: use template `.github/ISSUE_TEMPLATE/` (engine bug, model checkpoint, feature request) — preencha **todos** campos obrigatórios: hardware, driver, versão FreeToken, checkpoint ID, comando exato, log completo.
+- Uma mudança por PR, linkada à issue, com hardware/checkpoint/comando testado.
+
+---
+
+## Code Comments
+
+- Explicam "why" não-óbvio, nunca repetem o código.
+- Escreva código primeiro, comente só onde leitor ficaria confuso.
+- Máximo 1-2 linhas. Arquivos de config = sem comentários.
+- ASCII: `-` não em-dash, `->` não setas.
+
+---
+
+## Referências Rápidas (File:Line Patterns)
+
+| Área | Arquivos-Chave |
+|------|----------------|
+| VRAM Ledger | `engine/vram_ledger.py`, `engine/cache_budget.py` |
+| TurboKV/QSA Split | `kvcache/qsa_pool.py`, `kvcache/qsa_sparse.py`, `kernel/triton/qsa/decompress.py` |
+| MoE Offload | `moe/offload_cache.py`, `moe/expert_banks.py` |
+| MTP Spec | `scheduler/spec.py`, `models/qwen4_exp/model.py` |
+| GGUF Loader | `models/gguf/reader.py`, `models/gguf/config.py`, `layers/gguf.py` |
+| Chunked Prefill | `scheduler/prefill_adder.py`, `scheduler/cache.py` |
+| Radix Cache | `kvcache/radix/radix_cache.py` |
+
+---
+
+## Próximas Ações Prioritárias (Contexto Atual)
+
+1. Validar split-kernel Turbo4/QSA 16K (sha1 match baseline)
+2. Medir TG + accept-rate MTP=1 com Turbo4 ativo
+3. Debug non-determinismo sequential requests (log logits top-2)
+4. Live test k=2/k=3 content equivalence
+5. Phase 7: Expert pool keyed by (bank, role, type)
+
+> **Detalhes completos em:** `docs/dev/CONTEXT.md` → "Próximos Passos Imediatos" e `docs/dev/STATE.md` → "Handoff Crítico"

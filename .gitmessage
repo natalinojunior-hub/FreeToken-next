@@ -1,0 +1,25 @@
+
+# ----------------------------------------------------------------------
+# Template de Commit para FreeToken Next (Conventional Commits)
+# 
+# Formato: <tipo>(<escopo>): <mensagem>
+#
+# Tipos permitidos:
+#   feat     : Nova funcionalidade (ex: MTP, TurboKV)
+#   fix      : Correção de bug (ex: OOM, cache leak)
+#   perf     : Otimização de performance / VRAM
+#   refactor : Refatoração sem adicionar features ou corrigir bugs
+#   docs     : Mudanças apenas na documentação (ex: docs/dev/)
+#   chore    : Infraestrutura, build, pacotes, linter
+#   test     : Adição ou correção de testes
+#
+# Regras:
+# - Mensagem em letras minúsculas.
+# - Não coloque ponto final na mensagem.
+# - Escreva no imperativo (ex: "add carry shift", não "added carry shift").
+#
+# CHECKLIST DE QA (Responda na mente antes de salvar o commit):
+# [ ] Rodou `make ci` (Ruff, MyPy, Pytest)?
+# [ ] Consome menos que o teto de 15 GiB de VRAM?
+# [ ] Não usa /tmp como armazenamento de memória?
+# ----------------------------------------------------------------------
