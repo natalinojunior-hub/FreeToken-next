@@ -258,3 +258,22 @@ def test_free_req_resources_clears_qsa_pool_and_snapshots():
 
     assert freed_qsa_tables == [1], "QSA pool's free_req must be called with table_idx"
     assert 0 not in stub._spec_qsa_snapshots, "QSA snapshots must be cleared"
+
+
+def test_idle_asserts_spec_snapshot_slots_empty():
+    import pytest
+    from types import SimpleNamespace
+
+    page_table = torch.zeros(2, 32, dtype=torch.int32)
+    cm = CacheManager(8, 4, page_table, "radix")
+    stub = SimpleNamespace(
+        cache_manager=cm,
+        _spec_snapshot_slots={},
+    )
+    # Empty -> passes
+    Scheduler.run_when_idle(stub)
+
+    # Leaked slot -> raises AssertionError
+    stub._spec_snapshot_slots = {101: 3}
+    with pytest.raises(AssertionError, match="leaked spec snapshot slots in idle"):
+        Scheduler.run_when_idle(stub)
