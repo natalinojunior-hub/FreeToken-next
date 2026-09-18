@@ -800,3 +800,40 @@ target-equivalence past this point. Next step: escalate this exact repro (both p
 outputs, this file) to Opus 5 for a third architecture pass focused specifically on the QSA
 attention path's behavior under a `phase="prefill"` multi-token verify window, before any further
 implementation or any throughput measurement.
+
+## EXP-028 — Native MTP: content-correctness CONFIRMED live (fix validated)
+**Date:** 2026-09-17 · **Verdict:** **MEASURED / KEEP**
+
+Root cause of EXP-027's divergence found by Opus 5's third pass and fixed (see the fix commit
+for full detail): `run_spec_step`'s reject-path replay forward temporarily rewrote
+`req.cached_len`/`device_len` to re-derive the next chain's seed residual, and never restored
+them -- the step ended one token behind reality, so the next spec step re-drafted an
+already-committed token and re-applied its GDN update onto a recurrent+conv state that already
+had it, permanently corrupting the state from the first rejection onward. Also fixed:
+`LinearStatePool.copy_from` used `req.linear_slot_idx`, which is `None` under `--cache-type
+naive` (only hybrid-radix allocates it) -- added `_linear_slot()` to key by `table_idx` under
+naive, matching `build_fla_metadata`'s existing convention. Also fixed a latent k>=2 bug: the
+draft chain never advanced `cached_len`/`device_len` per step, so draft position i>=1 couldn't
+see its own prior draft-step KV (`prepare_metadata` always saw `seqlens_k=d`). Confirmed NOT the
+QSA `pending_ring`/`index_ratio`-boundary risk EXP-025 had flagged as top suspect -- that path
+already handles a non-aligned `cached_len` correctly (traced with file:line evidence).
+
+Retest against the real Flash-Next checkpoint (`--spec-mtp 1`, k=1, greedy, 16K, naive cache,
+single request): both the short prompt ("The capital of France is", `max_tokens` in
+{1,2,3,5,32}) and the longer prompt that previously diverged ("Write a short poem about the
+ocean...", `max_tokens=80`) now produce **content byte-identical** to the `--spec-mtp 0`
+baseline at every length tested. The only remaining difference from baseline is the
+pre-existing, MTP-unrelated `max_tokens` vs `completion_tokens` off-by-one (EXP-027 first
+observation, reproduced independently without `--spec-mtp`) -- MTP returns exactly
+`max_tokens` tokens where the baseline convention returns `max_tokens - 1`; content matches
+regardless, so this is a display/counting nuance, not a correctness issue, and is out of this
+campaign's scope to chase further.
+
+**Item E status: draft/verify/rollback loop now content-correct for k=1 on real hardware.**
+Still open: per-step acceptance-rate logging didn't surface in the server log (added
+`logger.info` in `run_spec_step`, but it did not appear in output despite the spec path
+demonstrably running -- minor observability gap, not a correctness blocker, needs a follow-up
+look at scheduler-subprocess log routing). k=2/3 not yet live-tested (the latent bug above was
+fixed by inspection, not by an executed k>=2 run). No throughput (PP/TG/acceptance-rate)
+measurement has been taken -- that is the next step, and only after it can the goal's
+target-equivalence and MTP preflight gates be marked satisfied.
