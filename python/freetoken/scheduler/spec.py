@@ -15,9 +15,12 @@ import torch
 from freetoken.core import Batch, Req
 from freetoken.engine.spec import accept_drafts
 from freetoken.message import DetokenizeMsg
+from freetoken.utils import init_logger
 
 if TYPE_CHECKING:
     from .scheduler import Scheduler  # noqa: F401  (self-typing only)
+
+logger = init_logger(__name__)
 
 
 class SchedulerSpecMixin:
@@ -46,6 +49,12 @@ class SchedulerSpecMixin:
         slot = self._spec_snapshot_slots.pop(req.uid, None)
         if slot is not None:
             self.engine.linear_state_pool.free([slot])
+
+    @staticmethod
+    def _linear_slot(req: Req) -> int:
+        """GDN/PLE state slot: the hybrid-radix live slot when allocated, else table_idx
+        (naive keeps the old keying -- same rule as build_fla_metadata's gdn_slot)."""
+        return req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
 
     def _commit_spec_tokens(self, req: Req, tokens: List[int], start_pos: int) -> int:
         """Append tokens one at a time, applying _process_last_data's per-token EOS/stop
@@ -117,6 +126,10 @@ class SchedulerSpecMixin:
         tok_prev = self.token_pool[req.table_idx, d - 1 : d]
         drafts: List[int] = []
         for i in range(k):
+            # prepare_metadata (e.g. qsa_sparse) reads req.cached_len/device_len for
+            # seqlens_k/extend_len; at i >= 1 the draft's own query must see its own prior
+            # draft-step KV, which needs these advanced per step, not left at the entry value.
+            req.cached_len, req.device_len = d - 1 + i, d + i
             db = Batch(reqs=[req], phase="prefill")
             db.padded_reqs = [req]
             db.positions = torch.tensor([d - 1 + i], dtype=torch.int32, device=self.device)
@@ -130,13 +143,14 @@ class SchedulerSpecMixin:
             tok_prev = torch.argmax(logits, dim=-1)
             drafts.append(int(tok_prev.item()))
             self.token_pool[req.table_idx, d + i] = tok_prev
+        req.cached_len, req.device_len = d - 1, d
 
         # ---- snapshot linear state (GDN conv+recurrent+PLE ctx) before verify mutates it ----
         pool = self.engine.linear_state_pool
         snap_slot = None
         if pool is not None:
             snap_slot = self._spec_snapshot_slot(req)
-            pool.copy_from(req.linear_slot_idx, snap_slot)
+            pool.copy_from(self._linear_slot(req), snap_slot)
 
         # ---- verify: one prefill-phase Batch over [d-1, d+k) ----
         req.device_len = d + k
@@ -149,6 +163,7 @@ class SchedulerSpecMixin:
         sampled = out.next_tokens_cpu.tolist()
         accepted = accept_drafts(sampled, drafts)
         m = len(accepted)
+        logger.info(f"spec: k={k} m={m} accepted={m - 1}/{k} drafts={drafts} sampled={sampled}")
 
         # ---- commit: only the tokens up to (and including) any finish reason count ----
         self.token_pool[req.table_idx, d : d + m] = out.next_tokens_gpu[:m]
@@ -174,14 +189,22 @@ class SchedulerSpecMixin:
             # (the draft KV wrote garbage past keep_len; _last_residual only holds the last
             # forward's rows).
             if snap_slot is not None:
-                pool.copy_from(snap_slot, req.linear_slot_idx)
+                pool.copy_from(snap_slot, self._linear_slot(req))
             start = d - 1
             rb = Batch(reqs=[req], phase="prefill")
+            # The replay re-forwards ALREADY-COMMITTED positions, so it needs the pre-commit
+            # window lengths -- but they must not survive it: keep_len/keep_len+1 (set above)
+            # are this step's true post-commit state. Leaving the replay's lengths in place
+            # rewinds the request one token behind input_ids, so the next step re-drafts the
+            # previous token AND re-applies position start to a GDN state that already has it
+            # (build_fla_metadata sets has_initial_state = cached_len > 0).
+            keep_cached, keep_device = req.cached_len, req.device_len
             req.cached_len = start
             req.device_len = start + committed
             rfi = self._prepare_batch(rb)
             rb.input_ids = self.token_pool[rfi.input_tuple]
             self.engine.forward_batch(rb, rfi.sample_args)  # sampled token discarded
+            req.cached_len, req.device_len = keep_cached, keep_device
 
         self.cache_manager.cache_req(req, finished=False)
         self.decode_manager.filter_reqs([req])
