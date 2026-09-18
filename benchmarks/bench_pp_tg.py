@@ -62,7 +62,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--serve-arg", dest="serve_args", action="append", default=[],
                    help="extra flag for ft serve, verbatim (repeatable)")
     p.add_argument("--label", default="run", help="tag written into the output rows")
-    p.add_argument("--server-timeout", type=float, default=2400)
+    p.add_argument("--server-timeout", type=float, default=600, help="max seconds to wait for server startup (default: 600s)")
+    p.add_argument("--stall-timeout", type=float, default=45.0, help="max seconds between token arrivals during decode (default: 45s)")
     p.add_argument("--json", dest="json_out", default=None, help="append result rows here")
     p.add_argument("--keep-alive", action="store_true", help="leave the server running (manual probing)")
     return p.parse_args(argv)
@@ -230,17 +231,56 @@ def stream_completion(origin: str, model_id: str, prompt: str, args: argparse.Na
     pieces: list[str] = []
     usage: dict | None = None
     t0 = time.perf_counter()
+
     watch_stop = threading.Event()
+    last_event_time = [time.monotonic()]
+    token_count = [0]
+    in_prefill = [True]
+
+    ttft_timeout = max(90.0, (args.tokens / 1000.0) * 2.5 + 30.0)
+    stall_timeout = getattr(args, "stall_timeout", 45.0)
+
     if proc is not None:
         def _watch():
+            last_heartbeat = time.monotonic()
             while not watch_stop.wait(0.5):
+                now = time.monotonic()
                 if proc.poll() is not None:
                     print(f"\n[bench] server process died with exitcode {proc.returncode}", flush=True)
                     os._exit(1)
+
+                if in_prefill[0]:
+                    elapsed_ttft = now - t0
+                    if now - last_heartbeat >= 5.0:
+                        last_heartbeat = now
+                        print(f"[bench-watchdog] prefill in progress: elapsed {elapsed_ttft:.1f}s / max {ttft_timeout:.1f}s", flush=True)
+                    if elapsed_ttft > ttft_timeout:
+                        err_msg = f"TTFT prefill timed out after {elapsed_ttft:.1f}s (max {ttft_timeout:.1f}s)! Server stalled or GPU deadlocked."
+                        print(f"\n[bench] {err_msg}", flush=True)
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except Exception:
+                            pass
+                        os._exit(1)
+                else:
+                    gap = now - last_event_time[0]
+                    if now - last_heartbeat >= 5.0:
+                        last_heartbeat = now
+                        print(f"[bench-watchdog] decoding: {token_count[0]}/{args.decode} tokens | elapsed {now - t0:.1f}s | last gap {gap:.2f}s", flush=True)
+                    if gap > stall_timeout:
+                        err_msg = f"Token generation stalled! No token for {gap:.1f}s (stall-timeout: {stall_timeout:.1f}s) after token {token_count[0]}/{args.decode}."
+                        print(f"\n[bench] {err_msg}", flush=True)
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except Exception:
+                            pass
+                        os._exit(1)
+
         threading.Thread(target=_watch, daemon=True).start()
+
     try:
         try:
-            resp = urllib.request.urlopen(req, timeout=1800)
+            resp = urllib.request.urlopen(req, timeout=int(ttft_timeout + 60))
         except urllib.error.HTTPError as e:
             sys.exit(f"[bench] request failed: HTTP {e.code}: {e.read()[:500]!r}")
         with resp:
@@ -260,6 +300,9 @@ def stream_completion(origin: str, model_id: str, prompt: str, args: argparse.Na
                     if text:
                         stamps.append(now)
                         pieces.append(text)
+                        in_prefill[0] = False
+                        token_count[0] += 1
+                        last_event_time[0] = time.monotonic()
     finally:
         watch_stop.set()
     if usage is None:
@@ -325,17 +368,26 @@ def die_with_log(msg: str, log_path: str) -> None:
 
 def wait_ready(origin: str, proc, log_path: str, timeout: float) -> None:
     deadline = time.monotonic() + timeout
+    t0 = time.monotonic()
+    last_print = t0
+    last_health_str = "connecting..."
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             die_with_log(f"server exited with code {proc.returncode} during startup", log_path)
+        now = time.monotonic()
+        if now - last_print >= 5.0:
+            last_print = now
+            print(f"[bench-watchdog] waiting for server readiness: {now - t0:.1f}s / {timeout:.0f}s (status: {last_health_str})", flush=True)
         try:
-            health = get_json(f"{origin}/health", timeout=5)
+            health = get_json(f"{origin}/health", timeout=3)
+            last_health_str = str(health.get("maintenance") or health.get("status") or health)
         except (OSError, ValueError):
             time.sleep(1.0)
             continue
         if health.get("status") == "error":
             die_with_log(f"server reported startup error: {health}", log_path)
         if health.get("maintenance") == "serving":
+            print(f"[bench-watchdog] server ready in {time.monotonic() - t0:.1f}s", flush=True)
             return
         time.sleep(1.0)
     die_with_log(f"server not ready after {timeout:.0f}s", log_path)
@@ -368,7 +420,9 @@ def main(argv: list[str] | None = None) -> int:
     prompt = build_prompt_text(args.model, args.prompt_file, args.tokens, args.prompt_offset)
     port = free_port()
     origin = f"http://127.0.0.1:{port}"
-    fd, log_path = tempfile.mkstemp(prefix="bench-pp-tg-", suffix=".log")
+    tmp_dir = os.environ.get("TMPDIR", "/models/desenvolvimento/tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    fd, log_path = tempfile.mkstemp(prefix="bench-pp-tg-", suffix=".log", dir=tmp_dir)
     cmd = serve_cmd(args, port)
     print(f"[bench] serve: {' '.join(cmd)}\n[bench] prompt: {args.tokens} tokens, log: {log_path}", flush=True)
 
