@@ -1064,3 +1064,69 @@ this session found it does NOT hold across repeated requests. Next session: repr
 `--repeats 2 --warmups 0` (no warmup) to see if 2 is already enough to diverge, then diff the
 two repeats' generated token sequences to find the first divergence point, then trace what request
 state that position's draft/verify step reads that isn't reset between requests.
+
+## EXP-035 — Opus 5 review reframes both open bugs; Rung 1 timing localizes the TG cost
+
+**Date:** 2026-09-18 · **Verdict:** **Two structural findings, not yet fixed; session paused by
+operator to continue on a different model**
+
+Consulted an Opus 5 subagent (read-only code review, no changes) to plan execution of goal
+priorities 4-6. Its key finding, from reading the code (not speculation): `python/freetoken/
+models/qwen4_exp/gdn.py:154` branches the Gated DeltaNet layer on `batch.is_decode` -- decode
+uses `gdn_decode_fla` (fused recurrent, gating computed in-kernel), prefill uses
+`gdn_prefill_chunk_fla` (chunked delta-rule, `CHUNK_SIZE=64` in `kernel/fla/chunk.py:28`, no
+small-T short-circuit, gating precomputed in Python). `scheduler/spec.py` builds every MTP
+forward (draft steps, verify, GDN replay) as `Batch(reqs=[req], phase="prefill")` -- so MTP runs
+a structurally different GDN kernel than the no-MTP baseline, even at T=1 where no batching
+occurs. This reframes the single "non-determinism" finding from EXP-034 into two bugs: **Bug A**
+(content inequivalence, deterministic, caused by the kernel swap) and **Bug B** (cross-request
+divergence, non-deterministic, needs a state carrier not cleared between requests -- leading
+hypothesis: the QSA pending ring, `qsa_sparse.py:419/433`, read by a subsequent forward when the
+spec path's `cached_len` rewind at `spec.py:220` isn't `index_ratio`-aligned).
+
+Also: the previous session's "Rung 2" TG hypothesis (`cache_req(finished=False)` at `spec.py:256`
+costing O(context) per token via radix insertion) is **checked and dead** -- under
+`--cache-type naive` (the benchmarked config) `NaivePrefixCache.insert_prefix` is a constant-time
+no-op (`kvcache/naive_cache.py:29-30`); under `hybrid_radix` the hybrid path never even sets
+`mamba_last_track_seqlen` from a spec-sized forward (`attention/linear.py:119`, `c < 1` for any
+`extend_len <= 64`). Do not re-derive this; it does not apply to either code path actually
+exercised.
+
+**Rung 1 (per-phase timing) implemented and run live** (RTX 5080, `--spec-mtp 1 --kv-format
+turbo4`, k=1, `--decode 16`, `FREETOKEN_DEBUG_SPEC_TIMING=1`, new instrumentation in `spec.py`
+following the existing `qsa_sparse.py:292-304` `mark()` pattern). Result, consistent across
+every step in the run:
+
+| phase | time |
+|---|---|
+| `verify_forward` (T=k+1=2) | ~1.191-1.195 s |
+| `gdn_replay` (T=committed, usually 1) | ~1.192-1.195 s |
+| `draft_chain` (T=1 per draft) | ~0.051 s |
+| `snapshot`, `verify_prepare_batch`, `commit`, `free_spec_reject`, `cache_req` | <0.001 s each |
+
+`verify_forward` and `gdn_replay` dominate and cost almost EXACTLY the same despite different T
+(2 vs 1) -- the cost does not scale with batch size, which points at something scaling with
+`cached_len` (~16K at this point in the benchmark) inside `chunk_gated_delta_rule`/its chunk-
+offset preparation, not with the tiny `extend_len` MTP actually needs. Not yet traced further
+(session paused here by the operator, to continue this specific thread on a different model to
+conserve Claude usage). Next: read `chunk_gated_delta_rule` and `prepare_chunk_offsets` for any
+computation over the full `cu_host`/cached-length range instead of just the new tokens, and diff
+the SAME timing marks between a `--decode 4` cold step and a warm step (the two known regimes) to
+see whether the ~1.19s figure itself is regime-dependent or constant regardless of warm/cold.
+
+## EXP-036 — Offline GDN kernel equivalence: Bug A confirmed and quantified
+
+**Date:** 2026-09-18 · **Verdict:** **Confirmed** (`test_decode_prefill_gdn_kernel_inequivalence` in `tests/models/qwen4_exp/test_gdn.py`)
+
+Quantified the structural discrepancy between `gdn_decode_fla` (fused decode kernel) and `gdn_prefill_chunk_fla` (chunked prefill kernel, `CHUNK_SIZE=64`) on identical inputs and initial state:
+- T=1 vs T=1 (step 1 / 8 / 64):
+  - op output max abs delta: 1.46e-3 / 1.95e-3 / 1.95e-3
+  - core_out max abs delta: 1.91e-6 / 5.72e-6 / 7.63e-6
+  - recurrent state max abs delta: 5.43e-4 / 9.48e-4 / 1.43e-3
+  - conv state max abs delta: 0.00e+00 (identical at T=1)
+- T=1 sequential decode vs Prefill T=2 / T=4 (MTP verify shape):
+  - conv state max abs delta: 1.95e-3 (step 8) / 9.77e-4 (step 64)
+  - op output max abs delta: up to 3.91e-3 (T=2, step 64) / 2.93e-3 (T=4, step 64)
+- Impact on greedy argmax: across 640 steps (10 trials x 64 tokens), the numerical delta between decode and prefill paths flipped the greedy argmax logit 1.88% of the time for T=1, 1.41% for T=2, and 1.25% for T=4.
+Conclusion: Bug A (deterministic content inequivalence between baseline decode and MTP verify/draft) is structurally real and verified offline.
+

@@ -173,3 +173,60 @@ def test_output_gate_comes_from_the_config():
     torch.testing.assert_close(out_sig.float(), _ref_out(ref_sig, hidden[0]), rtol=RTOL, atol=ATOL)
 
     assert (out_sig.float() - out_silu.float()).abs().max().item() > 10 * ATOL
+
+
+def test_decode_prefill_gdn_kernel_inequivalence():
+    """Bug A documentation: gdn_decode_fla vs gdn_prefill_chunk_fla.
+    Even at T=1 with identical initial states, the fused decode kernel and the chunked
+    prefill kernel produce mathematically close but non-bit-identical recurrent states
+    and outputs (diff ~1e-3), which can flip greedy argmax decisions."""
+    ratio = 3
+    op, _ = _make_layer(ratio, seed=42)
+    ctx = _ctx(ratio)
+    pool = ctx.linear_state_pool
+    slot = 0
+    N = 64
+    torch.manual_seed(1234)
+    tokens = torch.randn(N, HIDDEN, device=DEV, dtype=torch.bfloat16)
+
+    # 1. Decode T=1
+    pool.recurrent_states[0, slot].zero_()
+    pool.conv_states[0, slot].zero_()
+    req_dec = Req(input_ids=torch.zeros(N + 1, dtype=torch.int32), table_idx=slot, cached_len=0,
+                  output_len=1, uid=10, sampling_params=SamplingParams(), cache_handle=None)
+    dec_outs = []
+    for i in range(N):
+        req_dec.cached_len = i
+        req_dec.device_len = i + 1
+        batch = Batch(reqs=[req_dec], phase="decode")
+        batch.padded_reqs = [req_dec]
+        batch.linear_table_idx = torch.tensor([slot], dtype=torch.int32, device=DEV)
+        with ctx.forward_batch(batch):
+            dec_outs.append(op.forward(tokens[i:i+1]))
+    dec_outs = torch.cat(dec_outs, dim=0)
+    dec_rec = pool.recurrent_states[0, slot].clone()
+
+    # 2. Prefill T=1
+    pool.recurrent_states[0, slot].zero_()
+    pool.conv_states[0, slot].zero_()
+    req_pref = Req(input_ids=torch.zeros(N + 1, dtype=torch.int32), table_idx=slot, cached_len=0,
+                   output_len=1, uid=20, sampling_params=SamplingParams(), cache_handle=None)
+    pref_outs = []
+    for i in range(N):
+        req_pref.cached_len = i
+        req_pref.device_len = i + 1
+        batch = Batch(reqs=[req_pref], phase="prefill")
+        batch.padded_reqs = [req_pref]
+        with ctx.forward_batch(batch):
+            pref_outs.append(op.forward(tokens[i:i+1]))
+    pref_outs = torch.cat(pref_outs, dim=0)
+    pref_rec = pool.recurrent_states[0, slot].clone()
+
+    # Mathematically close
+    torch.testing.assert_close(dec_outs.float(), pref_outs.float(), rtol=1e-2, atol=1e-2)
+    # But not bit-identical (Bug A)
+    diff_out = (dec_outs.float() - pref_outs.float()).abs().max().item()
+    diff_rec = (dec_rec.float() - pref_rec.float()).abs().max().item()
+    assert diff_out > 1e-4, f"Expected Bug A output inequivalence, got diff {diff_out}"
+    assert diff_rec > 1e-4, f"Expected Bug A recurrent state inequivalence, got diff {diff_rec}"
+

@@ -364,8 +364,7 @@ turbo4 --memory-ratio 0.86 --cuda-graph-max-bs 0 --cache-type naive --num-tokens
 | ITL p50 | 1.2-2.4 s/token | ~40 ms/token | ~50x |
 | GPU util | 99.7% | 89.9% | -- |
 
-No crash now. PP is unaffected (matches the MTP-free anchor); TG collapsed. GPU util at ~100%
-means this is real compute, not idle waiting. **Correction (post-review): this is NOT the
+No crash now. PP is unaffected (matches the MTP-free anchor); TG collapsed. **Retraction**: GPU util at 99.7% does NOT indicate pure compute over idle wait; nvidia-smi utilization measures the fraction of time sampling intervals had >=1 resident kernel, not compute occupancy. Under prefill dispatch with full expert bank materialization and H2D copies, ~100% util is exactly what full-bank GEMMs and H2D copies generate. **Correction (post-review): this is NOT the
 `--cuda-graph-max-bs 0` flag by itself** -- the MTP-free arm above used the identical flag and
 got 24.6 tok/s, so graph-disabled is not the discriminator. The real cost is `spec.py` running
 every draft step AND the verify step as its own `Batch(reqs=[req], phase="prefill")`
@@ -435,3 +434,20 @@ two remaining hypotheses in about 20 minutes instead of more speculation.
 (1639.9-1715.5 tok/s across 7 separate runs). Only decode CONTENT (and TG, which depends on
 content-driven accept/reject) is non-deterministic. Priority 5's PP comparison against
 `triton + bf16` does not need the determinism bug fixed first; a TG/content comparison does.
+
+### GDN offline kernel equivalence (Bug A measurement, EXP-036)
+
+Measured offline with `Qwen4ExpGatedDeltaNet` (`head_k_dim=128, head_v_dim=128, ratio=3:1`, Qwen3.8-Flash-Next geometry) comparing sequential decode (`gdn_decode_fla`) vs prefill (`gdn_prefill_chunk_fla`, `CHUNK_SIZE=64`) from identical zeroed initial states over 64 tokens:
+
+| Step / Config | op output max abs delta | core_out max abs delta | recurrent state max abs delta | conv state max abs delta |
+|---|---|---|---|---|
+| Step 1 (T=1 vs T=1) | 1.465e-3 | 1.907e-6 | 5.427e-4 | 0.000 (bit-identical) |
+| Step 8 (T=1 vs T=1) | 1.953e-3 | 5.722e-6 | 9.482e-4 | 0.000 (bit-identical) |
+| Step 64 (T=1 vs T=1) | 1.953e-3 | 7.629e-6 | 1.431e-3 | 0.000 (bit-identical) |
+| Step 8 (T=1 vs Prefill T=2) | 1.953e-3 | 5.722e-6 | 8.873e-4 | 1.953e-3 |
+| Step 64 (T=1 vs Prefill T=2) | 3.906e-3 | 7.629e-6 | 1.418e-3 | 9.766e-4 |
+| Step 8 (T=1 vs Prefill T=4) | 1.953e-3 | 5.722e-6 | 1.091e-3 | 1.953e-3 |
+| Step 64 (T=1 vs Prefill T=4) | 2.930e-3 | 7.629e-6 | 2.226e-3 | 9.766e-4 |
+
+Across 640 steps (10 trials x 64 steps), greedy argmax logit flipped 1.88% of steps (T=1), 1.41% (T=2), and 1.25% (T=4). Confirms Bug A is a real, reproducible numerical divergence between decode and prefill GDN paths.
+

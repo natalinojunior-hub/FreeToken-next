@@ -9,6 +9,8 @@ one accepted token per step. Design history: docs/freetoken-next/EXPERIMENTS.md 
 
 from __future__ import annotations
 
+import os
+import time
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -21,6 +23,8 @@ if TYPE_CHECKING:
     from .scheduler import Scheduler  # noqa: F401  (self-typing only)
 
 logger = init_logger(__name__)
+
+SPEC_TIMING_ENV = "FREETOKEN_DEBUG_SPEC_TIMING"
 
 
 def _spec_mrope_positions(req: Req, cached_len: int, device_len: int, device: torch.device) -> torch.Tensor:
@@ -149,6 +153,17 @@ class SchedulerSpecMixin:
         if k <= 0:
             return False
 
+        debug_timing = os.getenv(SPEC_TIMING_ENV, "0") == "1"
+        _t0 = time.perf_counter()
+
+        def mark(stage: str) -> None:
+            if debug_timing:
+                torch.cuda.synchronize(self.device)
+                nonlocal _t0
+                now = time.perf_counter()
+                print(f"[spec-timing] k={k} {stage} {now - _t0:.4f}s", flush=True)
+                _t0 = now
+
         d = req.device_len  # invariant: d == req.cached_len + 1
         model = self.engine.model
         mtp = model.mtp
@@ -180,6 +195,7 @@ class SchedulerSpecMixin:
             drafts.append(int(tok_prev.item()))
             self.token_pool[req.table_idx, d + i] = tok_prev
         req.cached_len, req.device_len = d - 1, d
+        mark("draft_chain")
 
         # ---- snapshot linear state (GDN conv+recurrent+PLE ctx) before verify mutates it ----
         pool = self.engine.linear_state_pool
@@ -187,6 +203,7 @@ class SchedulerSpecMixin:
         if pool is not None:
             snap_slot = self._spec_snapshot_slot(req)
             pool.copy_from(self._linear_slot(req), snap_slot)
+        mark("snapshot")
 
         # ---- verify: one prefill-phase Batch over [d-1, d+k) ----
         req.device_len = d + k
@@ -194,8 +211,10 @@ class SchedulerSpecMixin:
         fi = self._prepare_batch(vb)
         vb.spec_logits_indices = torch.arange(k + 1, device=self.device)
         vb.input_ids = self.token_pool[fi.input_tuple]
+        mark("verify_prepare_batch")
         out = self.engine.forward_batch(vb, fi.sample_args)
         out.copy_done_event.synchronize()
+        mark("verify_forward")
         sampled = out.next_tokens_cpu.tolist()
         accepted = accept_drafts(sampled, drafts)
         m = len(accepted)
@@ -205,6 +224,7 @@ class SchedulerSpecMixin:
         self.token_pool[req.table_idx, d : d + m] = out.next_tokens_gpu[:m]
         committed = self._commit_spec_tokens(req, accepted, start_pos=d, spec_alloc_len=d + k)
         finished = committed < m or (committed == m and req in self.finished_reqs)
+        mark("commit")
 
         if not finished and (committed < m or m <= k):
             # Return whatever the verify window allocated beyond what actually counts: the
@@ -219,6 +239,7 @@ class SchedulerSpecMixin:
             self.cache_manager.free_spec_reject(req, keep_len=keep_len + 1, alloc_len=d + k)
             req.cached_len = keep_len
             req.device_len = keep_len + 1
+        mark("free_spec_reject")
 
         if finished:
             self.free_spec_snapshot_slot(req)
@@ -252,7 +273,9 @@ class SchedulerSpecMixin:
             rb.input_ids = self.token_pool[rfi.input_tuple]
             self.engine.forward_batch(rb, rfi.sample_args)  # sampled token discarded
             req.cached_len, req.device_len = keep_cached, keep_device
+            mark("gdn_replay")
 
         self.cache_manager.cache_req(req, finished=False)
+        mark("cache_req")
         self.decode_manager.filter_reqs([req])
         return True
