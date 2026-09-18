@@ -1153,4 +1153,21 @@ Conclusion: Bug A (deterministic content inequivalence between baseline decode a
      - Other: **12.24 ms (1.0%)**.
    - Conclusion: The TG collapse is 96.3% caused by MoE running the prefill materialize-all-experts path instead of the decode resident-cache path.
 
+## EXP-038 — Bug B State Carrier Probe: QSA pending_ring and cmp_k Identified as the Carrier
 
+**Date:** 2026-09-18 · **Verdict:** **Confirmed Hypothesis B1 (QSA `pending_ring` and `cmp_k_buffer` scratch row carry un-cleared state across requests)**
+
+Instrumented `run_spec_step` with hash tracking of all state carriers keyed by `table_idx` (`conv_states`, `recurrent_states`, `pending_ring`, `cmp_k_buffer` base and scratch row) on the first speculative step of each request across 6 sequential requests (`--decode 4 --repeats 6`):
+- `conv_states` hash: `7.900418e+05_[36, 10240, 3]` across **all 6 requests (bit-identical)**.
+- `recurrent_states` hash: `7.183923e+04_[36, 48, 128, 128]` across **all 6 requests (bit-identical)**.
+- `pending_ring` hash:
+  - Req 0 (fresh): `6.707354e+03_[13, 8, 128]`
+  - Req 1: `6.904555e+03_[13, 8, 128]` (DIVERGED)
+  - Reqs 2-5: `6.904555e+03_[13, 8, 128]` (STABILIZED at the leaked state)
+- `cmp_base` / `cmp_scratch` hash:
+  - Req 0: `4.838718e+06` / `1.193587e+03`
+  - Req 1: `4.876734e+06` / `1.295942e+03` (DIVERGED)
+  - Reqs 2-5: `4.895720e+06` / `1.301693e+03`
+- Mechanism: `qsa_pool.py` allocates `_pending_ring` (`[num_req_slots, layers, ring_capacity, index_head_dim]`) and `_cmp_k_buffer` which are documented as "never cleared". When a request finishes, `_free_req_resources` recycles `table_idx` without zeroing `pending_ring` or scratch rows. When MTP rewinds `cached_len` on spec reject, unclosed group rows remain in `pending_ring`, causing subsequent requests on recycled `table_idx` to read stale index keys during draft QSA attention.
+- Result: Drafts flip from `[76531]` (Reqs 0-1) to `[4881]` (Reqs 2-5) solely due to stale QSA ring/cmp state.
+- Carrier named: **QSA `pending_ring` and `_cmp_k_buffer[scratch]`**.

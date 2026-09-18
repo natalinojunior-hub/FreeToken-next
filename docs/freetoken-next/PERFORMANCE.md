@@ -477,4 +477,15 @@ Measured on RTX 5080 with Qwen3.8-Flash-Next at 16K context:
 
 Conclusion: MoE accounts for 1197.45 ms (96.3%) of the prefill forward time due to per-forward layer materialization and 512-expert GEMMs across all 48 layers.
 
+### Bug B State Carrier Probe (EXP-038)
+
+Measured initial state hashes across 6 sequential requests (`--decode 4 --repeats 6`):
+- `conv_states`: `7.900418e+05` (identical in all 6 requests).
+- `recurrent_states`: `7.183923e+04` (identical in all 6 requests).
+- `pending_ring`: `6.707354e+03` on Req 0 -> `6.904555e+03` on Req 1+ (diverged, state carrier found).
+- `cmp_k_buffer`: `4.838718e+06` on Req 0 -> `4.876734e+06` on Req 1 -> `4.895720e+06` on Req 2+ (diverged, state carrier found).
+
+Result: `conv` and `rec` are non-carriers (cleanly isolated). Stale rows in QSA `pending_ring` and `_cmp_k_buffer` scratch row survive request termination on `table_idx` recycling, altering subsequent draft decisions.
+
+
 

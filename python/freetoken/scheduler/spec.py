@@ -143,7 +143,56 @@ class SchedulerSpecMixin:
                 self.finished_reqs.add(req)
         return committed
 
+    def _probe_carrier_hashes(self, req: Req) -> dict:
+        hashes = {}
+        pool = getattr(self.engine, "linear_state_pool", None)
+        slot = self._linear_slot(req)
+        if pool is not None:
+            c = pool.conv_states[:, slot]
+            hashes["conv"] = f"{float(c.float().abs().sum().item()):.6e}_{list(c.shape)}"
+            rec = pool.recurrent_states[:, slot]
+            hashes["rec"] = f"{float(rec.float().abs().sum().item()):.6e}_{list(rec.shape)}"
+        else:
+            hashes["conv"] = hashes["rec"] = "None"
+
+        kv = getattr(self.engine, "kv_cache", None)
+        ring_buf = getattr(kv, "_pending_ring", None)
+        if ring_buf is not None:
+            r = ring_buf[req.table_idx]
+            hashes["ring"] = f"{float(r.float().abs().sum().item()):.6e}_{list(r.shape)}"
+        elif hasattr(kv, "pending_ring"):
+            try:
+                p0 = kv.pending_ring(0)
+                r = p0[req.table_idx]
+                hashes["ring"] = f"{float(r.float().abs().sum().item()):.6e}_{list(r.shape)}"
+            except Exception as e:
+                hashes["ring"] = f"err_{e}"
+        else:
+            hashes["ring"] = "None"
+
+        cmp_buf = getattr(kv, "_cmp_k_buffer", None)
+        if cmp_buf is not None:
+            base = getattr(kv, "_cmp_scratch_base", 0)
+            c_base = cmp_buf[:, :base]
+            hashes["cmp_base"] = f"{float(c_base.float().abs().sum().item()):.6e}_{list(c_base.shape)}"
+            c_scratch = cmp_buf[:, base + req.table_idx]
+            hashes["cmp_scratch"] = f"{float(c_scratch.float().abs().sum().item()):.6e}_{list(c_scratch.shape)}"
+        elif hasattr(kv, "cmp_k_cache"):
+            try:
+                base = getattr(kv, "cmp_scratch_base", 0)
+                c0 = kv.cmp_k_cache(0)
+                c_base = c0[:base]
+                hashes["cmp_base"] = f"{float(c_base.float().abs().sum().item()):.6e}_{list(c_base.shape)}"
+                c_scratch = c0[base + req.table_idx]
+                hashes["cmp_scratch"] = f"{float(c_scratch.float().abs().sum().item()):.6e}_{list(c_scratch.shape)}"
+            except Exception as e:
+                hashes["cmp_base"] = hashes["cmp_scratch"] = f"err_{e}"
+        else:
+            hashes["cmp_base"] = hashes["cmp_scratch"] = "None"
+        return hashes
+
     def run_spec_step(self) -> bool:
+
         """Run one speculative decode step for the single eligible request. Returns True if
         it ran (the caller should skip its own _schedule_next_batch/_forward this iteration)."""
         req = self._spec_eligible_req()
@@ -152,6 +201,14 @@ class SchedulerSpecMixin:
         k = min(self.spec_mtp, req.remain_len - 1)
         if k <= 0:
             return False
+
+        if not hasattr(self, "_spec_probed_uids"):
+            self._spec_probed_uids = set()
+
+        if req.uid not in self._spec_probed_uids:
+            self._spec_probed_uids.add(req.uid)
+            h = self._probe_carrier_hashes(req)
+            print(f"[carrier-probe] FIRST req.uid={req.uid} table_idx={req.table_idx} slot={self._linear_slot(req)} {h}", flush=True)
 
         debug_timing = os.getenv(SPEC_TIMING_ENV, "0") == "1"
         _t0 = time.perf_counter()
@@ -167,6 +224,7 @@ class SchedulerSpecMixin:
         d = req.device_len  # invariant: d == req.cached_len + 1
         model = self.engine.model
         mtp = model.mtp
+
 
         # ---- draft chain: k autoregressive steps through the draft head's own QSA slot ----
         r_prev = model.model._last_residual[-1:].clone()
@@ -242,9 +300,12 @@ class SchedulerSpecMixin:
         mark("free_spec_reject")
 
         if finished:
+            h = self._probe_carrier_hashes(req)
+            print(f"[carrier-probe] LAST  req.uid={req.uid} table_idx={req.table_idx} slot={self._linear_slot(req)} {h}", flush=True)
             self.free_spec_snapshot_slot(req)
             self.decode_manager.filter_reqs([req])
             return True
+
 
         if committed <= k:
             # Partial/full reject, request still live: undo GDN/PLE state and re-forward the
