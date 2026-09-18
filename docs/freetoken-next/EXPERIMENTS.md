@@ -853,3 +853,83 @@ pre-existing, already-documented (EXP-015) razor-thin margin, not a leak or regr
 introduced by this session's MTP work. Equally possible for a baseline run that happens to get
 unlucky. Operator rule going forward: at most 2 retries on any repeating failure, then measure
 instead of retrying again -- this entry is the result of following that rule.
+
+## EXP-030 — moe_cache_auto silently downgraded an explicit --num-tokens instead of refusing
+**Date:** 2026-09-17 · **Verdict:** **FIXED / KEEP**
+
+Found while trying to benchmark MTP's PP/TG at 16K: `--spec-mtp 1 --num-tokens 16576` started
+cleanly, logged "Allocating 8256 tokens for KV cache" (HALF of the requested 16576, and half of
+what `--spec-mtp 0` gets with the identical flag), and only surfaced the shortfall as a confusing
+`torch.OutOfMemoryError` deep inside a GDN kernel once a real 16384-token prompt was actually
+prefilled. Root cause: `Engine._resolve_auto_moe_cache_size` fed `vram_ledger.decide()` a
+`kv_reserve_tokens` floor of `max(config.kv_reserve_tokens, min_reserve)` -- using only the
+`--kv-reserve-tokens` flag (default 8192) as the KV floor for the MoE/KV split, never looking at
+an explicit `--num-tokens`/`--num-pages` override at all. The override was correctly *preserved*
+after the split (`if config.num_page_override is None: ...`), but the split itself, run first,
+had already decided how much VRAM to hand to experts based on the wrong (smaller) floor, and once
+an MTP-registered layer's extra weights/index slab made the budget tighter than the `--spec-mtp 0`
+case, "smaller floor, more experts" resolved to a KV allocation below what the user actually asked
+for and the request actually needed.
+
+Fix: fold `num_page_override * page_tokens` into the `kv_reserve_tokens` floor passed to
+`decide()`. `decide()` already asserts ("cache budget too small: minimum plan ... needs X > budget
+Y") when the resulting plan can't fit the budget -- so an unfundable `--num-tokens` now fails
+loudly at startup through that existing guard instead of silently under-provisioning and OOMing
+mid-request. No-op when no override is given. New regression test:
+`tests/engine/test_cache_budget.py::test_engine_resolve_auto_moe_cache_size_refuses_undersized_num_tokens_override`.
+845 passed, 63 skipped (2 pre-existing unrelated failures) across the focused suite.
+
+## EXP-031 — Host-RAM OOM during MTP benchmarking: root-caused with Opus 5, not a leak
+**Date:** 2026-09-17 · **Verdict:** **FIXED / KEEP (environment, not code)**
+
+EXP-029 (same session, same symptom) concluded "pre-existing razor-thin margin, retry at most
+twice" -- true but incomplete. The operator pushed back ("only 8-9GB RAM in use, not a RAM
+problem") after seeing `free -h` post-crash, and asked for a full investigation via Opus 5 rather
+than accepting the first explanation. That investigation (read-only shell diagnostics + engine
+source review) found:
+
+1. **The operator's post-crash `free -h` and the crash itself are both true, no contradiction**:
+   `journalctl -u earlyoom` at the exact kill timestamp shows `VmRSS 69428 MiB` for the dying
+   process and `mem avail: 7580 of 77673 MiB (9.76%)` -- the peak is real and transient; `free -h`
+   run afterward measures a different moment, after those ~69 GiB were already freed by the
+   SIGTERM. Six independent kills all showed VmRSS 69.0-69.6 GiB.
+2. **The "~15.7 GiB gap" between earlyoom's reported total (~77.6 GiB) and true `MemTotal`
+   (~93.4 GiB) is not a bug or a hidden reservation** -- `earlyoom --dryrun -r 1` prints `mem
+   total` and `user mem total` as two DIFFERENT, correctly-labeled numbers; earlyoom's threshold
+   check uses the second (live-recomputed, nets out shmem/tmpfs), confirmed by the journal
+   showing that denominator moving across a huge range (2279 -> 81632 MiB) that `MemTotal`
+   physically cannot. Practical consequence: **every 1 GiB parked in `/tmp` (a 46 GiB tmpfs)
+   costs ~0.9 GiB of the 10% SIGTERM margin**, not a neutral 1 GiB of a fixed pool.
+3. **Swap is 0** (`SwapTotal: 0`), and earlyoom only fires when memory AND swap are both below
+   threshold -- with no swap, the swap half of that condition is permanently satisfied, so the
+   memory trigger is effectively unguarded compared to a swap-enabled host.
+4. **The expert-bank loader itself is already tight, nothing to patch for RAM**: private
+   anonymous mmap (EXP-020), `drop_page_cache` before AND after every shard
+   (`nvfp4_banks.py:114-123`), pin-after-fill instead of a redundant zero-fill pass
+   (`host_banks.py:1-17`), chunked O_DIRECT reads with `posix_fadvise(DONTNEED)` bypassing page
+   cache entirely for bulk reads. The 68-70 GiB peak is the 48x512 NVFP4 bank set itself
+   (EXP-015's own 63.46 GiB price) plus runtime overhead -- real and irreducible without a
+   different residency strategy (streamed/bounded loading, future work, not this session).
+5. **The kills missed the threshold by only 78-187 MiB out of 93 GiB (~0.1-0.2%)**, while ~3.3
+   GiB of stale, unrelated tmpfs artifacts (old llama.cpp build trees, an npm cache, a benchmark
+   log from 2026-09-16 tool sessions unrelated to this campaign) were sitting in `/tmp` the whole
+   time -- 16-38x the deficit that actually mattered.
+
+**Fix applied**: moved the ~3.3 GiB of stale `/tmp` artifacts to `/models/backup/pytest-of-natal/
+tmp-leftovers-20260917/` (disk-backed, `natal`-writable; `/models/backup` itself is root:root and
+needs `sudo mkdir`+`chown` per subfolder -- already done for this path). `systemctl mask
+tmp.mount` (done earlier this session, confirmed `systemctl is-enabled tmp.mount` -> `masked`,
+symlinked to `/dev/null`) makes this permanent from the next reboot onward: `/tmp` will no longer
+mount as tmpfs at all, closing this entire failure class structurally rather than requiring
+per-session cleanup.
+
+**Secondary finding, flagged not fixed** (out of scope, a speed issue not a RAM one):
+`python/freetoken/moe/expert_banks.py:352`'s `_host_ram_fits_parallel` guard compares available
+RAM against the checkpoint's TOTAL file size (125.9 GiB) instead of the actual bank size (63.46
+GiB) -- on this host that guard can never pass, so the parallel expert-loading path is
+permanently unreachable (always silently falls back to serial, a load-time regression, not a
+correctness or RAM one). The same guard separately budgets the transient peak as one shard when
+`models/weight.py:86` documents `(prefetch+1)` = 3 shards (largest 9.99 GiB) -- fixing only the
+bank-size half without the transient half could newly allocate ~30 GiB of anonymous whole-shard
+buffers on top of the banks. Fix both together if parallel loading is ever revisited; not done
+this session.

@@ -3,6 +3,55 @@
 Snapshot date: 2026-09-17. This is the current truth; history goes to
 EXPERIMENTS.md / DECISIONS.md, not here.
 
+## Handoff (2026-09-17, session ending — continuing under Codex/Luna)
+
+**Read this section first.** Item E (native MTP, `.qwen/tmp/GOAL-FLASH-NEXT-MASTER.md`) is the
+active thread. Everything through "content-correctness confirmed live" is DONE and committed
+(see the MTP row below and EXP-021 through EXP-031). What is NOT done, in order:
+
+1. **Run the actual PP/TG/acceptance benchmark.** Every attempt this session died to the
+   host-RAM `earlyoom` race (EXP-029/031) before reaching a single measured number — the code
+   is validated for correctness, not yet for throughput. The RAM cause is now understood and
+   fixed (see the environment gotcha below); this should just work now. Command:
+   ```bash
+   FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1 TMPDIR=/models/desenvolvimento/tmp \
+     .venv/bin/python benchmarks/bench_pp_tg.py \
+     --model /models/Qwen3.8-Flash-Next-NVFP4-Radix --tokens 16384 --decode 64 \
+     --repeats 2 --warmups 1 --label mtp-k1 \
+     --serve-arg "--cache-type naive" --serve-arg "--max-running-requests 1" \
+     --serve-arg "--num-tokens 16576" --serve-arg "--spec-mtp 1" \
+     --json /models/desenvolvimento/tmp/mtp_validate/pp_tg.jsonl
+   ```
+   Compare against the `--spec-mtp 0` baseline (drop `--spec-mtp 1`, drop
+   `FREETOKEN_DISABLE_OVERLAP_SCHEDULING`): known-good anchor PP 1857.9 / TG 28.76 at this exact
+   config (EXP-031-era baseline run). Before running: check `free -h` and `du -sh /tmp/*` per
+   the gotcha below — if the host was rebooted since 2026-09-17, `/tmp` should no longer be
+   tmpfs at all (confirm with `mount | grep " /tmp "`) and this entire class of failure is gone.
+2. **k=2/k=3 live validation.** The draft-chain per-step position bug (draft step i>=1 couldn't
+   see its own prior KV) was fixed by code inspection during the k=1 debugging, never exercised
+   live. Run the same greedy content-equivalence check (short + the "ocean poem" prompt that
+   caught the k=1 bug) at `--spec-mtp 2` and `--spec-mtp 3` before trusting them.
+3. **Acceptance-rate logging is silent.** `scheduler/spec.py`'s `logger.info(f"spec: k=...")`
+   line never appeared in the server log despite the spec path demonstrably running (content
+   fix confirmed). Minor, not a correctness blocker — worth a quick look at scheduler-subprocess
+   log routing before relying on acceptance-rate numbers for the goal's report.
+4. **The prefill-window MTP warm-up pass is still missing** (EXP-025's throughput-critical gap):
+   the draft head's own KV never gets populated over the ORIGINAL PROMPT, only over positions
+   generated after MTP engages. Correctness is unaffected (target verify is still exact) but
+   acceptance rate is likely poor for the first several tokens after any prefill. Not
+   implemented this session; needed before trusting a measured acceptance rate as representative.
+5. Only after 1-4: the goal's preflight gates (target-equivalence ✅ done, acceptance/rollback
+   timing measured, a credible 256K projection) can be evaluated, and only then does a 256K
+   certification attempt become in-scope — not before, per the goal's own hard test budget.
+
+**Non-MTP loose end**: `python/freetoken/moe/expert_banks.py:352`'s `_host_ram_fits_parallel`
+guard was flagged (not fixed) by the Opus RAM investigation (EXP-031) — it compares against
+total checkpoint size (125.9 GiB) instead of the actual bank size (63.46 GiB), so the parallel
+expert-loading path is permanently unreachable on this host (silent perf regression, always
+serial-loads), AND its transient-memory budget separately under-counts the prefetch window
+(1 shard budgeted vs the documented 3). Both need fixing together if parallel loading is ever
+revisited — fixing only one half first could cause a NEW ~30 GiB transient OOM.
+
 ## Where we are
 
 **Phase 1 (clean fast base) DONE. Phase 6 (the VRAM ledger + governor) DONE: one account
@@ -30,7 +79,7 @@ known to be a pool-keying change and not a missing kernel.**
 | Phase 2 GGUF loader | **committed** (`86af2d3`); dense row measured, MoE rows gated | EXP-004: the IQ3_S 27B GGUF generated coherent, factually correct text and the NextN/MTP drop warned as designed; EXP-010 measured it (PP 2416.6 / TG 25.29 / RSS 2.17 GiB). The two MoE GGUFs that geometry blocks are gated by Phase 7 pool-keying, not by a missing kernel |
 | Phase 3 Turbo KV | **codec + pool + both fused paths landed; contiguous reader rewrite reverted** | `turbo_kv` (NMSE at Lloyd-Max theory: 0.0339 turbo3 / 0.0092 turbo4), `turbo_pool` (50 B / 66 B per token-head-slab vs 256 B bf16 = 5.12x / 3.88x, `kv_cost`/`unit_bytes` parity pinned), `turbo_attn` readers, `COMPRESSED` branches in the decode *and* prefill kernels, and `--kv-format` wired through config/factory/ledger. Serves on the host: plan gives **6183 slots + 8440 pages** where bf16 gave 6113 + 8238, and at **256K: 5427 slots vs 3183** (PERFORMANCE §10, EXP-012/013). The contiguous-load rewrite passed correctness pins but regressed the matched 16K A/B to TG 45.74, so the pre-rewrite readers are restored; EXP-013 records the evidence and next bounded-tile hypothesis |
 | Decision B MoE routing instrumentation | **partial / blocked on host load** | `--moe-collect-stats` is parser-tested and logs graph-safe aggregate/per-layer counters at worker shutdown (`56774dc`); detached reproduction reached only bank 176/192 and was killed with `exitcode=-9`, consistent with the 63.46 GiB bank footprint exceeding the host's 62 GiB available RAM (EXP-015) |
-| Native MTP config/reader seam | **content-correct live for k=1; throughput unmeasured** | Full pipeline implemented and validated against the real checkpoint (`--spec-mtp 1`, 16K, single request, naive cache): weight loading, MoE-bank aliasing, scheduler spec-loop (EXP-021/022/024/025/026). Five real bugs found and fixed via live serving (EXP-027/028), the last a state-corrupting reject-path rewind bug found by a third Opus 5 pass. Retest confirms MTP output is content byte-identical to `--spec-mtp 0` on both a short and a previously-diverging longer prompt. k=2/3 fixed by inspection, not yet live-tested. No PP/TG/acceptance measurement taken yet -- that and a k=2/3 live check are the next steps before any preflight gate can be marked satisfied |
+| Native MTP config/reader seam | **content-correct live for k=1; throughput STILL unmeasured** | Full pipeline implemented and validated against the real checkpoint (`--spec-mtp 1`, 16K, single request, naive cache): weight loading, MoE-bank aliasing, scheduler spec-loop (EXP-021/022/024/025/026). Six real bugs found and fixed via live serving (EXP-027/028: weight-loading `KeyError`, missing package export, MoE offload-cache layer-count assert + `moe_layer_id` aliasing, a per-token `cached_len`/`device_len` accounting bug, and the state-corrupting reject-path rewind bug found by a third Opus 5 pass). Retest confirms MTP output is content byte-identical to `--spec-mtp 0` on both a short and a previously-diverging longer prompt. k=2/3 fixed by inspection, not yet live-tested. A real `--moe-cache-auto` correctness bug was also found and fixed along the way (EXP-030: an explicit `--num-tokens` was silently downgraded instead of refusing, once the MTP layer's extra VRAM made the auto split tight). **No PP/TG/acceptance measurement has been taken yet** — every attempt so far died to a host-RAM `earlyoom` race during expert-bank loading (EXP-029/031), now understood and fixed (see below); the next session's first job is to actually run the benchmark |
 | NVMe/FTW cold-bank hypothesis | **converter resumable; artifact proven** | `FTWWriter` checkpoints every tensor and validates/truncates on restart; dense and streamed MoE entries resume without rewriting. Private host-bank mappings make `MADV_DONTNEED` reclaim conversion pages. Native Flash-Next resumed to a valid 73.53 GiB FTW with 48 layers and 10 shards (EXP-017/018/020); serving and throughput remain unmeasured |
 | Final gate declared | done | `benchmarks/cert_matrix.py` (D-012, PERFORMANCE.md §6): native `-FT` rows must clear their guard and every same-arch GGUF row reports parity against them |
 
@@ -96,9 +145,24 @@ cd /models/desenvolvimento/freetoken-next
 Environment gotchas: `UV_CACHE_DIR` must be writable (`/models/desenvolvimento/.uvcache`; the
 configured default is root-owned). Never use RAM as storage, under any circumstance: `/tmp` is
 a 46 GiB tmpfs that competes with host banks (offload expert banks, PLE tables) and can starve
-or OOM-kill a serving process that has nothing to do with what filled it — this bit an actual
-`--spec-mtp` validation run (earlyoom killed the worker at ~150/192 experts while 21 GiB of
-stale files from unrelated past sessions sat in `/tmp`, 2026-09-17). `/models` has 1.3+ TB free
-on real disk; always set `TMPDIR=/models/desenvolvimento/tmp` (checkpoint, serve, pytest
-`--basetemp`, any scratch download) and check `free -h` / `du -sh /tmp/*` before a large run.
-There is no swap.
+or OOM-kill a serving process that has nothing to do with what filled it. Confirmed by a live
+Opus 5 investigation (EXP-031): `earlyoom`'s reported "total" is NOT `MemTotal` — it's a
+live-recomputed `user mem total` that nets out shmem/tmpfs (`/usr/bin/earlyoom --dryrun -r 1`
+proves this: it prints `mem total` and `user mem total` as two different, correct numbers), so
+**every 1 GiB parked in `/tmp` costs ~0.9 GiB of the 10 % SIGTERM margin**, not 1 GiB of a fixed
+93 GiB pool. There is no swap (`SwapTotal: 0`), so earlyoom's memory trigger is permanently
+unguarded (the swap half of its AND-condition is trivially satisfied). The Flash-Next expert-bank
+loader itself is already tight (private anonymous mmap + `drop_page_cache` before/after every
+shard, EXP-020/EXP-031) — the ~68-70 GiB peak RSS is real and irreducible without a different
+residency strategy; it is not a leak. `--spec-mtp` adds no measurable host RAM over the
+`--spec-mtp 0` baseline (EXP-031's RSS trace: 68.37 GiB peak either way).
+**Fix applied this session**: `/tmp` cleared of ~21 GiB then ~3.3 GiB more of stale artifacts
+from unrelated past tool sessions (moved to `/models/backup/pytest-of-natal/` and
+`.../tmp-leftovers-20260917/`, which are natal-writable; `/models/backup` itself is root:root and
+needs `sudo mkdir + chown` per subfolder). `tmp.mount` is `systemctl mask`ed (confirmed
+`is-enabled` → `masked`, symlinked to `/dev/null`), so **after the next reboot `/tmp` stops being
+tmpfs entirely** and this whole class of failure goes away permanently; until then, re-check
+`du -sh /tmp/*` before any large `ft serve`/checkpoint run — stale build trees from OTHER tools
+on this shared machine (llama.cpp builds, npm caches, old benchmark logs) reaccumulate there.
+`/models` has 1.3+ TB free on real disk; always set `TMPDIR=/models/desenvolvimento/tmp`
+(checkpoint, serve, pytest `--basetemp`, any scratch download).
