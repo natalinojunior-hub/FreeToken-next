@@ -136,3 +136,10 @@ Causa real (mais provável): spec.py roda draft+verify como Batch(phase="prefill
 gerado (decisão de design da EXP-021, não regressão desta sessão) + >=2 syncs host por token
 (`tok_prev.item()`, `copy_done_event.synchronize()`) -- é o mesmo trabalho pendente do ROADMAP
 fase 10/12, não um bug pontual.
+
+hipótese de "estabiliza depois de N requests" (autotune/JIT) confirmada em --decode 4 (6
+repeats: 1-2 idênticos, 3-6 idênticos e diferentes de 1-2) mas DESMENTIDA em --decode 64
+(--warmups 2, repeat1 != repeat2 nas MESMAS posições que já tinham estabilizado no teste
+curto) -> uma hipótese que bate com UM experimento não é a causa raiz até bater também num
+experimento com parâmetro diferente (aqui, decode length) -- rodar o teste de confirmação
+com um parâmetro que muda antes de escrever a hipótese como resolvida na documentação.

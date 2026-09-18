@@ -388,20 +388,33 @@ somewhere in the MTP/spec path. Any future MTP+Turbo4 content-correctness claim 
 the EXP-027/028 byte-identical-to-`spec-mtp=0` check across a multi-request session, not just a
 single isolated request, until this is root-caused.
 
-**Leading hypothesis (UNVERIFIED, post-review):** `req.uid` is minted fresh per real generation
-(`state.new_user()` in `server/generation.py`) and `model.model._last_residual` is overwritten by
-every forward including request 2's own prefill, so neither of those ruled the leak in on
-inspection. `qsa_sparse.py`'s own docstring says the compressed index-key slab's rows "are never
-cleared" across requests, and correctness depends ENTIRELY on the per-forward `kvlen` clamp
-keeping every stale row (left over from whichever earlier request owned this `table_idx`/page
-before) below the visible/scorable range. `max_running_requests=1` means request 2 gets the SAME
-`table_idx` (and likely the same physical pages) request 1 just freed. The speculative path
-manually rewinds/advances `req.cached_len`/`device_len` several times per step (draft chain,
-verify, reject-replay) OUTSIDE the normal one-token-at-a-time `complete_one` cadence this clamp
-was presumably designed against -- if any of those manual assignments make the per-step `kvlen`
-metadata (`prepare_metadata`'s `kv_len_cpu`, `qsa_sparse.py:245`) claim more committed groups than
-this request has actually slab-committed, a stale row from the PREVIOUS occupant of that
-table_idx becomes scorable. This would explain why it never reproduces in an isolated single-
-request run (no previous occupant to leak from) and only in a multi-request session with page
-reuse. Not confirmed -- needs kernel-level tracing of the score/clamp path during a live repro,
-not further static reading.
+**Localized (2026-09-18, follow-up): this is a clean two-phase transition, not a leak.** Ran
+6 sequential requests on one server (`--decode 4`, minimal to localize fast): requests 1-2
+produce IDENTICAL output (`sha1 614aa7bcdf59`, ~0.6 tok/s, ITL ~1270ms); requests 3-6 ALSO
+produce IDENTICAL output to each other (`sha1 229272fa84fd`, ~2.33 tok/s, ITL ~47ms) but
+DIFFERENT from 1-2. It does not keep drifting after request 3 -- it stabilizes. A page-reuse/
+slab-staleness bug (the earlier hypothesis) would predict noisy, request-dependent variation
+tied to WHICH physical pages got reused each time, not a clean, stable two-state split with a
+4x speed jump attached to the SAME transition point. This is far more consistent with a JIT/
+autotune warmup: the first 1-2 real calls into some Triton kernel (plausibly `qsa_block_topk` or
+the turbo4 decompressor, both on the MTP-specific tiny-batch shapes) benchmark multiple kernel
+configs before caching a winner, and the cold-path config computes (correctly, just via a
+different reduction order / algorithm) slightly different floating-point results that flip a
+greedy argmax somewhere -- explaining both the speed AND content change at the identical
+transition point. `req.uid` (minted fresh per request) and `model.model._last_residual`
+(overwritten every forward) were checked and don't fit this pattern anyway.
+
+**Retracted: `--warmups 2` does NOT fix it.** Re-ran with `--decode 64 --warmups 2 --repeats 2`
+(4 total requests, matching the position where `--decode 4` had already stabilized): repeat1
+(request 3) sha1 `6e43ad8484ac`, repeat2 (request 4) sha1 `169bda4330cc` -- **still different
+from each other**, at the exact same request positions where the `--decode 4` probe had already
+converged to a stable, repeated value. So the two-phase-then-stable pattern seen at `--decode 4`
+does not generalize to `--decode 64` -- either the "settle point" depends on decode length /
+total forward-call count in a way not yet characterized, or there is a second, independent
+source of divergence that only a longer decode has enough steps to expose. **This is not solved
+by more warmup and not solved by more black-box benchmarking** -- it needs kernel-level tracing
+(dump the draft/verify logits or the QSA scored-block indices per step, diff the two repeats'
+traces to find the first byte that differs) in a future session. Until then: no MTP+Turbo4
+PP/TG number, including every one measured this session, should be treated as more than a rough
+order of magnitude -- the underlying computation is not yet known to be deterministic at any
+warmup depth tried.

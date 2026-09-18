@@ -78,28 +78,27 @@ order of priority (goal priorities 4-5 next):
    materialize-path penalty") -- a real redesign (decode-shaped, graph-capturable draft/verify),
    not a flag flip. Scope it before starting; this is multi-session work per the phase's own
    history.
-1. **Cross-request state leak (found this session, NOT fixed).** Two repeats of the identical
-   prompt on the same warmed server produce different `output_sha1`; two isolated fresh-server
-   single-request runs are byte-identical. `req.uid` (unique per real request, `state.new_user()`)
-   and `model.model._last_residual` (overwritten by every forward, including request 2's own
-   prefill) were checked and don't explain it. **Leading hypothesis**: `qsa_sparse.py`'s
-   compressed index-key slab rows are "never cleared" across requests by design (its own
-   docstring) -- correctness relies entirely on the per-forward `kvlen` clamp keeping any row
-   left over from the PREVIOUS occupant of this `table_idx`/page (request 1, since
-   `max_running_requests=1` hands request 2 the same slot) unreachable. The spec path manually
-   rewinds/advances `cached_len`/`device_len` several times per step (draft chain, verify,
-   reject-replay) outside the normal one-token-at-a-time cadence that clamp likely assumes; if
-   any of those steps' `kvlen` metadata (`qsa_sparse.py:245`, `prepare_metadata`'s `kv_len_cpu`)
-   overstates how much THIS request has actually slab-committed, a stale row from request 1
-   becomes scorable. Unverified -- needs kernel-level tracing of the score/clamp path during a
-   live repro, not more static reading. Repro: rerun the command below with `--repeats 2
-   --warmups 0` (no warmup, see if 2 is already enough), then diff the two repeats' token
-   sequences to find the first divergence.
+1. **Non-determinism across sequential requests in the same server session (found this session,
+   NOT fixed, root cause still unknown).** `req.uid` (unique per real request) and
+   `model.model._last_residual` (overwritten by every forward) were checked and ruled out.
+   Localized with `--decode 4` (cheap to iterate): 6 sequential requests gave TWO stable phases,
+   not continuous drift -- requests 1-2 identical to each other (`sha1 614aa7bcdf59`, ~0.6
+   tok/s), requests 3-6 identical to each other but different from 1-2 (`sha1 229272fa84fd`,
+   ~2.33 tok/s, a clean one-time transition, not a leak that keeps compounding). Looked like a
+   JIT/autotune warmup settling after ~2 real calls -- **but this does NOT generalize**: rerunning
+   at `--decode 64 --warmups 2 --repeats 2` (4 total requests, same positions where `--decode 4`
+   had already stabilized) still gave two DIFFERENT sha1 for repeat1 vs repeat2. So whatever
+   causes this is sensitive to decode length / total step count in a way not yet characterized,
+   not just "how many prior requests." **More black-box benchmarking will not resolve this** --
+   next step is dumping the draft/verify logits or the QSA scored-block indices per step for two
+   diverging repeats and diffing the traces to find the first byte that differs, at whatever
+   `--decode` length actually diverges (start from `--decode 4`'s known-divergent
+   requests-1-vs-3 pair, cheapest to iterate on).
    ```bash
    FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1 TMPDIR=/models/desenvolvimento/tmp \
      .venv/bin/python benchmarks/bench_pp_tg.py \
-     --model /models/Qwen3.8-Flash-Next-NVFP4-Radix --tokens 16384 --decode 64 \
-     --repeats 2 --warmups 0 --label mtp1-turbo4-repro \
+     --model /models/Qwen3.8-Flash-Next-NVFP4-Radix --tokens 16384 --decode 4 \
+     --repeats 6 --warmups 0 --label mtp1-turbo4-repro \
      --serve-arg "--cache-type naive" --serve-arg "--max-running-requests 1" \
      --serve-arg "--num-tokens 16576" --serve-arg "--spec-mtp 1" \
      --serve-arg "--kv-format turbo4" --serve-arg "--memory-ratio 0.86" \
