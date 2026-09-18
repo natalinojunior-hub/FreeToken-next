@@ -365,10 +365,18 @@ turbo4 --memory-ratio 0.86 --cuda-graph-max-bs 0 --cache-type naive --num-tokens
 | GPU util | 99.7% | 89.9% | -- |
 
 No crash now. PP is unaffected (matches the MTP-free anchor); TG collapsed. GPU util at ~100%
-means this is real compute, not idle waiting -- consistent with `--cuda-graph-max-bs 0` (CUDA
-graph stays disabled for `--spec-mtp` today) forcing every draft+verify step through eager,
-per-step Triton launches instead of a captured replay. Not yet root-caused; ties directly into
-the CUDA-graph/overlap blocker below.
+means this is real compute, not idle waiting. **Correction (post-review): this is NOT the
+`--cuda-graph-max-bs 0` flag by itself** -- the MTP-free arm above used the identical flag and
+got 24.6 tok/s, so graph-disabled is not the discriminator. The real cost is `spec.py` running
+every draft step AND the verify step as its own `Batch(reqs=[req], phase="prefill")`
+(`spec.py:165,193,236`) -- a design decision from EXP-021 ("MTP roda como Batch(phase='prefill',
+extend_len=k+1), fora do CUDA graph"), not a regression from this session. Prefill-phase code
+pays chunking/PLE/multimodal setup overhead sized for large batches, on every single generated
+token, plus at least 2 host syncs per token in the hot loop (`tok_prev.item()` per draft step,
+`out.copy_done_event.synchronize()` per verify). This matches ROADMAP phase 10/12's own status
+("MTP + TurboKV fused verify: no materialize-path penalty" -- still pending): the throughput
+integration was never done, only correctness. Goal priority 4 ("corrigir o bloqueio de CUDA
+Graph/overlap") is this same, substantial redesign -- not a quick flag fix.
 
 **Also found, NOT fixed**: the two repeats' `output_sha1` differ from each other
 (`2d8355daf32e` vs `6e43ad8484ac`) despite identical prompt/config/greedy sampling. Two isolated
@@ -379,3 +387,21 @@ server session, i.e. state leaking from one finished request into the next one's
 somewhere in the MTP/spec path. Any future MTP+Turbo4 content-correctness claim must reproduce
 the EXP-027/028 byte-identical-to-`spec-mtp=0` check across a multi-request session, not just a
 single isolated request, until this is root-caused.
+
+**Leading hypothesis (UNVERIFIED, post-review):** `req.uid` is minted fresh per real generation
+(`state.new_user()` in `server/generation.py`) and `model.model._last_residual` is overwritten by
+every forward including request 2's own prefill, so neither of those ruled the leak in on
+inspection. `qsa_sparse.py`'s own docstring says the compressed index-key slab's rows "are never
+cleared" across requests, and correctness depends ENTIRELY on the per-forward `kvlen` clamp
+keeping every stale row (left over from whichever earlier request owned this `table_idx`/page
+before) below the visible/scorable range. `max_running_requests=1` means request 2 gets the SAME
+`table_idx` (and likely the same physical pages) request 1 just freed. The speculative path
+manually rewinds/advances `req.cached_len`/`device_len` several times per step (draft chain,
+verify, reject-replay) OUTSIDE the normal one-token-at-a-time `complete_one` cadence this clamp
+was presumably designed against -- if any of those manual assignments make the per-step `kvlen`
+metadata (`prepare_metadata`'s `kv_len_cpu`, `qsa_sparse.py:245`) claim more committed groups than
+this request has actually slab-committed, a stale row from the PREVIOUS occupant of that
+table_idx becomes scorable. This would explain why it never reproduces in an isolated single-
+request run (no previous occupant to leak from) and only in a multi-request session with page
+reuse. Not confirmed -- needs kernel-level tracing of the score/clamp path during a live repro,
+not further static reading.

@@ -127,3 +127,12 @@ requests sequenciais na mesma sessão de servidor, não vazamento de página nem
 si -> antes de aceitar qualquer benchmark de PP/TG/conteúdo com múltiplos repeats como prova de
 correção, rodar também 2 processos de servidor SEPARADOS com 1 request cada e comparar sha1;
 throughput (PP/TG) continua válido mesmo com esse bug, só o CONTEÚDO multi-request é suspeito.
+
+atribuí a queda de TG (0.79 vs 24.6 tok/s) a "CUDA graph desligado" sem checar -> o braço SEM
+MTP usava a MESMA flag `--cuda-graph-max-bs 0` e rodava rápido, então isso não é o diferencial
+-> antes de atribuir uma regressão de performance a uma flag, comparar o baseline com a MESMA
+flag ativa, não assumir que a flag mencionada no comando é a causa só porque está presente.
+Causa real (mais provável): spec.py roda draft+verify como Batch(phase="prefill") a cada token
+gerado (decisão de design da EXP-021, não regressão desta sessão) + >=2 syncs host por token
+(`tok_prev.item()`, `copy_done_event.synchronize()`) -- é o mesmo trabalho pendente do ROADMAP
+fase 10/12, não um bug pontual.

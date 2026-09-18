@@ -66,20 +66,35 @@ focused test and live benchmark.
 it caused its own regression). MTP=1+Turbo4 now runs to completion live. What is NOT done, in
 order of priority (goal priorities 4-5 next):
 
-0. **CUDA graph / overlap for `--spec-mtp` (goal priority 4).** Live TG is 0.79 tok/s mean vs
-   24.6 without MTP (31-50x slower, ITL 1.2-2.4s/token) at 99.7% GPU util -- real compute, not
-   idle wait. `--spec-mtp` currently requires `FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1` and runs
-   with CUDA graph capture off; this is very likely why. Not investigated yet: is the graph
-   simply never attempted for the spec path, or does it fail to capture? Start at
-   `Scheduler.__init__`'s own guard (`spec_mtp > 0` requires
-   `ENV.DISABLE_OVERLAP_SCHEDULING`) and `engine/engine.py`'s graph_runner.
+0. **MTP throughput redesign (goal priority 4, "CUDA Graph/overlap").** Live TG is 0.79 tok/s
+   mean vs 24.6 without MTP (31-50x slower, ITL 1.2-2.4s/token) at 99.7% GPU util -- real
+   compute, not idle wait, and **not simply `--cuda-graph-max-bs 0`**: the MTP-free arm used the
+   SAME flag and hit 24.6 tok/s, so graph-disabled alone isn't the discriminator (ruled out by
+   review, see PERFORMANCE.md). The real cost is `spec.py` running the draft chain AND the
+   verify step as their own `Batch(reqs=[req], phase="prefill")` (`spec.py:165,193,236`), a
+   design decision from EXP-021, plus >=2 host syncs per generated token
+   (`tok_prev.item()` in the draft loop, `out.copy_done_event.synchronize()` after verify).
+   This is the SAME pending work as ROADMAP phase 10/12 ("MTP + TurboKV fused verify: no
+   materialize-path penalty") -- a real redesign (decode-shaped, graph-capturable draft/verify),
+   not a flag flip. Scope it before starting; this is multi-session work per the phase's own
+   history.
 1. **Cross-request state leak (found this session, NOT fixed).** Two repeats of the identical
    prompt on the same warmed server produce different `output_sha1`; two isolated fresh-server
-   single-request runs are byte-identical. Repro: rerun the command below with `--repeats 2
+   single-request runs are byte-identical. `req.uid` (unique per real request, `state.new_user()`)
+   and `model.model._last_residual` (overwritten by every forward, including request 2's own
+   prefill) were checked and don't explain it. **Leading hypothesis**: `qsa_sparse.py`'s
+   compressed index-key slab rows are "never cleared" across requests by design (its own
+   docstring) -- correctness relies entirely on the per-forward `kvlen` clamp keeping any row
+   left over from the PREVIOUS occupant of this `table_idx`/page (request 1, since
+   `max_running_requests=1` hands request 2 the same slot) unreachable. The spec path manually
+   rewinds/advances `cached_len`/`device_len` several times per step (draft chain, verify,
+   reject-replay) outside the normal one-token-at-a-time cadence that clamp likely assumes; if
+   any of those steps' `kvlen` metadata (`qsa_sparse.py:245`, `prepare_metadata`'s `kv_len_cpu`)
+   overstates how much THIS request has actually slab-committed, a stale row from request 1
+   becomes scorable. Unverified -- needs kernel-level tracing of the score/clamp path during a
+   live repro, not more static reading. Repro: rerun the command below with `--repeats 2
    --warmups 0` (no warmup, see if 2 is already enough), then diff the two repeats' token
-   sequences to find the first divergence, then trace what per-request state that step reads
-   that isn't reset between requests (candidates: `_last_residual`, reused `table_idx`/GDN slot
-   leftover content, a `page_table` row not fully overwritten before reuse).
+   sequences to find the first divergence.
    ```bash
    FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1 TMPDIR=/models/desenvolvimento/tmp \
      .venv/bin/python benchmarks/bench_pp_tg.py \
