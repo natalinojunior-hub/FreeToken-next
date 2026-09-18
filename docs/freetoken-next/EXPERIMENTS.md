@@ -1130,3 +1130,27 @@ Quantified the structural discrepancy between `gdn_decode_fla` (fused decode ker
 - Impact on greedy argmax: across 640 steps (10 trials x 64 tokens), the numerical delta between decode and prefill paths flipped the greedy argmax logit 1.88% of the time for T=1, 1.41% for T=2, and 1.25% for T=4.
 Conclusion: Bug A (deterministic content inequivalence between baseline decode and MTP verify/draft) is structurally real and verified offline.
 
+## EXP-037 — TG Attribution: MoE Full-Bank Materialization Localized as 96.3% of Forward Cost
+
+**Date:** 2026-09-18 · **Verdict:** **Confirmed Hypothesis 2.1 (MoE is the bottleneck, accounting for 1197.45 ms of the 1243.01 ms prefill forward)**
+
+1. **Action A (Cold vs Warm live probe, `--decode 4 --repeats 6`):**
+   - Cold regime (Reqs 1-2, `accepted=0/1`): `draft_chain` 0.055s, `verify_forward` 1.203s, `gdn_replay` 1.204s, TG 0.60 tok/s.
+   - Warm regime (Reqs 3-6, `accepted=1/1`): `draft_chain` 0.055s, `verify_forward` 1.202s, `gdn_replay` skipped (0s), TG 2.29 tok/s.
+   - Decisive discriminator: `verify_forward` takes **1.20s in both regimes**. The observed cold/warm TG jump is purely rejection (2 full forwards per token) vs acceptance (1 verify forward for 2 tokens), NOT the forward speeding up.
+
+2. **Action B (chunk indexing discarded):**
+   - Verified that `chunk_gated_delta_rule` indexes query indptr, not cached_len; `prepare_chunk_indices` does host syncs but only takes milliseconds. Formally discarded as cause of the ~1.2s cost.
+
+3. **Action C (A/B Forward Profiling on 16K Context):**
+   - Forward Decode (T=1): **50.66 ms mean** (steady-state 36 ms).
+   - Forward Prefill (T=1): **1203.61 ms mean** (~24x slower).
+   - Subsystem Profiler Breakdown (Single forward, 16K context):
+     - **MoE** (`layers/moe.py:198,221`): **1197.45 ms (96.3% of total)**. Prefill calls `materialize_layer` + `copy_missing` + `_expert_gemm(n=num_experts)` across all 48 layers (copying/evaluating all 512 experts per layer).
+     - **GDN** (`models/qwen4_exp/gdn.py:154`): **16.40 ms (1.3%)**.
+     - **QSA** (`qsa_sparse.py`): **16.43 ms (1.3%)**.
+     - **PLE** (`ple_disk.py`): **0.49 ms (0.0%)**.
+     - Other: **12.24 ms (1.0%)**.
+   - Conclusion: The TG collapse is 96.3% caused by MoE running the prefill materialize-all-experts path instead of the decode resident-cache path.
+
+

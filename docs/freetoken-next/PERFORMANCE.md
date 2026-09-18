@@ -451,3 +451,30 @@ Measured offline with `Qwen4ExpGatedDeltaNet` (`head_k_dim=128, head_v_dim=128, 
 
 Across 640 steps (10 trials x 64 steps), greedy argmax logit flipped 1.88% of steps (T=1), 1.41% (T=2), and 1.25% (T=4). Confirms Bug A is a real, reproducible numerical divergence between decode and prefill GDN paths.
 
+### TG Attribution: MoE Full-Bank Materialization (EXP-037)
+
+Measured on RTX 5080 with Qwen3.8-Flash-Next at 16K context:
+
+**1. Live Probe (Action A, `--decode 4 --repeats 6`):**
+- Reqs 1-2 (cold): `draft_chain` ~0.055s, `verify_forward` 1.203s, `accepted=0/1`, `gdn_replay` 1.204s, TG ~0.60 tok/s.
+- Reqs 3-6 (warm): `draft_chain` ~0.055s, `verify_forward` 1.202s, `accepted=1/1`, `gdn_replay` skipped, TG ~2.29 tok/s.
+- Key finding: `verify_forward` takes 1.20s in both regimes. The cold-to-warm jump is purely rejection (2 forwards/step) vs acceptance (1 forward/step), not an acceleration of the forward itself.
+
+**2. Isolated A/B Forward Comparison (Action C, 16K context):**
+- Decode forward (T=1): **50.66 ms mean** (steady-state 36 ms).
+- Prefill forward (T=1): **1203.61 ms mean** (~24x slower).
+
+**3. Subsystem Breakdown (Prefill T=1 vs Decode T=1):**
+
+| Subsystem | Decode T=1 (ms) | Prefill T=1 (ms) | % of Prefill Forward |
+|---|---|---|---|
+| **MoE** (`layers/moe.py`) | 31.94 | **1197.45** | **96.3%** |
+| **GDN** (`gdn.py`) | 6.07 | 16.40 | 1.3% |
+| **QSA** (`qsa_sparse.py`) | 14.20 | 16.43 | 1.3% |
+| **PLE** (`ple_disk.py`) | 0.34 | 0.49 | 0.0% |
+| **Other** (embeddings, norms, head) | 12.16 | 12.24 | 1.0% |
+| **Total** | **64.72** | **1243.01** | **100.0%** |
+
+Conclusion: MoE accounts for 1197.45 ms (96.3%) of the prefill forward time due to per-forward layer materialization and 512-expert GEMMs across all 48 layers.
+
+

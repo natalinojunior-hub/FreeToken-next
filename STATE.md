@@ -1,11 +1,11 @@
 # STATE
-Phase 1 (Bug A GDN Equivalence) DONE: EXP-036 confirmed. `gdn_decode_fla` vs `gdn_prefill_chunk_fla`
-differs by ~1.95e-3 in output, ~1.43e-3 in recurrent state, ~1.95e-3 in conv state for chunks T>1,
-causing greedy argmax flips on ~1.5% of steps. Unit test `test_decode_prefill_gdn_kernel_inequivalence`
-added to `tests/models/qwen4_exp/test_gdn.py`.
-Phase 2 (TG Attribution) NEXT: Run live cold vs warm probe (Action A) to test Hypothesis 2.1
-(MoE prefill materialized expert bank copy vs decode cache).
-Phase 3 (Bug B carrier probe B1-B4) READY to execute after Phase 2.
-Phase 4 (Fixes: defasagem helper, Bug B carrier fix, MoE decode-path dispatch) planned.
-Phase 5 (k=2/3 validation), Phase 6 (PP benchmark + 128k/256k gate), Phase 7 (fused verify spec) pending.
+Phase 1 (Bug A GDN Equivalence) DONE: EXP-036 confirmed. GDN decode vs prefill differs ~1.95e-3.
+Phase 2 (TG Attribution) DONE: EXP-037 confirmed Hypothesis 2.1. MoE accounts for 1197.45 ms
+(96.3%) of the 1243.01 ms prefill forward due to 48 layers of 512-expert materialization and GEMMs.
+Decode forward is 36-50 ms. Cold vs warm probe showed verify_forward is constant ~1.20s in both;
+the TG jump was purely rejection (2 forwards) vs acceptance (1 forward).
+Phase 3 (Bug B Carrier Probe B1-B4) NEXT: Probe state carriers across requests (QSA pending ring,
+conv states, linear states, cmp_k).
+Phase 4 (Fixes: defasagem helper, Bug B carrier, MoE decode-path dispatch) planned.
+Phase 5 (k=2/3 validation), Phase 6 (PP + long-context gate), Phase 7 (verify spec) pending.
 Baseline suite: 1934 passed / 206 skipped / 1 failed (flashinfer env).
