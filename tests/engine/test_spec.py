@@ -10,6 +10,7 @@ from freetoken.engine.spec import (
     pages_to_free,
     rebuild_conv_state,
     spec_message_len,
+    spec_rollback_lengths,
     unpack_spec_message,
 )
 
@@ -34,3 +35,10 @@ def test_rollback_helpers_keep_only_accepted_state():
     expected = torch.tensor([[3.0, 4.0, 5.0], [30.0, 40.0, 50.0]])
     assert torch.equal(rebuild_conv_state(previous, inputs, 2), expected)
     assert ngram_context_after([1, 2, 3], [4, 5], 1, 4, 0) == [0, 1, 2, 3]
+
+
+def test_spec_rollback_lengths():
+    # start_pos=100, committed=2 (pos 100, 101 committed) -> last cached is 101, device is 102
+    assert spec_rollback_lengths(100, 2) == (101, 102)
+    # start_pos=64, committed=1 (pos 64 committed) -> last cached is 64, device is 65
+    assert spec_rollback_lengths(64, 1) == (64, 65)

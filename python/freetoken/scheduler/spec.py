@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.core import Batch, Req
-from freetoken.engine.spec import accept_drafts
+from freetoken.engine.spec import accept_drafts, spec_rollback_lengths
 from freetoken.message import DetokenizeMsg
 from freetoken.utils import init_logger
 
@@ -127,16 +127,13 @@ class SchedulerSpecMixin:
                     break
             self.send_result(reply)
             if finished_now:
-                if req.device_len < spec_alloc_len:
+                keep_cached, keep_device = spec_rollback_lengths(start_pos, committed)
+                if keep_device < spec_alloc_len:
                     # free_spec_reject's keep_len is an EXCLUSIVE boundary (page_ceil(keep_len)
-                    # must exclude the page containing it): req.cached_len is one BEHIND that
-                    # (the standing complete_one-style lag -- see _padded_tail), so passing
-                    # cached_len here would, at an exact page boundary, hand back a page still
-                    # holding this request's own just-committed token (this bug reproduced live:
-                    # EXP-033's tail leak was actually this over-free wiping a real page, not an
-                    # under-free -- the "missing" page was corrupted/reassigned, not orphaned).
+                    # must exclude the page containing it): keep_device respects the standing
+                    # complete_one-style lag (keep_cached + 1 == keep_device).
                     self.cache_manager.free_spec_reject(
-                        req, keep_len=req.device_len, alloc_len=spec_alloc_len
+                        req, keep_len=keep_device, alloc_len=spec_alloc_len
                     )
                 self.decode_manager.remove_req(req)
                 self._free_req_resources(req)
@@ -288,15 +285,10 @@ class SchedulerSpecMixin:
             # Return whatever the verify window allocated beyond what actually counts: the
             # target rejected part of the draft, request still live. A mid-window FINISH is
             # reclaimed inside _commit_spec_tokens itself, before table_idx is recycled.
-            keep_len = d - 1 + committed
-            # free_spec_reject's keep_len must be the boundary AFTER the standing cached_len/
-            # device_len lag (keep_len+1 == the device_len this request is about to have): at
-            # an exact page boundary, passing keep_len itself would free the page holding the
-            # just-committed token at index keep_len (see the matching comment in
-            # _commit_spec_tokens -- same bug, same fix, on the "not finished" side of it).
-            self.cache_manager.free_spec_reject(req, keep_len=keep_len + 1, alloc_len=d + k)
-            req.cached_len = keep_len
-            req.device_len = keep_len + 1
+            keep_cached, keep_device = spec_rollback_lengths(d, committed)
+            self.cache_manager.free_spec_reject(req, keep_len=keep_device, alloc_len=d + k)
+            req.cached_len = keep_cached
+            req.device_len = keep_device
         mark("free_spec_reject")
 
         if finished:

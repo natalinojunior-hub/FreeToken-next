@@ -60,6 +60,18 @@ def pages_to_free(keep_len: int, alloc_len: int, page_size: int) -> tuple[int, i
     return first, max(first, last)
 
 
+def spec_rollback_lengths(start_pos: int, committed: int) -> tuple[int, int]:
+    """Return (keep_cached, keep_device) after committing tokens starting at start_pos.
+
+    keep_cached is the index of the last committed token (start_pos + committed - 1).
+    keep_device is the exclusive boundary for cache reclamation (start_pos + committed),
+    respecting the engine's 1-token decode lag convention.
+    """
+    keep_cached = start_pos + committed - 1
+    keep_device = start_pos + committed
+    return keep_cached, keep_device
+
+
 def rebuild_conv_state(prev_state: torch.Tensor, conv_in: torch.Tensor, accepted: int) -> torch.Tensor:
     """Rebuild a linear-attention convolution state after accepting ``accepted`` rows."""
     width = prev_state.shape[-1]
@@ -86,6 +98,7 @@ __all__ = [
     "unpack_spec_message",
     "spec_message_len",
     "pages_to_free",
+    "spec_rollback_lengths",
     "rebuild_conv_state",
     "ngram_context_after",
 ]
