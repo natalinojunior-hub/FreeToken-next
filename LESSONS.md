@@ -87,3 +87,43 @@ Economia confirmada: 16K requer apenas 60 MB de KV (em vez de 430 MB). 256K prec
   2. Verificar VRAM da GPU via `nvidia-smi` ou utilitário equivalente (garantir que não há processos remanescentes comendo memória de vídeo ou cycles de compute).
   3. Verificar processos órfãos (`ps aux | grep -i python` / `killall tail`) para erradicar agentes zumbis antes do run.
   Só prosseguir com a execução após confirmação visual de que o hardware está 100% livre.
+
+commit do patch de vazamento de página (EXP-033, `cache.py` alloc_end) veio com teste novo só
+pra `_spec_mrope_positions`, nada testando os 3 hunks de `alloc_end` que são o fix de verdade ->
+suíte verde não prova que o bug foi corrigido, só que o helper novo funciona -> todo bug fix
+precisa de um teste que exercite exatamente o `check_integrity()` (free_pages+cache_pages==
+num_pages) que expôs o sintoma original, confirmado falhando na linha antiga antes de aceitar
+a suíte como prova.
+
+o próprio fix de EXP-033 (`cache.py` alloc_end = max(cached_len, device_len)) estava errado ->
+`cached_len < device_len` é invariante padrão do código (device_len é sempre o próximo slot
+ainda não escrito, não um sinal exclusivo de spec), então o fix liberava sempre 1 página a mais
+em QUALQUER finish com page_size=1, quebrando 11 testes de scheduler não relacionados a spec
+-> só descobri porque rodei `pytest tests/scheduler/` inteiro em vez de só os 2 arquivos que o
+diff tocou. Regra: fix em código de cache/paginação compartilhado roda a suíte COMPLETA do
+subsistema antes de confiar, nunca só os arquivos que o diff tocou.
+
+bug reproduzido só com prompt de tamanho exatamente múltiplo de page_size (16384 tokens =
+256*64) -> um "replay" de estado GDN em spec.py rebobinava cached_len/device_len e chamava
+`_prepare_batch` de novo, que chama `allocate_paged` sem saber que aquele range JÁ tinha sido
+alocado pelo verify momentos antes -> ao cruzar um limite de página, aloca uma página NOVA e
+sobrescreve a entrada da page_table que já apontava pra página real, órfã ela pra sempre (nunca
+mais está em free_slots nem referenciada) -> `allocate_paged` não é idempotente entre duas
+chamadas sobre o mesmo range; qualquer replay/rebobinamento de cached_len/device_len pra refazer
+metadata precisa pular a realocação (`_prepare_batch(..., skip_alloc=True)`), nunca reusar o
+caminho completo de alocação.
+
+vazamento de slot do LinearStatePool (GDN snapshot) só apareceu no 2º repeat de um benchmark,
+nunca no 1º -> `_spec_eligible_req` desliga o spec no ÚLTIMO token do request (remain_len<=1),
+então TODO request termina pelo caminho normal (não-spec) de decode, que nunca chamava
+`free_spec_snapshot_slot` (só existia dentro do branch `if finished` do run_spec_step) -> taxa
+de vazamento de 100%, um slot morto por request -> fix pertence a `_free_req_resources` (o
+único caminho de cleanup que TODA rota de finish compartilha: abort, decode normal, spec), não
+dentro do código específico de spec.
+
+output_sha1 diferente entre 2 repeats do MESMO prompt no MESMO servidor (greedy, determinístico)
+mas IDÊNTICO entre 2 runs isolados (servidor novo a cada run) -> vazamento de estado entre
+requests sequenciais na mesma sessão de servidor, não vazamento de página nem bug de decode em
+si -> antes de aceitar qualquer benchmark de PP/TG/conteúdo com múltiplos repeats como prova de
+correção, rodar também 2 processos de servidor SEPARADOS com 1 request cada e comparar sha1;
+throughput (PP/TG) continua válido mesmo com esse bug, só o CONTEÚDO multi-request é suspeito.

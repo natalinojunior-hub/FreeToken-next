@@ -3,14 +3,35 @@
 Snapshot date: 2026-09-18. This is the current truth; history goes to
 EXPERIMENTS.md / DECISIONS.md, not here.
 
-## Current checkpoint (2026-09-18)
+## Current checkpoint (2026-09-18, session 2)
 
-The project is paused after the first real validation of the split Turbo4 path.
-Turbo4 now runs end to end at 16K in eager/no-overlap mode: PP 1713.7 / TG
-24.72, 14.86 GiB VRAM, 99% GPU. This is not directly comparable to the
-CUDA-graph/overlap baseline, but proves the current decompressor + QSA path on
-the real checkpoint. MTP=1 + Turbo4 reaches speculative decode and accepts a
-draft token, but its benchmark is invalidated by a one-page cache leak.
+MTP=1 + Turbo4's page leak (EXP-033) is fixed for real (EXP-034): the `cache.py`
+patch committed for it was itself wrong (regressed 11 unrelated scheduler
+tests) and was reverted; the actual bug was three separate mistakes in
+`spec.py` (mid-window finish not reclaiming the verify's surplus before
+`table_idx` recycling; `free_spec_reject`'s `keep_len` using the wrong
+lag convention; the GDN-state replay's `_prepare_batch` re-running
+`allocate_paged` over an already-allocated range and orphaning the real page
+at a page-boundary crossing -- exactly what a 16384-token prompt hits at
+page_size=64). All three have regression tests that fail pre-fix/pass
+post-fix. Live MTP=1+Turbo4 now completes with **no crash**.
+
+Two things it exposed, NOT yet fixed:
+1. **TG collapses 31-50x** (0.79 vs 24.6 tok/s without MTP) at 99.7% GPU
+   util -- real compute cost, tied to `--cuda-graph-max-bs 0` (CUDA graph
+   stays disabled for `--spec-mtp`). This is goal priority 4's own blocker.
+2. **Multi-request same-session output is non-deterministic**: two repeats
+   of the identical prompt on a warmed server produce DIFFERENT
+   `output_sha1`; two isolated fresh-server single-request runs are
+   byte-identical to each other. Something in the MTP/spec path leaks state
+   from one finished request into the next one's initial state. Not
+   root-caused. Do not trust a multi-request MTP+Turbo4 benchmark's content
+   for now -- only its timing.
+
+Turbo4 alone (no MTP) still runs end to end at 16K: PP 1639.9-1713.7 / TG
+24.6-24.72, 14.86 GiB VRAM, ~90-99% GPU, byte-identical and stable. This is
+not directly comparable to the CUDA-graph/overlap baseline, but proves the
+current decompressor + QSA path on the real checkpoint.
 
 The previous host-RAM/`earlyoom` blocker is no longer active: on 2026-09-18 the
 host reports 91 GiB total, 6.5 GiB used, 84 GiB available, and only 137 MiB in
@@ -38,30 +59,38 @@ MTP path exposed and received fixes for MRoPE positions and the current
 passed). The latest cache-tail fix is committed below but still needs a fresh
 focused test and live benchmark.
 
-## Handoff (2026-09-17, session ending — continuing under Codex/Luna)
+## Handoff (2026-09-18, session 2 ending)
 
-**Read this section first.** Item E (native MTP, `.qwen/tmp/GOAL-FLASH-NEXT-MASTER.md`) is the
-active thread. Everything through "content-correctness confirmed live" is DONE and committed
-(see the MTP row below and EXP-021 through EXP-031). What is NOT done, in order:
+**Read this section first.** Item E (native MTP) continues. EXP-034 fixed the real page-leak
+(three bugs in `spec.py`, not the `cache.py` patch session 1 committed -- that patch was reverted,
+it caused its own regression). MTP=1+Turbo4 now runs to completion live. What is NOT done, in
+order of priority (goal priorities 4-5 next):
 
-1. **Run the actual PP/TG/acceptance benchmark.** Earlier attempts died to the host-RAM
-   `earlyoom` race (EXP-029/031), but that environment blocker is now cleared: the host has
-   84 GiB available and `/tmp` is disk-backed with 137 MiB used. The code is validated for
-   correctness, not yet for throughput. Command:
+0. **CUDA graph / overlap for `--spec-mtp` (goal priority 4).** Live TG is 0.79 tok/s mean vs
+   24.6 without MTP (31-50x slower, ITL 1.2-2.4s/token) at 99.7% GPU util -- real compute, not
+   idle wait. `--spec-mtp` currently requires `FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1` and runs
+   with CUDA graph capture off; this is very likely why. Not investigated yet: is the graph
+   simply never attempted for the spec path, or does it fail to capture? Start at
+   `Scheduler.__init__`'s own guard (`spec_mtp > 0` requires
+   `ENV.DISABLE_OVERLAP_SCHEDULING`) and `engine/engine.py`'s graph_runner.
+1. **Cross-request state leak (found this session, NOT fixed).** Two repeats of the identical
+   prompt on the same warmed server produce different `output_sha1`; two isolated fresh-server
+   single-request runs are byte-identical. Repro: rerun the command below with `--repeats 2
+   --warmups 0` (no warmup, see if 2 is already enough), then diff the two repeats' token
+   sequences to find the first divergence, then trace what per-request state that step reads
+   that isn't reset between requests (candidates: `_last_residual`, reused `table_idx`/GDN slot
+   leftover content, a `page_table` row not fully overwritten before reuse).
    ```bash
    FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1 TMPDIR=/models/desenvolvimento/tmp \
      .venv/bin/python benchmarks/bench_pp_tg.py \
      --model /models/Qwen3.8-Flash-Next-NVFP4-Radix --tokens 16384 --decode 64 \
-     --repeats 2 --warmups 1 --label mtp-k1 \
+     --repeats 2 --warmups 0 --label mtp1-turbo4-repro \
      --serve-arg "--cache-type naive" --serve-arg "--max-running-requests 1" \
      --serve-arg "--num-tokens 16576" --serve-arg "--spec-mtp 1" \
-     --json /models/desenvolvimento/tmp/mtp_validate/pp_tg.jsonl
+     --serve-arg "--kv-format turbo4" --serve-arg "--memory-ratio 0.86" \
+     --serve-arg "--cuda-graph-max-bs 0" \
+     --json /models/desenvolvimento/tmp/mtp_validate/repro.jsonl
    ```
-   Compare against the `--spec-mtp 0` baseline (drop `--spec-mtp 1`, drop
-   `FREETOKEN_DISABLE_OVERLAP_SCHEDULING`): known-good anchor PP 1857.9 / TG 28.76 at this exact
-   config (EXP-031-era baseline run). Before running: check `free -h` and `du -sh /tmp/*` per
-   the gotcha below — if the host was rebooted since 2026-09-17, `/tmp` should no longer be
-   tmpfs at all (confirm with `mount | grep " /tmp "`) and this entire class of failure is gone.
 2. **k=2/k=3 live validation.** The draft-chain per-step position bug (draft step i>=1 couldn't
    see its own prior KV) was fixed by code inspection during the k=1 debugging, never exercised
    live. Run the same greedy content-equivalence check (short + the "ocean poem" prompt that

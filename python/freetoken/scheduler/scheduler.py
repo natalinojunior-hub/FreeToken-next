@@ -655,6 +655,15 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         self.cache_manager.cache_req(req, finished=True)
         self.table_manager.free(req.table_idx)
         req.table_idx = -1
+        # A request that stops being spec-eligible on its last token (remain_len <= 1, see
+        # _spec_eligible_req) finishes through the plain decode path, never through
+        # run_spec_step's own finished branch -- release here, universally, or the GDN
+        # snapshot slot leaks on every request and exhausts LinearStatePool after a
+        # handful of requests. Idempotent (pop with a default) if spec.py already freed it.
+        # hasattr guard: some scheduler-unit-test stubs build a bare `self` without the
+        # SchedulerSpecMixin (spec_mtp is always 0 for them, so there is nothing to free).
+        if hasattr(self, "free_spec_snapshot_slot"):
+            self.free_spec_snapshot_slot(req)
 
     def _reply_rebuild(self, request_id: str, status: str, error: str | None = None) -> None:
         # Single source of truth with the rollback snapshot (_current_cache_geometry): mamba is
@@ -807,7 +816,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         except Exception as e:  # noqa: BLE001
             logger.warning(f"could not log cache geometry: {e!r}")
 
-    def _prepare_batch(self, batch: Batch) -> ForwardInput:
+    def _prepare_batch(self, batch: Batch, *, skip_alloc: bool = False) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self._forward_iter += 1
         if batch.is_decode:
@@ -825,7 +834,14 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             self.cache_manager.free_swa_out_of_window_extend(batch.reqs)
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table.
-        self.cache_manager.allocate_paged(batch.reqs)
+        # skip_alloc: SchedulerSpecMixin's GDN-state replay rewinds cached_len/device_len to an
+        # already-verified window (its pages were allocated by that earlier verify's own
+        # _prepare_batch call) purely to recompute positions/attention metadata over it --
+        # allocate_paged has no memory of that prior call, so re-running it here on a rewound
+        # (cached_len, device_len) pair that straddles a page boundary grabs a FRESH page and
+        # overwrites the page_table row that already held the correct, real one (orphaning it).
+        if not skip_alloc:
+            self.cache_manager.allocate_paged(batch.reqs)
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)

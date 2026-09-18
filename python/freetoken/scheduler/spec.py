@@ -70,13 +70,20 @@ class SchedulerSpecMixin:
         (naive keeps the old keying -- same rule as build_fla_metadata's gdn_slot)."""
         return req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
 
-    def _commit_spec_tokens(self, req: Req, tokens: List[int], start_pos: int) -> int:
+    def _commit_spec_tokens(
+        self, req: Req, tokens: List[int], start_pos: int, spec_alloc_len: int
+    ) -> int:
         """Append tokens one at a time, applying _process_last_data's per-token EOS/stop
         /length finish logic. ``start_pos`` is tokens[0]'s device-table position (== d in
         run_spec_step): cached_len/device_len advance ONE token at a time here, exactly like
         complete_one(), rather than being pre-set to the whole window's end -- otherwise
         can_decode reflects the window's final length for every token in it, not each
         token's own position, and hit_length fires (or doesn't) at the wrong offset.
+        ``spec_alloc_len`` is the verify window's true allocation ceiling (d + k): a mid-window
+        finish rewinds cached_len/device_len to the truncation point, which is BELOW that
+        ceiling, so a finish here must reclaim [truncation, spec_alloc_len) itself, before
+        _free_req_resources recycles table_idx -- the caller can no longer do it afterward
+        (table_idx == -1 by then, and page_table[-1] silently frees a different row's pages).
         Returns how many actually count (stops at, and includes, the one that finishes the
         request -- exact-once-only completion)."""
         reply: List[DetokenizeMsg] = []
@@ -116,6 +123,17 @@ class SchedulerSpecMixin:
                     break
             self.send_result(reply)
             if finished_now:
+                if req.device_len < spec_alloc_len:
+                    # free_spec_reject's keep_len is an EXCLUSIVE boundary (page_ceil(keep_len)
+                    # must exclude the page containing it): req.cached_len is one BEHIND that
+                    # (the standing complete_one-style lag -- see _padded_tail), so passing
+                    # cached_len here would, at an exact page boundary, hand back a page still
+                    # holding this request's own just-committed token (this bug reproduced live:
+                    # EXP-033's tail leak was actually this over-free wiping a real page, not an
+                    # under-free -- the "missing" page was corrupted/reassigned, not orphaned).
+                    self.cache_manager.free_spec_reject(
+                        req, keep_len=req.device_len, alloc_len=spec_alloc_len
+                    )
                 self.decode_manager.remove_req(req)
                 self._free_req_resources(req)
                 self.finished_reqs.add(req)
@@ -185,16 +203,22 @@ class SchedulerSpecMixin:
 
         # ---- commit: only the tokens up to (and including) any finish reason count ----
         self.token_pool[req.table_idx, d : d + m] = out.next_tokens_gpu[:m]
-        committed = self._commit_spec_tokens(req, accepted, start_pos=d)
+        committed = self._commit_spec_tokens(req, accepted, start_pos=d, spec_alloc_len=d + k)
         finished = committed < m or (committed == m and req in self.finished_reqs)
 
-        if committed < m or m <= k:
-            # Return whatever the verify window allocated beyond what actually counts: either
-            # a mid-window finish truncated it, or the target rejected part of the draft.
+        if not finished and (committed < m or m <= k):
+            # Return whatever the verify window allocated beyond what actually counts: the
+            # target rejected part of the draft, request still live. A mid-window FINISH is
+            # reclaimed inside _commit_spec_tokens itself, before table_idx is recycled.
             keep_len = d - 1 + committed
-            self.cache_manager.free_spec_reject(req, keep_len=keep_len, alloc_len=d + k)
+            # free_spec_reject's keep_len must be the boundary AFTER the standing cached_len/
+            # device_len lag (keep_len+1 == the device_len this request is about to have): at
+            # an exact page boundary, passing keep_len itself would free the page holding the
+            # just-committed token at index keep_len (see the matching comment in
+            # _commit_spec_tokens -- same bug, same fix, on the "not finished" side of it).
+            self.cache_manager.free_spec_reject(req, keep_len=keep_len + 1, alloc_len=d + k)
             req.cached_len = keep_len
-            req.device_len = keep_len + (0 if finished else 1)
+            req.device_len = keep_len + 1
 
         if finished:
             self.free_spec_snapshot_slot(req)
@@ -219,7 +243,12 @@ class SchedulerSpecMixin:
             keep_cached, keep_device = req.cached_len, req.device_len
             req.cached_len = start
             req.device_len = start + committed
-            rfi = self._prepare_batch(rb)
+            # This window's pages were already allocated by the verify step's own
+            # _prepare_batch (which used device_len=d+k >= start+committed) -- re-running
+            # allocate_paged on the rewound (start, start+committed) pair would, at a page
+            # boundary, hand back a FRESH page and orphan the real one already there (see the
+            # matching comment on _prepare_batch's skip_alloc parameter).
+            rfi = self._prepare_batch(rb, skip_alloc=True)
             rb.input_ids = self.token_pool[rfi.input_tuple]
             self.engine.forward_batch(rb, rfi.sample_args)  # sampled token discarded
             req.cached_len, req.device_len = keep_cached, keep_device

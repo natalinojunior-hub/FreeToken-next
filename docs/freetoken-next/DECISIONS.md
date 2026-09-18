@@ -289,3 +289,26 @@ repeat count are resolved.
 The same probe reached MTP=1 speculation and accepted one draft token, then found a one-page
 finished-request cache leak. Cleanup now covers the allocated `device_len` tail; this fix must be
 tested before any MTP+Turbo4 throughput number is reported.
+
+## D-021 — Diagnose page-accounting bugs by bisecting to the real mechanism, not by patching the
+symptom's call site again
+
+**Date:** 2026-09-18 · **Status:** accepted · **Evidence:** EXP-034
+
+D-020's committed `cache.py` fix for the one-page leak (`alloc_end = max(cached_len, device_len)`)
+was itself wrong: `cached_len < device_len` is a standing invariant of this codebase (the next,
+not-yet-written slot), so the fix silently over-freed one page on every finished request at
+`page_size=1`, regressing 11 pre-existing, unrelated scheduler tests
+(`test_abort_inflight_prefill.py` and friends) that a scoped `pytest tests/scheduler/` run would
+have caught immediately -- the original fix was validated only against the two spec-specific test
+files it touched. **Decision: any fix to shared cache/page-accounting code runs the FULL
+`tests/scheduler/` suite (not just the files the diff touched) before being trusted, and a bug
+reproduced only at a specific numeric alignment (here: prompt length an exact multiple of
+`page_size`) is diagnosed by re-deriving the allocation arithmetic from the actual call sites
+(`allocate_paged`, `_prepare_batch`, `free_spec_reject`'s own contract) instead of adjusting the
+one line the traceback points at.** The real bugs were three, all in `spec.py`, none touching
+`cache.py`'s finished-tail logic at all: `_commit_spec_tokens`'s mid-window finish never
+reclaiming the verify's surplus before `table_idx` recycling; `free_spec_reject`'s `keep_len`
+argument using the wrong (lagged) convention; and the GDN-state replay's `_prepare_batch` call
+re-running `allocate_paged` over an already-allocated range, orphaning the original page at a
+page-boundary crossing. See EXP-034.

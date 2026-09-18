@@ -961,3 +961,106 @@ Root cause: a verify window can allocate the page containing its correction toke
 request cleanup released only through `cached_len`. The cleanup now also releases the allocated
 `device_len` page tail. The patch is committed with focused tests already passing before this last
 cache-tail edit; a post-edit focused test and live PP/TG run remain pending.
+
+## EXP-034 — EXP-033's `alloc_end` patch was itself wrong; the real leak was three separate bugs
+
+**Date:** 2026-09-18 · **Verdict:** **f9354cd's cache.py fix REVERTED; three different real bugs
+found and fixed instead; live MTP=1 + Turbo4 now runs to completion with no crash**
+
+Session start: re-ran the full non-slow suite before touching anything live. `tests/scheduler/`
+alone: **11 pre-existing failures** (`test_abort_inflight_prefill.py`, `test_dsv4_generic_manager.py`,
+`test_scheduler_chunked_prefill.py`, `test_swa_pagesize.py`), all `free_pages+cache_pages !=
+num_pages`, all **over-counted** (too many free, not too few). Bisected: these regressed with
+f9354cd's own `cache.py` change (checked out `f9354cd~1`'s `cache.py` alone, same tests pass).
+Root cause of THAT regression: `cached_len < device_len` is a **standing invariant** in this
+codebase (device_len is always the next, not-yet-written slot -- see `Req.__init__`'s own assert
+and `complete_one()`), not a spec-only artifact. f9354cd's `alloc_end =
+div_ceil(max(cached_len, device_len), page_size)` collapses to `device_len` always, and at
+`page_size=1` (these tests) that unconditionally frees one MORE page than `_padded_tail`'s
+original `cached_len`-only bound -- a page never allocated to the request in the first place.
+**Fix: reverted all three `alloc_end` hunks in `cache.py` back to `_padded_tail`/no-op** (the
+pre-f9354cd code). Full `tests/scheduler/` green again (104 passed) before proceeding.
+
+With `cache.py` reverted, the ORIGINAL EXP-033 symptom (`free_pages(258)+cache_pages(0)!=
+num_pages(259)`, live, RTX 5080, `--spec-mtp 1 --kv-format turbo4`, 16384-token prompt = exactly
+256 pages at page_size=64) was investigated from first principles instead of patched again at the
+same spot, and turned out to be **three independent bugs**, all specific to `spec.py`, all masked
+by the fact that no unit test ever exercised a page-ALIGNED prompt length (256*64) with k>=1:
+
+1. **`_commit_spec_tokens`'s mid-window finish never reclaimed the verify's surplus allocation.**
+   `_free_req_resources` (called mid-loop, on `finished_now`) recycles `table_idx` using only the
+   truncated `cached_len`/`device_len` at the finish point -- it has no way to know the verify
+   batch's own `_prepare_batch` allocated further out (`d+k`). Fix: `_commit_spec_tokens` now
+   takes `spec_alloc_len` and calls `free_spec_reject` itself, BEFORE `_free_req_resources` frees
+   `table_idx` -- after that, `free_spec_reject(req, ...)` would read `page_table[-1]` (Python
+   negative indexing, not an error) and silently corrupt a DIFFERENT request's row instead.
+
+2. **`free_spec_reject`'s `keep_len` argument used the wrong convention at run_spec_step's two
+   call sites.** `req.cached_len` always LAGS the last real, committed token by one (the standing
+   invariant from #above) -- `free_spec_reject`'s own contract (proven by
+   `test_reject_crossing_a_page_boundary_frees_the_speculative_page`) needs a boundary where index
+   `keep_len` itself is already fully speculative, i.e. `req.device_len` (`keep_len+1`), not
+   `req.cached_len`. Passing the lag value only differs from the correct one at an EXACT page
+   boundary -- which a 16384-token prompt at page_size=64 hits on its very first spec step
+   (`d-1=16384`) -- where it wrongly handed back the page still holding the just-committed,
+   real correction token (an OVER-free of a live page, not an under-free of a dead one).
+
+3. **The GDN-state "replay" (undoing draft KV, re-forwarding committed tokens as a plain prefill)
+   re-ran `allocate_paged` over a range whose pages were already assigned by the verify step's own
+   `_prepare_batch` moments earlier.** `allocate_paged` has no memory of a prior call; calling it
+   twice on an unchanged `(cached_len, device_len)` pair that straddles a page boundary grabs a
+   SECOND, different physical page and overwrites the `page_table` row that held the first one --
+   silently orphaning it (never in `free_slots`, never referenced again). This is what actually
+   produced the crash: at page_size=64, a 16384-token prompt makes `d-1` land exactly on the page
+   256/257 boundary on the request's very first spec step, and every rejected-draft replay after
+   that re-triggers the same double-allocate on the SAME row until the request finishes and the
+   orphaned page surfaces as `free_pages(258)+cache_pages(0)!=num_pages(259)`. Fix: `_prepare_batch`
+   gained a `skip_alloc: bool` parameter (default `False`, every other call site unaffected); the
+   replay call passes `skip_alloc=True`.
+
+4. **A fourth, unrelated leak surfaced once the crash stopped happening**: `LinearStatePool
+   exhausted: need 1, have 0` on the benchmark's 2nd repeat. `_spec_snapshot_slot` allocates a GDN
+   snapshot slot per `req.uid`, freed only by `run_spec_step`'s own `if finished:` branch -- but
+   `_spec_eligible_req` disables spec on a request's OWN LAST token (`remain_len <= 1`), so every
+   request's true finish goes through the PLAIN (non-spec) decode path instead, which never calls
+   `free_spec_snapshot_slot` at all. 100% leak rate, one request finishing = one dead slot forever.
+   Fix: moved the release into `_free_req_resources`, the one cleanup path every finish route
+   (abort, plain decode, spec) shares, guarded by `hasattr` for scheduler-unit-test stubs that
+   don't mix in `SchedulerSpecMixin`.
+
+Each fix has a dedicated regression test in `tests/scheduler/test_spec_reject_frees_pages.py`,
+confirmed to fail on the pre-fix code and pass after (`git stash`/manual revert + rerun, not just
+inspection). Full non-slow suite: **1934 passed, 1934 passed both times** (the 1 failure is the
+pre-existing `flashinfer` `nvcc`/`ptxas` alignment error on this host's CUDA 13.3, unrelated,
+already documented).
+
+**Live result** (RTX 5080, real serve, no sandbox, `TMPDIR=/models/desenvolvimento/tmp`):
+`--spec-mtp 1 --kv-format turbo4 --memory-ratio 0.86 --cuda-graph-max-bs 0 --cache-type naive
+--num-tokens 16576`, `FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1`, 16384-token prompt, greedy. Two
+repeats after 1 warmup now run to completion with **no crash**: PP 1715.2 (matches the MTP-free
+Turbo4 anchor of ~1714-1716, EXP-032), but **TG collapsed to 0.79 tok/s mean (0.52-1.07 tok/s
+across the two repeats)** against the MTP-free Turbo4 baseline of TG 24.6 (same run, same host,
+same config, `--spec-mtp` simply omitted) -- roughly a **31-50x** decode slowdown, ITL p50
+1.2-2.4 **seconds** per token at 99.7% GPU util. This is a real, valid PP/TG measurement (goal
+priority 3), not a crash -- but it is not a usable number yet: at 99% GPU util the cost is real
+compute, not idle waiting, consistent with `--cuda-graph-max-bs 0` (CUDA graph is disabled for
+`--spec-mtp` today) forcing every draft+verify step through eager, likely-unfused Triton
+launches instead of a captured replay. Ties directly into goal priority 4 (CUDA graph/overlap for
+MTP) -- not yet investigated this session.
+
+**New, separate, NOT YET FIXED finding**: the two repeats' `output_sha1` **differ** from each
+other (`2d8355daf32e` vs `6e43ad8484ac`) despite identical prompt/config/greedy sampling on the
+same warmed server. Isolated: two INDEPENDENT fresh-server single-request runs (decode=32, no
+warmup) produce IDENTICAL sha1 (`f423b6a1bade` both times) with near-identical PP/TG -- so a
+single request's own decode is fully deterministic and reproducible. The divergence only appears
+across SEQUENTIAL requests in the same server session (warmup -> repeat1 -> repeat2), pointing to
+residual state leaking from one finished request into the next one's initial state somewhere in
+the MTP/spec path (candidates: `_last_residual`, the reused `table_idx`/GDN slot's leftover
+content, or a page_table row not fully re-initialized before reuse). **Do not trust any
+multi-request MTP+Turbo4 benchmark's content-correctness until this is root-caused** -- the
+PP/TG throughput numbers above are still valid (they only measure timing), but the "byte-identical
+to spec-mtp=0" correctness bar from EXP-027/028 has NOT been re-confirmed for Turbo4 at 16K, and
+this session found it does NOT hold across repeated requests. Next session: reproduce with
+`--repeats 2 --warmups 0` (no warmup) to see if 2 is already enough to diverge, then diff the
+two repeats' generated token sequences to find the first divergence point, then trace what request
+state that position's draft/verify step reads that isn't reset between requests.

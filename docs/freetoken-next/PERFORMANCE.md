@@ -350,3 +350,32 @@ The first clean MTP=1 + Turbo4 probe reached speculative decode and logged an ac
 the verify window can allocate the page containing the correction token, while finished-request
 cleanup previously released only through `cached_len`, not the allocated `device_len` extent. The
 cleanup path was patched in `scheduler/cache.py`; no post-patch live benchmark has been run yet.
+
+**2026-09-18 follow-up (EXP-034): that `cache.py` patch was itself wrong** (regressed 11
+pre-existing scheduler tests) and reverted; the real leak was three separate `spec.py` bugs, all
+fixed (see EXP-034 for the full mechanism). Live result, RTX 5080, `--spec-mtp 1 --kv-format
+turbo4 --memory-ratio 0.86 --cuda-graph-max-bs 0 --cache-type naive --num-tokens 16576`,
+`FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1`, 16384-token prompt, 2 repeats after 1 warmup, greedy:
+
+| metric | MTP=1 + Turbo4 | Turbo4 only (`--spec-mtp 0`) | ratio |
+|---|---|---|---|
+| PP (tok/s) | 1715.2 | 1639.9 | ~1.0x (within noise) |
+| TG (tok/s) | 0.79 mean (0.52-1.07) | 24.60 | **31-50x slower** |
+| ITL p50 | 1.2-2.4 s/token | ~40 ms/token | ~50x |
+| GPU util | 99.7% | 89.9% | -- |
+
+No crash now. PP is unaffected (matches the MTP-free anchor); TG collapsed. GPU util at ~100%
+means this is real compute, not idle waiting -- consistent with `--cuda-graph-max-bs 0` (CUDA
+graph stays disabled for `--spec-mtp` today) forcing every draft+verify step through eager,
+per-step Triton launches instead of a captured replay. Not yet root-caused; ties directly into
+the CUDA-graph/overlap blocker below.
+
+**Also found, NOT fixed**: the two repeats' `output_sha1` differ from each other
+(`2d8355daf32e` vs `6e43ad8484ac`) despite identical prompt/config/greedy sampling. Two isolated
+fresh-server single-request runs (no warmup) are byte-identical to each other
+(`f423b6a1bade` both times) with matching PP/TG, so a single request's own decode is
+deterministic -- the divergence is specific to running MULTIPLE requests sequentially in the same
+server session, i.e. state leaking from one finished request into the next one's initial state
+somewhere in the MTP/spec path. Any future MTP+Turbo4 content-correctness claim must reproduce
+the EXP-027/028 byte-identical-to-`spec-mtp=0` check across a multi-request session, not just a
+single isolated request, until this is root-caused.
