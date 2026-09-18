@@ -653,6 +653,10 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
         self.cache_manager.cache_req(req, finished=True)
+        engine = getattr(self, "engine", None)
+        kv = getattr(engine, "kv_cache", None) if engine is not None else None
+        if kv is not None and hasattr(kv, "free_req"):
+            kv.free_req(req.table_idx)
         self.table_manager.free(req.table_idx)
         req.table_idx = -1
         # A request that stops being spec-eligible on its last token (remain_len <= 1, see

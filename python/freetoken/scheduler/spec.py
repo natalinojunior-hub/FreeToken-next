@@ -67,6 +67,44 @@ class SchedulerSpecMixin:
         slot = self._spec_snapshot_slots.pop(req.uid, None)
         if slot is not None:
             self.engine.linear_state_pool.free([slot])
+        if hasattr(self, "_spec_qsa_snapshots"):
+            self._spec_qsa_snapshots.pop(req.uid, None)
+
+    def _snapshot_qsa_state(self, req: Req) -> tuple[torch.Tensor, torch.Tensor] | None:
+        kv = getattr(self.engine, "kv_cache", None)
+        ring_buf = getattr(kv, "_pending_ring", None)
+        if ring_buf is None:
+            return None
+        if not hasattr(self, "_spec_qsa_snapshots"):
+            self._spec_qsa_snapshots: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        snap = self._spec_qsa_snapshots.get(req.uid)
+        ring_src = ring_buf[req.table_idx]
+        scratch_base = getattr(kv, "_cmp_scratch_base", 0)
+        scratch_src = kv._cmp_k_buffer[:, scratch_base + req.table_idx]
+        if snap is None:
+            snap_ring = ring_src.clone()
+            snap_scratch = scratch_src.clone()
+            self._spec_qsa_snapshots[req.uid] = (snap_ring, snap_scratch)
+        else:
+            snap_ring, snap_scratch = snap
+            snap_ring.copy_(ring_src)
+            snap_scratch.copy_(scratch_src)
+        return snap_ring, snap_scratch
+
+    def _restore_qsa_state(self, req: Req) -> None:
+        if not hasattr(self, "_spec_qsa_snapshots"):
+            return
+        snap = self._spec_qsa_snapshots.get(req.uid)
+        if snap is None:
+            return
+        kv = getattr(self.engine, "kv_cache", None)
+        ring_buf = getattr(kv, "_pending_ring", None)
+        if ring_buf is None:
+            return
+        snap_ring, snap_scratch = snap
+        ring_buf[req.table_idx].copy_(snap_ring)
+        scratch_base = getattr(kv, "_cmp_scratch_base", 0)
+        kv._cmp_k_buffer[:, scratch_base + req.table_idx].copy_(snap_scratch)
 
     @staticmethod
     def _linear_slot(req: Req) -> int:
@@ -222,6 +260,8 @@ class SchedulerSpecMixin:
         model = self.engine.model
         mtp = model.mtp
 
+        # Snapshot QSA pending ring and scratch cmp buffer before draft chain mutates them
+        self._snapshot_qsa_state(req)
 
         # ---- draft chain: k autoregressive steps through the draft head's own QSA slot ----
         r_prev = model.model._last_residual[-1:].clone()
@@ -306,6 +346,7 @@ class SchedulerSpecMixin:
             # forward's rows).
             if snap_slot is not None:
                 pool.copy_from(snap_slot, self._linear_slot(req))
+            self._restore_qsa_state(req)
             start = d - 1
             rb = Batch(reqs=[req], phase="prefill")
             # The replay re-forwards ALREADY-COMMITTED positions, so it needs the pre-commit

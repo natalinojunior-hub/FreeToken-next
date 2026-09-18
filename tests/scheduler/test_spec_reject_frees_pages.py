@@ -227,3 +227,34 @@ def test_spec_mrope_positions_use_three_axis_fallback():
     assert got.shape == (3, 1)
     assert got.dtype == torch.int32
     assert got.tolist() == [[11], [11], [11]]
+
+
+def test_free_req_resources_clears_qsa_pool_and_snapshots():
+    from types import SimpleNamespace
+
+    page_table = torch.zeros(2, 32, dtype=torch.int32)
+    cm = CacheManager(8, 4, page_table, "radix")
+    tm = TableManager(max_running_reqs=2, page_table=page_table)
+    freed_qsa_tables = []
+    stub = SimpleNamespace(
+        cache_manager=cm,
+        table_manager=tm,
+        engine=SimpleNamespace(
+            kv_cache=SimpleNamespace(free_req=freed_qsa_tables.append)
+        ),
+        _spec_snapshot_slots={},
+        _spec_qsa_snapshots={0: (torch.zeros(1), torch.zeros(1))},
+    )
+    stub.free_spec_snapshot_slot = lambda req: SchedulerSpecMixin.free_spec_snapshot_slot(stub, req)
+
+    req = _req(0, prompt_len=4)
+    req.table_idx = 1
+    req.device_len = 4
+    cm.allocate_paged([req])
+    req.cached_len = req.device_len
+    req.cache_handle = cm.prefix_cache.match_prefix(req.input_ids[:0]).cuda_handle
+
+    Scheduler._free_req_resources(stub, req)
+
+    assert freed_qsa_tables == [1], "QSA pool's free_req must be called with table_idx"
+    assert 0 not in stub._spec_qsa_snapshots, "QSA snapshots must be cleared"

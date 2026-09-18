@@ -279,5 +279,12 @@ class QSAKVCache(BaseKVCachePool):
     def num_req_slots(self) -> int:
         return self._num_req_slots
 
+    def free_req(self, table_idx: int) -> None:
+        """Zero the per-request pending ring and scratch cmp buffer when table_idx is released."""
+        if self._pending_ring is not None and 0 <= table_idx < self._num_req_slots:
+            self._pending_ring[table_idx].zero_()
+        if self._cmp_k_buffer is not None and 0 <= table_idx < self._num_req_slots:
+            self._cmp_k_buffer[:, self._cmp_scratch_base + table_idx].zero_()
+
 
 __all__ = ["QSAKVCache"]

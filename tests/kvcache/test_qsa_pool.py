@@ -227,3 +227,16 @@ def test_resolve_pool_class_and_factory():
 
     with pytest.raises(ValueError, match="num_req_slots"):
         create_kvcache_pool(mc, num_pages=4, page_size=64, dtype=torch.bfloat16, device=DEV)
+
+
+def test_free_req_clears_pending_ring_and_scratch():
+    pool = _pool(num_pages=4, num_req_slots=4)
+    # Dirty slot 1 with non-zero values
+    pool._pending_ring[1].fill_(42.0)
+    pool._cmp_k_buffer[:, pool.cmp_scratch_base + 1].fill_(7.0)
+    assert pool._pending_ring[1].abs().sum().item() > 0
+    assert pool._cmp_k_buffer[:, pool.cmp_scratch_base + 1].abs().sum().item() > 0
+
+    pool.free_req(1)
+    assert pool._pending_ring[1].abs().sum().item() == 0.0
+    assert pool._cmp_k_buffer[:, pool.cmp_scratch_base + 1].abs().sum().item() == 0.0
