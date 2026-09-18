@@ -747,3 +747,56 @@ unverified by execution -- correctness rests on the file:line-verified design on
 decision: implement now rather than wait for a live checkpoint (recorded per their explicit
 choice). First real validation must happen at a live 16K serve per the goal's preflight gates
 (MTP acceptance/target-equivalence), before any 256K attempt.
+
+## EXP-027 — Native MTP first live serve: real bugs found, then a CONFIRMED content divergence
+**Date:** 2026-09-17 · **Verdict:** **BLOCKED / CRITICAL CORRECTNESS BUG**
+
+First actual `--spec-mtp 1` serve against the real Flash-Next checkpoint (16K, naive cache,
+`--max-running-requests 1`, `FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1`), after freeing host RAM
+(21 GiB of stale `/tmp` tmpfs files from unrelated past sessions were competing with the ~63 GiB
+NVFP4 expert-bank footprint and causing an earlyoom kill during weight loading -- same
+pre-existing constraint as EXP-015, not caused by MTP; see AGENTS.md's new "never use RAM as
+storage" rule). Three real bugs found and fixed in sequence, each confirmed by the next serve
+attempt getting further:
+
+1. `iter_mtp_weights` was a reader seam only (EXP-016) -- nothing consumed it, so
+   `Qwen4ExpMTP`'s own dense weights were never loaded: `KeyError: 'mtp.pre_fc_norm_hidden.weight'`.
+   Fixed: `iter_mtp_weights` now fuses q/k/v -> qkv_proj and HC block-inject parts exactly like
+   `iter_weights` (reusing `_DenseFuser`), skips the draft's packed expert-bank tensors
+   (`_MTPQuantConfig` reuses the target's), and `Engine._load_weight_state_dict` chains it in.
+2. `iter_mtp_weights` wasn't exported from `qwen4_exp/__init__.py`, so `_load_attr` raised
+   `AttributeError`. Fixed: exported.
+3. `_init_offload_moe_cache`'s `assert len(layers) == num_moe_layers` failed (49 vs 48): the
+   generic `iter_offload_moe_layers` walk also finds the draft's own `Qwen4ExpMoE` instance.
+   Deeper bug underneath: that instance was built with `layer_id == config.num_layers` (its own
+   KV/attention slot), but `_MTPQuantConfig` routes its weights onto the TARGET's bank at
+   `first_k_dense_replace` -- so at runtime it would have indexed the offload cache's per-layer
+   arrays out of bounds. Added `moe_layer_id` to `Qwen4ExpDecoderLayer` to alias the two, and
+   adjusted the engine's count assert to expect one extra (aliased) layer when MTP is registered.
+4. A real per-token accounting bug in the new spec loop itself: `run_spec_step` pre-set
+   `req.cached_len`/`device_len` to the WHOLE verify window's end before `_commit_spec_tokens`'
+   per-token EOS/stop/length loop ran, so `hit_length` (which reads live `device_len` via
+   `req.can_decode`) saw the window's FINAL length for every token in it instead of each token's
+   own position. Fixed: `_commit_spec_tokens` now takes `start_pos` and advances
+   `cached_len`/`device_len` one token at a time, exactly like `complete_one()`.
+
+After all four fixes, the server serves real requests without crashing. A short greedy prompt
+("The capital of France is", max_tokens swept 1/2/3/5/32) matched the `--spec-mtp 0` baseline's
+token content exactly at every length tested -- but a longer, more complex prompt ("Write a
+short poem about the ocean...", max_tokens=80) **diverges from the baseline in actual content**,
+not just length: both start identically, then differ starting around token 13 (`"sea".` vs
+`"sea."` and completely different continuations after). Content divergence under greedy
+decoding with an `accept_drafts` contract that only ever commits target-verified tokens means
+the verify forward itself (a `phase="prefill"` `Batch` over a 2-token window) is computing
+something numerically different from what a real decode step at those same positions would
+compute -- not a bookkeeping bug. Prime suspect per the Opus review's own flagged risk (EXP-025
+point 8): the QSA `pending_ring`/compressed-group logic keyed by `position % index_ratio` may
+behave differently for a prefill-phase multi-position extend than for true decode, corrupting
+attention for prompts whose length interacts with `index_ratio` boundaries -- untested at the
+short prompt's length, triggered at the longer one's.
+
+**Item E status change: PARTIAL -> BLOCKED on a confirmed correctness bug.** Do not claim
+target-equivalence past this point. Next step: escalate this exact repro (both prompts, both
+outputs, this file) to Opus 5 for a third architecture pass focused specifically on the QSA
+attention path's behavior under a `phase="prefill"` multi-token verify window, before any further
+implementation or any throughput measurement.
