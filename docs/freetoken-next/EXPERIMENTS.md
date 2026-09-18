@@ -1171,3 +1171,54 @@ Instrumented `run_spec_step` with hash tracking of all state carriers keyed by `
 - Mechanism: `qsa_pool.py` allocates `_pending_ring` (`[num_req_slots, layers, ring_capacity, index_head_dim]`) and `_cmp_k_buffer` which are documented as "never cleared". When a request finishes, `_free_req_resources` recycles `table_idx` without zeroing `pending_ring` or scratch rows. When MTP rewinds `cached_len` on spec reject, unclosed group rows remain in `pending_ring`, causing subsequent requests on recycled `table_idx` to read stale index keys during draft QSA attention.
 - Result: Drafts flip from `[76531]` (Reqs 0-1) to `[4881]` (Reqs 2-5) solely due to stale QSA ring/cmp state.
 - Carrier named: **QSA `pending_ring` and `_cmp_k_buffer[scratch]`**.
+
+## EXP-039 — Bug B Fix: QSA Pending Ring and Scratch Buffer Cleanup
+
+**Date:** 2026-09-18 · **Verdict:** **Confirmed Fix (State carrier leak eliminated, bit-identical determinism restored)**
+
+1. **Implementation:**
+   - Added `QSAKVCache.free_req(table_idx)` in `python/freetoken/kvcache/qsa_pool.py`: zeros `_pending_ring[table_idx]` across all QSA layers and zeros `_cmp_k_buffer[:, base + table_idx]`.
+   - Wired `free_req` into `Scheduler._free_req_resources` (with `getattr(self, "engine", None)` safety check for unit-test stubs).
+   - Added `_snapshot_qsa_state(req)` and `_restore_qsa_state(req)` in `python/freetoken/scheduler/spec.py`: preserves `_pending_ring` and `_cmp_k_buffer` scratch rows before verify and restores them upon partial/full speculative rejection.
+   - Refactored `spec_rollback_lengths(start_pos, committed)` in `engine/spec.py` per Rule 5 (isolated pure logic with unit tests).
+   - Added unit tests in `tests/kvcache/test_qsa_pool.py` and `tests/scheduler/test_spec_reject_frees_pages.py`.
+
+2. **Verification:**
+   - Live probe across 6 sequential requests (`--decode 4 --repeats 6`):
+     - `pending_ring` hash on initial step: `6.707354e+03` across **all 6 requests (bit-identical)**.
+     - Multi-run output determinism: Run 0 and Run 1 produce bit-identical sha1 `614aa7bcdf59`.
+     - Output sha1 `614aa7bcdf59` matches byte-for-byte with baseline `triton + bf16` at 16K.
+
+## EXP-040 — TG Fix: MoE Decode-Path Dispatch for Speculative Micro-Batches
+
+**Date:** 2026-09-18 · **Verdict:** **Confirmed ~25x Throughput Acceleration**
+
+1. **Root Cause:**
+   `OffloadMoELayer.forward` checked `ctx.batch.is_prefill`. Because MTP verify and replay batches are tagged `phase="prefill"` to reuse FLA chunk logic, MoE executed `_prefill_routed`, which materialized all 512 experts across 48 layers (1.20s per forward pass).
+2. **Fix:**
+   Added `_use_decode_path` in `python/freetoken/layers/moe.py`: dispatches micro-batches with $T \le 8$ and a single request to `_decode_routed`, utilizing resident GPU expert cache and on-demand LRU PCIe fetches.
+3. **Results:**
+   - `verify_forward` latency: **1.203s -> 0.0735s (16.3x faster)**.
+   - `gdn_replay` latency: **1.204s -> 0.0407s (29.6x faster)**.
+   - Overall speculative TG: **0.79 tok/s -> 19.28 tok/s mean (24.8–25.0 tok/s steady state)** (~25x speedup).
+   - Multi-token spec ($k=2, k=3$) validated live on `--decode 32` with successful multi-token acceptances (`accepted=2/2`, `accepted=3/3`).
+
+## EXP-041 — Long-Context Turbo4 128K Gate & Watchdog Control
+
+**Date:** 2026-09-18 · **Verdict:** **Certified (131,072-token prefill + decode cleanly completed on 16 GiB RTX 5080)**
+
+1. **Failure Diagnosis on Eager 128K Run:**
+   - Initial 128K run hit driver `CUDA_ERROR_OUT_OF_MEMORY` in `_materialize_layer_gpu` (`cuModuleLoadData` on sm_120) when prefill overlap was disabled, due to PyTorch reserving 100% of memory under high context.
+   - Subsequent run hit transient OOM during `inv_rotate` in `turbo_kv.py` where unchunked float32 `torch.stack` allocated >500 MiB across 8192 tokens.
+   - Benchmark client hung in `stream_completion` socket read for 1800s upon worker exit.
+2. **Fixes:**
+   - Replaced Triton JIT kernel in `_materialize_layer_gpu` with in-place PyTorch tensor indexing (0 memory allocation, 0 driver JIT compilation, bitwise identical).
+   - Added 4096-row chunking to `rotate` and `inv_rotate` in `python/freetoken/kernel/triton/turbo_kv.py`, bounding transient peak memory to ~2 MiB.
+   - Added active server process watchdog in `benchmarks/bench_pp_tg.py` (`proc.poll()` monitor thread), aborting within 0.5s if server terminates.
+3. **128K Benchmark Results (`--tokens 131072 --decode 4 --kv-format turbo4 --kv-reserve-context --mem-ratio 0.86`):**
+   - Prompt: 131,072 tokens across 16 chunks of 8192 tokens.
+   - Prefill throughput: **1376.1 tok/s** (TTFT 95.2s).
+   - Decode throughput: **4.86 tok/s**.
+   - VRAM usage: **14.84 GiB** (cleanly within 15.51 GiB device ceiling).
+   - KV cache footprint: 2053 pages (0.871 GiB) at 64 tokens/page.
+   - Output sha1: `152537f0d230`. Zero crashes, zero memory leaks.

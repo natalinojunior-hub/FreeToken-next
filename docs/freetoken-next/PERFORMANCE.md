@@ -487,5 +487,40 @@ Measured initial state hashes across 6 sequential requests (`--decode 4 --repeat
 
 Result: `conv` and `rec` are non-carriers (cleanly isolated). Stale rows in QSA `pending_ring` and `_cmp_k_buffer` scratch row survive request termination on `table_idx` recycling, altering subsequent draft decisions.
 
+### Bug B Resolution & Determinism Parity (EXP-039)
+
+Implemented `QSAKVCache.free_req(table_idx)` to zero out `_pending_ring[table_idx]` and `_cmp_k_buffer[:, base + table_idx]`, wired into `Scheduler._free_req_resources`, plus snapshot/restore of QSA state in `spec.py` on speculative reject.
+
+Verification across 6 sequential requests (`--decode 4 --repeats 6`):
+- `pending_ring` hash on initial step: `6.707354e+03` across ALL 6 requests (bit-identical).
+- Multi-run output determinism: Run 0 and Run 1 produce bit-identical output sha1 `614aa7bcdf59`.
+- Comparison vs baseline `triton + bf16` at 16K: output sha1 `614aa7bcdf59` matches byte-for-byte with clean Turbo4 + MTP greedy output.
+
+### MoE Spec Micro-Batch Routing & TG Recovery (EXP-040)
+
+Dispatched speculative verify/replay micro-batches ($T \le 8, \text{len}(\text{reqs}) == 1$) through `OffloadMoELayer._decode_routed` rather than `_prefill_routed`, eliminating per-step layer materialization across 48 layers:
+
+| Operation | Before Fix (EXP-037) | After Fix (EXP-040) | Speedup |
+|---|---|---|---|
+| `verify_forward` | 1203 ms | **73.5 ms** | **16.3x** |
+| `gdn_replay` | 1204 ms | **40.7 ms** | **29.6x** |
+| Live Speculative TG | 0.79 tok/s | **19.28 tok/s mean (24.8–25.0 steady-state)** | **~25x** |
+
+Multi-token speculation validation (`--decode 32`):
+- $k=2$: multi-token acceptances live (`accepted=2/2`, `accepted=1/2`), TG 7.91 tok/s cold.
+- $k=3$: multi-token acceptances live (`accepted=3/3`, `accepted=1/3`), TG 7.38 tok/s cold.
+
+### Long-Context Turbo4 128K Certification (EXP-041)
+
+Benchmarked full 131,072-token context with Turbo4 compressed KV on RTX 5080 (15.51 GiB VRAM) via `bench_pp_tg.py` (`--tokens 131072 --decode 4 --kv-format turbo4 --kv-reserve-context --mem-ratio 0.86`):
+
+- **Prompt Tokens:** 131,072
+- **PP (Prefill Throughput):** **1376.1 tok/s** (TTFT 95.2 s across 16 chunks of 8192 tokens)
+- **TG (Decode Throughput):** **4.86 tok/s**
+- **VRAM Allocated:** **14.84 GiB** (cleanly under the 15.51 GiB device limit)
+- **KV Total Pages:** 2053 pages (0.871 GiB total KV at 64 tokens/page vs ~3.5 GiB for BF16)
+- **Output sha1:** `152537f0d230`
+- **Zero OOM / zero crashes:** In-place layer materialization and 4096-row chunked RWHT rotation kept transient peak memory within allocator limits.
+
 
 

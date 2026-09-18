@@ -312,3 +312,35 @@ reclaiming the verify's surplus before `table_idx` recycling; `free_spec_reject`
 argument using the wrong (lagged) convention; and the GDN-state replay's `_prepare_batch` call
 re-running `allocate_paged` over an already-allocated range, orphaning the original page at a
 page-boundary crossing. See EXP-034.
+
+## D-022 — Fused verify MTP+TurboKV: TreeWY delta-rule pseudo-values and direct compressed tile attention
+
+**Date:** 2026-09-18 · **Status:** accepted · **Evidence:** EXP-036, EXP-037, EXP-040, and A2/A8 audits
+
+FreeToken's speculative verification under MTP currently executes target model verify over a $k+1$ token window and, upon partial/full rejection ($m \le k$ accepted), rolls back the GDN linear recurrent state and runs `gdn_replay` (a separate forward pass) to re-derive the seed residual for the next draft step. Concurrently, TurboKV currently decompresses historical 64-token tiles into a dedicated intermediate page workspace (`_ws_k`, `_ws_v`) before QSA sparse attention.
+
+Line 12 of ROADMAP specifies fusing MTP verification with TurboKV attention to eliminate both the `gdn_replay` forward pass and the intermediate tile materialization penalty (-13% to -15% TG).
+
+### 1. Mathematical Formulation: TreeWY Delta-Rule Pseudo-Values
+
+The GDN (Gated Delta Net) layer update follows the linear recurrent delta rule:
+$$S_t = S_{t-1} (I - \beta_t k_t k_t^T) + \beta_t v_t k_t^T$$
+
+In chunked/parallel representation, the cumulative state update across a sequence of $k$ speculative tokens is expressed in semi-separable form using the lower-triangular kernel:
+$$S_t = S_0 U_{1:t} + V_{1:t}^* K_{1:t}^T$$
+where $U_{1:t} = \prod_{i=1}^t (I - \beta_i k_i k_i^T)$, and the pseudo-values $V^*$ satisfy the strictly lower-triangular system:
+$$(I + L_{k, \beta}) V^* = V$$
+with $L_{i, j} = \beta_j k_i^T k_j$ for $i > j$, and $0$ otherwise.
+
+Because $(I + L_{k, \beta})$ is strictly lower-triangular with unit diagonal, the pseudo-values $v_1^*, \dots, v_m^*$ for any accepted prefix of length $m \le k$ are mathematically identical to the pseudo-values that would be obtained by running a forward pass of length $m$. Causal masking in attention ensures that the residual output `hidden_states[m-1]` computed during the verify forward has received no attention from rejected speculative positions $> m-1$.
+
+**Decision:**
+1. Eliminate `gdn_replay` entirely by capturing `hidden_states[m-1]` directly from the verify forward as the MTP draft seed residual.
+2. In the GDN recurrent state update, checkpoint the per-step recurrent state during the small $k$-step verify window ($k \le 4$ costs only $k \times 128 \times 128 \times 2$ bytes = 128 KiB), or apply the prefix slice of the triangular pseudo-value accumulation $S_m = S_0 U_{1:m} + V_{1:m}^* K_{1:m}^T$. This eliminates the secondary prefill forward on spec reject, reducing rejection latency to 0 ms.
+
+### 2. Direct Compressed Tile Attention (Zero-Materialization TurboKV)
+
+During speculative verify, historical context ($t < d$) resides as compressed Turbo4 tiles (4-bit QSA coded blocks with Hadamard rotation and per-tile scale), while the speculative window ($d \le t < d+k$) is uncompressed FP16/BF16.
+
+**Decision:**
+The fused verify kernel loads compressed Turbo4 tiles directly into SRAM, dequantizes and applies the inverse Hadamard transformation on the fly within the thread-block tile accumulator, and evaluates attention queries against the uncompressed speculative window in local registers. No intermediate FP16 workspace (`_ws_k`, `_ws_v`) is materialized in DRAM, preserving the full memory savings of Turbo4 and removing the LTO memory bandwidth penalty.

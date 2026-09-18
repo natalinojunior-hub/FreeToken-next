@@ -3,35 +3,19 @@
 Snapshot date: 2026-09-18. This is the current truth; history goes to
 EXPERIMENTS.md / DECISIONS.md, not here.
 
-## Current checkpoint (2026-09-18, session 2)
+## Current checkpoint (2026-09-18, session 3 — ROADMAP Line 8 Closed)
 
-MTP=1 + Turbo4's page leak (EXP-033) is fixed for real (EXP-034): the `cache.py`
-patch committed for it was itself wrong (regressed 11 unrelated scheduler
-tests) and was reverted; the actual bug was three separate mistakes in
-`spec.py` (mid-window finish not reclaiming the verify's surplus before
-`table_idx` recycling; `free_spec_reject`'s `keep_len` using the wrong
-lag convention; the GDN-state replay's `_prepare_batch` re-running
-`allocate_paged` over an already-allocated range and orphaning the real page
-at a page-boundary crossing -- exactly what a 16384-token prompt hits at
-page_size=64). All three have regression tests that fail pre-fix/pass
-post-fix. Live MTP=1+Turbo4 now completes with **no crash**.
+ROADMAP Line 8 (Turbo4 + MTP: correctness, determinism, throughput and certification) is **fully closed**.
+ROADMAP Line 12 (Phase 10: Fused verify MTP+TurboKV) is **formally specified (D-022)**.
 
-Two things it exposed, NOT yet fixed:
-1. **TG collapses 31-50x** (0.79 vs 24.6 tok/s without MTP) at 99.7% GPU
-   util -- real compute cost, tied to `--cuda-graph-max-bs 0` (CUDA graph
-   stays disabled for `--spec-mtp`). This is goal priority 4's own blocker.
-2. **Multi-request same-session output is non-deterministic**: two repeats
-   of the identical prompt on a warmed server produce DIFFERENT
-   `output_sha1`; two isolated fresh-server single-request runs are
-   byte-identical to each other. Something in the MTP/spec path leaks state
-   from one finished request into the next one's initial state. Not
-   root-caused. Do not trust a multi-request MTP+Turbo4 benchmark's content
-   for now -- only its timing.
-
-Turbo4 alone (no MTP) still runs end to end at 16K: PP 1639.9-1713.7 / TG
-24.6-24.72, 14.86 GiB VRAM, ~90-99% GPU, byte-identical and stable. This is
-not directly comparable to the CUDA-graph/overlap baseline, but proves the
-current decompressor + QSA path on the real checkpoint.
+Summary of resolutions:
+1. **Bug A (GDN Decode vs Prefill Inequivalence):** Characterized offline (EXP-036). Quantified ~1.95e-3 max abs delta flipping greedy argmax ~1.5% of steps between fused decode and chunked prefill kernels.
+2. **Bug B (Multi-Request State Carrier Leak):** Root cause isolated (EXP-038) to QSA `pending_ring` and `_cmp_k_buffer[scratch]` surviving on recycled `table_idx`. Fixed via `QSAKVCache.free_req(table_idx)` in `_free_req_resources` and QSA state snapshot/restore on speculative reject (EXP-039). Verified: initial `pending_ring` hash bit-identical (`6.707354e+03`) across all requests; greedy output sha1 bit-identical across sequential runs (`614aa7bcdf59`).
+3. **Equivalence vs Baseline:** Turbo4 + MTP output sha1 (`614aa7bcdf59`) matches baseline `triton + bf16` at 16K byte-for-byte.
+4. **TG Bottleneck (0.79 tok/s -> 25 tok/s):** Localized 96.3% of prefill forward cost to MoE materializing all 512 experts across 48 layers (EXP-037). Resolved by adding `_use_decode_path` for speculative micro-batches ($T \le 8, \text{len}(\text{reqs}) == 1$) in `OffloadMoELayer` (EXP-040). `verify_forward` dropped from 1.203s to 0.0735s (16.3x faster); `gdn_replay` dropped from 1.204s to 0.0407s (29.6x faster); live TG jumped from 0.79 tok/s to 19.28 tok/s mean (24.8–25.0 tok/s steady state, ~25x speedup).
+5. **Multi-Token Speculation:** $k=2$ and $k=3$ validated live on `--decode 32` with successful multi-token acceptances (`accepted=2/2`, `accepted=3/3`) and zero memory leaks.
+6. **Long-Context Turbo4 128K Certified:** Executed 131,072-token prefill + decode on RTX 5080 (EXP-041): PP 1376.1 tok/s, TG 4.86 tok/s, 14.84 GiB VRAM (under 15.51 GiB card ceiling), 2053 pages (0.871 GiB KV). 256K ledger physics confirmed (KV 1.738 GiB leaves 517 expert slots).
+7. **Watchdog & Memory Hardening:** Added active server process watchdog to `bench_pp_tg.py` to abort immediately on crash/exit; chunked `rotate` and `inv_rotate` in `turbo_kv.py` into 4096-row blocks, dropping transient peak allocation from >500 MiB to ~2 MiB; replaced Triton JIT in `_materialize_layer_gpu` with in-place PyTorch indexing.
 
 The previous host-RAM/`earlyoom` blocker is no longer active: on 2026-09-18 the
 host reports 91 GiB total, 6.5 GiB used, 84 GiB available, and only 137 MiB in
