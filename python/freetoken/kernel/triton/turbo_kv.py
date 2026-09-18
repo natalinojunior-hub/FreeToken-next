@@ -133,26 +133,46 @@ def butterfly(x: torch.Tensor) -> torch.Tensor:
     return v
 
 
-def rotate(x: torch.Tensor) -> torch.Tensor:
+def rotate(x: torch.Tensor, chunk_size: int = 4096) -> torch.Tensor:
     """Forward RWHT: ``x * s1 -> butterfly -> /sqrt(128) -> * s2`` (``turbo_rotate_forward_cuda``).
 
     Rows may hold several rotation groups (head_dim 256 is two): each 128-element group rotates on
     its own, which is what the encoder does per group and what the tile readers assume."""
     s1, s2 = _signs(x.device)
-    grouped = x.reshape(*x.shape[:-1], -1, QK_TURBO).float()
-    out = butterfly(grouped * s1) * FWHT_SCALE * s2
-    out = out.reshape(x.shape)
-    return out.to(x.dtype) if x.dtype != torch.float32 else out
+    flat_x = x.reshape(-1, x.shape[-1])
+    if flat_x.shape[0] <= chunk_size:
+        grouped = flat_x.reshape(*flat_x.shape[:-1], -1, QK_TURBO).float()
+        out = butterfly(grouped * s1) * FWHT_SCALE * s2
+        out = out.reshape(x.shape)
+        return out.to(x.dtype) if x.dtype != torch.float32 else out
+
+    out = torch.empty_like(flat_x)
+    for i in range(0, flat_x.shape[0], chunk_size):
+        c = flat_x[i : i + chunk_size]
+        grouped = c.reshape(*c.shape[:-1], -1, QK_TURBO).float()
+        c_out = (butterfly(grouped * s1) * FWHT_SCALE * s2).reshape(c.shape)
+        out[i : i + chunk_size] = c_out.to(x.dtype) if x.dtype != torch.float32 else c_out
+    return out.reshape(x.shape)
 
 
-def inv_rotate(y: torch.Tensor) -> torch.Tensor:
+def inv_rotate(y: torch.Tensor, chunk_size: int = 4096) -> torch.Tensor:
     """Inverse RWHT: ``y * s2 -> butterfly -> /sqrt(128) -> * s1`` (the butterfly is an involution
     up to the scale, which is why the same 1/sqrt(128) is applied again)."""
     s1, s2 = _signs(y.device)
-    grouped = y.reshape(*y.shape[:-1], -1, QK_TURBO).float()
-    out = butterfly(grouped * s2) * FWHT_SCALE * s1
-    out = out.reshape(y.shape)
-    return out.to(y.dtype) if y.dtype != torch.float32 else out
+    flat_y = y.reshape(-1, y.shape[-1])
+    if flat_y.shape[0] <= chunk_size:
+        grouped = flat_y.reshape(*flat_y.shape[:-1], -1, QK_TURBO).float()
+        out = butterfly(grouped * s2) * FWHT_SCALE * s1
+        out = out.reshape(y.shape)
+        return out.to(y.dtype) if y.dtype != torch.float32 else out
+
+    out = torch.empty_like(flat_y)
+    for i in range(0, flat_y.shape[0], chunk_size):
+        c = flat_y[i : i + chunk_size]
+        grouped = c.reshape(*c.shape[:-1], -1, QK_TURBO).float()
+        c_out = (butterfly(grouped * s2) * FWHT_SCALE * s1).reshape(c.shape)
+        out[i : i + chunk_size] = c_out.to(y.dtype) if y.dtype != torch.float32 else c_out
+    return out.reshape(y.shape)
 
 
 def _normalize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

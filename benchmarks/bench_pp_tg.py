@@ -74,9 +74,17 @@ def get_json(url: str, timeout: float = 10) -> dict:
 
 
 def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    for _ in range(100):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            p = s.getsockname()[1]
+        try:
+            with socket.socket() as s2:
+                s2.bind(("127.0.0.1", p + 1))
+            return p
+        except OSError:
+            continue
+    return p
 
 
 def build_prompt_text(model: str, path: str, tokens: int, offset: int) -> str:
@@ -203,7 +211,7 @@ def mem_available_gib() -> float:
     return 0.0
 
 
-def stream_completion(origin: str, model_id: str, prompt: str, args: argparse.Namespace) -> dict:
+def stream_completion(origin: str, model_id: str, prompt: str, args: argparse.Namespace, proc=None) -> dict:
     body = {
         "model": model_id,
         "prompt": prompt,
@@ -222,27 +230,38 @@ def stream_completion(origin: str, model_id: str, prompt: str, args: argparse.Na
     pieces: list[str] = []
     usage: dict | None = None
     t0 = time.perf_counter()
+    watch_stop = threading.Event()
+    if proc is not None:
+        def _watch():
+            while not watch_stop.wait(0.5):
+                if proc.poll() is not None:
+                    print(f"\n[bench] server process died with exitcode {proc.returncode}", flush=True)
+                    os._exit(1)
+        threading.Thread(target=_watch, daemon=True).start()
     try:
-        resp = urllib.request.urlopen(req, timeout=1800)
-    except urllib.error.HTTPError as e:
-        sys.exit(f"[bench] request failed: HTTP {e.code}: {e.read()[:500]!r}")
-    with resp:
-        for raw in resp:
-            line = raw.strip()
-            if not line or not line.startswith(b"data:"):
-                continue
-            payload = line[len(b"data:"):].strip()
-            if payload == b"[DONE]":
-                break
-            now = time.perf_counter()
-            chunk = json.loads(payload)
-            if chunk.get("usage"):
-                usage = chunk["usage"]
-            for choice in chunk.get("choices", []):
-                text = choice.get("text") or (choice.get("delta") or {}).get("content")
-                if text:
-                    stamps.append(now)
-                    pieces.append(text)
+        try:
+            resp = urllib.request.urlopen(req, timeout=1800)
+        except urllib.error.HTTPError as e:
+            sys.exit(f"[bench] request failed: HTTP {e.code}: {e.read()[:500]!r}")
+        with resp:
+            for raw in resp:
+                line = raw.strip()
+                if not line or not line.startswith(b"data:"):
+                    continue
+                payload = line[len(b"data:"):].strip()
+                if payload == b"[DONE]":
+                    break
+                now = time.perf_counter()
+                chunk = json.loads(payload)
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                for choice in chunk.get("choices", []):
+                    text = choice.get("text") or (choice.get("delta") or {}).get("content")
+                    if text:
+                        stamps.append(now)
+                        pieces.append(text)
+    finally:
+        watch_stop.set()
     if usage is None:
         sys.exit("[bench] stream ended without a usage chunk; is this a FreeToken server?")
     return {"t0": t0, "stamps": stamps, "text": "".join(pieces), "usage": usage}
@@ -252,7 +271,7 @@ def one_run(origin: str, model_id: str, prompt: str, args: argparse.Namespace, p
     sampler = GpuSampler()
     sampler.start()
     t_send = time.perf_counter()
-    r = stream_completion(origin, model_id, prompt, args)
+    r = stream_completion(origin, model_id, prompt, args, proc=proc)
     stats = get_json(f"{origin}/v1/stats")
     gpu = sampler.stop()
     stamps, usage = r["stamps"], r["usage"]
@@ -366,7 +385,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[bench] model_id={model_id} ctx={card.get('ctx')} attn={card.get('attn')} "
                   f"moe={card.get('moe')}", flush=True)
             for _ in range(args.warmups):
-                stream_completion(origin, model_id, prompt, args)
+                stream_completion(origin, model_id, prompt, args, proc=proc)
             for i in range(args.repeats):
                 row = one_run(origin, model_id, prompt, args, proc)
                 rows.append(row)

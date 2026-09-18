@@ -189,20 +189,26 @@ def _ensure_experts_hybrid_cpu(
 
 
 def _materialize_layer_gpu(cache, layer_id: int) -> None:
-    block = triton.next_power_of_2(max(cache.num_experts, cache.cache_size))
-    _materialize_layer_kernel[(1,)](
-        cache.slot_for_id,
-        cache.id_of_slot,
-        cache.usage,
-        cache.step,
-        cache.evict_slots,
-        cache.src_indices,
-        cache.num_indices,
-        layer_id,
-        cache.num_experts,
-        cache.cache_size,
-        BLOCK=block,
-    )
+    E = cache.num_experts
+    base = layer_id * E
+    slot_ids = cache.id_of_slot.clone()
+    same_layer = (slot_ids >= base) & (slot_ids < base + E)
+    cache.id_of_slot.masked_fill_(same_layer, -1)
+    cache.usage.masked_fill_(same_layer, 0)
+
+    old_ids = slot_ids[:E]
+    valid = (old_ids >= 0) & (~same_layer[:E])
+    if valid.any():
+        cache.slot_for_id.view(-1)[old_ids[valid].to(torch.int64)] = -1
+
+    cache.step.add_(1)
+    off = torch.arange(E, device=cache.device, dtype=torch.int32)
+    cache.id_of_slot[:E] = base + off
+    cache.slot_for_id[layer_id, :E] = off
+    cache.usage[:E] = cache.step
+    cache.evict_slots[:E] = off
+    cache.src_indices[:E] = off
+    cache.num_indices.fill_(E)
 
 
 def _reset_cache_gpu(cache) -> None:
