@@ -340,6 +340,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         moe_prefill_overlap = True
         kv_reserve_tokens = 0
         kv_reserve_context = False
+        num_page_override = None
         max_seq_len_override = None
         max_seq_len = 2048  # what --kv-reserve-context would have to fund
         swa_full_tokens_ratio = 0.2
@@ -395,6 +396,70 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
 
     size, _, _ = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks(), StubMethod())
     assert size == 5
+
+
+def test_engine_resolve_auto_moe_cache_size_refuses_undersized_num_tokens_override():
+    """An explicit --num-tokens the budget cannot fund must raise, not silently start with
+    fewer pages than requested and OOM the first real request that needs the context."""
+    import torch
+
+    from freetoken.engine.engine import Engine
+    from freetoken.models.config import KVCacheGroupSpec
+
+    class StubModelConfig:
+        has_swa_attention = False
+        num_experts = 4
+        num_moe_layers = 2
+
+        def kv_cache_group_specs(self):
+            return [KVCacheGroupSpec(
+                name="full", layer_ids=(0, 1, 2), num_kv_heads=8, head_dim=64, sliding_window=None,
+            )]
+
+        def linear_attention_group(self):
+            return None
+
+    class StubConfig:
+        dtype = torch.float16
+        page_size = 16
+        max_running_req = 4
+        hybrid_swa_cache_mode = "auto"
+        memory_ratio = 0.9
+        moe_prefill_overlap = True
+        kv_reserve_tokens = 0
+        kv_reserve_context = False
+        num_page_override = 200  # the tiny stub budget resolves ~80 pages unconstrained
+        max_seq_len_override = None
+        max_seq_len = 2048
+        swa_full_tokens_ratio = 0.2
+        swa_num_pages_override = None
+        model_config = StubModelConfig()
+
+        class tp_info:
+            size = 1
+
+    class StubBanks:
+        sources = {
+            "gate_up": [torch.zeros(4, 32, 8, dtype=torch.float16)] * 2,
+            "down": [torch.zeros(4, 8, 16, dtype=torch.float16)] * 2,
+        }
+
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    engine = Engine.__new__(Engine)
+    engine._baseline_free = 10_000_000
+    engine._weights_bytes = 1_000_000
+    engine._pool_cls = MHAKVCache
+
+    from freetoken.engine.vram_ledger import Kind, VramLedger
+
+    engine.vram_ledger = VramLedger(
+        device_total_bytes=12_000_000, baseline_free=10_000_000, memory_ratio=0.9,
+    )
+    engine.vram_ledger.charge("weights:model", 1_000_000, Kind.IMMUTABLE)
+
+    with pytest.raises(AssertionError, match="cache budget too small"):
+        engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks())
 
 
 def test_kv_reserve_context_funds_the_context_before_experts():

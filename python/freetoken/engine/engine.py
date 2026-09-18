@@ -816,8 +816,24 @@ class Engine:
             # refuses outright when that leaves less than a working cache).
             plan = self.vram_ledger.plan_for_context(config.max_seq_len, **geometry)
         else:
+            # An explicit --num-tokens/--num-pages is a request for that much KV, not a mere
+            # suggestion -- moe_cache_auto's split only ever saw --kv-reserve-tokens (default
+            # 8192) as its floor, so a larger override was silently downgraded to whatever the
+            # auto split left for KV instead of erroring: the server would start, log a normal
+            # "Allocating N tokens" line for the SMALLER N, and only surface the shortfall as a
+            # confusing mid-request CUDA OOM once a real request needed the context the operator
+            # actually asked for. Fold the override into the floor so the split prioritizes it.
+            requested_tokens = (
+                config.num_page_override * page_tokens if config.num_page_override is not None else 0
+            )
+            # decide() floors num_pages at kv_reserve_tokens and asserts the resulting plan
+            # still fits the budget (cache_budget.py's "cache budget too small" check) -- folding
+            # the override in here means an unfundable --num-tokens now fails loudly at startup
+            # through that same guard, instead of silently resolving to whatever the auto split
+            # left for KV and only surfacing the shortfall as a confusing mid-request CUDA OOM.
             plan = self.vram_ledger.decide(
-                kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve), **geometry
+                kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve, requested_tokens),
+                **geometry,
             )
         self.memory_plan = plan
         logger.info_rank0(plan.report())
