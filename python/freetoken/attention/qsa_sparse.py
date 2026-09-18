@@ -32,6 +32,7 @@ static buffers (``prepare_for_replay``) so the whole path is CUDA-graph capturab
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, List
 
@@ -53,6 +54,7 @@ _LOGITS_WORKSPACE_BYTES = 128 << 20
 
 
 TORCH_TOPK_ENV = "FREETOKEN_QSA_TORCH_TOPK"
+QSA_TIMING_ENV = "FREETOKEN_DEBUG_QSA_TIMING"
 
 
 def _resolve_block_topk() -> Callable | None:
@@ -108,7 +110,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self.index_heads = args.index_n_heads
         self.token_topk = args.index_budget
         self.kvcache = get_global_ctx().kv_cache
-        assert isinstance(self.kvcache, QSAKVCache), (
+        assert hasattr(self.kvcache, "cmp_k_cache"), (
             f"qsa_sparse backend needs a QSA pool, got {type(self.kvcache).__name__}"
         )
         self.device = self.kvcache.device
@@ -145,6 +147,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
         # decode staging (static buffers under CUDA graphs; eager decode snapshots per step)
         self._graph: dict[str, torch.Tensor] = {}
         self.capture_bs: List[int] = []
+        self._ws_k: torch.Tensor | None = None
+        self._ws_v: torch.Tensor | None = None
 
     @staticmethod
     def _qsa_group(config: ModelConfig):
@@ -285,10 +289,28 @@ class QSASparseAttnBackend(BaseAttnBackend):
     ) -> torch.Tensor:
         from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
 
+        debug_timing = os.getenv(QSA_TIMING_ENV, "0") == "1"
+        started = time.perf_counter()
+
+        def mark(stage: str) -> None:
+            if debug_timing:
+                capturing = torch.cuda.is_current_stream_capturing()
+                if not capturing:
+                    torch.cuda.synchronize(self.device)
+                print(
+                    f"[qsa-timing] layer={layer_id} T={q.shape[0]} {stage} "
+                    f"{time.perf_counter() - started:.3f}s"
+                    + (" [capture]" if capturing else ""),
+                    flush=True,
+                )
+
+        mark("start")
+
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata)
         slot = self._idx_slot[layer_id]
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        mark("store_kv")
         if md.block_table is None:
             self._snapshot_decode(md, batch)
         if slot == 0 or md.cmp_rows is None:
@@ -298,16 +320,72 @@ class QSASparseAttnBackend(BaseAttnBackend):
             self._plan_index_writes(md, batch)
 
         self._update_index_cache(index, md, slot)
+        mark("index_cache")
         indices = self._select(index, md, slot)
-        return qsa_sparse_paged_attention(
-            q,
-            self.kvcache.k_cache(layer_id),
-            self.kvcache.v_cache(layer_id),
+        mark("select")
+        compressed = getattr(self.kvcache, "compressed", False) or getattr(
+            self.kvcache._pool, "compressed", False
+        )
+        if compressed:
+            from freetoken.kernel.triton.turbo_kv import rotate, inv_rotate
+            from freetoken.kernel.triton.qsa import decompress_turbo4_to_workspace
+
+            q_in = rotate(q.reshape(-1, self.head_dim)).reshape(q.shape)
+            mark("rotate")
+            num_cache_blocks = self.kvcache._pool._tokens // self.page_size
+            num_kv_heads = self.kvcache._pool._num_kv_heads
+            if (
+                self._ws_k is None
+                or self._ws_k.shape[0] < num_cache_blocks
+                or self._ws_k.shape[2] != num_kv_heads
+            ):
+                self._ws_k = torch.empty(
+                    (num_cache_blocks, self.page_size, num_kv_heads, self.head_dim),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                self._ws_v = torch.empty(
+                    (num_cache_blocks, self.page_size, num_kv_heads, self.head_dim),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+
+            k_codes, k_norm = self.kvcache.k_slab(layer_id)
+            v_codes, v_norm = self.kvcache.v_slab(layer_id)
+            decompress_turbo4_to_workspace(
+                k_codes=k_codes,
+                k_norm=k_norm,
+                v_codes=v_codes,
+                v_norm=v_norm,
+                cent=self.kvcache.cent_tensor,
+                block_table=md.block_table,
+                seq_lens=md.seq_lens,
+                workspace_k=self._ws_k,
+                workspace_v=self._ws_v,
+                book3=self.kvcache.book3,
+            )
+            mark("decompress")
+            k_cache = self._ws_k
+            v_cache = self._ws_v
+        else:
+            q_in = q
+            k_cache = self.kvcache.k_cache(layer_id)
+            v_cache = self.kvcache.v_cache(layer_id)
+
+        out = qsa_sparse_paged_attention(
+            q_in,
+            k_cache,
+            v_cache,
             indices,
             md.block_table,
             md.token_to_req,
             torch.empty_like(q),
         )
+        mark("attention")
+        if compressed:
+            out = inv_rotate(out.reshape(-1, self.head_dim)).reshape(out.shape)
+            mark("inverse_rotate")
+        return out
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it
@@ -518,6 +596,24 @@ class QSASparseAttnBackend(BaseAttnBackend):
         }
         if topk_scratch:
             self._graph["topk_scratch"] = empty(chunk, topk_scratch, dtype=torch.int32)
+
+        compressed = getattr(self.kvcache, "compressed", False) or getattr(
+            self.kvcache._pool, "compressed", False
+        )
+        if compressed:
+            num_cache_blocks = self.kvcache._pool._tokens // self.page_size
+            num_kv_heads = self.kvcache._pool._num_kv_heads
+            if (
+                self._ws_k is None
+                or self._ws_k.shape[0] < num_cache_blocks
+                or self._ws_k.shape[2] != num_kv_heads
+            ):
+                self._ws_k = empty(
+                    num_cache_blocks, self.page_size, num_kv_heads, self.head_dim, dtype=self.dtype
+                )
+                self._ws_v = empty(
+                    num_cache_blocks, self.page_size, num_kv_heads, self.head_dim, dtype=self.dtype
+                )
 
     def prepare_for_capture(self, batch: Batch) -> None:
         self.prepare_metadata(batch)

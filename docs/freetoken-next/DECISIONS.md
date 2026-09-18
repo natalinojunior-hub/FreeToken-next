@@ -262,3 +262,30 @@ engine had no caller and no allocation matching it. Keeping that line made the 2
 plan depend on an invented consumer. The dead parameter and charge are removed; any future
 compressed-KV or expert-dequant workspace must be measured and charged by its owning allocator.
 
+## D-019 — Validate TurboKV as two bounded kernels before QSA pruning
+
+**Date:** 2026-09-18 · **Status:** accepted · **Evidence:** current QSA worktree and `LESSONS.md`
+
+The fused TurboKV-deserialization plus sparse-attention Triton kernel triggered a `ptxas` host-RAM
+failure of roughly 70 GiB. The current implementation therefore keeps decompression in a separate
+Triton kernel and writes only the bounded page workspace consumed by the existing dense QSA
+attention kernel. This split is the validation target; the fused path is not to be revived as an
+optimization experiment before the separate path has correctness and A/B measurements.
+
+The order is binding: compile and correctness pins, compare against `triton + bf16` at 16K, measure
+TurboKV capacity and throughput at 128K/256K, and only then implement QSA block pruning or MoE/PLE
+prefetch. Until those gates pass, TurboKV has capacity evidence but no certified PP/TG result.
+
+## D-020 — Keep the first Turbo4 row as discovery evidence, not a certification gate
+
+**Date:** 2026-09-18 · **Status:** accepted · **Evidence:** real-host run `turbo4-16k-eager-r086`
+
+The split decompression path is proven executable on Flash-Next at 16K: PP 1713.7 / TG 24.72,
+14.86 GiB VRAM and 99% GPU utilisation. The run used eager mode and disabled overlap after the
+CUDA-graph path stalled, so it is not comparable enough to replace the 1857.7 / 28.685 baseline.
+Keep it as discovery evidence until the graph/overlap behavior, matched `triton + bf16` arm and
+repeat count are resolved.
+
+The same probe reached MTP=1 speculation and accepted one draft token, then found a one-page
+finished-request cache leak. Cleanup now covers the allocated `device_len` tail; this fix must be
+tested before any MTP+Turbo4 throughput number is reported.

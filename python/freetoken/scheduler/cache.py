@@ -307,7 +307,10 @@ class CacheManager:
             self._free_swa(page_indices[old_handle.cached_len : cached_len])
         self._free(page_indices[old_handle.cached_len : cached_len])
         if finished:  # this tail part should be freed
-            tail = self._padded_tail(req, new_handle.cached_len)
+            # A speculative verify may allocate the page containing the correction token,
+            # even though that token is not part of the reusable KV prefix.
+            alloc_end = div_ceil(max(req.cached_len, req.device_len), self.page_size) * self.page_size
+            tail = self.page_table[req.table_idx, new_handle.cached_len : alloc_end]
             if self.swa_paged:
                 self._free_swa(tail)
             self._free(tail)
@@ -372,10 +375,14 @@ class CacheManager:
                     req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
+                alloc_end = div_ceil(max(req.cached_len, req.device_len), self.page_size) * self.page_size
+                self._free(self.page_table[req.table_idx, max(free_upto, prefix_len) : alloc_end])
                 keep_live = not mamba_exist           # tree now owns linear_slot_idx
             else:
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto :])
+                alloc_end = div_ceil(max(req.cached_len, req.device_len), self.page_size) * self.page_size
+                self._free(self.page_table[req.table_idx, req.cached_len : alloc_end])
             self._free_req_slots(req, keep_live=keep_live)
             return
 

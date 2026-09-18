@@ -35,7 +35,9 @@ _INDEX_DTYPE_BYTES = 2
 _ROPE_POS_BYTES = 3 * 4
 
 
-class QSAKVCache(MHAKVCache):
+from .base import BaseKVCachePool
+
+class QSAKVCache(BaseKVCachePool):
     """MHA paged pool + the compressed index-key slab + the per-request pending ring.
 
     ``cmp_k_cache(slot)`` is row-flat ``[num_pages * page_size // index_ratio + num_req_slots,
@@ -66,6 +68,7 @@ class QSAKVCache(MHAKVCache):
         ring_capacity: int | None = None,
         layer_ids: Sequence[int] | None = None,
         mrope: bool = False,
+        kv_format: str = "auto",
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -93,24 +96,36 @@ class QSAKVCache(MHAKVCache):
         self._index_dtype = dtype
         self._page_size = page_size
         self._mrope = mrope
-        super().__init__(
-            num_kv_heads=num_kv_heads,
-            num_layers=num_layers,
-            head_dim=head_dim,
-            num_pages=num_pages,
-            page_size=page_size,
-            dtype=dtype,
-            device=device,
-            layer_ids=layer_ids,
-        )
+        if kv_format in ["turbo3", "turbo4"]:
+            from .turbo_pool import TurboMHAKVCache
+            self._pool = TurboMHAKVCache(
+                num_kv_heads=num_kv_heads, num_layers=num_layers, head_dim=head_dim,
+                num_pages=num_pages, page_size=page_size, dtype=dtype, device=device,
+                layer_ids=layer_ids, book=kv_format
+            )
+        else:
+            from .mha_pool import MHAKVCache
+            self._pool = MHAKVCache(
+                num_kv_heads=num_kv_heads, num_layers=num_layers, head_dim=head_dim,
+                num_pages=num_pages, page_size=page_size, dtype=dtype, device=device,
+                layer_ids=layer_ids
+            )
+        self.kv_format = kv_format
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
 
+    @property
+    def _kv_buffer(self):
+        # Keep the pool's established inspection surface while storage is delegated.
+        return self._pool._kv_buffer
+
+    @_kv_buffer.setter
+    def _kv_buffer(self, value):
+        self._pool._kv_buffer = value
+
     def _zero_kv_slabs(self) -> None:
-        # Defense-in-depth: the attend kernels pos-mask every K/V load (the real fix for
-        # torch.empty's recycled NaN/Inf bit patterns), but a zeroed slab keeps any future
-        # unmasked read finite instead of model-poisoning. One memset per (re)allocation.
-        self._kv_buffer.zero_()
+        if hasattr(self._pool, "_kv_buffer"):
+            self._pool._kv_buffer.zero_()
 
     def _alloc_index_tiers(self, num_pages: int) -> None:
         # ZERO-initialized: the score kernel reads whole rows of blocks unmasked and relies on
@@ -122,7 +137,7 @@ class QSAKVCache(MHAKVCache):
             self._cmp_scratch_base + self._num_req_slots,
             self._index_head_dim,
             dtype=self._index_dtype,
-            device=self._device,
+            device=self.device,
         )
         self._pending_ring = torch.zeros(
             self._num_req_slots,
@@ -130,11 +145,11 @@ class QSAKVCache(MHAKVCache):
             self._ring_capacity,
             self._index_head_dim,
             dtype=self._index_dtype,
-            device=self._device,
+            device=self.device,
         )
         # 3-axis rope position of every stored token: a compressed group ropes at its first token, which under mrope is not derivable from the logical position
         self._rope_positions = (
-            torch.zeros(num_pages * self._page_size, 3, dtype=torch.int32, device=self._device)
+            torch.zeros(num_pages * self._page_size, 3, dtype=torch.int32, device=self.device)
             if self._mrope
             else None
         )
@@ -148,14 +163,15 @@ class QSAKVCache(MHAKVCache):
         self._cmp_k_buffer = None
         self._pending_ring = None
         self._rope_positions = None
-        super().rebuild(num_pages)
+        self._pool.rebuild(num_pages)
         self._zero_kv_slabs()
         try:
             self._alloc_index_tiers(num_pages)
         except Exception:
-            self._kv_buffer = None
-            self._k_buffer = None
-            self._v_buffer = None
+            if hasattr(self._pool, "_kv_buffer"):
+                self._pool._kv_buffer = None
+                self._pool._k_buffer = None
+                self._pool._v_buffer = None
             raise
 
     @classmethod
@@ -180,10 +196,11 @@ class QSAKVCache(MHAKVCache):
         return per_token * config.page_size, fixed, config.page_size, 0
 
     def unit_bytes(self) -> tuple[int, int]:
-        # Only the shadow slab scales with pages, and only its non-scratch rows; the ring and
-        # the scratch rows are the fixed term kv_cost reports separately.
-        kv, swa = super().unit_bytes()
-        tokens = int(self._kv_buffer.shape[2]) * int(self._kv_buffer.shape[3])
+        kv, swa = self._pool.unit_bytes()
+        if hasattr(self._pool, "_kv_buffer"):
+            tokens = int(self._pool._kv_buffer.shape[2]) * int(self._pool._kv_buffer.shape[3])
+        else:
+            tokens = int(self._pool._num_storage_layers) * self._pool._tokens
         slab = (
             self._num_index_layers
             * self._cmp_scratch_base
@@ -191,6 +208,40 @@ class QSAKVCache(MHAKVCache):
             * self._index_dtype.itemsize
         )
         return kv + slab // tokens + (_ROPE_POS_BYTES if self._mrope else 0), swa
+
+
+
+    def rebuild_from_config(self, config, num_pages: int, **kwargs) -> None:
+        self.rebuild(num_pages + 1)
+
+    @property
+    def device(self) -> torch.device: return self._pool.device
+    @property
+    def dtype(self) -> torch.dtype: return self._pool.dtype
+    @property
+    def num_layers(self) -> int: return self._pool.num_layers
+    def k_cache(self, index: int) -> torch.Tensor:
+        if getattr(self._pool, "compressed", False):
+            return self._pool._k_codes[self._pool._dense(index)]
+        return self._pool.k_cache(index)
+    def v_cache(self, index: int) -> torch.Tensor:
+        if getattr(self._pool, "compressed", False):
+            return self._pool._v_codes[self._pool._dense(index)]
+        return self._pool.v_cache(index)
+    def k_slab(self, index: int):
+        return self._pool.k_slab(index)
+    def v_slab(self, index: int):
+        return self._pool.v_slab(index)
+    @property
+    def compressed(self) -> bool:
+        return getattr(self._pool, "compressed", False)
+    @property
+    def book3(self) -> bool:
+        return getattr(self._pool, "book3", False)
+    @property
+    def cent_tensor(self) -> torch.Tensor | None:
+        return getattr(self._pool, "cent_tensor", None)
+    def store_kv(self, *args, **kwargs) -> None: return self._pool.store_kv(*args, **kwargs)
 
     def cmp_k_cache(self, slot: int) -> torch.Tensor:
         """Compressed index keys of one sparse layer: ``[rows, index_head_dim]``."""

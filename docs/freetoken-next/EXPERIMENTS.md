@@ -933,3 +933,31 @@ correctness or RAM one). The same guard separately budgets the transient peak as
 bank-size half without the transient half could newly allocate ~30 GiB of anonymous whole-shard
 buffers on top of the banks. Fix both together if parallel loading is ever revisited; not done
 this session.
+
+## EXP-032 — Split Turbo4 path runs on the real Flash-Next checkpoint
+
+**Date:** 2026-09-18 · **Verdict:** **DISCOVERY PASS / NOT A CERTIFICATION ROW**
+
+Setup: RTX 5080, real host, `--kv-format turbo4`, `--memory-ratio 0.86`, `--cuda-graph-max-bs 0`,
+`FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1`, naive cache, 16K prompt, 16 generated tokens, one
+warmup and one measured repeat. Result: **PP 1713.7 / TG 24.72**, TTFT 9560.6 ms, VRAM 14.86
+GiB, GPU 99%, RSS 69.8 GiB, output sha1 `17f277f43565`.
+
+This confirms that the separate Triton decompression kernel, bounded workspace and existing QSA
+attention path execute end to end on the target checkpoint. It is not comparable to the certified
+CUDA-graph/overlap baseline and is not a repeated A/B gate. The graph/overlap path remains under
+investigation.
+
+## EXP-033 — MTP=1 + Turbo4 reaches speculation; finished-page cleanup exposed
+
+**Date:** 2026-09-18 · **Verdict:** **BLOCKED / FIX PATCHED, NOT RE-TESTED**
+
+After fixing MRoPE positions for the manually assembled draft batch and aligning the
+`ForwardOutput.copy_done_event` field, the real 16K MTP=1 + Turbo4 probe reached speculative
+decode and logged `k=1 m=2 accepted=1/1`. It then failed the idle cache check with one missing
+page: `free_pages(258) + cache_pages(0) != num_pages(259)`.
+
+Root cause: a verify window can allocate the page containing its correction token, while finished
+request cleanup released only through `cached_len`. The cleanup now also releases the allocated
+`device_len` page tail. The patch is committed with focused tests already passing before this last
+cache-tail edit; a post-edit focused test and live PP/TG run remain pending.

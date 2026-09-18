@@ -1831,11 +1831,14 @@ def _adjust_config(config: EngineConfig):
             "W8A16 fold is only validated exact in bfloat16); use bfloat16."
         )
     if getattr(config, "kv_format", "auto") in ("turbo3", "turbo4") and config.attention_backend == "auto":
-        # Coded tiles are readable only by our own kernels; auto-selecting fi here would produce a
-        # plan the first forward cannot execute.
-        override("attention_backend", "triton")
+        if AttnType.QSA in required_attn_types:
+            override("attention_backend", "qsa_sparse")
+        elif AttnType.DSA in required_attn_types:
+            override("attention_backend", "dsa_sparse")
+        else:
+            override("attention_backend", "triton")
         logger.info_rank0(
-            f"--kv-format {config.kv_format}: selecting the triton backend (coded KV tiles)"
+            f"--kv-format {config.kv_format}: selecting the {config.attention_backend} backend (coded KV tiles)"
         )
     if config.attention_backend == "auto":
         override(

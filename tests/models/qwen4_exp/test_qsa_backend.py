@@ -20,6 +20,22 @@ from .common import Fixture, requires_cuda, parsed_config, selection_spy
 QSA_LAYER = 3
 
 
+@requires_cuda
+def test_turbo4_split_path_runs():
+    """Exercise the separate TurboKV decompression and QSA attention path."""
+    config = parsed_config()
+    fixture = Fixture(config, num_pages=32, max_running_req=1, kv_format="turbo4")
+    attn = fixture.layer(QSA_LAYER)
+    length = 65
+    x = _inputs(fixture, [length])[0]
+    req = fixture.req(0, 0, length)
+
+    got = attn.forward(x, fixture.batch([req], "prefill"))
+
+    assert got.shape == x.shape
+    assert torch.isfinite(got).all()
+
+
 def _inputs(fixture: Fixture, lengths, extra: int = 0, seed: int = 11):
     generator = torch.Generator(device=fixture.device).manual_seed(seed)
     return [

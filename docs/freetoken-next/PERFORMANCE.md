@@ -301,3 +301,52 @@ turbo4's own plan rows read `128K: fits`, `256K: fits` where bf16 said `256K: ne
 the physics changed character: at bf16 a 1M context was "the entire pool budget, zero experts", and
 at turbo4 it is "a smaller expert cache". That is the difference D-016 was about -- compressed KV
 buys context outright, where paging would have bought it at 2.2 tok/s.
+
+## 11. Current TurboKV/QSA integration checkpoint (2026-09-18)
+
+The current worktree has moved beyond the historical fused-reader experiment. `qsa_sparse.py` now
+detects compressed QSA slabs, calls `qsa/decompress.py` to materialize the visible pages into a
+dense bounded workspace, and then calls the existing QSA attention kernel. This is intended to
+avoid the `ptxas` host-RAM failure caused by combining TurboKV decoding and sparse attention in one
+large Triton kernel.
+
+The current path has now produced its first real-model row. The rows in §10 are historical reader
+experiments and remain useful for cost diagnosis, but they do not certify the new split-kernel
+implementation under the normal CUDA-graph/overlap configuration.
+
+| arm | PP tok/s | TG tok/s | TTFT | VRAM | GPU | RSS | notes |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Flash-Next + Turbo4 split path | **1713.7** | **24.72** | 9560.6 ms | 14.86 GiB | 99% | 69.8 GiB | 16K, eager, overlap disabled, ratio 0.86, 16 generated |
+
+This is discovery evidence, not an apples-to-apples regression gate: CUDA Graph and overlap were
+disabled after the graph path stalled with the GPU idle, and it used one repeat.
+
+The next measurements must be, in order:
+
+1. compile and correctness pins for the separate decompression kernel;
+2. `triton + bf16` at 16K as the backend-matched baseline;
+3. Turbo4 versus that baseline at 16K;
+4. Turbo4 capacity and PP/TG at 128K and 256K;
+5. only then, MTP and QSA pruning A/B experiments.
+
+Until these measurements are repeated with matched backend settings, the only certified 16K
+Flash-Next row remains the uncompressed, no-MTP baseline in §3: PP 1857.7 / TG 28.685.
+
+### Real-model probe
+
+On 2026-09-18 the real Flash-Next checkpoint loaded with `--kv-format turbo4`, allocated the
+compressed QSA pool, and captured CUDA graphs successfully. A 16K request reached the first
+8192-token prefill report, then stopped making progress with the GPU idle; a 1K request showed the
+same non-completing behavior. The host had 84 GiB available RAM and no CUDA OOM. A toy Qwen4Exp
+fixture and the checkpoint-shaped decompressor both pass, so this is now an execution-progress
+issue in the full-model prefill path, not a memory-capacity result. The eager retry completed with
+the row above; the graph/overlap path remains a separate blocker.
+
+### MTP + Turbo4 probe
+
+The first clean MTP=1 + Turbo4 probe reached speculative decode and logged an accepted draft
+(`k=1`, `m=2`, `accepted=1/1`). It then failed the idle integrity check with
+`free_pages(258) + cache_pages(0) != num_pages(259)`. The cause is a cache-tail accounting bug:
+the verify window can allocate the page containing the correction token, while finished-request
+cleanup previously released only through `cached_len`, not the allocated `device_len` extent. The
+cleanup path was patched in `scheduler/cache.py`; no post-patch live benchmark has been run yet.

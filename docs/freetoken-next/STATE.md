@@ -1,7 +1,42 @@
 # STATE — freetoken-next
 
-Snapshot date: 2026-09-17. This is the current truth; history goes to
+Snapshot date: 2026-09-18. This is the current truth; history goes to
 EXPERIMENTS.md / DECISIONS.md, not here.
+
+## Current checkpoint (2026-09-18)
+
+The project is paused after the first real validation of the split Turbo4 path.
+Turbo4 now runs end to end at 16K in eager/no-overlap mode: PP 1713.7 / TG
+24.72, 14.86 GiB VRAM, 99% GPU. This is not directly comparable to the
+CUDA-graph/overlap baseline, but proves the current decompressor + QSA path on
+the real checkpoint. MTP=1 + Turbo4 reaches speculative decode and accepts a
+draft token, but its benchmark is invalidated by a one-page cache leak.
+
+The previous host-RAM/`earlyoom` blocker is no longer active: on 2026-09-18 the
+host reports 91 GiB total, 6.5 GiB used, 84 GiB available, and only 137 MiB in
+`/tmp`; `/tmp` is backed by the NVMe filesystem rather than tmpfs. RAM hygiene
+remains a preflight check, but it is not currently preventing the benchmark.
+
+The working tree contains an additional, uncommitted TurboKV/QSA integration:
+`qsa_pool.py` delegates the full-attention pool to `TurboMHAKVCache`,
+`qsa_sparse.py` detects compressed slabs and materializes a bounded page workspace,
+and `kernel/triton/qsa/decompress.py` provides a separate Triton decompression
+kernel before the existing dense QSA attention kernel. This is the intended escape
+from the fused deserialization/attention JIT that caused the ptxas host-RAM
+failure, but it still needs correctness, compilation, and performance validation.
+
+The next phase is therefore not yet QSA pruning. First validate this split-kernel
+path at 16K against `triton + bf16`; then measure the long-context memory benefit.
+Only after that gate passes should block pruning, score reuse, or MoE/PLE prefetch
+be implemented.
+
+Validation on 2026-09-18: the targeted TurboKV/QSA set is green (79 passed, one
+warning), the QSA backend suite passes on the real GPU, the split Turbo4 CUDA
+test passes, and the isolated decompressor passes with checkpoint geometry. The
+MTP path exposed and received fixes for MRoPE positions and the current
+`ForwardOutput.copy_done_event` name; focused scheduler/QSA tests pass (14
+passed). The latest cache-tail fix is committed below but still needs a fresh
+focused test and live benchmark.
 
 ## Handoff (2026-09-17, session ending — continuing under Codex/Luna)
 
@@ -9,10 +44,10 @@ EXPERIMENTS.md / DECISIONS.md, not here.
 active thread. Everything through "content-correctness confirmed live" is DONE and committed
 (see the MTP row below and EXP-021 through EXP-031). What is NOT done, in order:
 
-1. **Run the actual PP/TG/acceptance benchmark.** Every attempt this session died to the
-   host-RAM `earlyoom` race (EXP-029/031) before reaching a single measured number — the code
-   is validated for correctness, not yet for throughput. The RAM cause is now understood and
-   fixed (see the environment gotcha below); this should just work now. Command:
+1. **Run the actual PP/TG/acceptance benchmark.** Earlier attempts died to the host-RAM
+   `earlyoom` race (EXP-029/031), but that environment blocker is now cleared: the host has
+   84 GiB available and `/tmp` is disk-backed with 137 MiB used. The code is validated for
+   correctness, not yet for throughput. Command:
    ```bash
    FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1 TMPDIR=/models/desenvolvimento/tmp \
      .venv/bin/python benchmarks/bench_pp_tg.py \
@@ -77,7 +112,7 @@ known to be a pool-keying change and not a missing kernel.**
 | Benchmark a bare `.gguf` | **done** | `benchmarks/bench_pp_tg.py` now tokenizes through `utils/hf.load_tokenizer` (the engine's own GGUF vocab path) instead of `AutoTokenizer`, which can only read an HF directory |
 | Source audits (9, parallel) | **done** | `docs/freetoken-next/audits/A1…A9.md`; A7 = GGUF MoE geometry + refused-today matrix + the stride-vs-file table that closed the byte-layout question, A8 = turbo codec byte layout (turbo3 112 B / turbo4 132 B per 256-element row), A9 = unaccounted VRAM consumers |
 | Phase 2 GGUF loader | **committed** (`86af2d3`); dense row measured, MoE rows gated | EXP-004: the IQ3_S 27B GGUF generated coherent, factually correct text and the NextN/MTP drop warned as designed; EXP-010 measured it (PP 2416.6 / TG 25.29 / RSS 2.17 GiB). The two MoE GGUFs that geometry blocks are gated by Phase 7 pool-keying, not by a missing kernel |
-| Phase 3 Turbo KV | **codec + pool + both fused paths landed; contiguous reader rewrite reverted** | `turbo_kv` (NMSE at Lloyd-Max theory: 0.0339 turbo3 / 0.0092 turbo4), `turbo_pool` (50 B / 66 B per token-head-slab vs 256 B bf16 = 5.12x / 3.88x, `kv_cost`/`unit_bytes` parity pinned), `turbo_attn` readers, `COMPRESSED` branches in the decode *and* prefill kernels, and `--kv-format` wired through config/factory/ledger. Serves on the host: plan gives **6183 slots + 8440 pages** where bf16 gave 6113 + 8238, and at **256K: 5427 slots vs 3183** (PERFORMANCE §10, EXP-012/013). The contiguous-load rewrite passed correctness pins but regressed the matched 16K A/B to TG 45.74, so the pre-rewrite readers are restored; EXP-013 records the evidence and next bounded-tile hypothesis |
+| Phase 3 Turbo KV | **split path runs; A/B gate in progress** | Separate decompression + bounded dense workspace + existing QSA attention is live on Flash-Next: Turbo4 16K eager/no-overlap = PP 1713.7 / TG 24.72. MTP=1 reaches speculation but is blocked from a valid row by a one-page cache leak; the tail-free fix is not re-benchmarked yet. |
 | Decision B MoE routing instrumentation | **partial / blocked on host load** | `--moe-collect-stats` is parser-tested and logs graph-safe aggregate/per-layer counters at worker shutdown (`56774dc`); detached reproduction reached only bank 176/192 and was killed with `exitcode=-9`, consistent with the 63.46 GiB bank footprint exceeding the host's 62 GiB available RAM (EXP-015) |
 | Native MTP config/reader seam | **content-correct live for k=1; throughput STILL unmeasured** | Full pipeline implemented and validated against the real checkpoint (`--spec-mtp 1`, 16K, single request, naive cache): weight loading, MoE-bank aliasing, scheduler spec-loop (EXP-021/022/024/025/026). Six real bugs found and fixed via live serving (EXP-027/028: weight-loading `KeyError`, missing package export, MoE offload-cache layer-count assert + `moe_layer_id` aliasing, a per-token `cached_len`/`device_len` accounting bug, and the state-corrupting reject-path rewind bug found by a third Opus 5 pass). Retest confirms MTP output is content byte-identical to `--spec-mtp 0` on both a short and a previously-diverging longer prompt. k=2/3 fixed by inspection, not yet live-tested. A real `--moe-cache-auto` correctness bug was also found and fixed along the way (EXP-030: an explicit `--num-tokens` was silently downgraded instead of refusing, once the MTP layer's extra VRAM made the auto split tight). **No PP/TG/acceptance measurement has been taken yet** — every attempt so far died to a host-RAM `earlyoom` race during expert-bank loading (EXP-029/031), now understood and fixed (see below); the next session's first job is to actually run the benchmark |
 | NVMe/FTW cold-bank hypothesis | **converter resumable; artifact proven** | `FTWWriter` checkpoints every tensor and validates/truncates on restart; dense and streamed MoE entries resume without rewriting. Private host-bank mappings make `MADV_DONTNEED` reclaim conversion pages. Native Flash-Next resumed to a valid 73.53 GiB FTW with 48 layers and 10 shards (EXP-017/018/020); serving and throughput remain unmeasured |

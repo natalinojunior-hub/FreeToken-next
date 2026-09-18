@@ -23,6 +23,20 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _spec_mrope_positions(req: Req, cached_len: int, device_len: int, device: torch.device) -> torch.Tensor:
+    """Build the three-axis RoPE positions for a manually assembled draft batch."""
+    full = req.mrope_positions_full
+    if full is not None and device_len <= full.shape[1]:
+        return full[:, cached_len:device_len].to(device, non_blocking=True)
+    row = torch.arange(
+        cached_len + req.mrope_delta,
+        device_len + req.mrope_delta,
+        dtype=torch.int32,
+        device=device,
+    )
+    return row.unsqueeze(0).expand(3, -1)
+
+
 class SchedulerSpecMixin:
     """Mixed into Scheduler. Needs self.spec_mtp/token_pool/cache_manager/engine/decode_manager
     /eos_token_ids/toolcall_anchor_id/finished_reqs/_prepare_batch (see scheduler.py)."""
@@ -133,6 +147,10 @@ class SchedulerSpecMixin:
             db = Batch(reqs=[req], phase="prefill")
             db.padded_reqs = [req]
             db.positions = torch.tensor([d - 1 + i], dtype=torch.int32, device=self.device)
+            if self._model_is_mrope:
+                db.mrope_positions = _spec_mrope_positions(
+                    req, d - 1 + i, d + i, self.device
+                )
             db.out_loc = self.engine.page_table[req.table_idx, d - 1 + i : d + i]
             db.input_ids = tok_prev
             db.spec_logits_indices = torch.arange(1, device=self.device)
@@ -159,7 +177,7 @@ class SchedulerSpecMixin:
         vb.spec_logits_indices = torch.arange(k + 1, device=self.device)
         vb.input_ids = self.token_pool[fi.input_tuple]
         out = self.engine.forward_batch(vb, fi.sample_args)
-        out.copy_done.synchronize()
+        out.copy_done_event.synchronize()
         sampled = out.next_tokens_cpu.tolist()
         accepted = accept_drafts(sampled, drafts)
         m = len(accepted)

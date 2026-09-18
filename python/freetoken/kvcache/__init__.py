@@ -51,7 +51,7 @@ def resolve_pool_class(model_config: ModelConfig, kv_format: str = "auto") -> ty
         return MHAKVCache
     specs = list(specs_fn())
     types = {spec.attn_type for spec in specs}
-    if kv_format in TURBO_BOOKS and types != {AttnType.FULL}:
+    if kv_format in TURBO_BOOKS and AttnType.QSA not in types and types != {AttnType.FULL}:
         raise NotImplementedError(
             f"--kv-format {kv_format} compresses the full-attention KV slab only; this model's "
             f"KV groups are {sorted(t.value for t in types)}, whose pool families address latent, "
@@ -234,6 +234,7 @@ def create_kvcache_pool(
             ring_capacity=QSAKVCache.ring_capacity_for(spec.index_ratio, num_speculative_tokens),
             layer_ids=spec.layer_ids,
             mrope=model_config.model_is_mrope,
+            kv_format=kv_format,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:

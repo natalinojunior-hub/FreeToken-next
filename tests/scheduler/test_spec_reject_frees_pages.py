@@ -7,6 +7,7 @@ import torch
 
 from freetoken.core import Req, SamplingParams
 from freetoken.scheduler.cache import CacheManager
+from freetoken.scheduler.spec import _spec_mrope_positions
 
 PROMPT = list(range(1, 9))  # 8 tokens
 
@@ -73,3 +74,14 @@ def test_reject_never_touches_the_prefix_cache():
     cm.free_spec_reject(req, keep_len=4, alloc_len=5)
     # a rejected window was never cache_req'd, so the tree stays empty -- nothing to unlock/evict
     assert cm.prefix_cache.size_info.total_size == 0
+
+
+def test_spec_mrope_positions_use_three_axis_fallback():
+    from types import SimpleNamespace
+
+    req = SimpleNamespace(mrope_positions_full=None, mrope_delta=7)
+    got = _spec_mrope_positions(req, cached_len=4, device_len=5, device=torch.device("cpu"))
+
+    assert got.shape == (3, 1)
+    assert got.dtype == torch.int32
+    assert got.tolist() == [[11], [11], [11]]
