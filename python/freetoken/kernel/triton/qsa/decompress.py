@@ -32,21 +32,26 @@ def _decompress_turbo_paged_kernel(
     stride_ws_head,
     stride_table_req,
     num_cache_blocks,
+    selected_pages_ptr,
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     GROUPS: tl.constexpr,
     BOOK3: tl.constexpr = False,
+    USE_SELECTED: tl.constexpr = False,
 ):
     block_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
     req_idx = tl.program_id(2)
 
-    seq_len = tl.load(seq_lens_ptr + req_idx)
-    if block_idx * PAGE_SIZE >= seq_len:
-        return
+    if USE_SELECTED:
+        page_id = tl.load(selected_pages_ptr + block_idx)
+    else:
+        seq_len = tl.load(seq_lens_ptr + req_idx)
+        if block_idx * PAGE_SIZE >= seq_len:
+            return
+        page_id = tl.load(block_table_ptr + req_idx * stride_table_req + block_idx)
 
-    page_id = tl.load(block_table_ptr + req_idx * stride_table_req + block_idx)
     if page_id < 0 or page_id >= num_cache_blocks:
         return
 
@@ -179,11 +184,17 @@ def decompress_turbo4_to_workspace(
     workspace_k: torch.Tensor,
     workspace_v: torch.Tensor,
     book3: bool = False,
+    selected_pages: torch.Tensor | None = None,
 ) -> None:
-    """Decompress Turbo3 / Turbo4 KV pages into dense workspace buffers."""
+    """Decompress Turbo3 / Turbo4 KV pages into dense workspace buffers.
+    
+    When `selected_pages` is provided (1-D int32 tensor of physical page ids), only
+    those active pages are decompressed, bounding decode decompression cost to O(1)
+    with respect to context length.
+    """
     num_requests = block_table.shape[0]
     max_blocks = block_table.shape[1]
-    if max_blocks == 0 or num_requests == 0:
+    if num_requests == 0:
         return
 
     num_kv_heads = k_codes.shape[1]
@@ -192,7 +203,19 @@ def decompress_turbo4_to_workspace(
     groups = head_dim // 128
     num_cache_blocks = workspace_k.shape[0]
 
-    grid = (max_blocks, num_kv_heads, num_requests)
+    use_selected = selected_pages is not None
+    if use_selected:
+        num_blocks = selected_pages.numel()
+        if num_blocks == 0:
+            return
+        grid = (num_blocks, num_kv_heads, 1)
+        sel_ptr = selected_pages
+    else:
+        if max_blocks == 0:
+            return
+        grid = (max_blocks, num_kv_heads, num_requests)
+        sel_ptr = block_table  # unused when USE_SELECTED is False
+
     _decompress_turbo_paged_kernel[grid](
         k_codes,
         k_norm,
@@ -216,11 +239,13 @@ def decompress_turbo4_to_workspace(
         workspace_k.stride(2),
         block_table.stride(0),
         num_cache_blocks,
+        sel_ptr,
         PAGE_SIZE=page_size,
         HEAD_DIM=head_dim,
         NUM_KV_HEADS=num_kv_heads,
         GROUPS=groups,
         BOOK3=book3,
+        USE_SELECTED=use_selected,
         num_warps=4,
         num_stages=1,
     )

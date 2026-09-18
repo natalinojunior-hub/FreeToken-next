@@ -352,6 +352,16 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
             k_codes, k_norm = self.kvcache.k_slab(layer_id)
             v_codes, v_norm = self.kvcache.v_slab(layer_id)
+
+            selected_pages = None
+            if batch.is_decode and indices is not None:
+                valid = indices[indices >= 0]
+                if valid.numel() > 0:
+                    logical_p = valid // self.page_size
+                    req_idx = md.token_to_req[0] if md.token_to_req is not None else 0
+                    p_pages = md.block_table[req_idx.to(torch.int64), logical_p.to(torch.int64)]
+                    selected_pages = torch.unique(p_pages[p_pages >= 0]).to(torch.int32)
+
             decompress_turbo4_to_workspace(
                 k_codes=k_codes,
                 k_norm=k_norm,
@@ -363,6 +373,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
                 workspace_k=self._ws_k,
                 workspace_v=self._ws_v,
                 book3=self.kvcache.book3,
+                selected_pages=selected_pages,
             )
             mark("decompress")
             k_cache = self._ws_k

@@ -289,7 +289,10 @@ class SchedulerSpecMixin:
                 pool.copy_from(snap_slot, self._linear_slot(req))
             self._restore_qsa_state(req)
             start = d - 1
-            rb = Batch(reqs=[req], phase="prefill")
+            phase = "decode" if committed == 1 else "prefill"
+            rb = Batch(reqs=[req], phase=phase)
+            if rb.is_decode:
+                rb.padded_reqs = [req]
             # The replay re-forwards ALREADY-COMMITTED positions, so it needs the pre-commit
             # window lengths -- but they must not survive it: keep_len/keep_len+1 (set above)
             # are this step's true post-commit state. Leaving the replay's lengths in place
