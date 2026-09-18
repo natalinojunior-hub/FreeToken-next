@@ -837,3 +837,19 @@ look at scheduler-subprocess log routing). k=2/3 not yet live-tested (the latent
 fixed by inspection, not by an executed k>=2 run). No throughput (PP/TG/acceptance-rate)
 measurement has been taken -- that is the next step, and only after it can the goal's
 target-equivalence and MTP preflight gates be marked satisfied.
+
+## EXP-029 — MTP host-RAM OOM during benchmarking: confirmed pre-existing margin, not a leak
+**Date:** 2026-09-17 · **Verdict:** **INFORMATIONAL / NOT A BUG**
+
+Repeated `earlyoom` SIGTERMs while benchmarking `--spec-mtp 1` (exitcode=-15, during expert-bank
+loading, ~190/192) looked at first like an MTP-specific regression. Measured directly instead of
+retrying blind: sampled the scheduler subprocess's RSS every 1s through a full `--spec-mtp 1`
+load. Peak RSS was **68.37 GiB**, transiently dropping system-available memory to 9.79% for
+about one second (earlyoom's SIGTERM threshold is 10%) before settling to a 66.6 GiB steady
+state with ~11% available. This peak is statistically identical to the plain baseline's already
+-measured 68.4 GiB RSS (`bench_pp_tg.py`'s own baseline run) -- MTP does not use meaningfully
+more host RAM. The failures are a timing race between earlyoom's poll interval and this
+pre-existing, already-documented (EXP-015) razor-thin margin, not a leak or regression
+introduced by this session's MTP work. Equally possible for a baseline run that happens to get
+unlucky. Operator rule going forward: at most 2 retries on any repeating failure, then measure
+instead of retrying again -- this entry is the result of following that rule.
