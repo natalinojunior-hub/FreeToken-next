@@ -140,6 +140,12 @@ PRs são squash-merged; título do PR segue mesmo formato.
 ## Comandos de Verificação (Rodar OBRIGATORIAMENTE Antes de Entregar)
 
 ```bash
+# Preparar a máquina (Mata zumbis, limpa /tmp, checa RAM/VRAM)
+make preflight
+
+# Recompilar Kernels C++ do Zero (Use se houver problemas de import ou SegFault)
+make rebuild
+
 # Validação Total Local (Ruff + MyPy + Pytest rápidos)
 make ci
 

@@ -12,12 +12,23 @@ help:
 	@echo "make lint       - Checa problemas de estilo com ruff"
 	@echo "make typecheck  - Faz a análise estática de tipos com MyPy"
 	@echo "make ci         - Emula uma esteira de CI local (Lint + Typecheck + Tests)"
+	@echo "make preflight  - Limpa zumbis, /tmp e checa VRAM/RAM antes de testes pesados"
+	@echo "make rebuild    - Limpa caches e recompila as extensões C++ do zero"
 	@echo "make clean      - Remove arquivos de build, cache e pycache"
 	@echo "--------------------------------------------------------"
 
 install:
 	uv pip install -e ".[accel,dev]"
 	uv run pre-commit install
+
+preflight:
+	@./scripts/preflight.sh
+
+rebuild:
+	@echo "Limpando artefatos antigos de C++..."
+	rm -rf build/ python/freetoken.egg-info/
+	@echo "Recompilando extensões..."
+	uv run python setup.py build_ext --inplace
 
 test:
 	TMPDIR=/models/desenvolvimento/tmp uv run pytest tests -m "not slow" -q --basetemp=/models/desenvolvimento/tmp
