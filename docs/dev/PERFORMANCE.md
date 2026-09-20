@@ -51,6 +51,8 @@
 | **NVFP4 + MTP=1 @ 16K/16dec (naive cache, Radix)** | **1670** | **24.39** | **14.49 GiB** | `17f277f43565` | MTP k=1, 100% accept (1/1), naive cache |
 | **NVFP4 + MTP=2 @ 16K/16dec (naive cache, Radix)** | **1687** | **25.09** | **14.49 GiB** | `17f277f43565` | **Best MTP TG**, 100% accept (2/2), naive cache |
 | **NVFP4 + MTP=3 @ 16K/16dec (naive cache, Radix)** | — | — | — | — | **CRASH**: shape mismatch GDN layer [48,128,128] vs [1,48,128,128] |
+| **NVFP4 + MTP=4 @ 4K/64dec (naive cache, Radix, warmup fix)** | **1732** | **27.8** | **14.19 GiB** | `573a19610680` | **SHA1 matches k=0**, warmup full context, _last_residual fix |
+| **NVFP4 + MTP=0 @ 4K/64dec (naive cache, Radix, baseline)** | **1768** | **30.0** | **14.10 GiB** | `573a19610680` | Baseline greedy, same SHA1 |
 
 
 ---
@@ -125,7 +127,7 @@ pytest tests -m "not slow" --basetemp=/models/desenvolvimento/tmp
 
 ## Correção de premissa: comparação "NVFP4+Turbo4 justo vs LTO" não existe hoje — 2026-09-20
 
-LTO (`llama-turbo-optimal`) é um fork do llama.cpp: só roda GGUF. Não executa o checkpoint NVFP4-Radix do FreeToken. Os próprios docs do LTO (`QWEN38_FLASH_MTP_REFERENCE_BASELINE.md:53-54`) afirmam que qualquer smoke-test do FreeToken é "non-isomorphic to GGUF LTO". Não há como fazer a comparação como originalmente formulada (mesmo quant NVFP4+Turbo4 nos dois lados) — LTO nesse quant não existe.
+LTO (`llama-turbo-optimal`) é um fork do llama.cpp: só roda GGUF. Não executa o checkpoint NVFP4-Radix do FreeToken. Os próprios docs do LTO (QWEN38_FLASH_MTP_REFERENCE_BASELINE, seção 53-54) afirmam que qualquer smoke-test do FreeToken é "non-isomorphic to GGUF LTO". Não há como fazer a comparação como originalmente formulada (mesmo quant NVFP4+Turbo4 nos dois lados) — LTO nesse quant não existe.
 
 Números que existem, nenhum comparável 1:1 entre si (contexto/quant/config diferentes):
 - **LTO, target-only (sem MTP), Unsloth-IQ4_XS GGUF, KV q8_0, prompt curto**: 38.41 tok/s (não é 16K, não é NVFP4).

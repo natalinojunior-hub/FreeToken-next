@@ -91,15 +91,25 @@ Measured peak → ratchets reserve floor for next plan
 Prefill (prompt)
     │
     ▼
-MTP Warm-up (carry shift: h_{t-1} + x_t → draft x_{t+1})  ← EXP-043 fix
+MTP Warm-up: full prefill context → draft KV populated (no spec_logits_indices)  ← EXP-050 fix
     │
     ▼
 Spec Loop (per decode step):
+    ├── Confidence gate: first draft step top-1 prob ≥ 0.85 else skip (adaptive_mtp.py)
     ├── Draft forward (k tokens) → draft logits
-    ├── Target verify (parallel) → accept/reject
-    ├── Accepted tokens → append KV, update carry
-    └── Rejected → QSA snapshot/restore (EXP-039)
+    ├── Target verify (prefill attention) → accept/reject
+    ├── Accepted tokens → DECODE REPLAY (extend_len=1 per token) for SHA1 equivalence
+    ├── Rejected → QSA snapshot/restore + zero-replay GDN
+    └── _last_residual updated to last committed token for next draft chain
 ```
+
+**Key Fixes (2026-09-20):**
+- **Warmup**: Removed `spec_logits_indices` to populate draft KV over full prefill window (was only last token)
+- **SHA1 Equivalence**: Decode replay for all accepted tokens ensures bit-identical output vs k=0 greedy baseline
+- **Adaptive Gating**: `AdaptiveMTPController` skips speculation when draft confidence < 0.85
+- **Residual Seeding**: `_last_residual` updated after commit from verify window's last accepted token
+
+**Current Optimal Config**: K=4 achieves 27.8 tok/s TG (baseline 30.0, -7%), PP 1732 tok/s, SHA1 `573a19610680` matches k=0.
 
 ---
 

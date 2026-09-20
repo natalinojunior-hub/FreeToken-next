@@ -142,3 +142,4 @@ export TMPDIR=/models/desenvolvimento/tmp
 3. ~~Executar `benchmarks/cert_matrix.py` para matriz completa de certificação~~ — rodado a 16384 ctx (2026-09-20): 1 regressão de guard (PP em `native-35b-a3b`) + 2 falhas de VRAM/OOM pré-existentes não investigadas. Ver `PERFORMANCE.md` e `STATE.md`.
 4. Investigar regressão de guard PP em `native-35b-a3b` (-0.5%, `cert_matrix.py`) e falhas de VRAM em `native-flash-next`/`gguf-qwen38-27b-iq3s` a 16384 ctx.
 5. Testes 512K/1M diferidos (requerem flag `--allow-rope-extend`)
+6. **MTP Speculative Decode Optimization (NVFP4-Radix)**: K=4 achieves 27.8 tok/s TG (-7% vs k=0 30.0), PP 1732, SHA1 `573a19610680` matches k=0 greedy baseline. Fixes: warmup full prefill context (no `spec_logits_indices`), decode replay for SHA1 equivalence, `_last_residual` seeding, adaptive gating via `adaptive_mtp.py`. Target: batched multi-token decode replay to reach +35% TG (39.7 tok/s).
