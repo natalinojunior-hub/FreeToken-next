@@ -20,9 +20,7 @@ def ssm_state_dtype() -> torch.dtype:
     return _SSM_DTYPES.get(str(ENV.MAMBA_SSM_DTYPE).lower(), torch.float32)
 
 
-def _linear_local_dims(
-    group: LinearGatedDeltaGroupConfig, tp_size: int
-) -> tuple[int, int, int]:
+def _linear_local_dims(group: LinearGatedDeltaGroupConfig, tp_size: int) -> tuple[int, int, int]:
     """TP-local ``(n_layers, conv_dim, v_heads)`` for the GDN state tensors -- the single
     source of the sharding math shared by the pool allocation and the byte estimate."""
     local_k_heads = div_even(group.num_key_heads, tp_size, allow_replicate=True)
@@ -83,8 +81,7 @@ class LinearStatePool:
         if len(set(names)) != len(names):
             raise ValueError(f"duplicate slot_state names: {names}")
         self._state_layer_index = {
-            spec.name: {lid: i for i, lid in enumerate(spec.layer_ids)}
-            for spec in self._slot_specs
+            spec.name: {lid: i for i, lid in enumerate(spec.layer_ids)} for spec in self._slot_specs
         }
         self.slot_states: dict[str, torch.Tensor] = self._alloc_slot_states(num_slots)
 
@@ -126,9 +123,7 @@ class LinearStatePool:
     def alloc(self, n: int = 1) -> list[int]:
         """Pop ``n`` free slot ids (LIFO). Raises if the pool is exhausted."""
         if n > len(self._free_slots):
-            raise RuntimeError(
-                f"LinearStatePool exhausted: need {n}, have {len(self._free_slots)}"
-            )
+            raise RuntimeError(f"LinearStatePool exhausted: need {n}, have {len(self._free_slots)}")
         return [self._free_slots.pop() for _ in range(n)]
 
     def reclaim_all_slots(self) -> None:

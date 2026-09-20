@@ -125,9 +125,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         scores = tl.where(valid[None, :], scores, -1.0e20)
         next_max = tl.maximum(max_value, tl.max(scores, axis=1))
         alpha = tl.math.exp2(max_value - next_max)
-        probabilities = tl.where(
-            valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
-        )
+        probabilities = tl.where(valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0)
         accumulator = tl.dot(
             probabilities.to(values.dtype),
             values,
@@ -289,9 +287,7 @@ def qsa_sparse_paged_attention(
     else:
         # FP32 partials preserve accuracy when merging independently normalized
         # splits.
-        partial_output = torch.empty(
-            (num_splits, *q.shape), dtype=torch.float32, device=q.device
-        )
+        partial_output = torch.empty((num_splits, *q.shape), dtype=torch.float32, device=q.device)
         partial_lse = torch.empty(
             (num_splits, q.shape[0], q.shape[1]),
             dtype=torch.float32,

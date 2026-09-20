@@ -32,9 +32,7 @@ def test_harmony_non_stream_splits_analysis_and_final():
 
 def test_harmony_non_stream_analysis_only():
     parser = ReasoningParser("gpt_oss")
-    reasoning, content = parser.parse_non_stream(
-        "<|channel|>analysis<|message|>still thinking"
-    )
+    reasoning, content = parser.parse_non_stream("<|channel|>analysis<|message|>still thinking")
     assert reasoning == "still thinking"
     assert content == ""
 
@@ -51,7 +49,7 @@ def test_harmony_non_stream_final_only():
 def test_harmony_non_stream_preserves_commentary_tool_block_verbatim():
     text = (
         "<|channel|>analysis<|message|>need weather<|end|>"
-        '<|start|>assistant<|channel|>commentary to=functions.get_weather '
+        "<|start|>assistant<|channel|>commentary to=functions.get_weather "
         '<|message|>{"city":"Paris"}<|call|>'
     )
     parser = ReasoningParser("gpt_oss")

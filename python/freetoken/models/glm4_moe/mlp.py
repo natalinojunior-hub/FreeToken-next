@@ -18,11 +18,34 @@ class GlmGatedMLP(BaseOP):
     checkpoint stores for their prefix (NVFP4 in the GLM-4 releases)."""
 
     def __init__(
-        self, hidden_size: int, intermediate_size: int, *, quant_config: QuantConfig | None = None, prefix: str = ""
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        *,
+        quant_config: QuantConfig | None = None,
+        prefix: str = "",
     ):
-        self.gate_proj = LinearReplicated(hidden_size, intermediate_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.gate_proj")
-        self.up_proj = LinearReplicated(hidden_size, intermediate_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.up_proj")
-        self.down_proj = LinearReplicated(intermediate_size, hidden_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.down_proj")
+        self.gate_proj = LinearReplicated(
+            hidden_size,
+            intermediate_size,
+            has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_proj",
+        )
+        self.up_proj = LinearReplicated(
+            hidden_size,
+            intermediate_size,
+            has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.up_proj",
+        )
+        self.down_proj = LinearReplicated(
+            intermediate_size,
+            hidden_size,
+            has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+        )
 
     @nvtx_annotate("MLP")
     def forward(self, x: torch.Tensor) -> torch.Tensor:

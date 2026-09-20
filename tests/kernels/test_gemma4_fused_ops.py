@@ -90,7 +90,9 @@ def test_gemma_dual_rmsnorm_residual_scalar_matches_reference(
     )
 
     combined = _ref_rmsnorm(x1, w1, 1e-6).float() + _ref_rmsnorm(x2, w2, 1e-6).float()
-    ref = (residual.float() + _ref_rmsnorm(combined.to(x1.dtype), w3, 1e-6).float()) * scalar.float()
+    ref = (
+        residual.float() + _ref_rmsnorm(combined.to(x1.dtype), w3, 1e-6).float()
+    ) * scalar.float()
     torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
 
 
@@ -106,9 +108,7 @@ def test_gemma4_router_uses_sgl_kernel_topk_softmax_semantics():
     torch.manual_seed(3)
     router = Gemma4Router(cfg)
     logits = torch.randn((5, cfg.num_experts), device="cuda", dtype=torch.bfloat16)
-    per_expert_scale = (
-        torch.rand((cfg.num_experts,), device="cuda", dtype=torch.bfloat16) + 0.5
-    )
+    per_expert_scale = torch.rand((cfg.num_experts,), device="cuda", dtype=torch.bfloat16) + 0.5
     router.per_expert_scale = per_expert_scale
     router.scale = torch.ones((cfg.hidden_size,), device="cuda", dtype=torch.bfloat16)
     router.norm.forward = lambda x: x

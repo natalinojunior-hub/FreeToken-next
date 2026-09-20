@@ -37,7 +37,15 @@ def _parse_ggml_common_h() -> dict[str, int]:
     Returns a dict mapping quant type names (e.g. "block_q4_0") to their byte sizes.
     Substitutes QK_K=256 and K_SCALE_SIZE=12 before computing sizes.
     """
-    header_path = Path(__file__).parent.parent.parent / "python" / "freetoken" / "kernel" / "csrc" / "gguf" / "ggml-common.h"
+    header_path = (
+        Path(__file__).parent.parent.parent
+        / "python"
+        / "freetoken"
+        / "kernel"
+        / "csrc"
+        / "gguf"
+        / "ggml-common.h"
+    )
     with open(header_path) as f:
         content = f.read()
 
@@ -153,7 +161,7 @@ def _extract_switch_cases(file_path: str, func_name: str) -> set[int]:
             brace_count -= 1
         end_pos += 1
 
-    switch_body = content[brace_pos + 1:end_pos - 1]
+    switch_body = content[brace_pos + 1 : end_pos - 1]
 
     # Extract all "case <number>:" labels
     case_pattern = r"case\s+(\d+):"
@@ -249,12 +257,8 @@ def test_capability_sets_are_consistent():
     - None of the five sets intersects GGML_UNQUANTIZED (F32, F16, BF16)
     """
     # Check set equalities
-    assert MMVQ_TYPES == DEQUANT_TYPES, (
-        f"MMVQ_TYPES {MMVQ_TYPES} != DEQUANT_TYPES {DEQUANT_TYPES}"
-    )
-    assert MMQ_TYPES == MOE_MMQ_TYPES, (
-        f"MMQ_TYPES {MMQ_TYPES} != MOE_MMQ_TYPES {MOE_MMQ_TYPES}"
-    )
+    assert MMVQ_TYPES == DEQUANT_TYPES, f"MMVQ_TYPES {MMVQ_TYPES} != DEQUANT_TYPES {DEQUANT_TYPES}"
+    assert MMQ_TYPES == MOE_MMQ_TYPES, f"MMQ_TYPES {MMQ_TYPES} != MOE_MMQ_TYPES {MOE_MMQ_TYPES}"
     assert MOE_VEC_TYPES == DEQUANT_TYPES, (
         f"MOE_VEC_TYPES {MOE_VEC_TYPES} != DEQUANT_TYPES {DEQUANT_TYPES}"
     )
@@ -289,7 +293,15 @@ def test_capability_sets_match_cuda_switches():
 
     This is the critical test that prevents Python tables from drifting from C source.
     """
-    kernel_path = Path(__file__).parent.parent.parent / "python" / "freetoken" / "kernel" / "csrc" / "gguf" / "gguf_kernel.cu"
+    kernel_path = (
+        Path(__file__).parent.parent.parent
+        / "python"
+        / "freetoken"
+        / "kernel"
+        / "csrc"
+        / "gguf"
+        / "gguf_kernel.cu"
+    )
 
     # Extract cases for each kernel
     mmvq_cases = _extract_switch_cases(str(kernel_path), "ggml_mul_mat_vec_a8")
@@ -302,9 +314,7 @@ def test_capability_sets_match_cuda_switches():
     assert mmvq_cases == MMVQ_TYPES, (
         f"ggml_mul_mat_vec_a8 cases {mmvq_cases} != MMVQ_TYPES {MMVQ_TYPES}"
     )
-    assert mmq_cases == MMQ_TYPES, (
-        f"ggml_mul_mat_a8 cases {mmq_cases} != MMQ_TYPES {MMQ_TYPES}"
-    )
+    assert mmq_cases == MMQ_TYPES, f"ggml_mul_mat_a8 cases {mmq_cases} != MMQ_TYPES {MMQ_TYPES}"
     assert moe_a8_cases == MOE_MMQ_TYPES, (
         f"ggml_moe_a8 cases {moe_a8_cases} != MOE_MMQ_TYPES {MOE_MMQ_TYPES}"
     )

@@ -45,6 +45,7 @@ from .config import parse_config
 _CKPT = "model.language_model"
 _MODEL = "model"
 
+
 # MTP-layer experts (layer == num_layers under the full checkpoint) map to None
 # alongside the dense prefix; the bank loader skips them.
 def _layer_to_bank(layer, config):
@@ -90,6 +91,7 @@ def _select_expert_source_spec(model_path: str) -> Nvfp4ExpertSourceSpec:
     get = quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
     method = str(get("quant_method") or "").lower()
     return _NVFP4_CT_SOURCE_SPEC if method == "compressed-tensors" else _NVFP4_SOURCE_SPEC
+
 
 # KDA in_proj fusion order; MUST match Glm5NextKDA._in_proj_split.
 _KDA_IN_PROJ = ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj")
@@ -146,9 +148,10 @@ def _iter_dsa_layer(reader, layer: int) -> Iterator[tuple[str, torch.Tensor]]:
         yield f"{dst}.{norm}.weight", reader.get(f"{src}.{norm}.weight").to(torch.bfloat16)
     # kpool indexer (every DSA layer owns one). Kept bf16; the APE is fp32.
     for proj in ("wq_b", "wk", "weights_proj"):
-        yield f"{dst}.indexer.{proj}.weight", reader.get(
-            f"{src}.indexer.{proj}.weight"
-        ).to(torch.bfloat16)
+        yield (
+            f"{dst}.indexer.{proj}.weight",
+            reader.get(f"{src}.indexer.{proj}.weight").to(torch.bfloat16),
+        )
     for part, dtype in (
         ("k_norm.weight", torch.bfloat16),
         ("k_norm.bias", torch.bfloat16),
@@ -202,21 +205,26 @@ def iter_weights(
                 yield from _iter_dsa_layer(reader, layer)
 
             # mHC mixing tensors, fp32 on every layer.
-            for hc in ("hc_attn_fn", "hc_attn_base", "hc_attn_scale",
-                       "hc_ffn_fn", "hc_ffn_base", "hc_ffn_scale"):
+            for hc in (
+                "hc_attn_fn",
+                "hc_attn_base",
+                "hc_attn_scale",
+                "hc_ffn_fn",
+                "hc_ffn_base",
+                "hc_ffn_scale",
+            ):
                 yield f"{dst}.{hc}", reader.get(f"{src}.{hc}").to(torch.float32)
 
             for norm in ("input_layernorm", "post_attention_layernorm"):
-                yield f"{dst}.{norm}.weight", reader.get(f"{src}.{norm}.weight").to(
-                    torch.bfloat16
-                )
+                yield f"{dst}.{norm}.weight", reader.get(f"{src}.{norm}.weight").to(torch.bfloat16)
 
             if layer < config.first_k_dense_replace:
                 for proj in ("gate_proj", "up_proj", "down_proj"):
                     yield from _proj(reader, f"{src}.mlp.{proj}", f"{dst}.mlp.{proj}")
             else:
-                yield f"{dst}.mlp.gate.weight", reader.get(f"{src}.mlp.gate.weight").to(
-                    torch.bfloat16
+                yield (
+                    f"{dst}.mlp.gate.weight",
+                    reader.get(f"{src}.mlp.gate.weight").to(torch.bfloat16),
                 )
                 yield (
                     f"{dst}.mlp.e_score_correction_bias",
@@ -225,11 +233,16 @@ def iter_weights(
                     reader.get(f"{src}.mlp.gate.e_score_correction_bias").to(torch.float32),
                 )
                 for proj in ("gate_proj", "up_proj", "down_proj"):
-                    yield from _proj(reader, f"{src}.mlp.shared_experts.{proj}", f"{dst}.mlp.shared_experts.{proj}")
+                    yield from _proj(
+                        reader,
+                        f"{src}.mlp.shared_experts.{proj}",
+                        f"{dst}.mlp.shared_experts.{proj}",
+                    )
 
-        yield f"{_MODEL}.embed_tokens.weight", reader.get(
-            f"{_CKPT}.embed_tokens.weight"
-        ).to(torch.bfloat16)
+        yield (
+            f"{_MODEL}.embed_tokens.weight",
+            reader.get(f"{_CKPT}.embed_tokens.weight").to(torch.bfloat16),
+        )
         yield f"{_MODEL}.norm.weight", reader.get(f"{_CKPT}.norm.weight").to(torch.bfloat16)
         yield "lm_head.weight", reader.get("lm_head.weight").to(torch.bfloat16)
         if include_vision:
@@ -238,7 +251,9 @@ def iter_weights(
         reader.close()
 
 
-def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+def iter_vision_weights(
+    model_path: str, device: torch.device
+) -> Iterator[tuple[str, torch.Tensor]]:
     """The vision tower alone, named as iter_weights names it."""
     folder = download_hf_weight(model_path)
     with open(os.path.join(folder, "model.safetensors.index.json")) as f:
@@ -250,7 +265,15 @@ def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple
         reader.close()
 
 
-def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
+def iter_expert_pieces(
+    model_path,
+    config,
+    kind: QuantKind,
+    *,
+    parallel: bool | None = False,
+    workers: int = 8,
+    chunk: int = 8 << 20,
+):
     """Block-fp8 routed experts, one piece per expert: ``{gate, up, down}`` fp8 codes and their ``_scale`` companions; other kinds use the generic readers."""
     if kind is not QuantKind.FP8_BLOCK:
         return None
@@ -285,7 +308,11 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
         reader = _ShardReader(folder, weight_map, torch.device("cpu"))
         try:
             layers = range(config.first_k_dense_replace, config.num_layers)
-            for layer in tqdm(layers, desc="Loading GLM-5.3 fp8 experts (serial)", disable=not get_tp_info().is_primary()):
+            for layer in tqdm(
+                layers,
+                desc="Loading GLM-5.3 fp8 experts (serial)",
+                disable=not get_tp_info().is_primary(),
+            ):
                 for e in range(config.num_experts):
                     base = f"{_CKPT}.layers.{layer}.mlp.experts.{e}"
                     for proj in ("gate", "up", "down"):

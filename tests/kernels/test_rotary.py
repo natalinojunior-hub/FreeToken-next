@@ -49,7 +49,7 @@ def test_yarn_rope_scales_cos_sin_by_attention_factor():
             / (2 * math.log(base))
         )
 
-    low = max(correction_dim(beta_fast), 0.0)        # fast beta -> smaller dim (~8.1)
+    low = max(correction_dim(beta_fast), 0.0)  # fast beta -> smaller dim (~8.1)
     high = min(correction_dim(beta_slow), half - 1)  # slow beta -> larger dim (~17.4)
     dims = torch.arange(half, dtype=torch.float32)
     ramp = torch.clamp((dims - low) / max(high - low, 1.0), 0.0, 1.0)
@@ -115,20 +115,53 @@ def test_yarn_correction_range_matches_hf_where_the_clamp_and_gap_bind():
 
     max_position = 512
     cases = [  # (rotary_dim, base, scaling) -- each binds a different branch
-        (128, 1e4, {"factor": 16.0, "beta_fast": 32.0, "beta_slow": 1.0,
-                    "original_max_position_embeddings": 131072, "truncate": True}),
-        (128, 1e6, {"factor": 16.0, "beta_fast": 1.0, "beta_slow": 1.0,
-                    "original_max_position_embeddings": 32768, "truncate": False}),
-        (128, 1e6, {"factor": 16.0, "beta_fast": 1.15, "beta_slow": 1.0,
-                    "original_max_position_embeddings": 32768, "truncate": False}),
+        (
+            128,
+            1e4,
+            {
+                "factor": 16.0,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "original_max_position_embeddings": 131072,
+                "truncate": True,
+            },
+        ),
+        (
+            128,
+            1e6,
+            {
+                "factor": 16.0,
+                "beta_fast": 1.0,
+                "beta_slow": 1.0,
+                "original_max_position_embeddings": 32768,
+                "truncate": False,
+            },
+        ),
+        (
+            128,
+            1e6,
+            {
+                "factor": 16.0,
+                "beta_fast": 1.15,
+                "beta_slow": 1.0,
+                "original_max_position_embeddings": 32768,
+                "truncate": False,
+            },
+        ),
     ]
     for rotary_dim, base, scaling in cases:
         get_rope.cache_clear()
-        rope = get_rope(head_dim=rotary_dim, rotary_dim=rotary_dim, max_position=max_position,
-                        base=base, rope_scaling=(("rope_type", "yarn"), *scaling.items()))
+        rope = get_rope(
+            head_dim=rotary_dim,
+            rotary_dim=rotary_dim,
+            max_position=max_position,
+            base=base,
+            rope_scaling=(("rope_type", "yarn"), *scaling.items()),
+        )
         params = {"rope_type": "yarn", "rope_theta": base, "partial_rotary_factor": 1.0, **scaling}
         inv_freq, attn_factor = ROPE_INIT_FUNCTIONS["yarn"](
-            _Shim(rotary_dim, max_position, params), device=torch.device("cpu"))
+            _Shim(rotary_dim, max_position, params), device=torch.device("cpu")
+        )
         freqs = torch.outer(torch.arange(max_position, dtype=torch.float), inv_freq.float())
         expected = torch.cat((freqs.cos() * attn_factor, freqs.sin() * attn_factor), dim=-1)
         torch.testing.assert_close(rope._cos_sin_cache, expected, rtol=0, atol=1e-6)

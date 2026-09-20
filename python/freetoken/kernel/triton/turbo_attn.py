@@ -40,13 +40,19 @@ def turbo_k_tile(
     grp = offs_d // 128
     jj = offs_d % 128
     if BOOK3:
-        low = tl.load(codes_ptr + col + (grp * 48 + jj // 4)[:, None], mask=mask_n[None, :], other=0)
-        bit = tl.load(codes_ptr + col + (grp * 48 + 32 + jj // 8)[:, None], mask=mask_n[None, :], other=0)
+        low = tl.load(
+            codes_ptr + col + (grp * 48 + jj // 4)[:, None], mask=mask_n[None, :], other=0
+        )
+        bit = tl.load(
+            codes_ptr + col + (grp * 48 + 32 + jj // 8)[:, None], mask=mask_n[None, :], other=0
+        )
         idx = ((low.to(tl.int32) >> ((jj % 4) * 2)[:, None]) & 3) | (
             ((bit.to(tl.int32) >> (jj % 8)[:, None]) & 1) << 2
         )
     else:
-        byte = tl.load(codes_ptr + col + (grp * 64 + jj // 2)[:, None], mask=mask_n[None, :], other=0)
+        byte = tl.load(
+            codes_ptr + col + (grp * 64 + jj // 2)[:, None], mask=mask_n[None, :], other=0
+        )
         idx = (byte.to(tl.int32) >> ((jj % 2) * 4)[:, None]) & 15
     vals = tl.load(cent_ptr + idx)
     nrm = tl.load(norm_ptr + ncol + grp[:, None], mask=mask_n[None, :], other=0.0).to(tl.float32)
@@ -75,13 +81,19 @@ def turbo_v_tile(
     grp = offs_d // 128
     jj = offs_d % 128
     if BOOK3:
-        low = tl.load(codes_ptr + row + (grp * 48 + jj // 4)[None, :], mask=mask_n[:, None], other=0)
-        bit = tl.load(codes_ptr + row + (grp * 48 + 32 + jj // 8)[None, :], mask=mask_n[:, None], other=0)
+        low = tl.load(
+            codes_ptr + row + (grp * 48 + jj // 4)[None, :], mask=mask_n[:, None], other=0
+        )
+        bit = tl.load(
+            codes_ptr + row + (grp * 48 + 32 + jj // 8)[None, :], mask=mask_n[:, None], other=0
+        )
         idx = ((low.to(tl.int32) >> ((jj % 4) * 2)[None, :]) & 3) | (
             ((bit.to(tl.int32) >> (jj % 8)[None, :]) & 1) << 2
         )
     else:
-        byte = tl.load(codes_ptr + row + (grp * 64 + jj // 2)[None, :], mask=mask_n[:, None], other=0)
+        byte = tl.load(
+            codes_ptr + row + (grp * 64 + jj // 2)[None, :], mask=mask_n[:, None], other=0
+        )
         idx = (byte.to(tl.int32) >> ((jj % 2) * 4)[None, :]) & 15
     vals = tl.load(cent_ptr + idx)
     nrm = tl.load(norm_ptr + nrow + grp[None, :], mask=mask_n[:, None], other=0.0).to(tl.float32)

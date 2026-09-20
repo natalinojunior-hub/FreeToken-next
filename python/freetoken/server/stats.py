@@ -139,19 +139,28 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
     ready_at = getattr(state, "ready_at", None)
     uptime_s = max(0, int(time.monotonic() - ready_at)) if ready_at is not None else 0
     kv = (
-        {"used_pages": tr.kv_used_pages, "total_pages": tr.kv_total_pages,
-         "page_size": getattr(config, "page_size", 1)}
-        if tr.kv_total_pages > 0 else None
+        {
+            "used_pages": tr.kv_used_pages,
+            "total_pages": tr.kv_total_pages,
+            "page_size": getattr(config, "page_size", 1),
+        }
+        if tr.kv_total_pages > 0
+        else None
     )
     mamba = (
         {"used_slots": tr.mamba_used_slots, "total_slots": tr.mamba_total_slots}
-        if tr.mamba_total_slots > 0 else None
+        if tr.mamba_total_slots > 0
+        else None
     )
     sps = _swa_page_size(config)
     swa = (
-        {"used_pages": tr.swa_used_tokens // sps, "total_pages": tr.swa_total_tokens // sps,
-         "page_size": sps}
-        if tr.swa_total_tokens > 0 else None
+        {
+            "used_pages": tr.swa_used_tokens // sps,
+            "total_pages": tr.swa_total_tokens // sps,
+            "page_size": sps,
+        }
+        if tr.swa_total_tokens > 0
+        else None
     )
     return {
         "instance_id": getattr(state, "instance_id", None),

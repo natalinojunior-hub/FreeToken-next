@@ -4,6 +4,7 @@ decode kernel. Borrowed verbatim (pure torch+triton, no sglang deps) from sglang
 Does gating(sigmoid+softplus) + optional in-kernel l2norm + delta-rule recurrent update +
 per-request state read/write-by-index in ONE kernel — no external gating or
 gather/scatter/clone glue."""
+
 from typing import Optional
 
 import torch
@@ -102,13 +103,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     if USE_INITIAL_STATE:
         idx = tl.load(h0_indices + i_n)
         if idx >= 0:
-            p_h0 = (
-                h0_source
-                + idx * HV * K * V
-                + i_hv * K * V
-                + o_v[None, :] * K
-                + o_k[:, None]
-            )
+            p_h0 = h0_source + idx * HV * K * V + i_hv * K * V + o_v[None, :] * K + o_k[:, None]
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     # Preload tree attention data if needed
@@ -120,9 +115,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             + (i_n * stride_retrieve_parent_token_seq)
             + token_indices * stride_retrieve_parent_token_token
         )
-        parent_idx_tokens = tl.load(
-            retrieve_parent_token_base, mask=mask_retrieve, other=0
-        )
+        parent_idx_tokens = tl.load(retrieve_parent_token_base, mask=mask_retrieve, other=0)
 
     # Prepare intermediate state cache index if enabled
     cache_idx = -1
@@ -135,9 +128,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
             # step_idx == 0 uses b_h from USE_INITIAL_STATE
             if step_idx != 0 and cache_idx >= 0:
-                parent_step_idx = tl.sum(
-                    tl.where(token_indices == step_idx, parent_idx_tokens, 0)
-                )
+                parent_step_idx = tl.sum(tl.where(token_indices == step_idx, parent_idx_tokens, 0))
                 step_offset = parent_step_idx * HV * K * V
                 cache_ptr = (
                     intermediate_states_buffer
@@ -234,13 +225,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         if USE_INITIAL_STATE:
             idx = tl.load(h0_indices + i_n)
             if idx >= 0:
-                p_h0 = (
-                    h0_source
-                    + idx * HV * K * V
-                    + i_hv * K * V
-                    + o_v[None, :] * K
-                    + o_k[:, None]
-                )
+                p_h0 = h0_source + idx * HV * K * V + i_hv * K * V + o_v[None, :] * K + o_k[:, None]
                 tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
@@ -318,9 +303,7 @@ def fused_sigmoid_gating_delta_rule_update(
     # Per-req stride must match the buffer's allocated dim, not runtime steps
     # (they can differ under --speculative-adaptive).
     cache_stride_steps = (
-        intermediate_states_buffer.shape[1]
-        if intermediate_states_buffer is not None
-        else 0
+        intermediate_states_buffer.shape[1] if intermediate_states_buffer is not None else 0
     )
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](

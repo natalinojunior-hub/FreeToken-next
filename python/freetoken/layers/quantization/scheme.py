@@ -11,6 +11,7 @@ import torch
 # -1 selects the whole dimension: (-1, -1) one scale per tensor, (1, -1) one per output row, (1, 16) one per 16 input elements, (128, 128) a 2-D block
 GroupShape = tuple[int, int]
 
+
 class QuantKind(Enum):
     """The quantization kinds; one Method per (kind, layer kind)."""
 
@@ -35,8 +36,6 @@ class WeightDesc:
     elem: str
     group: GroupShape | None
     scale: str | None
-
-
 
 
 @dataclass(frozen=True, eq=False)
@@ -75,23 +74,37 @@ class QuantScheme:
 # ---------------------------------------------------------------------------
 
 
-def fp8_tensor_scheme(scale: str, *, per_row: bool = False, input_scale: bool = False) -> QuantScheme:
+def fp8_tensor_scheme(
+    scale: str, *, per_row: bool = False, input_scale: bool = False
+) -> QuantScheme:
     roles = {"weight", "weight_scale"} | ({"input_scale"} if input_scale else set())
-    return QuantScheme(QuantKind.FP8_TENSOR, WeightDesc("e4m3", (1, -1) if per_row else (-1, -1), scale), roles)
+    return QuantScheme(
+        QuantKind.FP8_TENSOR, WeightDesc("e4m3", (1, -1) if per_row else (-1, -1), scale), roles
+    )
 
 
 def fp8_block_scheme(scale: str) -> QuantScheme:
-    return QuantScheme(QuantKind.FP8_BLOCK, WeightDesc("e4m3", (FP8_BLOCK, FP8_BLOCK), scale), {"weight", "weight_scale_inv"})
+    return QuantScheme(
+        QuantKind.FP8_BLOCK,
+        WeightDesc("e4m3", (FP8_BLOCK, FP8_BLOCK), scale),
+        {"weight", "weight_scale_inv"},
+    )
 
 
 def mxfp8_scheme() -> QuantScheme:
-    return QuantScheme(QuantKind.MXFP8, WeightDesc("e4m3", (1, MX_GROUP), "e8m0"), {"weight", "weight_scale_inv"})
+    return QuantScheme(
+        QuantKind.MXFP8, WeightDesc("e4m3", (1, MX_GROUP), "e8m0"), {"weight", "weight_scale_inv"}
+    )
 
 
 def nvfp4_scheme(*, input_scale: bool) -> QuantScheme:
-    roles = {"weight", "weight_scale", "weight_global"} | ({"input_scale"} if input_scale else set())
+    roles = {"weight", "weight_scale", "weight_global"} | (
+        {"input_scale"} if input_scale else set()
+    )
     return QuantScheme(QuantKind.NVFP4, WeightDesc("e2m1", (1, NVFP4_GROUP), "e4m3"), roles)
 
 
 def mxfp4_scheme() -> QuantScheme:
-    return QuantScheme(QuantKind.MXFP4, WeightDesc("e2m1", (1, MX_GROUP), "e8m0"), {"weight", "weight_scale"})
+    return QuantScheme(
+        QuantKind.MXFP4, WeightDesc("e2m1", (1, MX_GROUP), "e8m0"), {"weight", "weight_scale"}
+    )

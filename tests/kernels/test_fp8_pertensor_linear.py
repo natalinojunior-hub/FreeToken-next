@@ -49,11 +49,14 @@ def _dequant(w8: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("M", [1, 2, 4, 8, 16, 64, 300])
 # (5120, 14336) and (5120, 16384) are Qwen3.5-27B's fused qkv_proj / in_proj_qkvz;
 # (1024, 6144) is a standalone o_proj shape; 6112 leaves a k-mask tail.
-@pytest.mark.parametrize("K,part_rows", [
-    (5120, [12288, 1024, 1024]),
-    (1024, [6144]),
-    (6112, [512, 128]),
-])
+@pytest.mark.parametrize(
+    "K,part_rows",
+    [
+        (5120, [12288, 1024, 1024]),
+        (1024, [6144]),
+        (6112, [512, 128]),
+    ],
+)
 def test_w8a16_matches_dequant_reference(M: int, K: int, part_rows: list[int]):
     """Without an ``input_scale`` every M stays on the W8A16 kernels, activation exact."""
     from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
@@ -68,10 +71,13 @@ def test_w8a16_matches_dequant_reference(M: int, K: int, part_rows: list[int]):
 
 @pytest.mark.skipif(not e4m3_native(), reason="torch._scaled_mm needs sm_89+")
 @pytest.mark.parametrize("M", [1, 2, 4, 16, 64])
-@pytest.mark.parametrize("part_rows,uniform", [
-    ([12288, 1024, 1024], False),  # fused -> piecewise-constant scale -> row-wise
-    ([6144], True),                # standalone -> one scalar -> tensor-wise
-])
+@pytest.mark.parametrize(
+    "part_rows,uniform",
+    [
+        ([12288, 1024, 1024], False),  # fused -> piecewise-constant scale -> row-wise
+        ([6144], True),  # standalone -> one scalar -> tensor-wise
+    ],
+)
 def test_w8a8_matches_w8a8_reference(M: int, part_rows: list[int], uniform: bool):
     from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
 
@@ -171,6 +177,9 @@ def test_fused_layer_forward_on_a_side_stream_completes():
         os._exit(124)  # a normal exit would wait on the stuck kernel
     """)
     proc = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True, timeout=300,
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=300,
     )
     assert proc.returncode == 0, f"rc={proc.returncode}\n{proc.stdout}\n{proc.stderr[-2000:]}"

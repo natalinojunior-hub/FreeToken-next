@@ -56,9 +56,7 @@ def swigluoai_and_mul(
     return swigluoai_and_mul(x, out=out, alpha=alpha, limit=limit)
 
 
-def swiglu_clamp_and_mul(
-    x, out=None, *, alpha: float = 1.0, limit: float = 10.0
-):
+def swiglu_clamp_and_mul(x, out=None, *, alpha: float = 1.0, limit: float = 10.0):
     """GLM-5.3 clamped SwiGLU over UNINTERLEAVED halves: ``clamp(gate, max=limit) * sigmoid(alpha * gate) * clamp(up, +-limit)``."""
     from freetoken.kernel.triton.activation import swiglu_clamp_and_mul
 

@@ -18,7 +18,9 @@ if TYPE_CHECKING:
 class MiniMaxM2DecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         self.self_attn = MiniMaxM2Attention(config, layer_id, prefix=f"{prefix}.self_attn")
-        self.block_sparse_moe = MiniMaxM2SparseMoeBlock(config, layer_id, prefix=f"{prefix}.block_sparse_moe")
+        self.block_sparse_moe = MiniMaxM2SparseMoeBlock(
+            config, layer_id, prefix=f"{prefix}.block_sparse_moe"
+        )
         self.input_layernorm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNormFused(
             size=config.hidden_size, eps=config.rms_norm_eps

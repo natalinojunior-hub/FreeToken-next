@@ -89,8 +89,11 @@ def test_fused_recurrent_serves_slot_zero():
     indices = torch.zeros((1, T), dtype=torch.int64, device="cuda")  # slot 0
     cu = torch.tensor([0, T], dtype=torch.int32, device="cuda")
     o, _ = fused_recurrent_kda(
-        q=q.unsqueeze(0), k=k.unsqueeze(0), v=v.unsqueeze(0),
-        g=g_raw.unsqueeze(0), beta=beta_raw.unsqueeze(0),
+        q=q.unsqueeze(0),
+        k=k.unsqueeze(0),
+        v=v.unsqueeze(0),
+        g=g_raw.unsqueeze(0),
+        beta=beta_raw.unsqueeze(0),
         initial_state=pool,
         use_qk_l2norm_in_kernel=True,
         cu_seqlens=cu,

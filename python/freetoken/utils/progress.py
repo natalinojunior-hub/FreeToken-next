@@ -77,14 +77,23 @@ def byte_bar(total: int, desc: str) -> tqdm:
     """A byte-scaled bar (shows e.g. ``12.8GiB [00:02, 6.1GiB/s]``); ``update(nbytes)`` it
     as each tensor/bank/shard finishes reading. Also drives the progress sink when installed.
     Thread-safe to update from a pool."""
-    return _SinkTqdm(total=total, desc=desc, unit="B", unit_scale=True, unit_divisor=1024,
-                     disable=not _on_primary(), leave=False, dynamic_ncols=True)
+    return _SinkTqdm(
+        total=total,
+        desc=desc,
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+        disable=not _on_primary(),
+        leave=False,
+        dynamic_ncols=True,
+    )
 
 
 def count_bar(iterable, desc: str, total: int | None = None) -> tqdm:
     """A plain count bar over an iterable (use when total bytes aren't known up front)."""
-    return tqdm(iterable, desc=desc, total=total, disable=not _on_primary(),
-                leave=False, dynamic_ncols=True)
+    return tqdm(
+        iterable, desc=desc, total=total, disable=not _on_primary(), leave=False, dynamic_ncols=True
+    )
 
 
 __all__ = ["byte_bar", "count_bar", "set_progress_sink"]

@@ -19,7 +19,9 @@ def _quant_block(w):
 
 def _dequant(q, s):
     n, k = q.shape
-    return (q.float().view(n // BLOCK, BLOCK, k // BLOCK, BLOCK) * s.float()[:, None, :, None]).view(n, k)
+    return (
+        q.float().view(n // BLOCK, BLOCK, k // BLOCK, BLOCK) * s.float()[:, None, :, None]
+    ).view(n, k)
 
 
 def _experts():
@@ -51,24 +53,40 @@ def _reference(x, gate_up, gate_up_scale, down, down_scale, w, ids, activation, 
     return out.to(x.dtype)
 
 
-@pytest.mark.parametrize("activation, alpha, limit", [("silu", 1.0, float("inf")), ("swiglu_clamp", 1.0, 0.5), ("gelu_tanh", 1.0, float("inf"))])
+@pytest.mark.parametrize(
+    "activation, alpha, limit",
+    [("silu", 1.0, float("inf")), ("swiglu_clamp", 1.0, 0.5), ("gelu_tanh", 1.0, float("inf"))],
+)
 def test_fp8_block_moe_epilogues_match_the_reference(activation, alpha, limit):
-    from freetoken.kernel.triton.fp8_blockscale_moe import fused_experts_decode_fp8_blockscale, fused_experts_fp8_blockscale
+    from freetoken.kernel.triton.fp8_blockscale_moe import (
+        fused_experts_decode_fp8_blockscale,
+        fused_experts_fp8_blockscale,
+    )
 
     gate_up, gate_up_scale, down, down_scale = _experts()
     w, ids = _routing()
     x = torch.randn(M, H, device="cuda", dtype=torch.bfloat16)
-    ref = _reference(x, gate_up, gate_up_scale, down, down_scale, w, ids, activation, alpha, limit).float()
-    plain = _reference(x, gate_up, gate_up_scale, down, down_scale, w, ids, "silu", 1.0, float("inf")).float()
+    ref = _reference(
+        x, gate_up, gate_up_scale, down, down_scale, w, ids, activation, alpha, limit
+    ).float()
+    plain = _reference(
+        x, gate_up, gate_up_scale, down, down_scale, w, ids, "silu", 1.0, float("inf")
+    ).float()
     if activation != "silu":
-        assert not torch.allclose(ref, plain, rtol=1e-2, atol=1e-3), "the epilogue under test must change the result"
+        assert not torch.allclose(ref, plain, rtol=1e-2, atol=1e-3), (
+            "the epilogue under test must change the result"
+        )
 
-    decode = fused_experts_decode_fp8_blockscale(x, gate_up, gate_up_scale, down, down_scale, w, ids, activation, alpha, limit).float()
+    decode = fused_experts_decode_fp8_blockscale(
+        x, gate_up, gate_up_scale, down, down_scale, w, ids, activation, alpha, limit
+    ).float()
     # W8A16 decode: only bf16 accumulation-order differences remain
     assert torch.nn.functional.cosine_similarity(decode.flatten(), ref.flatten(), dim=0) > 0.999
     assert (decode - ref).abs().max() <= 2e-2 * ref.abs().max() + 1e-3
 
-    prefill = fused_experts_fp8_blockscale(x, gate_up, gate_up_scale, down, down_scale, w, ids, E, activation, alpha, limit).float()
+    prefill = fused_experts_fp8_blockscale(
+        x, gate_up, gate_up_scale, down, down_scale, w, ids, E, activation, alpha, limit
+    ).float()
     # W8A8 prefill quantizes the activations per 128-group, so the tolerance is the fp8 activation error
     assert torch.nn.functional.cosine_similarity(prefill.flatten(), ref.flatten(), dim=0) > 0.99
     assert (prefill - ref).abs().max() <= 8e-2 * ref.abs().max() + 1e-3

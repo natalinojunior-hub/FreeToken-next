@@ -80,7 +80,6 @@ def chunk_gated_delta_rule_fwd(
 
 
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
-
     @staticmethod
     @input_guard
     @autocast_custom_fwd
@@ -105,9 +104,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             k = l2norm_fwd(k)
 
         chunk_indices = (
-            prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
-            if cu_seqlens is not None
-            else None
+            prepare_chunk_indices(cu_seqlens, CHUNK_SIZE) if cu_seqlens is not None else None
         )
         g, o, A, w, h, v_new = chunk_gated_delta_rule_fwd(
             q=q,
@@ -202,21 +199,19 @@ def chunk_gated_delta_rule(
         )
     """
     assert q.dtype == k.dtype == v.dtype
-    assert (
-        q.dtype != torch.float32
-    ), "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16."
-    assert (
-        len(beta.shape) == 3
-    ), "beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
+    assert q.dtype != torch.float32, (
+        "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16."
+    )
+    assert len(beta.shape) == 3, (
+        "beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
+    )
 
     if head_first:
         raise DeprecationWarning(
             "head_first is deprecated and will be removed in a future version. "
             "Please use head_first=False for now instead."
         )
-        q, k, v, beta, g = map(
-            lambda x: rearrange(x, "b h t ... -> b t h ..."), (q, k, v, beta, g)
-        )
+        q, k, v, beta, g = map(lambda x: rearrange(x, "b h t ... -> b t h ..."), (q, k, v, beta, g))
     # if not head_first and q.shape[1] < q.shape[2]:
     #     warnings.warn(
     #         f"Input tensor shape suggests potential format mismatch: seq_len ({q.shape[1]}) < num_heads ({q.shape[2]}). "

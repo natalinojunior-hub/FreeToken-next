@@ -129,16 +129,16 @@ class AnthropicCountTokensResponse(BaseModel):
 class AnthropicDelta(BaseModel):
     """Delta payload for streaming events."""
 
-    type: Literal["text_delta", "input_json_delta", "thinking_delta", "signature_delta"] | None = None
+    type: Literal["text_delta", "input_json_delta", "thinking_delta", "signature_delta"] | None = (
+        None
+    )
     text: str | None = None
     partial_json: str | None = None
     thinking: str | None = None
     signature: str | None = None
 
     # message_delta carries the terminal stop reason.
-    stop_reason: (
-        Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"] | None
-    ) = None
+    stop_reason: Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"] | None = None
     stop_sequence: str | None = None
 
 
@@ -148,9 +148,7 @@ class AnthropicMessagesResponse(BaseModel):
     role: Literal["assistant"] = "assistant"
     content: list[AnthropicContentBlock]
     model: str
-    stop_reason: (
-        Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"] | None
-    ) = None
+    stop_reason: Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"] | None = None
     stop_sequence: str | None = None
     usage: AnthropicUsage | None = None
 

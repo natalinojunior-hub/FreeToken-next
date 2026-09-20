@@ -25,8 +25,10 @@ _ENGINE_FLAGS = ("--model", "--model-path")
 
 
 def _wants_local_engine(argv: Sequence[str]) -> bool:
-    return any(arg in _ENGINE_FLAGS or arg.startswith(tuple(f + "=" for f in _ENGINE_FLAGS))
-               for arg in argv)
+    return any(
+        arg in _ENGINE_FLAGS or arg.startswith(tuple(f + "=" for f in _ENGINE_FLAGS))
+        for arg in argv
+    )
 
 
 def _build_parser(prog: str) -> argparse.ArgumentParser:

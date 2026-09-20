@@ -76,7 +76,7 @@ def ref_select(
             if init_blocks:
                 s[: min(init_blocks, nb)] = 1e30
             if local_blocks:
-                s[max(0, nb - local_blocks):] = 1e29
+                s[max(0, nb - local_blocks) :] = 1e29
             k = min(topk, nb)
             rows.append(set(torch.topk(s, k).indices.tolist()))
         out.append(rows)
@@ -134,9 +134,7 @@ def scatter_rows(
     ``fill=0.0`` (BSAKVCache zero-inits it; the score kernels rely on that).
     """
     S = x.shape[0]
-    slab = torch.full(
-        (total_pages * BLK, *x.shape[1:]), fill, dtype=x.dtype, device=x.device
-    )
+    slab = torch.full((total_pages * BLK, *x.shape[1:]), fill, dtype=x.dtype, device=x.device)
     for b in range((S + BLK - 1) // BLK):
         n = min(BLK, S - b * BLK)
         base = int(block_rows[b])
@@ -169,9 +167,7 @@ def test_prefill_index_score_and_topk(kv_len: int, q_len: int, topk: int):
     cu = torch.tensor([0, q_len], dtype=torch.int32, device=DEV)
     seq = torch.tensor([kv_len], dtype=torch.int32, device=DEV)
     pre = torch.tensor([prefix], dtype=torch.int32, device=DEV)
-    score = m3_index_score_prefill(
-        iq, ik_slab, block_rows.view(1, -1), cu, seq, pre, q_len, kv_len
-    )
+    score = m3_index_score_prefill(iq, ik_slab, block_rows.view(1, -1), cu, seq, pre, q_len, kv_len)
     ref = ref_block_scores(iq, ik, q_pos)
     for t in range(q_len):
         nb = int(q_pos[t]) // BLK + 1
@@ -258,15 +254,22 @@ def test_prefill_attend(kv_len: int, q_len: int, topk: int):
     cu = torch.tensor([0, q_len], dtype=torch.int32, device=DEV)
     seq = torch.tensor([kv_len], dtype=torch.int32, device=DEV)
     pre = torch.tensor([prefix], dtype=torch.int32, device=DEV)
-    score = m3_index_score_prefill(
-        iq, ik_slab, block_rows.view(1, -1), cu, seq, pre, q_len, kv_len
-    )
+    score = m3_index_score_prefill(iq, ik_slab, block_rows.view(1, -1), cu, seq, pre, q_len, kv_len)
     topk_idx = m3_index_topk_prefill(score, cu, pre, q_len, topk, INIT, LOCAL)
 
     out = torch.empty_like(q)
     m3_sparse_attn_prefill(
-        q, k_slab, v_slab, topk_idx, block_rows.view(1, -1), cu, seq, pre,
-        q_len, SCALE, out,
+        q,
+        k_slab,
+        v_slab,
+        topk_idx,
+        block_rows.view(1, -1),
+        cu,
+        seq,
+        pre,
+        q_len,
+        SCALE,
+        out,
     )
 
     ref_scores = ref_block_scores(iq, ik, q_pos)
@@ -289,14 +292,21 @@ def test_prefill_attend_equals_dense_when_topk_covers():
     cu = torch.tensor([0, q_len], dtype=torch.int32, device=DEV)
     seq = torch.tensor([kv_len], dtype=torch.int32, device=DEV)
     pre = torch.tensor([prefix], dtype=torch.int32, device=DEV)
-    score = m3_index_score_prefill(
-        iq, ik_slab, block_rows.view(1, -1), cu, seq, pre, q_len, kv_len
-    )
+    score = m3_index_score_prefill(iq, ik_slab, block_rows.view(1, -1), cu, seq, pre, q_len, kv_len)
     topk_idx = m3_index_topk_prefill(score, cu, pre, q_len, TOPK, INIT, LOCAL)
     out = torch.empty_like(q)
     m3_sparse_attn_prefill(
-        q, k_slab, v_slab, topk_idx, block_rows.view(1, -1), cu, seq, pre,
-        q_len, SCALE, out,
+        q,
+        k_slab,
+        v_slab,
+        topk_idx,
+        block_rows.view(1, -1),
+        cu,
+        seq,
+        pre,
+        q_len,
+        SCALE,
+        out,
     )
     # dense causal reference
     group = HQ // KVH
@@ -339,7 +349,9 @@ def test_decode_attend(kv_lens: list[int], topk: int):
         kk = torch.randn(L, KVH, D, device=DEV, dtype=torch.bfloat16)
         vv = torch.randn(L, KVH, D, device=DEV, dtype=torch.bfloat16)
         ik = torch.randn(L, D_IDX, device=DEV, dtype=torch.bfloat16)
-        ks.append(kk); vs.append(vv); iks.append(ik)
+        ks.append(kk)
+        vs.append(vv)
+        iks.append(ik)
         br, pages = layouts[i]
         k_slab[off * BLK : (off + pages) * BLK] = scatter_rows(kk, br, pages)
         v_slab[off * BLK : (off + pages) * BLK] = scatter_rows(vv, br, pages)
@@ -378,9 +390,7 @@ def test_decode_attend_capture_replay_mutated_lengths():
         layouts.append((br, pages))
         block_rows[i] = br + total * BLK
         total += pages
-    k_slab = torch.full(
-        (total * BLK, KVH, D), float("nan"), device=DEV, dtype=torch.bfloat16
-    )
+    k_slab = torch.full((total * BLK, KVH, D), float("nan"), device=DEV, dtype=torch.bfloat16)
     v_slab = torch.full_like(k_slab, float("nan"))
     ik_slab = torch.zeros(total * BLK, D_IDX, device=DEV, dtype=torch.bfloat16)
 
@@ -392,7 +402,9 @@ def test_decode_attend_capture_replay_mutated_lengths():
             kk = torch.randn(MAXL, KVH, D, device=DEV, dtype=torch.bfloat16)
             vv = torch.randn(MAXL, KVH, D, device=DEV, dtype=torch.bfloat16)
             ik = torch.randn(MAXL, D_IDX, device=DEV, dtype=torch.bfloat16)
-            ks.append(kk); vs.append(vv); iks.append(ik)
+            ks.append(kk)
+            vs.append(vv)
+            iks.append(ik)
             br, pages = layouts[i]
             k_slab[off * BLK : (off + pages) * BLK] = scatter_rows(kk, br, pages)
             v_slab[off * BLK : (off + pages) * BLK] = scatter_rows(vv, br, pages)

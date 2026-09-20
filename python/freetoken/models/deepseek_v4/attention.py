@@ -9,7 +9,13 @@ import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace
 from freetoken.kernel.triton.dsv4.norm import rms_norm
-from freetoken.layers import BaseOP, LinearColParallelMerged, LinearReplicated, LinearRowParallel, RMSNorm
+from freetoken.layers import (
+    BaseOP,
+    LinearColParallelMerged,
+    LinearReplicated,
+    LinearRowParallel,
+    RMSNorm,
+)
 
 from .args import DeepseekV4Args
 from .compress import Compressor, Indexer
@@ -41,21 +47,57 @@ class Attention(BaseOP):
 
         self.attn_sink = torch.empty(self.n_heads, dtype=torch.float32)
         # the latent projections are replicated; wq_b shards over heads, wo_b over the output groups
-        self.wq_a = LinearReplicated(self.dim, self.q_lora_rank, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_a")
+        self.wq_a = LinearReplicated(
+            self.dim,
+            self.q_lora_rank,
+            has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wq_a",
+        )
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
-        self.wq_b = LinearColParallelMerged(self.q_lora_rank, [self.n_heads * self.head_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_b")
-        self.wkv = LinearReplicated(self.dim, self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wkv")
+        self.wq_b = LinearColParallelMerged(
+            self.q_lora_rank,
+            [self.n_heads * self.head_dim],
+            has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wq_b",
+        )
+        self.wkv = LinearReplicated(
+            self.dim,
+            self.head_dim,
+            has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wkv",
+        )
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
         # wo_a is one [o_lora_rank, K] matrix per output group, stacked on N and applied as a bmm; the reference dequantizes it to bf16 and so does the reader. Under TP it shards on N by group like wo_b shards on K.
         wo_a_rows = self.n_groups * args.o_lora_rank
         wo_a_k = self.n_heads * self.head_dim // self.n_groups
         self.wo_a = torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16)
-        self.wo_b = LinearRowParallel(self.n_groups * args.o_lora_rank, self.dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wo_b")
-        self.softmax_scale = self.head_dim ** -0.5
+        self.wo_b = LinearRowParallel(
+            self.n_groups * args.o_lora_rank,
+            self.dim,
+            has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wo_b",
+        )
+        self.softmax_scale = self.head_dim**-0.5
 
         if self.compress_ratio:
-            self.compressor = Compressor(args, self.compress_ratio, self.head_dim, quant_config=quant_config, prefix=f"{prefix}.compressor")
-            self.indexer = Indexer(args, self.compress_ratio, quant_config=quant_config, prefix=f"{prefix}.indexer") if self.compress_ratio == 4 else None
+            self.compressor = Compressor(
+                args,
+                self.compress_ratio,
+                self.head_dim,
+                quant_config=quant_config,
+                prefix=f"{prefix}.compressor",
+            )
+            self.indexer = (
+                Indexer(
+                    args, self.compress_ratio, quant_config=quant_config, prefix=f"{prefix}.indexer"
+                )
+                if self.compress_ratio == 4
+                else None
+            )
         else:
             self.compressor = None
             self.indexer = None
@@ -65,8 +107,13 @@ class Attention(BaseOP):
         else:
             original_seq_len, rope_theta = 0, args.rope_theta
         self._freqs_params = (
-            self.rope_head_dim, args.max_seq_len, original_seq_len,
-            rope_theta, args.rope_factor, args.beta_fast, args.beta_slow,
+            self.rope_head_dim,
+            args.max_seq_len,
+            original_seq_len,
+            rope_theta,
+            args.rope_factor,
+            args.beta_fast,
+            args.beta_slow,
         )
         # Bound on first forward (freqs/arange only; pool buffers are read off the LIVE pool).
         self._freqs_cis: torch.Tensor | None = None
@@ -96,7 +143,6 @@ class Attention(BaseOP):
             self.compressor.reset()
         if self.indexer is not None:
             self.indexer.reset()
-
 
     def _wo(self, o: torch.Tensor, bsz: int, seqlen: int) -> torch.Tensor:
         o = o.reshape(bsz, seqlen, self.n_groups, -1)
@@ -139,12 +185,14 @@ class Attention(BaseOP):
         # host sync (.item()), so do it after the ratio-0 early-out.
         tail_ws = (
             int(self.attn.window_slots_of(ti, start_pos - 1, start_pos).item())
-            if start_pos > 0 else None
+            if start_pos > 0
+            else None
         )
         if start_pos == 0:
             self.reset()  # re-seed the compressor/indexer carry from scratch
             blocks = (
-                self.indexer.forward(x_seg, qr_seg, 0, 0, slots, ti) if self.indexer is not None
+                self.indexer.forward(x_seg, qr_seg, 0, 0, slots, ti)
+                if self.indexer is not None
                 else get_compress_topk_idxs(ratio, 1, n, 0, 0).to(device)
             )
             self.compressor.forward(x_seg, 0, slots, ti=ti)
@@ -178,7 +226,7 @@ class Attention(BaseOP):
         _, T, _ = x.size()
         if len(segments) == 1:
             # single contiguous segment: a free slice view instead of a per-layer gather
-            freqs = self._freqs_cis[segments[0][3]:segments[0][3] + T]
+            freqs = self._freqs_cis[segments[0][3] : segments[0][3] + T]
         else:
             freqs = self._freqs_cis.index_select(0, flat_positions)  # [T, rd//2] per-token rope
 
@@ -199,7 +247,7 @@ class Attention(BaseOP):
         max_c = 0
         for off, n, ti, start_pos in segments:
             win_global, cmp_global = self._prefill_segment(
-                x[:, off:off + n], qr[:, off:off + n], kv[0, off:off + n], ti, start_pos, n
+                x[:, off : off + n], qr[:, off : off + n], kv[0, off : off + n], ti, start_pos, n
             )
             win_parts.append(win_global)
             cmp_parts.append(cmp_global)
@@ -229,7 +277,12 @@ class Attention(BaseOP):
         topk_idxs = (flat[0] if len(flat) == 1 else torch.cat(flat, dim=1)).int()
 
         o = self.attn.attend(
-            q, self.layer_id, topk_idxs, n_window, self.attn_sink, self.softmax_scale,
+            q,
+            self.layer_id,
+            topk_idxs,
+            n_window,
+            self.attn_sink,
+            self.softmax_scale,
             has_compression=bool(ratio),
         )
         apply_rotary_emb(o[..., -rd:], freqs, True)
@@ -240,14 +293,18 @@ class Attention(BaseOP):
         # [0, (p+1)//ratio); pool index = block + offset, causal-masked to -1 beyond (p+1)//ratio.
         ratio = self.compress_ratio
         n_blocks = end // ratio
-        blk = torch.arange(n_blocks, device=device).unsqueeze(0)         # [1, n_blocks]
+        blk = torch.arange(n_blocks, device=device).unsqueeze(0)  # [1, n_blocks]
         abs_p1 = (start_pos + torch.arange(seqlen, device=device) + 1).unsqueeze(1)  # [seqlen,1]
         valid = blk < (abs_p1 // ratio)
         out = torch.where(valid, blk + offset, -1)
         return out.unsqueeze(0).expand(bsz, -1, -1)
 
     def decode_step(
-        self, x: torch.Tensor, pos: torch.Tensor, rows: torch.Tensor, cmp_stage_cap: int,
+        self,
+        x: torch.Tensor,
+        pos: torch.Tensor,
+        rows: torch.Tensor,
+        cmp_stage_cap: int,
         wctx=None,
     ) -> torch.Tensor:
         """Batched single-token attention (EAGER/graph). Per row, builds the per-query top-k as
@@ -317,8 +374,14 @@ class Attention(BaseOP):
         topk_idxs = topk_idxs.int()
 
         o = self.attn.attend(
-            q, self.layer_id, topk_idxs, n_window, self.attn_sink, self.softmax_scale,
-            cmp_counts=cmp_counts, has_compression=bool(ratio),
+            q,
+            self.layer_id,
+            topk_idxs,
+            n_window,
+            self.attn_sink,
+            self.softmax_scale,
+            cmp_counts=cmp_counts,
+            has_compression=bool(ratio),
         )
         apply_rotary_emb_decode(o[..., -rd:], freqs_t, True)  # per-row position freqs (inverse)
         return self._wo(o, B, 1)

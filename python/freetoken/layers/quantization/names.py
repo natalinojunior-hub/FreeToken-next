@@ -45,11 +45,15 @@ def ct_set(patterns: tuple[str, ...], *, class_names: bool) -> Matcher:
     # a class name other than Linear cannot be matched from a module name alone; fail here rather than serve the module bf16
     unknown = [p for p in names if "." not in p and p[:1].isupper()] if class_names else []
     if unknown:
-        raise NotImplementedError(f"compressed-tensors target class {unknown[0]!r} is not supported; only Linear is")
+        raise NotImplementedError(
+            f"compressed-tensors target class {unknown[0]!r} is not supported; only Linear is"
+        )
     regexes = [p[3:] for p in patterns if p.startswith("re:")]
     rx = re.compile("|".join(f"(?:{r})" for r in regexes)) if regexes else None
     any_linear = class_names and "Linear" in patterns
-    return lambda name: any_linear or name in names or (rx is not None and rx.match(name) is not None)
+    return lambda name: (
+        any_linear or name in names or (rx is not None and rx.match(name) is not None)
+    )
 
 
 _ROUTED_EXPERT = re.compile(r"\.experts\.\d+(\.|$)")
@@ -75,7 +79,7 @@ class NameMap:
     def to_checkpoint(self, prefix: str) -> tuple[str, ...]:
         for attr_root, ckpt_root in sorted(self.roots, key=lambda r: -len(r[0])):
             if prefix == attr_root or prefix.startswith(attr_root + "."):
-                prefix = ckpt_root + prefix[len(attr_root):]
+                prefix = ckpt_root + prefix[len(attr_root) :]
                 break
         for attr_seg, ckpt_seg in self.segments:
             prefix = _replace_segment(prefix, attr_seg, ckpt_seg)

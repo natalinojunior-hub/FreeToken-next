@@ -7,12 +7,14 @@
 **Hardware alvo:** RTX 5080 (15.51 GiB VRAM, SM120 Blackwell, PCIe 4.0), 96 GB DDR5 RAM, NVMe.
 
 **Checkpoints principais:**
-- Qwen3.8-Flash-Next-NVFP4 (48 layers, 36 GDN, 12 QSA, 256 experts, MTP nativo)
-- Qwen3.6-35B-A3B-NVFP4 (48 layers, MoE 8 experts ativos)
+- **Família Qwen 3.8 Flash Next** — **ALVO ÚNICO EXCLUSIVO ATUAL**:
+  - `Qwen3.8-Flash-Next-NVFP4-Radix` (`/models/Qwen3.8-Flash-Next-NVFP4-Radix`): 48 layers (36 GDN, 12 QSA), 256 experts, MTP nativo em Blackwell SM120.
+  - `Qwen3.8-Flash-Next-Unsloth-IQ4_XS` (`/models/Qwen3.8-Flash-Next-Unsloth-IQ4_XS`): Checkpoint GGUF compacto (UD-IQ4_XS sharded + MTP heads em `MTP/`), alvo de alta performance TG por menor tamanho e footprint de memória.
+- *Demais modelos (Qwen 35B-A3B, Ornith, Tiel, etc.) temporariamente BLOQUEADOS para novas features/testes; foco 100% na família Qwen 3.8 Flash Next.*
 
 ---
 
-## Estado Atual (2026-09-18)
+## Estado Atual (2026-09-19)
 
 ### ✅ CONCLUÍDO — Roadmap Lines 1-8, 11
 - **Line 1-3:** Lineage, build, baselines reproduzidos (35B: PP 4611/TG 158.8; Flash: PP 1858/TG 28.7)
@@ -36,6 +38,22 @@
   - Pillar 2: Zero-replay GDN
   - Split-kernel Turbo4/QSA: decompressão separada + attention denso (evita ptxas host-OOM)
 
+### ✅ CONCLUÍDO NESTA SESSÃO (2026-09-19)
+- **Benchmark MTP Varredura Completa NVFP4 (k=0..6):**
+  - $k=0$ (Greedy baseline): **TG 27.73 tok/s**, PP 1681 tok/s, VRAM 13.75 GiB, sha1 `c0e2b6c30ac9`
+  - $k=1$ (MTP Speculative): **TG 24.39 tok/s**, PP 1670 tok/s, VRAM 14.49 GiB, sha1 `17f277f43565`, 100% accept (1/1)
+  - $k=2$ (MTP Multi-Token): **TG 25.09 tok/s** (best MTP TG), PP 1687 tok/s, VRAM 14.49 GiB, sha1 `17f277f43565`, 100% accept (2/2)
+  - $k=3$: **CRASH** — shape mismatch GDN layer [48,128,128] vs [1,48,128,128] durante verify forward
+  - $k=4,5,6$: Não testados (k=3 falhou)
+  - **Conclusão:** Para NVFP4 + naive cache + Radix backend em 16K context, MTP overhead excede benefício — melhor TG em k=0 (27.73 tok/s). MTP k=2 é melhor entre configs MTP (25.09 tok/s) mas ainda 9.5% abaixo do baseline.
+- **GGUF Adapter qwen4_exp — ARQUITETURA INCOMPATÍVEL:**
+  - Checkpoint `Qwen3.8-Flash-Next-Unsloth-IQ4_XS/UD-IQ4_XS` tem geometrias divergentes:
+    - PLE key_proj: GGUF tem [10240, 2560] (in=hidden_size), modelo espera [10240, 160] (in=ple_embed_dim)
+    - Indexer k_proj: GGUF tem 1 head (128), modelo espera 2 heads (256)
+  - Fixes parciais aplicados (detecção automática ple_embed_dim via tensor shape), mas mismatches estruturais impedem load completo.
+  - **Bloqueado** até realinhamento de arquitetura ou conversão do checkpoint.
+- **Documentação Atualizada:** `docs/dev/PERFORMANCE.md` (anchors NVFP4 k=0,1,2,3), `docs/dev/STATE.md` (status atual)
+
 ### ⏳ PENDENTE — Roadmap Lines 12-18
 - Line 12: TCQ/VBR policy
 - Line 13: PLE tiered/paged RAM KV
@@ -55,6 +73,10 @@
 | 35B-A3B | 128K | 3189 | 89.3 | 14.4 GiB | 22.0 GiB | — |
 | 35B-A3B | 256K | 2354 | 63.8 | 14.5 GiB | 22.0 GiB | — |
 | Flash-Next | 128K | 1376 | 4.86 | 14.84 GiB | — | — |
+| **Flash-Next NVFP4 (naive cache) k=0** | 16K | **1681** | **27.73** | 13.75 GiB | 69.7 GiB | 94.4% |
+| **Flash-Next NVFP4 (naive cache) k=1** | 16K | 1670 | 24.39 | 14.49 GiB | 69.7 GiB | 87.3% |
+| **Flash-Next NVFP4 (naive cache) k=2** | 16K | 1687 | **25.09** | 14.49 GiB | 70.4 GiB | 92.4% |
+| **Flash-Next NVFP4 (naive cache) k=3** | 16K | — | **CRASH** | — | — | — |
 
 ---
 
@@ -102,7 +124,7 @@ export TMPDIR=/models/desenvolvimento/tmp
 
 | Arquivo | Papel | Conteúdo Principal |
 |---------|-------|-------------------|
-| `STATE.md` | Estado executável atual | Snapshot 2026-09-18, handoffs, gates, comandos |
+| `STATE.md` | Estado executável atual | Snapshot 2026-09-19, handoffs, gates, comandos |
 | `ROADMAP.md` | Plano fases 1-18 | Status, gates, dependências |
 | `LESSONS.md` | Padrões sintoma→causa→fix | 164 entradas validadas em hardware real |
 | `DECISIONS.md` | Registro imutável D-001 a D-023 | Por que cada escolha arquitetural |
@@ -117,9 +139,7 @@ export TMPDIR=/models/desenvolvimento/tmp
 
 ## Próximos Passos Imediatos (Prioridade)
 
-1. **Validar split-kernel Turbo4/QSA** em 16K contra baseline Triton+BF16 (sha1 match)
-2. **Medir accept-rate + TG** MTP=1 com Turbo4 ativo (goal priority 4)
-3. **Resolver non-determinismo** requests sequenciais same-server (logging logits top-2)
-4. **Live test k=2/k=3** content equivalence (short + ocean poem prompt)
-5. **Implementar prefill-window MTP warm-up** (EXP-025 gap)
-6. **Phase 7:** Expert pool keyed by (bank, role, type) — unblock Ornith/Tiel MoE GGUF
+1. Investigar crash k=3 (GDN shape mismatch) — possível fix em `scheduler/spec.py` verify forward path
+2. Resolver mismatches arquiteturais GGUF Unsloth-IQ4_XS (PLE dims, indexer heads)
+3. Executar `benchmarks/cert_matrix.py` para matriz completa de certificação
+4. Testes 512K/1M diferidos (requerem flag `--allow-rope-extend`)

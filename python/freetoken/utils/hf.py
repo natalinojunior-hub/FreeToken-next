@@ -48,9 +48,7 @@ def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
     return tokenizer
 
 
-def load_eos_token_ids(
-    model_path: str, tokenizer: PreTrainedTokenizerBase
-) -> FrozenSet[int]:
+def load_eos_token_ids(model_path: str, tokenizer: PreTrainedTokenizerBase) -> FrozenSet[int]:
     """Return the full set of stop-token ids for generation.
 
     Chat models often terminate a turn with a token other than ``tokenizer.eos_token``
@@ -79,9 +77,7 @@ def load_eos_token_ids(
     return frozenset(ids)
 
 
-def load_toolcall_anchor_id(
-    tokenizer: PreTrainedTokenizerBase, opener: str | None
-) -> int | None:
+def load_toolcall_anchor_id(tokenizer: PreTrainedTokenizerBase, opener: str | None) -> int | None:
     """The single token id of ``opener`` -- the wire format's unique tool-call opening
     marker, declared by the model's detector (``BaseFormatDetector.toolcall_opener``).
     None when there is no opener or the tokenizer spells it with more than one token:
@@ -259,7 +255,9 @@ def _weight_allow_patterns(repo_id: str) -> list[str]:
     except Exception as e:
         logger.warning(
             "no usable %s for %s (%s); falling back to *.safetensors",
-            SAFE_WEIGHTS_INDEX_NAME, repo_id, e,
+            SAFE_WEIGHTS_INDEX_NAME,
+            repo_id,
+            e,
         )
         return ["*.safetensors"]
     return shards or ["*.safetensors"]

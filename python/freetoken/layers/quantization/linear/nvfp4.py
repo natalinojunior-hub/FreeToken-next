@@ -24,12 +24,16 @@ class TritonNvfp4LinearKernel(LinearKernel):
     def finalize(self, layer: Any) -> None:
         from freetoken.kernel.triton.nvfp4_linear import nvfp4_transpose_resident
 
-        layer.weight, layer.weight_scale = nvfp4_transpose_resident(layer.weight, layer.weight_scale)
+        layer.weight, layer.weight_scale = nvfp4_transpose_resident(
+            layer.weight, layer.weight_scale
+        )
 
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
         from freetoken.kernel.triton.nvfp4_linear import nvfp4_dense_linear_t
 
-        return nvfp4_dense_linear_t(x, layer.weight, layer.weight_scale, layer.weight_global, layer.bias)
+        return nvfp4_dense_linear_t(
+            x, layer.weight, layer.weight_scale, layer.weight_global, layer.bias
+        )
 
 
 class MarlinNvfp4LinearKernel(LinearKernel):
@@ -55,7 +59,9 @@ class MarlinNvfp4LinearKernel(LinearKernel):
         return None
 
     def finalize(self, layer: Any) -> None:
-        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import prepare_fp4_layer_for_marlin
+        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+            prepare_fp4_layer_for_marlin,
+        )
 
         # Marlin wants the per-tensor scalar; weight_global is that scalar broadcast to [N]
         packed = SimpleNamespace(
@@ -77,7 +83,9 @@ class MarlinNvfp4LinearKernel(LinearKernel):
         layer.weight_global = torch.empty(0, dtype=torch.float16, device=dev)
 
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
-        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import apply_fp4_marlin_linear
+        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+            apply_fp4_marlin_linear,
+        )
 
         out = apply_fp4_marlin_linear(
             input=x,
@@ -102,8 +110,11 @@ class EmulationNvfp4LinearKernel(LinearKernel):
         *lead, K = x.shape
         slots = torch.zeros(1, dtype=torch.int32, device=x.device)
         w = dequant_nvfp4(
-            layer.weight.unsqueeze(0), layer.weight_scale.unsqueeze(0), layer.weight_global.unsqueeze(0),
-            slots, dtype=torch.bfloat16,
+            layer.weight.unsqueeze(0),
+            layer.weight_scale.unsqueeze(0),
+            layer.weight_global.unsqueeze(0),
+            slots,
+            dtype=torch.bfloat16,
         )[0]
         out = (x.reshape(-1, K) @ w.t()).to(x.dtype).reshape(*lead, w.shape[0])
         return out + layer.bias.to(out.dtype) if layer.bias is not None else out
@@ -121,4 +132,6 @@ class Nvfp4LinearMethod(LinearMethod):
         layer.weight_scale = torch.empty(g.out_features, g.in_features // GROUP, dtype=FP8)
         layer.weight_global = torch.empty(g.out_features, dtype=torch.float16)
         # no W4A16 kernel reads it; declared so a W4A4 checkpoint loads complete and a W4A4 kernel finds it in place
-        layer.input_scale = torch.empty((), dtype=torch.float32) if self.scheme.has("input_scale") else None
+        layer.input_scale = (
+            torch.empty((), dtype=torch.float32) if self.scheme.has("input_scale") else None
+        )

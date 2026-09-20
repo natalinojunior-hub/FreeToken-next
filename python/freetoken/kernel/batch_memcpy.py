@@ -48,7 +48,9 @@ def load_batch_memcpy():
     """
     cuda = torch.version.cuda
     if cuda is None or tuple(int(x) for x in cuda.split(".")[:2]) < (13, 0):
-        raise RuntimeError(f"cudaMemcpyBatchAsync binding requires CUDA >= 13.0 (torch built with {cuda})")
+        raise RuntimeError(
+            f"cudaMemcpyBatchAsync binding requires CUDA >= 13.0 (torch built with {cuda})"
+        )
     fn = _jit_batch_memcpy_module().batch_memcpy
     _probe(fn)
     return fn

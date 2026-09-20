@@ -199,9 +199,9 @@ def moe_sum_reduce_triton(input: torch.Tensor, output: torch.Tensor) -> None:
 
 def mxfp4_fused_moe_kernel_t_triton(
     A: torch.Tensor,
-    B_blocks_t: torch.Tensor,   # transposed layout [E, K//2, N] (uint8, N innermost)
-    B_scales_t: torch.Tensor,   # transposed layout [E, K//32, N] (uint8)
-    bias: torch.Tensor,         # [E, N]
+    B_blocks_t: torch.Tensor,  # transposed layout [E, K//2, N] (uint8, N innermost)
+    B_scales_t: torch.Tensor,  # transposed layout [E, K//32, N] (uint8)
+    bias: torch.Tensor,  # [E, N]
     C: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -268,12 +268,12 @@ def mxfp4_fused_moe_kernel_t_triton(
         topk_ids.numel(),
         A.stride(0),
         A.stride(1),
-        B_blocks_t.stride(0),   # stride_be
-        B_blocks_t.stride(2),   # stride_bn  (N axis, contiguous)
-        B_blocks_t.stride(1),   # stride_bk2 (K-byte axis)
-        B_scales_t.stride(0),   # stride_se
-        B_scales_t.stride(2),   # stride_sn  (N axis, contiguous)
-        B_scales_t.stride(1),   # stride_sk32 (scale-K axis)
+        B_blocks_t.stride(0),  # stride_be
+        B_blocks_t.stride(2),  # stride_bn  (N axis, contiguous)
+        B_blocks_t.stride(1),  # stride_bk2 (K-byte axis)
+        B_scales_t.stride(0),  # stride_se
+        B_scales_t.stride(2),  # stride_sn  (N axis, contiguous)
+        B_scales_t.stride(1),  # stride_sk32 (scale-K axis)
         bias.stride(0),
         bias.stride(1),
         C.stride(-2),
@@ -434,8 +434,22 @@ def gpt_oss_fused_routing(
 
 
 _FP4_LUT_FLOATS = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
 ]
 _fp4_lut_cache: Dict[Any, "torch.Tensor"] = {}
 
@@ -487,18 +501,38 @@ def mxfp4_splitk_gemv_triton(
 
     grid = (triton.cdiv(N, block_n), routes * num_splits)
     mxfp4_splitk_gemv_kernel[grid](
-        x, w_blocks_t, w_scales_t, bias_arg, expert_ids, partial, lut, N, K,
-        stride_xe, w_blocks_t.stride(0), w_blocks_t.stride(1),
-        w_scales_t.stride(0), w_scales_t.stride(1), bias_stride, N,
-        HAS_BIAS=has_bias, BLOCK_N=block_n,  # type: ignore
-        NUM_K_SPLITS=num_splits, K_GROUPS_PER_SPLIT=kgps,  # type: ignore
+        x,
+        w_blocks_t,
+        w_scales_t,
+        bias_arg,
+        expert_ids,
+        partial,
+        lut,
+        N,
+        K,
+        stride_xe,
+        w_blocks_t.stride(0),
+        w_blocks_t.stride(1),
+        w_scales_t.stride(0),
+        w_scales_t.stride(1),
+        bias_stride,
+        N,
+        HAS_BIAS=has_bias,
+        BLOCK_N=block_n,  # type: ignore
+        NUM_K_SPLITS=num_splits,
+        K_GROUPS_PER_SPLIT=kgps,  # type: ignore
         num_warps=num_warps,
     )
     has_wts = expert_wts is not None
     rgrid = (triton.cdiv(N, block_n), routes)
     mxfp4_splitk_reduce_kernel[rgrid](
-        partial, out, N, expert_wts if has_wts else x,
-        HAS_EXPERT_WTS=has_wts, NUM_K_SPLITS=num_splits, BLOCK_N=block_n,  # type: ignore
+        partial,
+        out,
+        N,
+        expert_wts if has_wts else x,
+        HAS_EXPERT_WTS=has_wts,
+        NUM_K_SPLITS=num_splits,
+        BLOCK_N=block_n,  # type: ignore
         num_warps=num_warps,
     )
     return out

@@ -40,8 +40,11 @@ class MuseGlimmerMLP(BaseOP):
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = LinearReplicated(
-            config.intermediate_size, config.hidden_size, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.down_proj",
+            config.intermediate_size,
+            config.hidden_size,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.down_proj",
         )
 
     @nvtx_annotate("MLP")

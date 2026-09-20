@@ -29,11 +29,11 @@ def _pack_q4_0(nibbles: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     S, OUT, K = nibbles.shape
     nb = K // 32
     blk = nibbles.reshape(S, OUT, nb, 32)
-    lo = blk[..., :16]      # elems 0..15 -> low nibbles of bytes 0..15
-    hi = blk[..., 16:]      # elems 16..31 -> high nibbles of bytes 0..15
-    packed = (lo | (hi << 4)).to(torch.uint8)                       # [S, OUT, nb, 16]
+    lo = blk[..., :16]  # elems 0..15 -> low nibbles of bytes 0..15
+    hi = blk[..., 16:]  # elems 16..31 -> high nibbles of bytes 0..15
+    packed = (lo | (hi << 4)).to(torch.uint8)  # [S, OUT, nb, 16]
     d_bytes = scale.to(torch.float16).view(torch.uint8).reshape(S, OUT, nb, 2)
-    row = torch.cat([d_bytes, packed], dim=-1)                      # [S, OUT, nb, 18]
+    row = torch.cat([d_bytes, packed], dim=-1)  # [S, OUT, nb, 18]
     return row.reshape(S, OUT, nb * 18).contiguous()
 
 
@@ -56,7 +56,7 @@ def _make_q4_0_cache(L, E, H, I, seed=0):
     def rows(OUT, K):
         nib = torch.randint(0, 16, (S, OUT, K), dtype=torch.uint8)
         scale = 0.02 + 0.03 * torch.rand(S, OUT, K // 32)
-        packed = _pack_q4_0(nib, scale)                            # [S, OUT, K//32*18]
+        packed = _pack_q4_0(nib, scale)  # [S, OUT, K//32*18]
         pinned = alloc_pinned_tensor(*packed.shape, dtype=torch.uint8)
         pinned.copy_(packed)
         return pinned
@@ -78,7 +78,7 @@ def test_cpu_decode_q4_0_matches_dequant_then_gpu(bs):
     from freetoken.moe.fused import fused_experts_decode_impl
 
     torch.manual_seed(400 + bs)
-    L, E, H, I, top_k = 3, 16, 2816, 704, 8   # gemma-4-26B-A4B geometry (H,I % 32 == 0)
+    L, E, H, I, top_k = 3, 16, 2816, 704, 8  # gemma-4-26B-A4B geometry (H,I % 32 == 0)
     layer = 1
     dev = torch.device("cuda")
     cache = _make_q4_0_cache(L, E, H, I)
@@ -102,7 +102,7 @@ def test_cpu_decode_q4_0_matches_dequant_then_gpu(bs):
 
     b = cache.bank_sources
     gate_up_layer = _dequant_bank(b["gate_up"][layer], H, dev)  # [E, 2I, H]
-    down_layer = _dequant_bank(b["down"][layer], I, dev)        # [E, H, I]
+    down_layer = _dequant_bank(b["down"][layer], I, dev)  # [E, H, I]
     gpu_out = fused_experts_decode_impl(
         hidden, gate_up_layer, down_layer, w, ids.clone(), "gelu_tanh", False
     ).float()
@@ -125,8 +125,13 @@ def test_cpu_decode_q4_0_matches_ggml_mmvq():
     cache = _make_q4_0_cache(L, E, H, I)
 
     ex = CpuMoeExecutor(
-        cache, top_k=top_k, activation="gelu_tanh",
-        apply_router_weight_on_input=False, num_threads=0, max_tokens=bs, device=dev,
+        cache,
+        top_k=top_k,
+        activation="gelu_tanh",
+        apply_router_weight_on_input=False,
+        num_threads=0,
+        max_tokens=bs,
+        device=dev,
     )
 
     hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16) * 0.5
@@ -163,8 +168,13 @@ def test_cpu_moe_decode_q4_0_cuda_graph_replay():
     torch.cuda.set_stream(stream)
 
     ex = CpuMoeExecutor(
-        cache, top_k=top_k, activation="gelu_tanh",
-        apply_router_weight_on_input=False, num_threads=8, max_tokens=bs, device=dev,
+        cache,
+        top_k=top_k,
+        activation="gelu_tanh",
+        apply_router_weight_on_input=False,
+        num_threads=8,
+        max_tokens=bs,
+        device=dev,
     )
     b = cache.bank_sources
     gate_up_layer = _dequant_bank(b["gate_up"][layer], H, dev)

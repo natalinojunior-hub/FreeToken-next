@@ -69,9 +69,7 @@ def mhc_pre(
         comb = comb / (comb.sum(dim=-1, keepdim=True) + hc_eps)
         comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
 
-    layer_input = (
-        (pre_mix.unsqueeze(-1) * residual.to(torch.float32)).sum(dim=1).to(residual.dtype)
-    )
+    layer_input = (pre_mix.unsqueeze(-1) * residual.to(torch.float32)).sum(dim=1).to(residual.dtype)
     return post_mix.view(t, n, 1), comb, layer_input
 
 
@@ -82,9 +80,7 @@ def mhc_post(
     comb_mix: torch.Tensor,  # [T, n, n] fp32
 ) -> torch.Tensor:
     """out_j = sum_i comb_ij * residual_i + post_j * x; returns [T, n, hidden]."""
-    mixed = torch.einsum(
-        "tij,tih->tjh", comb_mix.to(torch.float32), residual.to(torch.float32)
-    )
+    mixed = torch.einsum("tij,tih->tjh", comb_mix.to(torch.float32), residual.to(torch.float32))
     post = post_mix.to(torch.float32) * x.unsqueeze(-2).to(torch.float32)
     return (mixed + post).to(residual.dtype)
 
@@ -131,12 +127,30 @@ def mhc_fused_post_pre(
         from freetoken.kernel.triton.mhc import mhc_fused_post_pre_triton
 
         return mhc_fused_post_pre_triton(
-            x, residual, post_mix, comb_mix, fn, hc_scale, hc_base,
-            rms_eps, hc_eps, post_mult, sinkhorn_repeat,
+            x,
+            residual,
+            post_mix,
+            comb_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_eps,
+            post_mult,
+            sinkhorn_repeat,
         )
     return mhc_fused_post_pre_torch(
-        x, residual, post_mix, comb_mix, fn, hc_scale, hc_base,
-        rms_eps, hc_eps, post_mult, sinkhorn_repeat,
+        x,
+        residual,
+        post_mix,
+        comb_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_eps,
+        post_mult,
+        sinkhorn_repeat,
     )
 
 

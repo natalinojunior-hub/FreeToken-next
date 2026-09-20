@@ -67,7 +67,9 @@ STOP_REASON_MAP = {
 }
 
 
-def _anthropic_stop(finish_reason: str | None, matched_stop: str | None) -> tuple[str | None, str | None]:
+def _anthropic_stop(
+    finish_reason: str | None, matched_stop: str | None
+) -> tuple[str | None, str | None]:
     """(stop_reason, stop_sequence). A stop-string hit is reported as 'stop_sequence'
     with the matched string, otherwise the finish_reason is mapped normally."""
     if matched_stop is not None:
@@ -86,7 +88,9 @@ def register_anthropic_routes(
         state = get_state()
         mstate = getattr(state, "maintenance_state", "serving")
         if mstate != "serving":
-            detail = "model is still loading" if mstate == "loading" else "cache rebuild in progress"
+            detail = (
+                "model is still loading" if mstate == "loading" else "cache rebuild in progress"
+            )
             return _anthropic_error_response(503, "overloaded_error", detail)
         return await handle_anthropic_messages(req, request, state, get_model_sampling())
 
@@ -115,7 +119,8 @@ async def handle_anthropic_messages(
 ):
     try:
         spec = convert_anthropic_to_genspec(
-            req, model_sampling,
+            req,
+            model_sampling,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
             default_max_tokens=(
                 getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
@@ -129,7 +134,9 @@ async def handle_anthropic_messages(
     if req.stream:
         events = anthropic_event_stream(
             generate_events(uid, spec, state, source="/v1/messages"),
-            req.model, uid, cache_report=cache_report,
+            req.model,
+            uid,
+            cache_report=cache_report,
         )
         if request is not None:
             events = state.stream_with_cancellation(events, request, uid)
@@ -182,7 +189,9 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
 def convert_anthropic_prompt(
     req: AnthropicMessagesRequest | AnthropicCountTokensRequest,
     reasoning_parser: str | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None, list[dict[str, Any]] | None, dict[str, Any]]:
+) -> tuple[
+    list[dict[str, Any]], list[dict[str, Any]] | None, list[dict[str, Any]] | None, dict[str, Any]
+]:
     """(messages, template_tools, parser_tools, chat_template_kwargs) — the prompt
     side of the conversion, shared by /v1/messages and /v1/messages/count_tokens so
     a counted prompt is exactly the prompt a generation would tokenize."""
@@ -194,9 +203,7 @@ def convert_anthropic_prompt(
         if isinstance(req.system, str):
             system_texts.append(req.system)
         else:
-            system_texts.append(
-                "".join(b.text for b in req.system if b.type == "text" and b.text)
-            )
+            system_texts.append("".join(b.text for b in req.system if b.type == "text" and b.text))
 
     other: list[dict[str, Any]] = []
     for msg in req.messages:
@@ -245,7 +252,9 @@ def convert_anthropic_prompt(
                     content_parts.extend(images)
                 else:
                     if images:
-                        raise ValueError("images inside a tool_result are only accepted in a user message")
+                        raise ValueError(
+                            "images inside a tool_result are only accepted in a user message"
+                        )
                     content_parts.append({"type": "text", "text": f"Tool result: {text}"})
 
         openai_msg: dict[str, Any] = {"role": msg.role}
@@ -285,7 +294,9 @@ def convert_anthropic_prompt(
     if req.tool_choice and req.tool_choice.type == "none":
         template_tools, parser_tools = None, None
     else:
-        selected = req.tool_choice.name if (req.tool_choice and req.tool_choice.type == "tool") else None
+        selected = (
+            req.tool_choice.name if (req.tool_choice and req.tool_choice.type == "tool") else None
+        )
         template_tools, parser_tools = split_tool_lists(raw_tools, selected)
 
     # Native extended-thinking toggle -> template kwargs, broadcast in every
@@ -434,18 +445,24 @@ async def anthropic_event_stream(
     def _open_text() -> str:
         nonlocal block_open
         block_open = "text"
-        return _event(AnthropicStreamEvent(
-            type="content_block_start", index=block_index,
-            content_block=AnthropicContentBlock(type="text", text=""),
-        ))
+        return _event(
+            AnthropicStreamEvent(
+                type="content_block_start",
+                index=block_index,
+                content_block=AnthropicContentBlock(type="text", text=""),
+            )
+        )
 
     def _open_thinking() -> str:
         nonlocal block_open
         block_open = "thinking"
-        return _event(AnthropicStreamEvent(
-            type="content_block_start", index=block_index,
-            content_block=AnthropicContentBlock(type="thinking", thinking=""),
-        ))
+        return _event(
+            AnthropicStreamEvent(
+                type="content_block_start",
+                index=block_index,
+                content_block=AnthropicContentBlock(type="thinking", thinking=""),
+            )
+        )
 
     def _stop_block() -> list[str]:
         nonlocal block_open, block_index
@@ -454,36 +471,52 @@ async def anthropic_event_stream(
             # Real thinking blocks end with a signature_delta; emit an empty one for
             # shape compliance (this server has no signing key and never verifies
             # signatures on replayed thinking blocks).
-            frames.append(_event(AnthropicStreamEvent(
-                type="content_block_delta", index=block_index,
-                delta=AnthropicDelta(type="signature_delta", signature=""),
-            )))
+            frames.append(
+                _event(
+                    AnthropicStreamEvent(
+                        type="content_block_delta",
+                        index=block_index,
+                        delta=AnthropicDelta(type="signature_delta", signature=""),
+                    )
+                )
+            )
         frames.append(_event(AnthropicStreamEvent(type="content_block_stop", index=block_index)))
         block_open = None
         block_index += 1
         return frames
 
     # message_start (input_tokens filled in by the terminal message_delta).
-    yield _event(AnthropicStreamEvent(
-        type="message_start",
-        message=AnthropicMessagesResponse(
-            id=f"msg_{uid}", content=[], model=model,
-            usage=AnthropicUsage(input_tokens=0, output_tokens=0),
-        ),
-    ))
+    yield _event(
+        AnthropicStreamEvent(
+            type="message_start",
+            message=AnthropicMessagesResponse(
+                id=f"msg_{uid}",
+                content=[],
+                model=model,
+                usage=AnthropicUsage(input_tokens=0, output_tokens=0),
+            ),
+        )
+    )
 
     def _open_tool(name: str | None, ordinal: int | None, stable: bool = True) -> list[str]:
         nonlocal block_open, tool_args_sent, tool_ordinal, tool_stable
         frames: list[str] = []
         if block_open:
             frames.extend(_stop_block())
-        frames.append(_event(AnthropicStreamEvent(
-            type="content_block_start", index=block_index,
-            content_block=AnthropicContentBlock(
-                type="tool_use", id=_tool_use_id(name, block_index),
-                name=name, input={},
-            ),
-        )))
+        frames.append(
+            _event(
+                AnthropicStreamEvent(
+                    type="content_block_start",
+                    index=block_index,
+                    content_block=AnthropicContentBlock(
+                        type="tool_use",
+                        id=_tool_use_id(name, block_index),
+                        name=name,
+                        input={},
+                    ),
+                )
+            )
+        )
         block_open = "tool"
         tool_args_sent = ""
         tool_ordinal = ordinal
@@ -493,10 +526,13 @@ async def anthropic_event_stream(
     def _tool_args_delta(fragment: str) -> str:
         nonlocal tool_args_sent
         tool_args_sent += fragment
-        return _event(AnthropicStreamEvent(
-            type="content_block_delta", index=block_index,
-            delta=AnthropicDelta(type="input_json_delta", partial_json=fragment),
-        ))
+        return _event(
+            AnthropicStreamEvent(
+                type="content_block_delta",
+                index=block_index,
+                delta=AnthropicDelta(type="input_json_delta", partial_json=fragment),
+            )
+        )
 
     tool_args_sent = ""
     tool_ordinal: int | None = None
@@ -516,10 +552,13 @@ async def anthropic_event_stream(
                         for f in _stop_block():
                             yield f
                     yield _open_thinking()
-                yield _event(AnthropicStreamEvent(
-                    type="content_block_delta", index=block_index,
-                    delta=AnthropicDelta(type="thinking_delta", thinking=ev.text),
-                ))
+                yield _event(
+                    AnthropicStreamEvent(
+                        type="content_block_delta",
+                        index=block_index,
+                        delta=AnthropicDelta(type="thinking_delta", thinking=ev.text),
+                    )
+                )
 
             elif isinstance(ev, ContentDelta):
                 if ev.text == "":
@@ -529,10 +568,13 @@ async def anthropic_event_stream(
                         for f in _stop_block():
                             yield f
                     yield _open_text()
-                yield _event(AnthropicStreamEvent(
-                    type="content_block_delta", index=block_index,
-                    delta=AnthropicDelta(type="text_delta", text=ev.text),
-                ))
+                yield _event(
+                    AnthropicStreamEvent(
+                        type="content_block_delta",
+                        index=block_index,
+                        delta=AnthropicDelta(type="text_delta", text=ev.text),
+                    )
+                )
 
             elif isinstance(ev, ToolCallStart):
                 for f in _open_tool(ev.name, ev.tool_index, ev.args_prefix_stable):
@@ -552,7 +594,7 @@ async def anthropic_event_stream(
                         # the final (authoritative) arguments wasn't streamed yet.
                         final = call.parameters or ""
                         if final.startswith(tool_args_sent):
-                            remainder = final[len(tool_args_sent):]
+                            remainder = final[len(tool_args_sent) :]
                             if remainder:
                                 yield _tool_args_delta(remainder)
                         for f in _stop_block():
@@ -570,13 +612,15 @@ async def anthropic_event_stream(
                     for f in _stop_block():
                         yield f
                 stop_reason, stop_sequence = _anthropic_stop(ev.finish_reason, ev.matched_stop)
-                yield _event(AnthropicStreamEvent(
-                    type="message_delta",
-                    delta=AnthropicDelta(stop_reason=stop_reason, stop_sequence=stop_sequence),
-                    usage=_anthropic_usage(
-                        ev.prompt_tokens, ev.completion_tokens, ev.cached_tokens, cache_report
-                    ),
-                ))
+                yield _event(
+                    AnthropicStreamEvent(
+                        type="message_delta",
+                        delta=AnthropicDelta(stop_reason=stop_reason, stop_sequence=stop_sequence),
+                        usage=_anthropic_usage(
+                            ev.prompt_tokens, ev.completion_tokens, ev.cached_tokens, cache_report
+                        ),
+                    )
+                )
                 yield _event(AnthropicStreamEvent(type="message_stop"))
                 # Anthropic streams terminate on message_stop — no OpenAI-style
                 # `data: [DONE]` sentinel (it would be an unknown event to strict clients).
@@ -587,16 +631,22 @@ async def anthropic_event_stream(
         if block_open:
             for f in _stop_block():
                 yield f
-        yield _event(AnthropicStreamEvent(
-            type="error", error=AnthropicError(type="invalid_request_error", message=str(exc)),
-        ))
+        yield _event(
+            AnthropicStreamEvent(
+                type="error",
+                error=AnthropicError(type="invalid_request_error", message=str(exc)),
+            )
+        )
     except Exception as exc:  # noqa: BLE001 — surface as an Anthropic error event
         if block_open:
             for f in _stop_block():
                 yield f
-        yield _event(AnthropicStreamEvent(
-            type="error", error=AnthropicError(type="internal_error", message=str(exc)),
-        ))
+        yield _event(
+            AnthropicStreamEvent(
+                type="error",
+                error=AnthropicError(type="internal_error", message=str(exc)),
+            )
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -635,9 +685,7 @@ def _validation_error_message(exc: RequestValidationError) -> str:
         return "invalid request"
 
 
-def _anthropic_error_response(
-    status_code: int, err_type: str, message: str
-) -> JSONResponse:
+def _anthropic_error_response(status_code: int, err_type: str, message: str) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
         content=AnthropicErrorResponse(

@@ -30,9 +30,19 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
     """
 
     def __init__(
-        self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
-        conv_kernel_size, rms_norm_eps, layer_id, output_gate: str = "sigmoid",
-        *, quant_config: QuantConfig | None = None, prefix: str = "",
+        self,
+        hidden_size,
+        num_k_heads,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+        conv_kernel_size,
+        rms_norm_eps,
+        layer_id,
+        output_gate: str = "sigmoid",
+        *,
+        quant_config: QuantConfig | None = None,
+        prefix: str = "",
     ):
         self.layer_id = layer_id
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
@@ -52,24 +62,34 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         self.conv_kernel_size = conv_kernel_size
         # quantized checkpoints quantize qkv|z but not b|a, so the fusion splits into a qkvz GEMM and a ba GEMM with their own schemes (matches sglang / vLLM)
         self._split_in_proj = (
-            quant_config is not None and quant_config.scheme_for(f"{prefix}.in_proj_qkvz") is not None
+            quant_config is not None
+            and quant_config.scheme_for(f"{prefix}.in_proj_qkvz") is not None
         )
 
         self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
         if self._split_in_proj:
             self.in_proj_qkvz = LinearColParallelMerged(
-                hidden_size, [self.conv_dim, self.value_dim], has_bias=False,
-                quant_config=quant_config, prefix=f"{prefix}.in_proj_qkvz",
+                hidden_size,
+                [self.conv_dim, self.value_dim],
+                has_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj_qkvz",
             )
             self.in_proj_ba = LinearColParallelMerged(
-                hidden_size, [num_v_heads, num_v_heads], has_bias=False,
-                quant_config=quant_config, prefix=f"{prefix}.in_proj_ba",
+                hidden_size,
+                [num_v_heads, num_v_heads],
+                has_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj_ba",
             )
         else:
             # Fused input projection (one GEMM instead of four): qkv | z | b | a.
             self.in_proj = LinearColParallelMerged(
-                hidden_size, self._in_proj_split, has_bias=False,
-                quant_config=quant_config, prefix=f"{prefix}.in_proj",
+                hidden_size,
+                self._in_proj_split,
+                has_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj",
             )
         self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,
@@ -80,8 +100,11 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
         self.norm = GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=output_gate)
         self.out_proj = LinearReplicated(
-            self.value_dim, hidden_size, has_bias=False,
-            quant_config=quant_config, prefix=f"{prefix}.out_proj",
+            self.value_dim,
+            hidden_size,
+            has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.out_proj",
         )
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
@@ -92,14 +115,22 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
     def _conv_weight(self) -> torch.Tensor:
         return self.conv1d.weight.squeeze(1)  # [conv_dim, kernel] for the fused kernel
 
-    def _conv_prefill(self, conv_in, pool, cu_seqlens, cache_indices, has_initial_state) -> torch.Tensor:
+    def _conv_prefill(
+        self, conv_in, pool, cu_seqlens, cache_indices, has_initial_state
+    ) -> torch.Tensor:
         """Varlen causal conv (fused sgl_kernel) with silu; reads/updates each request's
         conv state in place by ``cache_indices`` slot. ``conv_in`` [total, conv_dim].
         ``cu_seqlens`` / ``cache_indices`` / ``has_initial_state`` come from FLAMetadata."""
         li = pool.local_index(self.layer_id)
         x = conv_in.transpose(0, 1).contiguous()  # [conv_dim, total]
-        out = causal_conv1d_varlen(x, self._conv_weight(), pool.conv_states[li],
-                                   cu_seqlens, cache_indices, has_initial_state)
+        out = causal_conv1d_varlen(
+            x,
+            self._conv_weight(),
+            pool.conv_states[li],
+            cu_seqlens,
+            cache_indices,
+            has_initial_state,
+        )
         return out.transpose(0, 1)  # [total, conv_dim]
 
     def _conv_decode(self, conv_in: torch.Tensor, table_idx: torch.Tensor, pool) -> torch.Tensor:
@@ -109,8 +140,9 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         li = pool.local_index(self.layer_id)
         return causal_conv1d_decode(conv_in, pool.conv_states[li], self._conv_weight(), table_idx)
 
-    def _write_track_snapshot(self, pool, li: int, conv_in: torch.Tensor,
-                              h: torch.Tensor, fla) -> None:
+    def _write_track_snapshot(
+        self, pool, li: int, conv_in: torch.Tensor, h: torch.Tensor, fla
+    ) -> None:
         """Snapshot this layer's recurrent + conv state at the chunk-aligned track boundary
         into a donatable pool slot, on the forward stream (hybrid-radix extra_buffer path).
         SSM: ``recurrent_states[li, dst] = h[0, h_row]`` -- a DIRECT copy (h is [V,K], the
@@ -122,6 +154,84 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         # conv_in [total, conv_dim]; gather the (kernel-1) window per tracked req.
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
+
+    def _spec_verify_step_by_step(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_in: torch.Tensor,
+        z: torch.Tensor,
+        li: int,
+        pool,
+        fla,
+        total: int,
+        dtype: torch.dtype,
+        batch=None,
+    ) -> torch.Tensor:
+        """Step-by-step verify forward for zero-replay GDN.
+
+        When spec_logits_indices is set, the verify batch has extend_len = k+1.
+        We process each token step-by-step using the decode kernel, capturing
+        recurrent+conv state checkpoints at each step for potential rollback.
+
+        Returns core_out [total, head_v_dim] matching chunk kernel output.
+        """
+        from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla
+        from freetoken.kernel.causal_conv1d import causal_conv1d_decode
+
+        B = 1  # speculative verification request is always a single sequence
+        device = conv_in.device
+
+        # Initialize checkpoints on batch if present
+        if batch is not None and getattr(batch, "gdn_checkpoints", None) is None:
+            batch.gdn_checkpoints = {}
+
+        cu_dec = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        core_outs = []
+
+        # Process each token step-by-step
+        for t in range(total):
+            # Single-token conv decode
+            mixed = self._conv_decode(conv_in[t : t + 1], fla.cache_indices, pool)  # [B, conv_dim]
+
+            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+            q_t = qf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
+            k_t = kf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
+            v_t = vf.reshape(1, B, self.num_v_heads, self.head_v_dim).to(dtype)
+
+            # Single-token recurrent decode
+            a_t = a[t : t + 1]
+            b_t = b[t : t + 1]
+
+            out_t = gdn_decode_fla(
+                q_t,
+                k_t,
+                v_t,
+                a_t,
+                b_t,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                state_source=pool.recurrent_states[li],
+                indices=fla.cache_indices,
+                cu_seqlens=cu_dec,
+                scale=self.head_k_dim**-0.5,
+            )
+
+            core_outs.append(out_t)
+
+            # Checkpoint: clone recurrent + conv state after this step
+            if batch is not None and getattr(batch, "gdn_checkpoints", None) is not None:
+                rec_state = pool.recurrent_states[li, fla.cache_indices].clone()
+                conv_state = pool.conv_states[li, fla.cache_indices].clone()
+                batch.gdn_checkpoints.setdefault(t, {})[li] = (rec_state, conv_state)
+
+        core_out = torch.cat(core_outs, dim=0)  # [total, num_v, V]
+        return core_out
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
@@ -162,13 +272,41 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             k = kf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
             v = vf.reshape(1, B, self.num_v_heads, self.head_v_dim).to(dtype)
             core_out = gdn_decode_fla(
-                q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
-                state_source=pool.recurrent_states[li], indices=fla.cache_indices,
-                cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+                q,
+                k,
+                v,
+                a,
+                b,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                state_source=pool.recurrent_states[li],
+                indices=fla.cache_indices,
+                cu_seqlens=fla.cu_seqlens,
+                scale=self.head_k_dim**-0.5,
+            )
+        elif getattr(batch, "spec_logits_indices", None) is not None and pool is not None:
+            # Zero-Replay GDN: process verify prefill step-by-step to capture exact checkpoints
+            core_out = self._spec_verify_step_by_step(
+                q=None,
+                k=None,
+                v=None,
+                g=None,
+                beta=None,
+                a=a,
+                b=b,
+                conv_in=conv_in,
+                z=z,
+                li=li,
+                pool=pool,
+                fla=fla,
+                total=total,
+                dtype=dtype,
+                batch=batch,
             )
         else:
             mixed = self._conv_prefill(
-                conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+                conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state
+            )
             # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
@@ -181,11 +319,18 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             # fresh sequences (cached_len==0) must start from a zeroed slot.
             if fla.fresh_state_indices is not None:
                 pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
+
             track = fla.track_dst is not None
             result = gdn_prefill_chunk_fla(
-                q, k, v, g, beta,
-                state_source=pool.recurrent_states[li], indices=fla.cache_indices,
-                cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+                q,
+                k,
+                v,
+                g,
+                beta,
+                state_source=pool.recurrent_states[li],
+                indices=fla.cache_indices,
+                cu_seqlens=fla.cu_seqlens,
+                scale=self.head_k_dim**-0.5,
                 return_h=track,
             )
             if track:

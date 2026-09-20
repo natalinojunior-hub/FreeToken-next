@@ -70,8 +70,17 @@ _SM_CFGS = [
 @triton.autotune(configs=_SM_CFGS, key=["CHUNK"], **autotune_cache_kwargs)
 @triton.jit
 def _sm_partial(
-    logits_ptr, pm_ptr, pl_ptr, temp_ptr, temp_scalar, HAS_TEMP: tl.constexpr,
-    V, G, CHUNK, row_stride, BLOCK_SIZE: tl.constexpr,
+    logits_ptr,
+    pm_ptr,
+    pl_ptr,
+    temp_ptr,
+    temp_scalar,
+    HAS_TEMP: tl.constexpr,
+    V,
+    G,
+    CHUNK,
+    row_stride,
+    BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     row = pid // G
@@ -101,8 +110,19 @@ def _sm_partial(
 @triton.autotune(configs=_SM_CFGS, key=["CHUNK"], **autotune_cache_kwargs)
 @triton.jit
 def _sm_finalize(
-    logits_ptr, probs_ptr, pm_ptr, pl_ptr, temp_ptr, temp_scalar, HAS_TEMP: tl.constexpr,
-    V, G, CHUNK, row_stride, G_POW2: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+    logits_ptr,
+    probs_ptr,
+    pm_ptr,
+    pl_ptr,
+    temp_ptr,
+    temp_scalar,
+    HAS_TEMP: tl.constexpr,
+    V,
+    G,
+    CHUNK,
+    row_stride,
+    G_POW2: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     row = pid // G
@@ -148,9 +168,23 @@ def softmax(logits, temperature=None, enable_pdl=None):
     pm = torch.empty(B * G, device=logits.device, dtype=torch.float32)
     pl = torch.empty(B * G, device=logits.device, dtype=torch.float32)
     grid = (B * G,)
-    _sm_partial[grid](logits, pm, pl, temp_arr, temp_scalar, has_temp, V, G, CHUNK, logits.stride(0))
-    _sm_finalize[grid](logits, probs, pm, pl, temp_arr, temp_scalar, has_temp, V, G, CHUNK,
-                       logits.stride(0), _next_pow2(G))
+    _sm_partial[grid](
+        logits, pm, pl, temp_arr, temp_scalar, has_temp, V, G, CHUNK, logits.stride(0)
+    )
+    _sm_finalize[grid](
+        logits,
+        probs,
+        pm,
+        pl,
+        temp_arr,
+        temp_scalar,
+        has_temp,
+        V,
+        G,
+        CHUNK,
+        logits.stride(0),
+        _next_pow2(G),
+    )
     return probs
 
 
@@ -170,7 +204,9 @@ def top_p_renorm_probs(probs, top_p):
 # ---------------------------------------------------------------------------
 # multi-CTA inverse-CDF draw
 # ---------------------------------------------------------------------------
-@triton.autotune(configs=_SR_CFGS, key=["CHUNK"], reset_to_zero=["psum_ptr"], **autotune_cache_kwargs)
+@triton.autotune(
+    configs=_SR_CFGS, key=["CHUNK"], reset_to_zero=["psum_ptr"], **autotune_cache_kwargs
+)
 @triton.jit
 def _draw_part(probs_ptr, thr_ptr, psum_ptr, V, G, CHUNK, row_stride, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
@@ -201,8 +237,20 @@ def _draw_scan(psum_ptr, choff_ptr, u_ptr, target_ptr, last_ptr, G, G_POW2: tl.c
 
 @triton.autotune(configs=_SR_CFGS, key=["CHUNK"], **autotune_cache_kwargs)
 @triton.jit
-def _draw_find(probs_ptr, thr_ptr, choff_ptr, target_ptr, psum_ptr, last_ptr, out_ptr, V, G, CHUNK, row_stride,
-               BLOCK_SIZE: tl.constexpr):
+def _draw_find(
+    probs_ptr,
+    thr_ptr,
+    choff_ptr,
+    target_ptr,
+    psum_ptr,
+    last_ptr,
+    out_ptr,
+    V,
+    G,
+    CHUNK,
+    row_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
     pid = tl.program_id(0)
     row = pid // G
     thr = tl.load(thr_ptr + row)
@@ -244,7 +292,11 @@ def _gen_u(B, device, seed, offset):
         _UGEN[device] = g
     if seed is not None:
         s = int(seed if not isinstance(seed, torch.Tensor) else seed.view(-1)[0])
-        o = 0 if offset is None else int(offset if not isinstance(offset, torch.Tensor) else offset.view(-1)[0])
+        o = (
+            0
+            if offset is None
+            else int(offset if not isinstance(offset, torch.Tensor) else offset.view(-1)[0])
+        )
         g.manual_seed((s * 0x9E3779B97F4A7C15 + o) & 0x7FFFFFFFFFFFFFFF)
     return torch.rand(B, device=device, generator=g, dtype=torch.float32)
 
@@ -272,8 +324,16 @@ def _zeros_thr(B, dev):
     return torch.zeros(B, device=dev, dtype=torch.float32)
 
 
-def sampling_from_probs(probs, indices=None, deterministic=True, generator=None,
-                        check_nan=False, seed=None, offset=None, return_valid=False):
+def sampling_from_probs(
+    probs,
+    indices=None,
+    deterministic=True,
+    generator=None,
+    check_nan=False,
+    seed=None,
+    offset=None,
+    return_valid=False,
+):
     probs = probs.float()
     src = probs if indices is None else probs[indices].contiguous()
     out = _draw(src, _zeros_thr(src.size(0), src.device), seed, offset)
@@ -281,8 +341,17 @@ def sampling_from_probs(probs, indices=None, deterministic=True, generator=None,
     return (out, torch.ones_like(out, dtype=torch.bool)) if return_valid else out
 
 
-def top_p_sampling_from_probs(probs, top_p, indices=None, deterministic=True, generator=None,
-                              check_nan=False, seed=None, offset=None, return_valid=False):
+def top_p_sampling_from_probs(
+    probs,
+    top_p,
+    indices=None,
+    deterministic=True,
+    generator=None,
+    check_nan=False,
+    seed=None,
+    offset=None,
+    return_valid=False,
+):
     probs = probs.float()
     src = probs if indices is None else probs[indices].contiguous()
     out = _topp(src, _topp_target(top_p, src.size(0), src.device), None, True, seed, offset)
@@ -321,15 +390,31 @@ def _row_barrier(bar_ptr, need):
 
 @triton.jit
 def _bits_round(
-    probs_ptr, base, start, end, hist_ptr, bar_ptr, target, lo, above, need,
-    S: tl.constexpr, WIDTH: tl.constexpr, BINS: tl.constexpr, BLOCK: tl.constexpr,
+    probs_ptr,
+    base,
+    start,
+    end,
+    hist_ptr,
+    bar_ptr,
+    target,
+    lo,
+    above,
+    need,
+    S: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BINS: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     jj = tl.arange(0, BINS)
     acc = tl.zeros([BINS], tl.int32)
     for s0 in tl.range(start, end, BLOCK):
         offs = s0 + tl.arange(0, BLOCK)
         mask = offs < end
-        y = tl.load(probs_ptr + base + offs, mask=mask, other=-1.0).to(tl.float32).to(tl.int32, bitcast=True)
+        y = (
+            tl.load(probs_ptr + base + offs, mask=mask, other=-1.0)
+            .to(tl.float32)
+            .to(tl.int32, bitcast=True)
+        )
         d = y - lo
         if WIDTH == 0:
             inrange = mask & (y >= lo) & (y <= _INF_BITS)
@@ -355,9 +440,23 @@ def _bits_round(
 
 @triton.jit
 def _topk_fused(
-    probs_ptr, target_ptr, hist_ptr, bar_ptr, ksum_ptr, psum_ptr, u_ptr, out_ptr, tok_ptr,
-    V, G, CHUNK, row_stride,
-    DRAW: tl.constexpr, G_POW2: tl.constexpr, BINS: tl.constexpr, BLOCK: tl.constexpr,
+    probs_ptr,
+    target_ptr,
+    hist_ptr,
+    bar_ptr,
+    ksum_ptr,
+    psum_ptr,
+    u_ptr,
+    out_ptr,
+    tok_ptr,
+    V,
+    G,
+    CHUNK,
+    row_stride,
+    DRAW: tl.constexpr,
+    G_POW2: tl.constexpr,
+    BINS: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
     row = pid // G
@@ -370,19 +469,103 @@ def _topk_fused(
     brow = bar_ptr + row
     lo = 0
     above = lo
-    lo, above = _bits_round(probs_ptr, base, start, end, hrow, brow, target, lo, above, G, 23, 0, BINS, BLOCK)
-    lo, above = _bits_round(probs_ptr, base, start, end, hrow + BINS, brow, target, lo, above, 2 * G, 15, 1 << 23, BINS, BLOCK)
-    lo, above = _bits_round(probs_ptr, base, start, end, hrow + 2 * BINS, brow, target, lo, above, 3 * G, 7, 1 << 15, BINS, BLOCK)
-    lo, above = _bits_round(probs_ptr, base, start, end, hrow + 3 * BINS, brow, target, lo, above, 4 * G, 0, 1 << 7, BINS, BLOCK)
-    _keep_tail(probs_ptr, base, start, end, pid, row, cta, lo.to(tl.float32, bitcast=True), brow, 5 * G,
-               ksum_ptr, psum_ptr, u_ptr, out_ptr, tok_ptr, V, G, DRAW, G_POW2, BLOCK)
+    lo, above = _bits_round(
+        probs_ptr, base, start, end, hrow, brow, target, lo, above, G, 23, 0, BINS, BLOCK
+    )
+    lo, above = _bits_round(
+        probs_ptr,
+        base,
+        start,
+        end,
+        hrow + BINS,
+        brow,
+        target,
+        lo,
+        above,
+        2 * G,
+        15,
+        1 << 23,
+        BINS,
+        BLOCK,
+    )
+    lo, above = _bits_round(
+        probs_ptr,
+        base,
+        start,
+        end,
+        hrow + 2 * BINS,
+        brow,
+        target,
+        lo,
+        above,
+        3 * G,
+        7,
+        1 << 15,
+        BINS,
+        BLOCK,
+    )
+    lo, above = _bits_round(
+        probs_ptr,
+        base,
+        start,
+        end,
+        hrow + 3 * BINS,
+        brow,
+        target,
+        lo,
+        above,
+        4 * G,
+        0,
+        1 << 7,
+        BINS,
+        BLOCK,
+    )
+    _keep_tail(
+        probs_ptr,
+        base,
+        start,
+        end,
+        pid,
+        row,
+        cta,
+        lo.to(tl.float32, bitcast=True),
+        brow,
+        5 * G,
+        ksum_ptr,
+        psum_ptr,
+        u_ptr,
+        out_ptr,
+        tok_ptr,
+        V,
+        G,
+        DRAW,
+        G_POW2,
+        BLOCK,
+    )
 
 
 @triton.jit
 def _keep_tail(
-    probs_ptr, base, start, end, pid, row, cta, thr, bar_ptr, need,
-    ksum_ptr, psum_ptr, u_ptr, out_ptr, tok_ptr, V, G,
-    DRAW: tl.constexpr, G_POW2: tl.constexpr, BLOCK: tl.constexpr,
+    probs_ptr,
+    base,
+    start,
+    end,
+    pid,
+    row,
+    cta,
+    thr,
+    bar_ptr,
+    need,
+    ksum_ptr,
+    psum_ptr,
+    u_ptr,
+    out_ptr,
+    tok_ptr,
+    V,
+    G,
+    DRAW: tl.constexpr,
+    G_POW2: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     # Keep x >= thr over this chunk. This deliberately retains every boundary tie,
     # matching flashinfer's top-k and top-p filtering semantics.
@@ -436,8 +619,21 @@ _PMBINS = 256
 
 @triton.jit
 def _pmass_round(
-    probs_ptr, base, start, end, priv_ptr, mass_ptr, bar_ptr, target, lo, above, need,
-    S: tl.constexpr, WIDTH: tl.constexpr, BINS: tl.constexpr, BLOCK: tl.constexpr,
+    probs_ptr,
+    base,
+    start,
+    end,
+    priv_ptr,
+    mass_ptr,
+    bar_ptr,
+    target,
+    lo,
+    above,
+    need,
+    S: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BINS: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     # top-p round over the bit pattern: per-bin MASS (exact up to fp32 atomic order) via scatter-add into this
     # CTA's private buffer, then one reduction into the row buffer, so the bin holding the p crossing is known
@@ -469,9 +665,28 @@ def _pmass_round(
 
 @triton.jit
 def _topp_fused(
-    probs_ptr, tp_ptr, tk_ptr, hist_ptr, priv_ptr, mass_ptr, bar_ptr, ksumk_ptr, ksum_ptr, psum_ptr, u_ptr,
-    out_ptr, tok_ptr, V, G, CHUNK, row_stride,
-    TOPK: tl.constexpr, DRAW: tl.constexpr, G_POW2: tl.constexpr, KBINS: tl.constexpr, PBINS: tl.constexpr,
+    probs_ptr,
+    tp_ptr,
+    tk_ptr,
+    hist_ptr,
+    priv_ptr,
+    mass_ptr,
+    bar_ptr,
+    ksumk_ptr,
+    ksum_ptr,
+    psum_ptr,
+    u_ptr,
+    out_ptr,
+    tok_ptr,
+    V,
+    G,
+    CHUNK,
+    row_stride,
+    TOPK: tl.constexpr,
+    DRAW: tl.constexpr,
+    G_POW2: tl.constexpr,
+    KBINS: tl.constexpr,
+    PBINS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     # top-p, optionally after an exact top-k stage: the top-k threshold becomes the lower edge of the top-p
@@ -488,10 +703,57 @@ def _topp_fused(
         tk = tl.maximum(tl.load(tk_ptr + row), 1)
         hk = hist_ptr + row * 4 * KBINS
         above_i = lo
-        lo, above_i = _bits_round(probs_ptr, base, start, end, hk, brow, tk, lo, above_i, G, 23, 0, KBINS, BLOCK)
-        lo, above_i = _bits_round(probs_ptr, base, start, end, hk + KBINS, brow, tk, lo, above_i, 2 * G, 15, 1 << 23, KBINS, BLOCK)
-        lo, above_i = _bits_round(probs_ptr, base, start, end, hk + 2 * KBINS, brow, tk, lo, above_i, 3 * G, 7, 1 << 15, KBINS, BLOCK)
-        lo, above_i = _bits_round(probs_ptr, base, start, end, hk + 3 * KBINS, brow, tk, lo, above_i, 4 * G, 0, 1 << 7, KBINS, BLOCK)
+        lo, above_i = _bits_round(
+            probs_ptr, base, start, end, hk, brow, tk, lo, above_i, G, 23, 0, KBINS, BLOCK
+        )
+        lo, above_i = _bits_round(
+            probs_ptr,
+            base,
+            start,
+            end,
+            hk + KBINS,
+            brow,
+            tk,
+            lo,
+            above_i,
+            2 * G,
+            15,
+            1 << 23,
+            KBINS,
+            BLOCK,
+        )
+        lo, above_i = _bits_round(
+            probs_ptr,
+            base,
+            start,
+            end,
+            hk + 2 * KBINS,
+            brow,
+            tk,
+            lo,
+            above_i,
+            3 * G,
+            7,
+            1 << 15,
+            KBINS,
+            BLOCK,
+        )
+        lo, above_i = _bits_round(
+            probs_ptr,
+            base,
+            start,
+            end,
+            hk + 3 * KBINS,
+            brow,
+            tk,
+            lo,
+            above_i,
+            4 * G,
+            0,
+            1 << 7,
+            KBINS,
+            BLOCK,
+        )
         thr_k = lo.to(tl.float32, bitcast=True)
         s = 0.0
         for s0 in tl.range(start, end, BLOCK):
@@ -509,20 +771,102 @@ def _topp_fused(
     mp = mass_ptr + row * 4 * PBINS
     pp = priv_ptr + pid * 4 * PBINS
     above = 0.0
-    lo, above = _pmass_round(probs_ptr, base, start, end, pp, mp, brow, target, lo, above, (done + 1) * G,
-                            23, 0, PBINS, BLOCK)
-    lo, above = _pmass_round(probs_ptr, base, start, end, pp + PBINS, mp + PBINS, brow, target, lo, above,
-                            (done + 2) * G, 15, 1 << 23, PBINS, BLOCK)
-    lo, above = _pmass_round(probs_ptr, base, start, end, pp + 2 * PBINS, mp + 2 * PBINS, brow, target, lo, above,
-                            (done + 3) * G, 7, 1 << 15, PBINS, BLOCK)
-    lo, above = _pmass_round(probs_ptr, base, start, end, pp + 3 * PBINS, mp + 3 * PBINS, brow, target, lo, above,
-                            (done + 4) * G, 0, 1 << 7, PBINS, BLOCK)
-    _keep_tail(probs_ptr, base, start, end, pid, row, cta, lo.to(tl.float32, bitcast=True), brow,
-               (done + 5) * G, ksum_ptr, psum_ptr, u_ptr, out_ptr, tok_ptr, V, G, DRAW, G_POW2, BLOCK)
+    lo, above = _pmass_round(
+        probs_ptr,
+        base,
+        start,
+        end,
+        pp,
+        mp,
+        brow,
+        target,
+        lo,
+        above,
+        (done + 1) * G,
+        23,
+        0,
+        PBINS,
+        BLOCK,
+    )
+    lo, above = _pmass_round(
+        probs_ptr,
+        base,
+        start,
+        end,
+        pp + PBINS,
+        mp + PBINS,
+        brow,
+        target,
+        lo,
+        above,
+        (done + 2) * G,
+        15,
+        1 << 23,
+        PBINS,
+        BLOCK,
+    )
+    lo, above = _pmass_round(
+        probs_ptr,
+        base,
+        start,
+        end,
+        pp + 2 * PBINS,
+        mp + 2 * PBINS,
+        brow,
+        target,
+        lo,
+        above,
+        (done + 3) * G,
+        7,
+        1 << 15,
+        PBINS,
+        BLOCK,
+    )
+    lo, above = _pmass_round(
+        probs_ptr,
+        base,
+        start,
+        end,
+        pp + 3 * PBINS,
+        mp + 3 * PBINS,
+        brow,
+        target,
+        lo,
+        above,
+        (done + 4) * G,
+        0,
+        1 << 7,
+        PBINS,
+        BLOCK,
+    )
+    _keep_tail(
+        probs_ptr,
+        base,
+        start,
+        end,
+        pid,
+        row,
+        cta,
+        lo.to(tl.float32, bitcast=True),
+        brow,
+        (done + 5) * G,
+        ksum_ptr,
+        psum_ptr,
+        u_ptr,
+        out_ptr,
+        tok_ptr,
+        V,
+        G,
+        DRAW,
+        G_POW2,
+        BLOCK,
+    )
 
 
 _COOPERATIVE_DISABLED = set()
-_COOP_CTAS_PER_SM = 2  # the fused kernels use ~80 regs/thread at 8 warps; 4/SM fails the cooperative launch
+_COOP_CTAS_PER_SM = (
+    2  # the fused kernels use ~80 regs/thread at 8 warps; 4/SM fails the cooperative launch
+)
 
 
 def _fused_plan(B, V, device, force_single=False):
@@ -543,17 +887,17 @@ def _fused_launch(probs, kernel, tk, tp, draw, seed, offset, force_single=False)
     n_mass = 4 * _PMBINS if kernel is _topp_fused else 0
     # hist[B, n_hist] | mass[B, n_mass] | priv[B * G, n_mass] | bar/ksum/ksum_k/tok[B]
     ws = torch.zeros(B * (n_hist + n_mass) + B * G * n_mass + 4 * B, device=dev, dtype=torch.int32)
-    hist = ws[:B * n_hist]
-    mass = ws[B * n_hist:B * (n_hist + n_mass)].view(torch.float32)
-    priv = ws[B * (n_hist + n_mass):B * (n_hist + n_mass) + B * G * n_mass].view(torch.float32)
+    hist = ws[: B * n_hist]
+    mass = ws[B * n_hist : B * (n_hist + n_mass)].view(torch.float32)
+    priv = ws[B * (n_hist + n_mass) : B * (n_hist + n_mass) + B * G * n_mass].view(torch.float32)
     tail = B * (n_hist + n_mass) + B * G * n_mass
-    bar = ws[tail:tail + B]
-    ksum = ws[tail + B:tail + 2 * B].view(torch.float32)
-    ksum_k = ws[tail + 2 * B:tail + 3 * B].view(torch.float32)
+    bar = ws[tail : tail + B]
+    ksum = ws[tail + B : tail + 2 * B].view(torch.float32)
+    ksum_k = ws[tail + 2 * B : tail + 3 * B].view(torch.float32)
     if draw:
         psum = torch.empty(B * G, device=dev, dtype=torch.float32)
         u = _gen_u(B, dev, seed, offset)
-        res = ws[tail + 3 * B:]
+        res = ws[tail + 3 * B :]
         out, tok = probs, res
     else:
         psum, u = ksum, ksum
@@ -561,14 +905,55 @@ def _fused_launch(probs, kernel, tk, tp, draw, seed, offset, force_single=False)
         out, tok = res, bar
     # a lone CTA per row in a single wave streams faster with more warps; with G > 1 the co-residency budget caps warps
     wide = G == 1 and B <= _num_sm(dev)
-    common = dict(DRAW=draw, G_POW2=_next_pow2(G), BLOCK=8192 if wide else _FUSED_BLOCK, num_warps=32 if wide else 8,
-                  launch_cooperative_grid=G > 1)
+    common = dict(
+        DRAW=draw,
+        G_POW2=_next_pow2(G),
+        BLOCK=8192 if wide else _FUSED_BLOCK,
+        num_warps=32 if wide else 8,
+        launch_cooperative_grid=G > 1,
+    )
     if kernel is _topk_fused:
-        _topk_fused[(B * G,)](probs, tk, hist, bar, ksum, psum, u, out, tok, V, G, CHUNK, probs.stride(0),
-                              BINS=_KBINS, **common)
+        _topk_fused[(B * G,)](
+            probs,
+            tk,
+            hist,
+            bar,
+            ksum,
+            psum,
+            u,
+            out,
+            tok,
+            V,
+            G,
+            CHUNK,
+            probs.stride(0),
+            BINS=_KBINS,
+            **common,
+        )
     else:
-        _topp_fused[(B * G,)](probs, tp, tk if tk is not None else tp, hist, priv, mass, bar, ksum_k, ksum, psum, u, out, tok,
-                              V, G, CHUNK, probs.stride(0), TOPK=tk is not None, KBINS=_KBINS, PBINS=_PMBINS, **common)
+        _topp_fused[(B * G,)](
+            probs,
+            tp,
+            tk if tk is not None else tp,
+            hist,
+            priv,
+            mass,
+            bar,
+            ksum_k,
+            ksum,
+            psum,
+            u,
+            out,
+            tok,
+            V,
+            G,
+            CHUNK,
+            probs.stride(0),
+            TOPK=tk is not None,
+            KBINS=_KBINS,
+            PBINS=_PMBINS,
+            **common,
+        )
     return res
 
 
@@ -592,8 +977,11 @@ def _exact_launch(probs, kernel, tk, tp, draw, seed, offset):
         if force_single or G == 1 or not _is_cooperative_launch_error(exc):
             raise
         _COOPERATIVE_DISABLED.add(key)
-        logger.warning("cooperative triton sampling unavailable on %s (%s); retrying with one CTA per row",
-                       probs.device, exc)
+        logger.warning(
+            "cooperative triton sampling unavailable on %s (%s); retrying with one CTA per row",
+            probs.device,
+            exc,
+        )
         return _fused_launch(probs, kernel, tk, tp, draw, seed, offset, force_single=True)
 
 
@@ -622,8 +1010,17 @@ def top_k_renorm_probs(probs, top_k):
     return _topk(probs, _topk_target(top_k, probs.size(0), probs.device), False)
 
 
-def top_k_sampling_from_probs(probs, top_k, indices=None, deterministic=True, generator=None,
-                              check_nan=False, seed=None, offset=None, return_valid=False):
+def top_k_sampling_from_probs(
+    probs,
+    top_k,
+    indices=None,
+    deterministic=True,
+    generator=None,
+    check_nan=False,
+    seed=None,
+    offset=None,
+    return_valid=False,
+):
     probs = probs.float()
     src = probs if indices is None else probs[indices].contiguous()
     out = _topk(src, _topk_target(top_k, src.size(0), src.device), True, seed, offset)
@@ -631,20 +1028,40 @@ def top_k_sampling_from_probs(probs, top_k, indices=None, deterministic=True, ge
     return (out, torch.ones_like(out, dtype=torch.bool)) if return_valid else out
 
 
-def top_k_top_p_sampling_from_probs(probs, top_k, top_p, indices=None,
-                                    filter_apply_order="top_k_first", deterministic=True,
-                                    generator=None, check_nan=False, seed=None, offset=None,
-                                    return_valid=False):
+def top_k_top_p_sampling_from_probs(
+    probs,
+    top_k,
+    top_p,
+    indices=None,
+    filter_apply_order="top_k_first",
+    deterministic=True,
+    generator=None,
+    check_nan=False,
+    seed=None,
+    offset=None,
+    return_valid=False,
+):
     probs = probs.float()
     src = probs if indices is None else probs[indices].contiguous()
     B = src.size(0)
-    out = _topp(src, _topp_target(top_p, B, src.device), _topk_target(top_k, B, src.device), True, seed, offset)
+    out = _topp(
+        src,
+        _topp_target(top_p, B, src.device),
+        _topk_target(top_k, B, src.device),
+        True,
+        seed,
+        offset,
+    )
     out = out.to(indices.dtype) if indices is not None else out
     return (out, torch.ones_like(out, dtype=torch.bool)) if return_valid else out
 
 
 __all__ = [
-    "softmax", "top_k_renorm_probs", "top_p_renorm_probs",
-    "sampling_from_probs", "top_k_sampling_from_probs",
-    "top_p_sampling_from_probs", "top_k_top_p_sampling_from_probs",
+    "softmax",
+    "top_k_renorm_probs",
+    "top_p_renorm_probs",
+    "sampling_from_probs",
+    "top_k_sampling_from_probs",
+    "top_p_sampling_from_probs",
+    "top_k_top_p_sampling_from_probs",
 ]

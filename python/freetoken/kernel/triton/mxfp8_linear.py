@@ -29,8 +29,9 @@ MXFP8_BLOCK = 32
 _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
 
 
-def mxfp8_dequant(weight: torch.Tensor, scale_codes: torch.Tensor,
-                  dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+def mxfp8_dequant(
+    weight: torch.Tensor, scale_codes: torch.Tensor, dtype: torch.dtype = torch.bfloat16
+) -> torch.Tensor:
     """Dequant: ``w[n, k] * 2**(codes[n, k//32] - 127)`` -> ``dtype``.
 
     Serves the large-M forward (dequant + cuBLAS), the load-time bf16 ablation
@@ -58,9 +59,23 @@ _GEMV_MAX_M = 256
 
 @triton.jit
 def _mxfp8_gemv_m1_splitk_kernel(
-    a_ptr, w_ptr, s_ptr, part_ptr, N, K, n_kb, kb_per,
-    stride_ak, stride_wn, stride_wk, stride_sn, stride_sk, stride_pk, stride_pn,
-    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    w_ptr,
+    s_ptr,
+    part_ptr,
+    N,
+    K,
+    n_kb,
+    kb_per,
+    stride_ak,
+    stride_wn,
+    stride_wk,
+    stride_sn,
+    stride_sk,
+    stride_pk,
+    stride_pn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
     """M == 1 specialization: a plain fp32 multiply-reduce. The dot tile's 16-row
     padding costs ~30% at M=1 on RTX PRO 6000 / 5090, hence this kernel -- but on
@@ -83,16 +98,19 @@ def _mxfp8_gemv_m1_splitk_kernel(
             if e4m3_native_cx():
                 w = tl.load(
                     w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
-                    mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+                    mask=n_mask[:, None] & k_mask[None, :],
+                    other=0.0,
                 ).to(tl.float32)
             else:
-                w = e4m3_u8_to_f32(tl.load(
-                    w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
-                    mask=n_mask[:, None] & k_mask[None, :], other=0,
-                ))
+                w = e4m3_u8_to_f32(
+                    tl.load(
+                        w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
+                        mask=n_mask[:, None] & k_mask[None, :],
+                        other=0,
+                    )
+                )
             codes = tl.load(
-                s_ptr + offs_n[:, None] * stride_sn
-                + (kb * KB32 + off_kb32[None, :]) * stride_sk,
+                s_ptr + offs_n[:, None] * stride_sn + (kb * KB32 + off_kb32[None, :]) * stride_sk,
                 mask=n_mask[:, None] & ((kb * KB32 + off_kb32[None, :]) * 32 < K),
                 other=127,
             ).to(tl.float32)  # [BLOCK_N, KB32]
@@ -104,10 +122,27 @@ def _mxfp8_gemv_m1_splitk_kernel(
 
 @triton.jit
 def _mxfp8_gemv_splitk_kernel(
-    a_ptr, w_ptr, s_ptr, part_ptr, M, N, K, n_kb, kb_per,
-    stride_am, stride_ak, stride_wn, stride_wk, stride_sn, stride_sk,
-    stride_pk, stride_pm, stride_pn,
-    M_TILE: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    w_ptr,
+    s_ptr,
+    part_ptr,
+    M,
+    N,
+    K,
+    n_kb,
+    kb_per,
+    stride_am,
+    stride_ak,
+    stride_wn,
+    stride_wk,
+    stride_sn,
+    stride_sk,
+    stride_pk,
+    stride_pm,
+    stride_pn,
+    M_TILE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
     """Each (pid_n, pid_k) accumulates ``kb_per`` BLOCK_K chunks of ``a[:M] @ w^T``
     for a BLOCK_N slice of outputs. BLOCK_K is a multiple of 32, so each chunk
@@ -131,21 +166,25 @@ def _mxfp8_gemv_splitk_kernel(
             k_mask = offs_k < K
             a = tl.load(
                 a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak,
-                mask=m_mask[:, None] & k_mask[None, :], other=0.0,
+                mask=m_mask[:, None] & k_mask[None, :],
+                other=0.0,
             )  # [M_TILE, BLOCK_K] bf16
             if e4m3_native_cx():
                 w = tl.load(
                     w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
-                    mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+                    mask=n_mask[:, None] & k_mask[None, :],
+                    other=0.0,
                 ).to(tl.float32)
             else:
-                w = e4m3_u8_to_f32(tl.load(
-                    w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
-                    mask=n_mask[:, None] & k_mask[None, :], other=0,
-                ))
+                w = e4m3_u8_to_f32(
+                    tl.load(
+                        w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
+                        mask=n_mask[:, None] & k_mask[None, :],
+                        other=0,
+                    )
+                )
             codes = tl.load(
-                s_ptr + offs_n[:, None] * stride_sn
-                + (kb * KB32 + off_kb32[None, :]) * stride_sk,
+                s_ptr + offs_n[:, None] * stride_sn + (kb * KB32 + off_kb32[None, :]) * stride_sk,
                 mask=n_mask[:, None] & ((kb * KB32 + off_kb32[None, :]) * 32 < K),
                 other=127,
             ).to(tl.float32)  # [BLOCK_N, KB32]
@@ -163,9 +202,17 @@ def _mxfp8_gemv_splitk_kernel(
 
 @triton.jit
 def _splitk_reduce_kernel(
-    part_ptr, out_ptr, N, SPLIT_K: tl.constexpr,
-    stride_pk, stride_pm, stride_pn, stride_om, stride_on,
-    BLOCK: tl.constexpr, OUT: tl.constexpr,
+    part_ptr,
+    out_ptr,
+    N,
+    SPLIT_K: tl.constexpr,
+    stride_pk,
+    stride_pm,
+    stride_pn,
+    stride_om,
+    stride_on,
+    BLOCK: tl.constexpr,
+    OUT: tl.constexpr,
 ):
     pid_m = tl.program_id(1)
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -174,13 +221,15 @@ def _splitk_reduce_kernel(
     for k in tl.static_range(SPLIT_K):
         acc += tl.load(
             part_ptr + k * stride_pk + pid_m * stride_pm + offs * stride_pn,
-            mask=mask, other=0.0,
+            mask=mask,
+            other=0.0,
         )
     tl.store(out_ptr + pid_m * stride_om + offs * stride_on, acc.to(OUT), mask=mask)
 
 
-def _gemv(a: torch.Tensor, weight: torch.Tensor, scale_codes: torch.Tensor,
-          out_dtype: torch.dtype) -> torch.Tensor:
+def _gemv(
+    a: torch.Tensor, weight: torch.Tensor, scale_codes: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
     """Small-M split-K GEMV. ``a`` [M, K] bf16 (M <= _GEMV_MAX_M); ``weight``
     [N, K] fp8; ``scale_codes`` [N, K//32] uint8."""
     M, K = a.shape
@@ -195,11 +244,24 @@ def _gemv(a: torch.Tensor, weight: torch.Tensor, scale_codes: torch.Tensor,
     part = torch.empty((split_k, M, N), dtype=torch.float32, device=a.device)
     if M == 1:
         _mxfp8_gemv_m1_splitk_kernel[(n_tiles, split_k)](
-            a, weight, scale_codes, part, N, K, n_kb, kb_per,
-            a.stride(1), weight.stride(0), weight.stride(1),
-            scale_codes.stride(0), scale_codes.stride(1),
-            part.stride(0), part.stride(2),
-            BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=1,
+            a,
+            weight,
+            scale_codes,
+            part,
+            N,
+            K,
+            n_kb,
+            kb_per,
+            a.stride(1),
+            weight.stride(0),
+            weight.stride(1),
+            scale_codes.stride(0),
+            scale_codes.stride(1),
+            part.stride(0),
+            part.stride(2),
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            num_warps=1,
         )
     else:
         # M_TILE buckets to the next pow2 >= 16 (tl.dot minimum); the whole batch
@@ -207,25 +269,51 @@ def _gemv(a: torch.Tensor, weight: torch.Tensor, scale_codes: torch.Tensor,
         # tile is row padding, amortized with proportionally more warps.
         m_tile = max(16, triton.next_power_of_2(M))
         _mxfp8_gemv_splitk_kernel[(n_tiles, split_k)](
-            a, weight, scale_codes, part, M, N, K, n_kb, kb_per,
-            a.stride(0), a.stride(1), weight.stride(0), weight.stride(1),
-            scale_codes.stride(0), scale_codes.stride(1),
-            part.stride(0), part.stride(1), part.stride(2),
-            M_TILE=m_tile, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            a,
+            weight,
+            scale_codes,
+            part,
+            M,
+            N,
+            K,
+            n_kb,
+            kb_per,
+            a.stride(0),
+            a.stride(1),
+            weight.stride(0),
+            weight.stride(1),
+            scale_codes.stride(0),
+            scale_codes.stride(1),
+            part.stride(0),
+            part.stride(1),
+            part.stride(2),
+            M_TILE=m_tile,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
             num_warps=m_tile // 16,
         )
     out = torch.empty((M, N), dtype=out_dtype, device=a.device)
     _splitk_reduce_kernel[(triton.cdiv(N, 256), M)](
-        part, out, N, split_k,
-        part.stride(0), part.stride(1), part.stride(2), out.stride(0), out.stride(1),
-        BLOCK=256, OUT=_TL_DTYPE[out_dtype if out_dtype in _TL_DTYPE else torch.bfloat16],
+        part,
+        out,
+        N,
+        split_k,
+        part.stride(0),
+        part.stride(1),
+        part.stride(2),
+        out.stride(0),
+        out.stride(1),
+        BLOCK=256,
+        OUT=_TL_DTYPE[out_dtype if out_dtype in _TL_DTYPE else torch.bfloat16],
         num_warps=2,
     )
     return out
 
 
 def mxfp8_linear(
-    x: torch.Tensor, weight: torch.Tensor, scale_codes: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale_codes: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``y = x @ dequant(weight, scale_codes)^T``. Small batches

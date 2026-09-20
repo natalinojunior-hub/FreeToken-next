@@ -22,19 +22,35 @@ _TL = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl
 
 @triton.jit
 def _decode_fp8_moe_kernel(
-    a_ptr,        # [M, K] activation (compute dtype, bf16)
-    w_ptr,        # [E, N, K] float8_e4m3fn
-    s_ptr,        # [E, N//128, K//128] bf16 (weight_scale_inv)
-    c_ptr,        # [M, TOP_K, N] output
-    topk_weights_ptr, topk_ids_ptr,
-    total_routes, N, K,
-    stride_am, stride_ak,
-    stride_we, stride_wn, stride_wk,
-    stride_se, stride_sn, stride_sk,
-    stride_cm, stride_ck, stride_cn,
-    stride_twm, stride_twk, stride_tidm, stride_tidk,
-    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  # BLOCK_K == 128 (one weight scale block)
-    TOP_K: tl.constexpr, A_ROW_IS_ROUTE: tl.constexpr, MUL_ROUTED_WEIGHT: tl.constexpr,
+    a_ptr,  # [M, K] activation (compute dtype, bf16)
+    w_ptr,  # [E, N, K] float8_e4m3fn
+    s_ptr,  # [E, N//128, K//128] bf16 (weight_scale_inv)
+    c_ptr,  # [M, TOP_K, N] output
+    topk_weights_ptr,
+    topk_ids_ptr,
+    total_routes,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_we,
+    stride_wn,
+    stride_wk,
+    stride_se,
+    stride_sn,
+    stride_sk,
+    stride_cm,
+    stride_ck,
+    stride_cn,
+    stride_twm,
+    stride_twk,
+    stride_tidm,
+    stride_tidk,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,  # BLOCK_K == 128 (one weight scale block)
+    TOP_K: tl.constexpr,
+    A_ROW_IS_ROUTE: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
     compute_type: tl.constexpr,
 ):
     route_id = tl.program_id(0)
@@ -58,14 +74,20 @@ def _decode_fp8_moe_kernel(
         if e4m3_native_cx():
             w = tl.load(
                 w_slot + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
-                mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+                mask=n_mask[:, None] & k_mask[None, :],
+                other=0.0,
             ).to(tl.float32)
         else:
-            w = e4m3_u8_to_f32(tl.load(
-                w_slot + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
-                mask=n_mask[:, None] & k_mask[None, :], other=0,
-            ))
-        sc = tl.load(s_slot + sn * stride_sn + kb * stride_sk, mask=n_mask, other=0.0).to(tl.float32)
+            w = e4m3_u8_to_f32(
+                tl.load(
+                    w_slot + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
+                    mask=n_mask[:, None] & k_mask[None, :],
+                    other=0,
+                )
+            )
+        sc = tl.load(s_slot + sn * stride_sn + kb * stride_sk, mask=n_mask, other=0.0).to(
+            tl.float32
+        )
         a = tl.load(a_base + offs_k * stride_ak, mask=k_mask, other=0.0).to(tl.float32)
         acc += tl.sum(w * a[None, :], axis=1) * sc
 
@@ -84,21 +106,51 @@ def _decode_gemm(a, w, s, c, topk_weights, topk_ids, mul_routed_weight, a_row_is
     BLOCK_N = 16
     grid = (total_routes, triton.cdiv(N, BLOCK_N))
     _decode_fp8_moe_kernel[grid](
-        a, w, s, c, topk_weights, topk_ids, total_routes, N, w.shape[2],
-        a.stride(0), a.stride(1),
-        w.stride(0), w.stride(1), w.stride(2),
-        s.stride(0), s.stride(1), s.stride(2),
-        c.stride(0), c.stride(1), c.stride(2),
-        topk_weights.stride(0), topk_weights.stride(1), topk_ids.stride(0), topk_ids.stride(1),
-        BLOCK_N=BLOCK_N, BLOCK_K=128, TOP_K=top_k,
-        A_ROW_IS_ROUTE=a_row_is_route, MUL_ROUTED_WEIGHT=mul_routed_weight,
-        compute_type=_TL.get(c.dtype, tl.bfloat16), num_warps=4,
+        a,
+        w,
+        s,
+        c,
+        topk_weights,
+        topk_ids,
+        total_routes,
+        N,
+        w.shape[2],
+        a.stride(0),
+        a.stride(1),
+        w.stride(0),
+        w.stride(1),
+        w.stride(2),
+        s.stride(0),
+        s.stride(1),
+        s.stride(2),
+        c.stride(0),
+        c.stride(1),
+        c.stride(2),
+        topk_weights.stride(0),
+        topk_weights.stride(1),
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=128,
+        TOP_K=top_k,
+        A_ROW_IS_ROUTE=a_row_is_route,
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        compute_type=_TL.get(c.dtype, tl.bfloat16),
+        num_warps=4,
     )
 
 
 def fused_experts_decode_fp8_blockscale(
-    hidden_states, gate_up, gate_up_scale, down, down_scale,
-    topk_weights, topk_ids, activation="silu", act_alpha=1.0, act_limit=float("inf"),
+    hidden_states,
+    gate_up,
+    gate_up_scale,
+    down,
+    down_scale,
+    topk_weights,
+    topk_ids,
+    activation="silu",
+    act_alpha=1.0,
+    act_limit=float("inf"),
 ) -> torch.Tensor:
     """Decode (bs-1) inline-dequant block-fp8 MoE. ``topk_ids`` index rows of the expert
     banks (resident: expert id; offload: cache slot)."""
@@ -129,18 +181,38 @@ def fused_experts_decode_fp8_blockscale(
 # ======================================================================================
 @triton.jit
 def _prefill_fp8_moe_kernel(
-    a_ptr, w_ptr, s_ptr, c_ptr,
-    topk_weights_ptr, sorted_token_ids_ptr, expert_ids_ptr, num_tokens_post_padded_ptr,
+    a_ptr,
+    w_ptr,
+    s_ptr,
+    c_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
     a_scale_ptr,
-    N, K, EM, num_valid_tokens,
-    stride_am, stride_ak,
-    stride_we, stride_wn, stride_wk,
-    stride_se, stride_sn, stride_sk,
-    stride_asm, stride_ask,
-    stride_cm, stride_cn,
+    N,
+    K,
+    EM,
+    num_valid_tokens,
+    stride_am,
+    stride_ak,
+    stride_we,
+    stride_wn,
+    stride_wk,
+    stride_se,
+    stride_sn,
+    stride_sk,
+    stride_asm,
+    stride_ask,
+    stride_cm,
+    stride_cn,
     stride_tw,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr, MUL_ROUTED_WEIGHT: tl.constexpr, top_k: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
     compute_type: tl.constexpr,
 ):
     """W8A8: ``a`` is fp8 (per-128-K-group act scale ``a_scale``), ``w`` fp8 (per-128x128
@@ -180,7 +252,9 @@ def _prefill_fp8_moe_kernel(
         if e4m3_native_cx():
             w = tl.load(w_base + offs_k[:, None] * stride_wk, mask=w_mask, other=0.0)  # fp8
         else:
-            w = e4m3_u8_to_f32(tl.load(w_base + offs_k[:, None] * stride_wk, mask=w_mask, other=0)).to(tl.bfloat16)
+            w = e4m3_u8_to_f32(
+                tl.load(w_base + offs_k[:, None] * stride_wk, mask=w_mask, other=0)
+            ).to(tl.bfloat16)
         wsc = tl.load(s_base + kb * stride_sk).to(tl.float32)
         asc = tl.load(as_base + kb * stride_ask, mask=token_mask, other=0.0).to(tl.float32)
         acc += tl.dot(a, w) * asc[:, None] * wsc
@@ -196,27 +270,73 @@ def _prefill_fp8_moe_kernel(
     tl.store(c_ptrs, acc, mask=token_mask[:, None] & (offs_cn[None, :] < N))
 
 
-def _prefill_gemm(a_fp8, a_scale, w, s, c, tw, sorted_ids, expert_ids, ntpp, num_valid,
-                  kernel_top_k, mul_routed_weight, cfg):
+def _prefill_gemm(
+    a_fp8,
+    a_scale,
+    w,
+    s,
+    c,
+    tw,
+    sorted_ids,
+    expert_ids,
+    ntpp,
+    num_valid,
+    kernel_top_k,
+    mul_routed_weight,
+    cfg,
+):
     N, K = w.shape[1], w.shape[2]
     EM = sorted_ids.shape[0]
     w = e4m3_kernel_view(w)
-    grid = lambda META: (triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)  # noqa: E731
+    grid = lambda META: (
+        triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )  # noqa: E731
     _prefill_fp8_moe_kernel[grid](
-        a_fp8, w, s, c, tw, sorted_ids, expert_ids, ntpp, a_scale, N, K, EM, num_valid,
-        a_fp8.stride(0), a_fp8.stride(1),
-        w.stride(0), w.stride(1), w.stride(2),
-        s.stride(0), s.stride(1), s.stride(2),
-        a_scale.stride(0), a_scale.stride(1),
-        c.stride(1), c.stride(2), tw.stride(0),
-        MUL_ROUTED_WEIGHT=mul_routed_weight, top_k=kernel_top_k,
-        compute_type=_TL.get(c.dtype, tl.bfloat16), **cfg,
+        a_fp8,
+        w,
+        s,
+        c,
+        tw,
+        sorted_ids,
+        expert_ids,
+        ntpp,
+        a_scale,
+        N,
+        K,
+        EM,
+        num_valid,
+        a_fp8.stride(0),
+        a_fp8.stride(1),
+        w.stride(0),
+        w.stride(1),
+        w.stride(2),
+        s.stride(0),
+        s.stride(1),
+        s.stride(2),
+        a_scale.stride(0),
+        a_scale.stride(1),
+        c.stride(1),
+        c.stride(2),
+        tw.stride(0),
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        top_k=kernel_top_k,
+        compute_type=_TL.get(c.dtype, tl.bfloat16),
+        **cfg,
     )
 
 
 def fused_experts_fp8_blockscale(
-    hidden_states, gate_up, gate_up_scale, down, down_scale,
-    topk_weights, topk_ids, num_experts, activation="silu", act_alpha=1.0, act_limit=float("inf"),
+    hidden_states,
+    gate_up,
+    gate_up_scale,
+    down,
+    down_scale,
+    topk_weights,
+    topk_ids,
+    num_experts,
+    activation="silu",
+    act_alpha=1.0,
+    act_limit=float("inf"),
 ) -> torch.Tensor:
     """Prefill inline-dequant block-fp8 MoE. ``topk_ids`` index expert rows in [0, num_experts)
     (materialized layer: position == expert id)."""
@@ -230,8 +350,14 @@ def fused_experts_fp8_blockscale(
     two_i = gate_up.shape[1]
     inter = two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
-    cfg = dict(BLOCK_SIZE_M=64 if M > 64 else 16, BLOCK_SIZE_N=128, BLOCK_SIZE_K=128,
-               GROUP_SIZE_M=8, num_warps=8 if M > 64 else 4, num_stages=3)
+    cfg = dict(
+        BLOCK_SIZE_M=64 if M > 64 else 16,
+        BLOCK_SIZE_N=128,
+        BLOCK_SIZE_K=128,
+        GROUP_SIZE_M=8,
+        num_warps=8 if M > 64 else 4,
+        num_stages=3,
+    )
 
     sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, cfg["BLOCK_SIZE_M"], num_experts)
     tw = topk_weights.reshape(-1).contiguous()
@@ -241,14 +367,40 @@ def fused_experts_fp8_blockscale(
     # kernel runs on fp8 tensor cores (compute-bound prefill); both block scales applied in-loop.
     a1_fp8, a1_scale = per_token_group_quant_fp8(hidden_states, 128)
     ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
-    _prefill_gemm(a1_fp8, a1_scale, gate_up, gate_up_scale, ic1, tw, sorted_ids, expert_ids, ntpp,
-                  num_valid, top_k, False, cfg)
+    _prefill_gemm(
+        a1_fp8,
+        a1_scale,
+        gate_up,
+        gate_up_scale,
+        ic1,
+        tw,
+        sorted_ids,
+        expert_ids,
+        ntpp,
+        num_valid,
+        top_k,
+        False,
+        cfg,
+    )
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
     gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     a2_fp8, a2_scale = per_token_group_quant_fp8(ic2, 128)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
-    _prefill_gemm(a2_fp8, a2_scale, down, down_scale, ic3, tw, sorted_ids, expert_ids, ntpp,
-                  num_valid, 1, True, cfg)
+    _prefill_gemm(
+        a2_fp8,
+        a2_scale,
+        down,
+        down_scale,
+        ic3,
+        tw,
+        sorted_ids,
+        expert_ids,
+        ntpp,
+        num_valid,
+        1,
+        True,
+        cfg,
+    )
     out = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(ic3, out)
     return out

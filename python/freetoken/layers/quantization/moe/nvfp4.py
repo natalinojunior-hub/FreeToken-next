@@ -25,7 +25,18 @@ from freetoken.utils import init_logger
 
 from ..registry import LayerKind, register_method
 from ..scheme import NVFP4_GROUP as GROUP, QuantKind
-from .base import BankSpec, ExpertView, fused_global, fused_piece, gated_epilogue_reason, global_rows, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
+from .base import (
+    BankSpec,
+    ExpertView,
+    fused_global,
+    fused_piece,
+    gated_epilogue_reason,
+    global_rows,
+    limit_or_inf,
+    MoEConfig,
+    MoEKernel,
+    MoEMethod,
+)
 
 logger = init_logger(__name__)
 
@@ -41,7 +52,9 @@ class TritonNvfp4MoEKernel(MoEKernel):
     cpu_format = "nvfp4"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        reason = self._common_reject(
+            cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False
+        )
         if reason:
             return reason
         reason = gated_epilogue_reason(cfg)
@@ -71,11 +84,37 @@ class TritonNvfp4MoEKernel(MoEKernel):
         from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin, fused_experts_nvfp4
 
         t = view.tensors
-        banks = (t["gate_up"], t["gate_up_scale"], t["gate_up_global"], t["down"], t["down_scale"], t["down_global"])
+        banks = (
+            t["gate_up"],
+            t["gate_up_scale"],
+            t["gate_up_global"],
+            t["down"],
+            t["down_scale"],
+            t["down_global"],
+        )
         alpha, limit = float(layer.alpha), limit_or_inf(layer)
         if is_prefill:
-            return fused_experts_nvfp4(x, *banks, topk_weights, topk_ids, view.n, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
-        return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
+            return fused_experts_nvfp4(
+                x,
+                *banks,
+                topk_weights,
+                topk_ids,
+                view.n,
+                layer.activation,
+                layer.apply_router_weight_on_input,
+                alpha,
+                limit,
+            )
+        return fused_experts_decode_nvfp4_marlin(
+            x,
+            *banks,
+            topk_weights,
+            topk_ids,
+            layer.activation,
+            layer.apply_router_weight_on_input,
+            alpha,
+            limit,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +269,9 @@ class MarlinNvfp4MoEKernel(MoEKernel):
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         if not backend.is_vllm_installed():
             return "vLLM is not installed"
-        reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=False, plain_silu_only=True)
+        reason = self._common_reject(
+            cfg, resident_ok=False, tp_ok=False, cpu_ok=False, plain_silu_only=True
+        )
         if reason:
             return reason
         if not _marlin_symbols_ok():
@@ -254,17 +295,25 @@ class MarlinNvfp4MoEKernel(MoEKernel):
     def pack(self, pieces, cfg: MoEConfig, out):
         i, h = cfg.intermediate, cfg.hidden
         device = torch.device("cuda")
-        gu, gus, gug = fused_piece(pieces, "gate_up"), fused_piece(pieces, "gate_up_scale"), fused_global(pieces, i)
+        gu, gus, gug = (
+            fused_piece(pieces, "gate_up"),
+            fused_piece(pieces, "gate_up_scale"),
+            fused_global(pieces, i),
+        )
         dn, dns, dng = pieces["down"], pieces["down_scale"], global_rows(pieces["down_global"], h)
         e = gu.shape[0]
         gate_up_alpha = torch.empty(e, dtype=torch.bfloat16, device=device)
         down_alpha = torch.empty(e, dtype=torch.bfloat16, device=device)
         for k in range(e):
-            qw, sc, al = _marlin_pack_proj(gu[k].to(device), gus[k].to(device), gug[k].to(device), size_k=h, size_n=2 * i)
+            qw, sc, al = _marlin_pack_proj(
+                gu[k].to(device), gus[k].to(device), gug[k].to(device), size_k=h, size_n=2 * i
+            )
             out["gate_up"][k].copy_(qw)
             out["gate_up_scale"][k].copy_(sc.view(FP8))
             gate_up_alpha[k] = al[0]
-            qw, sc, al = _marlin_pack_proj(dn[k].to(device), dns[k].to(device), dng[k].to(device), size_k=i, size_n=h)
+            qw, sc, al = _marlin_pack_proj(
+                dn[k].to(device), dns[k].to(device), dng[k].to(device), size_k=i, size_n=h
+            )
             out["down"][k].copy_(qw)
             out["down_scale"][k].copy_(sc.view(FP8))
             down_alpha[k] = al[0]
@@ -274,7 +323,19 @@ class MarlinNvfp4MoEKernel(MoEKernel):
     def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
         t = view.tensors
         assert view.alphas is not None
-        return marlin_fused_experts(x, t["gate_up"], t["gate_up_scale"], view.alphas[0], t["down"], t["down_scale"], view.alphas[1], topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input)
+        return marlin_fused_experts(
+            x,
+            t["gate_up"],
+            t["gate_up_scale"],
+            view.alphas[0],
+            t["down"],
+            t["down_scale"],
+            view.alphas[1],
+            topk_weights,
+            topk_ids,
+            layer.activation,
+            layer.apply_router_weight_on_input,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +557,9 @@ class B12xNvfp4MoEKernel(MoEKernel):
             return f"b12x requires sm_120+, got sm_{cc[0]}{cc[1]}"
         if not backend.is_flashinfer_installed():
             return "flashinfer is not installed"
-        reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=False, plain_silu_only=True)
+        reason = self._common_reject(
+            cfg, resident_ok=False, tp_ok=False, cpu_ok=False, plain_silu_only=True
+        )
         if reason:
             return reason
         return _b12x_unusable_reason(cc)
@@ -507,7 +570,9 @@ class B12xNvfp4MoEKernel(MoEKernel):
 
     def slot_limit(self, cfg: MoEConfig) -> int | None:
         # the cute launcher indexes each bank with int32 element offsets
-        per_slot = max(math.prod(spec.shape) for spec in self.layout(cfg).values() if not spec.resident)
+        per_slot = max(
+            math.prod(spec.shape) for spec in self.layout(cfg).values() if not spec.resident
+        )
         return (2**31 - 1) // per_slot
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
@@ -523,7 +588,9 @@ class B12xNvfp4MoEKernel(MoEKernel):
         }
 
     def pack(self, pieces, cfg: MoEConfig, out):
-        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import prepare_w4a16_packed_weights
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import (
+            prepare_w4a16_packed_weights,
+        )
 
         i, h = cfg.intermediate, cfg.hidden
         device = torch.device("cuda")
@@ -552,16 +619,42 @@ class B12xNvfp4MoEKernel(MoEKernel):
             source_format="modelopt",
         )
         e = gu.shape[0]
-        for role, t in (("gate_up", prepared.w13), ("gate_up_scale", prepared.w13_scale), ("down", prepared.w2), ("down_scale", prepared.w2_scale)):
+        for role, t in (
+            ("gate_up", prepared.w13),
+            ("gate_up_scale", prepared.w13_scale),
+            ("down", prepared.w2),
+            ("down_scale", prepared.w2_scale),
+        ):
             bank = out[role]
-            assert t.shape[1:] == bank.shape[1:] and t.dtype == bank.dtype, (role, t.shape, t.dtype, bank.shape, bank.dtype)
+            assert t.shape[1:] == bank.shape[1:] and t.dtype == bank.dtype, (
+                role,
+                t.shape,
+                t.dtype,
+                bank.shape,
+                bank.dtype,
+            )
             bank.copy_(t[:e])
-        return {"gate_up_alpha": prepared.w13_global_scale[:e].float(), "down_alpha": prepared.w2_global_scale[:e].float()}
+        return {
+            "gate_up_alpha": prepared.w13_global_scale[:e].float(),
+            "down_alpha": prepared.w2_global_scale[:e].float(),
+        }
 
     def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
         t = view.tensors
         assert view.alphas is not None
-        return b12x_fused_experts(x, t["gate_up"], t["gate_up_scale"], view.alphas[0], t["down"], t["down_scale"], view.alphas[1], topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input)
+        return b12x_fused_experts(
+            x,
+            t["gate_up"],
+            t["gate_up_scale"],
+            view.alphas[0],
+            t["down"],
+            t["down_scale"],
+            view.alphas[1],
+            topk_weights,
+            topk_ids,
+            layer.activation,
+            layer.apply_router_weight_on_input,
+        )
 
 
 @register_method(QuantKind.NVFP4, LayerKind.MOE)

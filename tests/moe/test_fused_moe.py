@@ -72,20 +72,26 @@ def test_fused_experts_decode_matches_reference_for_non_contiguous_slots(batch_s
     torch.manual_seed(42 + batch_size)
 
     hidden_states = 0.5 * torch.randn(batch_size, hidden_size, device=device, dtype=dtype)
-    gate_up = torch.randn(
-        cache_size,
-        intermediate_size * 2,
-        hidden_size,
-        device=device,
-        dtype=dtype,
-    ) * 0.5
-    down = torch.randn(
-        cache_size,
-        hidden_size,
-        intermediate_size,
-        device=device,
-        dtype=dtype,
-    ) * 0.5
+    gate_up = (
+        torch.randn(
+            cache_size,
+            intermediate_size * 2,
+            hidden_size,
+            device=device,
+            dtype=dtype,
+        )
+        * 0.5
+    )
+    down = (
+        torch.randn(
+            cache_size,
+            hidden_size,
+            intermediate_size,
+            device=device,
+            dtype=dtype,
+        )
+        * 0.5
+    )
     weights = torch.rand(batch_size, top_k, device=device, dtype=torch.float32)
     topk_weights = weights / weights.sum(dim=-1, keepdim=True)
     slot_ids = torch.tensor([31, 4, 18, 0, 29, 7, 35, 12], device=device, dtype=torch.int32)
@@ -113,20 +119,26 @@ def test_fused_experts_decode_matches_grouped_impl(dtype, apply_router_weight_on
     torch.manual_seed(91)
 
     hidden_states = 0.25 * torch.randn(batch_size, hidden_size, device=device, dtype=dtype)
-    gate_up = torch.randn(
-        num_experts,
-        intermediate_size * 2,
-        hidden_size,
-        device=device,
-        dtype=dtype,
-    ) * 0.25
-    down = torch.randn(
-        num_experts,
-        hidden_size,
-        intermediate_size,
-        device=device,
-        dtype=dtype,
-    ) * 0.25
+    gate_up = (
+        torch.randn(
+            num_experts,
+            intermediate_size * 2,
+            hidden_size,
+            device=device,
+            dtype=dtype,
+        )
+        * 0.25
+    )
+    down = (
+        torch.randn(
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            device=device,
+            dtype=dtype,
+        )
+        * 0.25
+    )
     weights = torch.rand(batch_size, top_k, device=device, dtype=torch.float32)
     topk_weights = weights / weights.sum(dim=-1, keepdim=True)
     topk_ids = torch.tensor(
@@ -169,20 +181,26 @@ def test_fused_experts_grouped_impl_is_cuda_graph_capturable():
     torch.manual_seed(17)
 
     hidden_states = 0.25 * torch.randn(batch_size, hidden_size, device=device, dtype=dtype)
-    gate_up = torch.randn(
-        num_experts,
-        intermediate_size * 2,
-        hidden_size,
-        device=device,
-        dtype=dtype,
-    ) * 0.25
-    down = torch.randn(
-        num_experts,
-        hidden_size,
-        intermediate_size,
-        device=device,
-        dtype=dtype,
-    ) * 0.25
+    gate_up = (
+        torch.randn(
+            num_experts,
+            intermediate_size * 2,
+            hidden_size,
+            device=device,
+            dtype=dtype,
+        )
+        * 0.25
+    )
+    down = (
+        torch.randn(
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            device=device,
+            dtype=dtype,
+        )
+        * 0.25
+    )
     topk_weights = torch.tensor([[0.4, 0.3, 0.2, 0.1]], device=device, dtype=torch.float32)
     topk_ids = torch.tensor([[6, 1, 4, 7]], device=device, dtype=torch.int32)
     output = torch.empty_like(hidden_states)
@@ -228,20 +246,26 @@ def test_fused_experts_decode_activation_and_router_weight_modes(
     torch.manual_seed(123)
 
     hidden_states = 0.5 * torch.randn(batch_size, hidden_size, device=device, dtype=dtype)
-    gate_up = torch.randn(
-        cache_size,
-        intermediate_size * 2,
-        hidden_size,
-        device=device,
-        dtype=dtype,
-    ) * 0.5
-    down = torch.randn(
-        cache_size,
-        hidden_size,
-        intermediate_size,
-        device=device,
-        dtype=dtype,
-    ) * 0.5
+    gate_up = (
+        torch.randn(
+            cache_size,
+            intermediate_size * 2,
+            hidden_size,
+            device=device,
+            dtype=dtype,
+        )
+        * 0.5
+    )
+    down = (
+        torch.randn(
+            cache_size,
+            hidden_size,
+            intermediate_size,
+            device=device,
+            dtype=dtype,
+        )
+        * 0.5
+    )
     topk_weights = torch.tensor(
         [[0.4, 0.3, 0.2, 0.1], [0.15, 0.35, 0.25, 0.25], [0.1, 0.2, 0.3, 0.4]],
         device=device,

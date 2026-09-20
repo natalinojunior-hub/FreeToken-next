@@ -14,24 +14,54 @@ from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig
 from freetoken.models.blocks import embed_input_ids
 from freetoken.models.qwen3_vl import deepstack_add, parse_config
 
-ROPE = {"rope_theta": 5_000_000, "rope_type": "default", "mrope_section": [24, 20, 20], "mrope_interleaved": True}
+ROPE = {
+    "rope_theta": 5_000_000,
+    "rope_type": "default",
+    "mrope_section": [24, 20, 20],
+    "mrope_interleaved": True,
+}
 
 
 def _hf_config(num_experts=0, arch="Qwen3VLForConditionalGeneration"):
     text = SimpleNamespace(
-        hidden_size=64, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2, head_dim=16,
-        intermediate_size=128, rms_norm_eps=1e-6, hidden_act="silu", vocab_size=1000,
-        max_position_embeddings=4096, rope_parameters=ROPE, rope_scaling=ROPE, model_type="qwen3_vl_text",
-        num_experts=num_experts, num_experts_per_tok=2, moe_intermediate_size=32, norm_topk_prob=True,
+        hidden_size=64,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        intermediate_size=128,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        vocab_size=1000,
+        max_position_embeddings=4096,
+        rope_parameters=ROPE,
+        rope_scaling=ROPE,
+        model_type="qwen3_vl_text",
+        num_experts=num_experts,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        norm_topk_prob=True,
     )
     vision = SimpleNamespace(
-        hidden_size=32, depth=3, num_heads=4, intermediate_size=64, patch_size=16, temporal_patch_size=2,
-        spatial_merge_size=2, num_position_embeddings=16, out_hidden_size=64, in_channels=3,
+        hidden_size=32,
+        depth=3,
+        num_heads=4,
+        intermediate_size=64,
+        patch_size=16,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        num_position_embeddings=16,
+        out_hidden_size=64,
+        in_channels=3,
         deepstack_visual_indexes=[0, 1],
     )
     return SimpleNamespace(
-        text_config=text, vision_config=vision, image_token_id=151655, tie_word_embeddings=False,
-        model_type="qwen3_vl", architectures=[arch],
+        text_config=text,
+        vision_config=vision,
+        image_token_id=151655,
+        tie_word_embeddings=False,
+        model_type="qwen3_vl",
+        architectures=[arch],
     )
 
 
@@ -43,17 +73,27 @@ def _engine_config(monkeypatch, hf, processor, **overrides):
     monkeypatch.setattr(engine_config, "checkpoint_quant_config", lambda *args: None)
     monkeypatch.setattr(mm_processor, "get_mm_processor", lambda path, mm=None: processor)
     return EngineConfig(
-        model_path="/fake", tp_info=DistributedInfo(rank=0, size=1), dtype=torch.bfloat16, **overrides
+        model_path="/fake",
+        tp_info=DistributedInfo(rank=0, size=1),
+        dtype=torch.bfloat16,
+        **overrides,
     )
 
 
 def test_vision_carries_mrope_and_deepstack():
     c = parse_config(_hf_config())
     assert c.is_multimodal and c.model_is_mrope
-    assert c.rotary_config.mrope_section == [24, 20, 20] and c.rotary_config.mrope_layout == "interleaved"
+    assert (
+        c.rotary_config.mrope_section == [24, 20, 20]
+        and c.rotary_config.mrope_layout == "interleaved"
+    )
     assert c.rotary_config.base == 5_000_000 and c.rotary_config.scaling is None
     assert c.vision_config.deepstack_visual_indexes == (0, 1) and c.image_token_id == 151655
-    assert c.num_layers == 4 and c.num_experts == 0 and c.architectures == ["Qwen3VLForConditionalGeneration"]
+    assert (
+        c.num_layers == 4
+        and c.num_experts == 0
+        and c.architectures == ["Qwen3VLForConditionalGeneration"]
+    )
     assert [g.attn_type.name for g in c.kv_cache_group_specs()] == ["FULL"]
 
 
@@ -72,7 +112,9 @@ def test_engine_builds_the_tower_for_a_registered_family(monkeypatch):
 
 def test_text_model_only_hands_the_parser_a_config_without_vision(monkeypatch):
     hf = _hf_config()
-    c = _engine_config(monkeypatch, hf, object(), mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)))
+    c = _engine_config(
+        monkeypatch, hf, object(), mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS))
+    )
     assert not c.served_modalities
     assert not c.model_config.is_multimodal and not c.model_config.model_is_mrope
     assert hf.vision_config is not None  # the cached checkpoint config is left alone
@@ -80,9 +122,13 @@ def test_text_model_only_hands_the_parser_a_config_without_vision(monkeypatch):
 
 @pytest.mark.parametrize("kinds, served", [({"vision"}, set()), ({"audio"}, {"image"})])
 def test_mm_disable_drops_only_the_named_tower(monkeypatch, kinds, served):
-    c = _engine_config(monkeypatch, _hf_config(), object(), mm=MultimodalConfig(disabled_encoders=frozenset(kinds)))
+    c = _engine_config(
+        monkeypatch, _hf_config(), object(), mm=MultimodalConfig(disabled_encoders=frozenset(kinds))
+    )
     assert c.served_modalities == served and not c.mm.text_model_only
-    assert c.model_config.is_multimodal == bool(served) and c.model_config.model_is_mrope == bool(served)
+    assert c.model_config.is_multimodal == bool(served) and c.model_config.model_is_mrope == bool(
+        served
+    )
 
 
 def test_registered_encoders_come_with_a_processor_and_the_model_hooks():
@@ -102,7 +148,11 @@ def test_a_family_without_registered_encoders_is_served_text_only(monkeypatch):
     from dataclasses import replace
     from freetoken.models.register import get_model_spec
 
-    monkeypatch.setattr(engine_config, "get_model_spec", lambda arch: replace(get_model_spec(arch), mm_processor=None, encoders=()))
+    monkeypatch.setattr(
+        engine_config,
+        "get_model_spec",
+        lambda arch: replace(get_model_spec(arch), mm_processor=None, encoders=()),
+    )
     c = _engine_config(monkeypatch, _hf_config(), None)
     assert not c.active_encoders and not c.served_modalities and not c.model_config.is_multimodal
 
@@ -129,12 +179,16 @@ def test_tower_roots_make_the_fp8_ignore_list_match():
             ],
         },
     )
-    with_roots = QuantConfig.from_hf(hf, name_map=NameMap(roots=spec.checkpoint_roots, packed=spec.packed_modules_mapping))
+    with_roots = QuantConfig.from_hf(
+        hf, name_map=NameMap(roots=spec.checkpoint_roots, packed=spec.packed_modules_mapping)
+    )
     assert with_roots.scheme_for("model.layers.0.self_attn.qkv_proj") is not None
     assert with_roots.scheme_for("visual.blocks.0.attn.qkv") is None
     assert with_roots.scheme_for("visual.merger.linear_fc2") is None
     # without the visual -> model.visual root the tower would be built fp8 against bf16 tensors
-    without = QuantConfig.from_hf(hf, name_map=NameMap(roots=(), packed=spec.packed_modules_mapping))
+    without = QuantConfig.from_hf(
+        hf, name_map=NameMap(roots=(), packed=spec.packed_modules_mapping)
+    )
     assert without.scheme_for("visual.blocks.0.attn.qkv") is not None
 
 
@@ -142,7 +196,9 @@ def test_image_rows_take_the_leading_columns_and_deepstack_adds_the_next_block()
     H = 4
     table = torch.arange(10 * H, dtype=torch.float32).view(10, H)
     embed = SimpleNamespace(forward=lambda ids: table[ids], num_embeddings=10)
-    assert torch.equal(embed_input_ids(embed, torch.tensor([1, 2]), SimpleNamespace(mm_embeds=None)), table[[1, 2]])
+    assert torch.equal(
+        embed_input_ids(embed, torch.tensor([1, 2]), SimpleNamespace(mm_embeds=None)), table[[1, 2]]
+    )
     ids = torch.tensor([1, MM_PAD_SHIFT_VALUE + 7, 2, MM_PAD_SHIFT_VALUE + 7])
     mm = torch.arange(2 * 3 * H, dtype=torch.float32).view(2, 3 * H)
     rows = torch.tensor([1, 3])

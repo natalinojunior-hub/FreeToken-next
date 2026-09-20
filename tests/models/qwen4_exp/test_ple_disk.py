@@ -61,7 +61,9 @@ def _make_store(tmp_path, *, write=True, use_io_uring=True):
 
 def _fill(store, args, window, tokens):
     ctx = torch.tensor([window[0], window[1], *tokens], dtype=torch.int64)
-    staging = torch.empty(len(tokens) * args.num_ngram_heads * args.ngram_head_dim, dtype=torch.uint8)
+    staging = torch.empty(
+        len(tokens) * args.num_ngram_heads * args.ngram_head_dim, dtype=torch.uint8
+    )
     store.stage(ctx.data_ptr(), len(tokens), staging.data_ptr())
     store.flush(0)
     return staging
@@ -86,7 +88,9 @@ def _make_table(tmp_path):
     multipliers, sizes, offsets = hash_constants(args)
     total_rows = int(offsets[-1] + sizes[-1])
     gen = torch.Generator().manual_seed(9)
-    table = torch.randint(0, 256, (total_rows, args.ngram_head_dim), dtype=torch.uint8, generator=gen)
+    table = torch.randint(
+        0, 256, (total_rows, args.ngram_head_dim), dtype=torch.uint8, generator=gen
+    )
     n_shards = next(k for k in (4, 2, 1) if total_rows % k == 0)
     _write_checkpoint(tmp_path, table, n_shards)
     constants = {
@@ -142,7 +146,9 @@ def test_store_stages_bitwise_rows(tmp_path):
         store.stage(ctx.data_ptr() + 24 * i, 1, staging.data_ptr() + i * row)
     store.flush(0)
     for i, context in enumerate(contexts):
-        assert torch.equal(staging[i * row : (i + 1) * row], _fill(store, args, context, [9])), f"lane {i}"
+        assert torch.equal(staging[i * row : (i + 1) * row], _fill(store, args, context, [9])), (
+            f"lane {i}"
+        )
 
     # hundreds of deduped reads through the 64-deep pipeline
     gen = torch.Generator().manual_seed(23)
@@ -171,16 +177,22 @@ def test_layouts_readers_and_errors(tmp_path):
     fa.write_bytes(b"j" * 1231 + shard(0) + b"k" * 77 + shard(2))
     fb.write_bytes(shard(1) + b"m" * 4095 + shard(3))
     kwargs = dict(
-        rows_per_extent=per, row_bytes=cols, row_stride=cols,
-        multipliers=[3, 5, 7], head_vocab_sizes=sizes, head_offsets=offsets,
+        rows_per_extent=per,
+        row_bytes=cols,
+        row_stride=cols,
+        multipliers=[3, 5, 7],
+        head_vocab_sizes=sizes,
+        head_offsets=offsets,
         eos_token_id=eos,
     )
     ref = _ple_store.PleStore(
         paths=[str(flat)], extent_file=[0, 0, 0, 0], extent_base=[0, nb, 2 * nb, 3 * nb], **kwargs
     )
     multi = _ple_store.PleStore(
-        paths=[str(fa), str(fb)], extent_file=[0, 1, 0, 1],
-        extent_base=[1231, 0, 1231 + nb + 77, nb + 4095], **kwargs,
+        paths=[str(fa), str(fb)],
+        extent_file=[0, 1, 0, 1],
+        extent_base=[1231, 0, 1231 + nb + 77, nb + 4095],
+        **kwargs,
     )
     tokens = torch.randint(0, eos, (40,), generator=gen, dtype=torch.int64)
     ctx = torch.cat((torch.tensor([eos, eos], dtype=torch.int64), tokens))
@@ -198,7 +210,9 @@ def test_layouts_readers_and_errors(tmp_path):
     pool, _, _ = _make_store(tmp_path, write=False, use_io_uring=False)
     gen2 = torch.Generator().manual_seed(31)
     seq = torch.randint(0, EOS, (150,), generator=gen2, dtype=torch.int64).tolist()
-    assert torch.equal(_fill(pool, args, (EOS, EOS), seq), _fill(ring, args, (EOS, EOS), seq)), "pool vs ring"
+    assert torch.equal(_fill(pool, args, (EOS, EOS), seq), _fill(ring, args, (EOS, EOS), seq)), (
+        "pool vs ring"
+    )
 
     # geometry that exceeds the file is rejected at construction
     del ring, pool
@@ -213,22 +227,28 @@ def test_layouts_readers_and_errors(tmp_path):
     from freetoken.models.qwen4_exp.ple_disk import source_from_safetensors
 
     save_file(
-        {f"{_KEY_PREFIX}.shard_0.weight": torch.zeros(8, 4, dtype=torch.uint8),
-         f"{_KEY_PREFIX}.weight_scale": torch.tensor(1.0, dtype=torch.bfloat16)},
+        {
+            f"{_KEY_PREFIX}.shard_0.weight": torch.zeros(8, 4, dtype=torch.uint8),
+            f"{_KEY_PREFIX}.weight_scale": torch.tensor(1.0, dtype=torch.bfloat16),
+        },
         str(tmp_path / "model.safetensors"),
     )
     with pytest.raises(ValueError, match="dtype"):
         source_from_safetensors(str(tmp_path))
     save_file(
-        {f"{_KEY_PREFIX}.shard_1.weight": torch.zeros(8, 4, dtype=torch.float8_e4m3fn),
-         f"{_KEY_PREFIX}.weight_scale": torch.tensor(1.0, dtype=torch.bfloat16)},
+        {
+            f"{_KEY_PREFIX}.shard_1.weight": torch.zeros(8, 4, dtype=torch.float8_e4m3fn),
+            f"{_KEY_PREFIX}.weight_scale": torch.tensor(1.0, dtype=torch.bfloat16),
+        },
         str(tmp_path / "model.safetensors"),
     )
     with pytest.raises(ValueError, match="contiguous"):
         source_from_safetensors(str(tmp_path))
     save_file(
-        {f"{_KEY_PREFIX}.shard_0.weight": torch.zeros(8, 4, dtype=torch.float8_e4m3fn),
-         f"{_KEY_PREFIX}.weight_scale": torch.tensor(1.0, dtype=torch.bfloat16)},
+        {
+            f"{_KEY_PREFIX}.shard_0.weight": torch.zeros(8, 4, dtype=torch.float8_e4m3fn),
+            f"{_KEY_PREFIX}.weight_scale": torch.tensor(1.0, dtype=torch.bfloat16),
+        },
         str(tmp_path / "model.safetensors"),
     )
     save_file(
@@ -247,8 +267,11 @@ def test_layouts_readers_and_errors(tmp_path):
     rows = int(offs[-1] + vocab[-1])
     _write_checkpoint(tmp_path, torch.zeros(rows // 2, args.ngram_head_dim, dtype=torch.uint8), 1)
     constants = {
-        "num_ngram_heads": args.num_ngram_heads, "layer_multipliers": multipliers.tolist(),
-        "per_head_vocab_sizes": vocab.tolist(), "per_head_offsets": offs.tolist(), "eos_token_id": EOS,
+        "num_ngram_heads": args.num_ngram_heads,
+        "layer_multipliers": multipliers.tolist(),
+        "per_head_vocab_sizes": vocab.tolist(),
+        "per_head_offsets": offs.tolist(),
+        "eos_token_id": EOS,
     }
     with pytest.raises(ValueError, match="hash addresses"):
         DiskRowTable(source_from_safetensors(str(tmp_path)), constants)
@@ -271,7 +294,9 @@ def test_disk_table_matches_oracle(tmp_path):
         disk.fill([torch.tensor([older, newer, token])], graph=False)
         ids = emb.row_ids(_meta([[token]], [[older, newer]], decode=True)).cuda()
         out = torch.empty((1, ids.shape[-1] * disk.head_dim), dtype=disk.dtype, device="cuda")
-        assert disk.lookup(ids, out) is out and _bitwise_equal(out, oracle.lookup(ids)), f"token {token}"
+        assert disk.lookup(ids, out) is out and _bitwise_equal(out, oracle.lookup(ids)), (
+            f"token {token}"
+        )
         older, newer = newer, token
 
     # the engine hook end to end: eager decode, then fresh + continuation prefill
@@ -280,9 +305,15 @@ def test_disk_table_matches_oracle(tmp_path):
     assert _bitwise_equal(disk.lookup(ids), oracle.lookup(ids)), "hook decode"
 
     prompt = [3, 4, EOS, 5, 6, 8]
-    fresh = SimpleNamespace(input_ids=torch.tensor(prompt[:4], dtype=torch.int32), device_len=4, cached_len=0)
-    cont = SimpleNamespace(input_ids=torch.tensor(prompt, dtype=torch.int32), device_len=6, cached_len=4)
-    disk.host_fill_batch(SimpleNamespace(is_decode=False, padded_reqs=[fresh, cont]), use_graph=False)
+    fresh = SimpleNamespace(
+        input_ids=torch.tensor(prompt[:4], dtype=torch.int32), device_len=4, cached_len=0
+    )
+    cont = SimpleNamespace(
+        input_ids=torch.tensor(prompt, dtype=torch.int32), device_len=6, cached_len=4
+    )
+    disk.host_fill_batch(
+        SimpleNamespace(is_decode=False, padded_reqs=[fresh, cont]), use_graph=False
+    )
     ids = emb.row_ids(_meta([prompt[:4], prompt[4:]], [[EOS, EOS], [prompt[2], prompt[3]]])).cuda()
     assert _bitwise_equal(disk.lookup(ids), oracle.lookup(ids)), "hook prefill"
 

@@ -18,6 +18,7 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def _tiny_config():
     """Minimal gpt-oss-like ModelConfig for the mxfp4 offload path."""
     from freetoken.models.config import ModelConfig, RotaryConfig
+
     rotary = RotaryConfig(
         head_dim=64,
         rotary_dim=64,
@@ -66,12 +67,23 @@ def _offload_layer(config, layer_id, cache):
     from freetoken.layers.quantization import QuantConfig
     from freetoken.models.gpt_oss.moe import GptOssOffloadMoELayer
 
-    quant = QuantConfig.from_hf({"quantization_config": {"quant_method": "mxfp4", "modules_to_not_convert": []}})
+    quant = QuantConfig.from_hf(
+        {"quantization_config": {"quant_method": "mxfp4", "modules_to_not_convert": []}}
+    )
     layer = GptOssOffloadMoELayer(
-        layer_id, config.num_experts, config.num_experts_per_tok, config.hidden_size,
-        config.moe_intermediate_size, renormalize=True, activation="gpt_oss_swiglu",
-        alpha=config.hidden_act_alpha, limit=config.swiglu_limit, interleaved=True, has_bias=True,
-        quant_config=quant, prefix=f"model.layers.{layer_id}.mlp.experts",
+        layer_id,
+        config.num_experts,
+        config.num_experts_per_tok,
+        config.hidden_size,
+        config.moe_intermediate_size,
+        renormalize=True,
+        activation="gpt_oss_swiglu",
+        alpha=config.hidden_act_alpha,
+        limit=config.swiglu_limit,
+        interleaved=True,
+        has_bias=True,
+        quant_config=quant,
+        prefix=f"model.layers.{layer_id}.mlp.experts",
     )
     layer.offload_cache = cache
     return layer
@@ -82,7 +94,9 @@ def _make_offload_cache(config, device, *, cache_size=None, prefill_overlap=Fals
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     probe = _offload_layer(config, 0, None)
-    banks = build_expert_banks(probe.quant_method, config.num_layers, None, device=device, dummy=True)
+    banks = build_expert_banks(
+        probe.quant_method, config.num_layers, None, device=device, dummy=True
+    )
     cache = OffloadMoeCache(
         num_layers=config.num_layers,
         num_experts=config.num_experts,
@@ -147,7 +161,9 @@ def _mxfp4_dequant_reference(run, M, seed):
     alpha, limit = 1.702, 7.0
     hb, ib = H // 32, I // 32
 
-    gu_b = torch.randint(0, 256, (E, 2 * I, hb, 16), device=device, dtype=torch.uint8, generator=gen)
+    gu_b = torch.randint(
+        0, 256, (E, 2 * I, hb, 16), device=device, dtype=torch.uint8, generator=gen
+    )
     gu_s = torch.full((E, 2 * I, hb), 124, device=device, dtype=torch.uint8)
     gu_bias = 0.05 * torch.randn(E, 2 * I, device=device, dtype=torch.bfloat16, generator=gen)
     dn_b = torch.randint(0, 256, (E, H, ib, 16), device=device, dtype=torch.uint8, generator=gen)
@@ -161,8 +177,18 @@ def _mxfp4_dequant_reference(run, M, seed):
     gbt, gst = _transpose_mxfp4_for_decode(gu_b, gu_s)
     dbt, dst = _transpose_mxfp4_for_decode(dn_b, dn_s)
     out = run(
-        hidden, tw, tid, gbt, gst, gu_bias, dbt, dst, dn_bias,
-        top_k=top_k, hidden_act_alpha=alpha, swiglu_limit=limit,
+        hidden,
+        tw,
+        tid,
+        gbt,
+        gst,
+        gu_bias,
+        dbt,
+        dst,
+        dn_bias,
+        top_k=top_k,
+        hidden_act_alpha=alpha,
+        swiglu_limit=limit,
     )
 
     expected = torch.zeros(M, H, device=device, dtype=torch.float32)
@@ -221,10 +247,18 @@ def test_offload_decode_bit_identical_under_eviction(tp1):
         g = lambda k: cache.bank_sources[k][layer_id].to(dev)
         tid_ref = torch.tensor([expert_ids], dtype=torch.int32, device=dev)
         return _run_mxfp4_splitk_decode_experts(
-            hidden, tw, tid_ref,
-            g("gate_up"), g("gate_up_scale"), g("gate_up_bias"),
-            g("down"), g("down_scale"), g("down_bias"),
-            top_k=tk, hidden_act_alpha=c.hidden_act_alpha, swiglu_limit=c.swiglu_limit,
+            hidden,
+            tw,
+            tid_ref,
+            g("gate_up"),
+            g("gate_up_scale"),
+            g("gate_up_bias"),
+            g("down"),
+            g("down_scale"),
+            g("down_bias"),
+            top_k=tk,
+            hidden_act_alpha=c.hidden_act_alpha,
+            swiglu_limit=c.swiglu_limit,
         )
 
     # A: cold-load layer-1 experts 0,1
@@ -236,10 +270,16 @@ def test_offload_decode_bit_identical_under_eviction(tp1):
     assert torch.equal(out_b, ref(1, [2, 3])), "Call B (fill cache) failed"
 
     # Evictor: layer0 [0,1] claims the two LRU-oldest slots (A's) -> L1E0,L1E1 evicted
-    out_ev = layer0._decode_routed(hidden, tw, torch.tensor([[0, 1]], dtype=torch.int32, device=dev))
+    out_ev = layer0._decode_routed(
+        hidden, tw, torch.tensor([[0, 1]], dtype=torch.int32, device=dev)
+    )
     assert torch.equal(out_ev, ref(0, [0, 1])), "Evictor call failed"
-    assert int(cache.slot_for_id[1, 0].item()) == -1, "Eviction did not happen (L1E0 still resident)"
-    assert int(cache.slot_for_id[1, 1].item()) == -1, "Eviction did not happen (L1E1 still resident)"
+    assert int(cache.slot_for_id[1, 0].item()) == -1, (
+        "Eviction did not happen (L1E0 still resident)"
+    )
+    assert int(cache.slot_for_id[1, 1].item()) == -1, (
+        "Eviction did not happen (L1E1 still resident)"
+    )
 
     # C: L1E0,L1E1 missing -> reload (evicting L1E2,L1E3)
     out_c = layer1._decode_routed(hidden, tw, torch.tensor([[0, 1]], dtype=torch.int32, device=dev))
@@ -273,10 +313,18 @@ def test_offload_prefill_overlap_matches_reference(M, tp1):
 
     g = lambda k: cache.bank_sources[k][0].to(dev)  # layer-0 source rows
     out_ref = _run_mxfp4_prefill_experts_t(
-        hidden, tw, tid,
-        g("gate_up"), g("gate_up_scale"), g("gate_up_bias"),
-        g("down"), g("down_scale"), g("down_bias"),
-        top_k=tk, hidden_act_alpha=c.hidden_act_alpha, swiglu_limit=c.swiglu_limit,
+        hidden,
+        tw,
+        tid,
+        g("gate_up"),
+        g("gate_up_scale"),
+        g("gate_up_bias"),
+        g("down"),
+        g("down_scale"),
+        g("down_bias"),
+        top_k=tk,
+        hidden_act_alpha=c.hidden_act_alpha,
+        swiglu_limit=c.swiglu_limit,
     )
     max_diff = (out_overlap - out_ref).abs().max().item()
     assert torch.equal(out_overlap, out_ref), f"overlap prefill differs; max_diff={max_diff}"

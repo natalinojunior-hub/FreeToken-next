@@ -28,10 +28,19 @@ from .register import _load_attr, get_model_spec
 
 # safetensors header dtype strings -> torch dtypes (for the parallel reader below)
 _ST_DTYPE = {
-    "F64": torch.float64, "F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16,
-    "I64": torch.int64, "I32": torch.int32, "I16": torch.int16, "I8": torch.int8,
-    "U8": torch.uint8, "BOOL": torch.bool,
-    "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2, "F8_E8M0": torch.float8_e8m0fnu,
+    "F64": torch.float64,
+    "F32": torch.float32,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "I64": torch.int64,
+    "I32": torch.int32,
+    "I16": torch.int16,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E5M2": torch.float8_e5m2,
+    "F8_E8M0": torch.float8_e8m0fnu,
 }
 _ODIRECT_BLK = 4096
 
@@ -51,7 +60,7 @@ def _read_shard_odirect_parallel(path: str, workers: int, chunk: int) -> mmap.mm
     def rd(o):
         want = min(chunk, asize - o)
         want = min(want, ((size - o + _ODIRECT_BLK - 1) // _ODIRECT_BLK) * _ODIRECT_BLK)
-        os.preadv(fd, [mv[o:o + want]], o)
+        os.preadv(fd, [mv[o : o + want]], o)
 
     try:
         if len(offs) <= 1:
@@ -115,7 +124,7 @@ def iter_expert_tensors_parallel(
                         pass
                 buf = _read_shard_odirect_parallel(path, workers, chunk)  # overlaps placement
                 n = struct.unpack("<Q", bytes(buf[:8]))[0]
-                hdr = json.loads(bytes(buf[8:8 + n]))
+                hdr = json.loads(bytes(buf[8 : 8 + n]))
                 q.put((buf, hdr, 8 + n, shards[shard], os.path.getsize(path)))
         except BaseException as e:  # surface reader errors to the consumer
             err.append(e)
@@ -126,8 +135,10 @@ def iter_expert_tensors_parallel(
 
     th = threading.Thread(target=_reader, name="expert-prefetch", daemon=True)
     th.start()
-    bar = byte_bar(sum(os.path.getsize(os.path.join(model_path, s)) for s in shard_list),
-                   "Loading experts (parallel)")
+    bar = byte_bar(
+        sum(os.path.getsize(os.path.join(model_path, s)) for s in shard_list),
+        "Loading experts (parallel)",
+    )
     try:
         while True:
             item = q.get()
@@ -138,7 +149,7 @@ def iter_expert_tensors_parallel(
             for name in names:
                 meta = hdr[name]
                 b, e = meta["data_offsets"]
-                t = torch.frombuffer(mv[base + b: base + e], dtype=_ST_DTYPE[meta["dtype"]])
+                t = torch.frombuffer(mv[base + b : base + e], dtype=_ST_DTYPE[meta["dtype"]])
                 yield name, (t.view(*meta["shape"]) if meta["shape"] else t)
             bar.update(shard_sz)
             del mv, buf  # freed once the consumer drops the last yielded tensor of this shard
@@ -171,7 +182,9 @@ def experts_scattered(model_path: str) -> bool:
             with open(index) as f:
                 shards = sorted(set(json.load(f)["weight_map"].values()))
         else:
-            shards = sorted(os.path.basename(p) for p in glob.glob(os.path.join(model_path, "*.safetensors")))
+            shards = sorted(
+                os.path.basename(p) for p in glob.glob(os.path.join(model_path, "*.safetensors"))
+            )
         sizes: list[int] = []
         for shard in shards:
             try:
@@ -259,7 +272,9 @@ def ftw_lacks_vision(model_path: str) -> bool:
 
     if not is_ftw_checkpoint(model_path):
         return False
-    return not any(name.startswith(VISION_KEY_PREFIXES) for name in ftw_tensor_names(model_path, "weight"))
+    return not any(
+        name.startswith(VISION_KEY_PREFIXES) for name in ftw_tensor_names(model_path, "weight")
+    )
 
 
 def load_q4_0_moe_expert_sources(

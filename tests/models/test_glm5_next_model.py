@@ -28,34 +28,62 @@ def _hf_config():
     from freetoken.utils.hf import RawConfigShim
 
     text = {
-        "hidden_size": HIDDEN, "intermediate_size": 96, "num_hidden_layers": 2,
-        "num_attention_heads": 2, "vocab_size": VOCAB, "hidden_act": "silu",
-        "rms_norm_eps": 1e-5, "max_position_embeddings": 4096,
+        "hidden_size": HIDDEN,
+        "intermediate_size": 96,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "vocab_size": VOCAB,
+        "hidden_act": "silu",
+        "rms_norm_eps": 1e-5,
+        "max_position_embeddings": 4096,
         "tie_word_embeddings": False,
-        "q_lora_rank": 48, "kv_lora_rank": LATENT, "qk_nope_head_dim": 32,
-        "qk_rope_head_dim": 0, "v_head_dim": 32, "mla_use_nope": True,
-        "index_n_heads": IDX_H, "index_head_dim": IDX_D, "index_topk": 32,
-        "indexer_types": ["full", "full"], "indexer_rope_interleave": True,
-        "index_kpool": 4, "index_kpool_compress": True,
+        "q_lora_rank": 48,
+        "kv_lora_rank": LATENT,
+        "qk_nope_head_dim": 32,
+        "qk_rope_head_dim": 0,
+        "v_head_dim": 32,
+        "mla_use_nope": True,
+        "index_n_heads": IDX_H,
+        "index_head_dim": IDX_D,
+        "index_topk": 32,
+        "indexer_types": ["full", "full"],
+        "indexer_rope_interleave": True,
+        "index_kpool": 4,
+        "index_kpool_compress": True,
         "index_kpool_always_select_tail": True,
         "linear_attn_config": {
-            "num_heads": KDA_H, "head_dim": KDA_D,
-            "short_conv_kernel_size": 4, "gate_lower_bound": -5.0,
+            "num_heads": KDA_H,
+            "head_dim": KDA_D,
+            "short_conv_kernel_size": 4,
+            "gate_lower_bound": -5.0,
         },
         "layer_types": ["linear_attention", "deepseek_sparse_attention"],
         "mlp_layer_types": ["dense", "dense"],  # no MoE machinery in this test
         "first_k_dense_replace": 2,
-        "mhc": True, "hc_mult": 4, "hc_eps": 1e-6, "hc_sinkhorn_iters": 20,
-        "n_routed_experts": 8, "num_experts_per_tok": 2, "n_shared_experts": 1,
-        "moe_intermediate_size": 32, "norm_topk_prob": True,
-        "routed_scaling_factor": 2.5, "scoring_func": "sigmoid",
-        "n_group": 1, "topk_group": 1, "swiglu_limit": 10.0,
-        "attention_bias": False, "model_type": "glm5_next_text",
+        "mhc": True,
+        "hc_mult": 4,
+        "hc_eps": 1e-6,
+        "hc_sinkhorn_iters": 20,
+        "n_routed_experts": 8,
+        "num_experts_per_tok": 2,
+        "n_shared_experts": 1,
+        "moe_intermediate_size": 32,
+        "norm_topk_prob": True,
+        "routed_scaling_factor": 2.5,
+        "scoring_func": "sigmoid",
+        "n_group": 1,
+        "topk_group": 1,
+        "swiglu_limit": 10.0,
+        "attention_bias": False,
+        "model_type": "glm5_next_text",
     }
-    return RawConfigShim({
-        "architectures": ["Glm5NextForConditionalGeneration"],
-        "model_type": "glm5_next", "text_config": text,
-    })
+    return RawConfigShim(
+        {
+            "architectures": ["Glm5NextForConditionalGeneration"],
+            "model_type": "glm5_next",
+            "text_config": text,
+        }
+    )
 
 
 @pytest.fixture()
@@ -93,21 +121,33 @@ def rig(monkeypatch):
     model.load_state_dict(rand)
 
     kv = KpoolDSAKVCache(
-        latent_dim=LATENT, num_layers=2, num_pages=4, page_size=64,
-        dtype=torch.bfloat16, device=torch.device(DEV),
-        index_head_dim=IDX_D, num_index_layers=1,
-        index_ratio=4, num_req_slots=4,
+        latent_dim=LATENT,
+        num_layers=2,
+        num_pages=4,
+        page_size=64,
+        dtype=torch.bfloat16,
+        device=torch.device(DEV),
+        index_head_dim=IDX_D,
+        num_index_layers=1,
+        index_ratio=4,
+        num_req_slots=4,
     )
     page_table = torch.full((2, 256), -1, dtype=torch.int32, device=DEV)
     page_table[0] = torch.arange(256, dtype=torch.int32, device=DEV)
     linear_pool = LinearStatePool(
-        config.linear_attention_group(), num_slots=4,
-        dtype=torch.bfloat16, device=torch.device(DEV), tp_size=1,
+        config.linear_attention_group(),
+        num_slots=4,
+        dtype=torch.bfloat16,
+        device=torch.device(DEV),
+        tp_size=1,
     )
 
     ctx = SimpleNamespace(
-        kv_cache=kv, page_table=page_table, linear_state_pool=linear_pool,
-        attn_backend=None, batch=None,
+        kv_cache=kv,
+        page_table=page_table,
+        linear_state_pool=linear_pool,
+        attn_backend=None,
+        batch=None,
     )
     for mod in (
         "freetoken.attention.dsa.get_global_ctx",
@@ -123,8 +163,12 @@ def rig(monkeypatch):
 
 def _req(device_len, cached_len):
     return SimpleNamespace(
-        table_idx=0, device_len=device_len, extend_len=device_len - cached_len,
-        cached_len=cached_len, linear_slot_idx=1, mamba_ping_pong=None,
+        table_idx=0,
+        device_len=device_len,
+        extend_len=device_len - cached_len,
+        cached_len=cached_len,
+        linear_slot_idx=1,
+        mamba_ping_pong=None,
     )
 
 
@@ -135,8 +179,11 @@ def _batch(ctx, ids, t0, phase):
     is_decode = phase == "decode"
     batch = SimpleNamespace(
         phase=phase,
-        is_prefill=not is_decode, is_decode=is_decode, size=1,
-        reqs=[_req(t1, t0)], padded_reqs=[_req(t1, t0)],
+        is_prefill=not is_decode,
+        is_decode=is_decode,
+        size=1,
+        reqs=[_req(t1, t0)],
+        padded_reqs=[_req(t1, t0)],
         input_ids=torch.tensor(ids, device=DEV),
         positions=torch.arange(t0, t1, device=DEV),
         out_loc=torch.arange(t0, t1, device=DEV),
@@ -146,8 +193,7 @@ def _batch(ctx, ids, t0, phase):
             cache_indices=torch.tensor([1], dtype=torch.int32, device=DEV),
             has_initial_state=None if is_decode else torch.tensor([t0 > 0], device=DEV),
             fresh_state_indices=(
-                None if (is_decode or t0 > 0)
-                else torch.tensor([1], dtype=torch.int64, device=DEV)
+                None if (is_decode or t0 > 0) else torch.tensor([1], dtype=torch.int64, device=DEV)
             ),
         ),
         mm_embeds=None,

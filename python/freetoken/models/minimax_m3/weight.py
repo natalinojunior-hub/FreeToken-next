@@ -127,19 +127,16 @@ def _emit_fused(
         return
     from freetoken.kernel.triton.mxfp8_linear import mxfp8_dequant
 
-    dequant = [
-        mxfp8_dequant(w, s, dtype=torch.bfloat16) if s is not None else w
-        for w, s in parts
-    ]
-    yield f"{out_key}.weight", (
-        torch.cat(dequant, dim=0) if len(dequant) > 1 else dequant[0]
-    )
+    dequant = [mxfp8_dequant(w, s, dtype=torch.bfloat16) if s is not None else w for w, s in parts]
+    yield f"{out_key}.weight", (torch.cat(dequant, dim=0) if len(dequant) > 1 else dequant[0])
 
 
 _VISION_ATTN = "vision_tower.vision_model.encoder.layers.{}.self_attn"
 
 
-def _iter_vision(reader: _ShardReader, weight_map: dict, num_layers: int) -> Iterator[tuple[str, torch.Tensor]]:
+def _iter_vision(
+    reader: _ShardReader, weight_map: dict, num_layers: int
+) -> Iterator[tuple[str, torch.Tensor]]:
     """The tower under its checkpoint names with q/k/v fused, the projector and patch-merge MLP under the tower prefix; all bf16 (the patch embedding is stored fp32)."""
     for name in weight_map:
         if name.startswith(("multi_modal_projector.", "patch_merge_mlp.")):
@@ -151,7 +148,10 @@ def _iter_vision(reader: _ShardReader, weight_map: dict, num_layers: int) -> Ite
         for kind in ("weight", "bias"):
             parts = [reader.get(f"{attn}.{proj}.{kind}") for proj in ("q_proj", "k_proj", "v_proj")]
             yield f"{attn}.qkv.{kind}", torch.cat(parts, dim=0).to(torch.bfloat16)
-            yield f"{attn}.out_proj.{kind}", reader.get(f"{attn}.out_proj.{kind}").to(torch.bfloat16)
+            yield (
+                f"{attn}.out_proj.{kind}",
+                reader.get(f"{attn}.out_proj.{kind}").to(torch.bfloat16),
+            )
 
 
 def iter_weights(
@@ -237,9 +237,7 @@ def iter_weights(
                     [f"{s_src}.gate_proj", f"{s_src}.up_proj"],
                     mlp_mx,
                 )
-                yield from _emit_fused(
-                    reader, f"{s_dst}.down_proj", [f"{s_src}.down_proj"], mlp_mx
-                )
+                yield from _emit_fused(reader, f"{s_dst}.down_proj", [f"{s_src}.down_proj"], mlp_mx)
             else:
                 yield from _emit_fused(
                     reader,
@@ -260,7 +258,9 @@ def iter_weights(
         reader.close()
 
 
-def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+def iter_vision_weights(
+    model_path: str, device: torch.device
+) -> Iterator[tuple[str, torch.Tensor]]:
     """The vision tower alone, named as iter_weights names it."""
     config = parse_config(cached_load_hf_config(model_path))
     if config.vision_config is None:

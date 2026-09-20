@@ -71,16 +71,34 @@ def _decode_gemm(
     total_routes = M * top_k
     grid = (total_routes, triton.cdiv(N, _DECODE_BLOCK_N))
     _decode_nvfp4_moe_kernel[grid](
-        a, packed, scale, glob, c, topk_weights, topk_ids,
+        a,
+        packed,
+        scale,
+        glob,
+        c,
+        topk_weights,
+        topk_ids,
         _e2m1_lut(a.device.index),
-        total_routes, N, K,
-        a.stride(0), a.stride(1),
-        packed.stride(0), packed.stride(1), packed.stride(2),
-        scale.stride(0), scale.stride(1), scale.stride(2),
-        glob.stride(0), glob.stride(1),
-        c.stride(0), c.stride(1), c.stride(2),
-        topk_weights.stride(0), topk_weights.stride(1),
-        topk_ids.stride(0), topk_ids.stride(1),
+        total_routes,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        packed.stride(0),
+        packed.stride(1),
+        packed.stride(2),
+        scale.stride(0),
+        scale.stride(1),
+        scale.stride(2),
+        glob.stride(0),
+        glob.stride(1),
+        c.stride(0),
+        c.stride(1),
+        c.stride(2),
+        topk_weights.stride(0),
+        topk_weights.stride(1),
+        topk_ids.stride(0),
+        topk_ids.stride(1),
         BLOCK_SIZE_N=_DECODE_BLOCK_N,
         BLOCK_SIZE_KB=_DECODE_BLOCK_KB,
         TOP_K=top_k,
@@ -116,16 +134,34 @@ def _decode_gemm_marlin(
     block_kw = _DECODE_MARLIN_DEEPK_BLOCK_KW if deep_k else _DECODE_MARLIN_BLOCK_KW
     grid = (total_routes, triton.cdiv(N, block_n))
     _decode_nvfp4_marlin_kernel[grid](
-        a, packed_i32, scale, glob, c, topk_weights, topk_ids,
+        a,
+        packed_i32,
+        scale,
+        glob,
+        c,
+        topk_weights,
+        topk_ids,
         _e2m1_lut(a.device.index),
-        total_routes, N, K,
-        a.stride(0), a.stride(1),
-        packed_i32.stride(0), packed_i32.stride(1), packed_i32.stride(2),
-        scale.stride(0), scale.stride(1), scale.stride(2),
-        glob.stride(0), glob.stride(1),
-        c.stride(0), c.stride(1), c.stride(2),
-        topk_weights.stride(0), topk_weights.stride(1),
-        topk_ids.stride(0), topk_ids.stride(1),
+        total_routes,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        packed_i32.stride(0),
+        packed_i32.stride(1),
+        packed_i32.stride(2),
+        scale.stride(0),
+        scale.stride(1),
+        scale.stride(2),
+        glob.stride(0),
+        glob.stride(1),
+        c.stride(0),
+        c.stride(1),
+        c.stride(2),
+        topk_weights.stride(0),
+        topk_weights.stride(1),
+        topk_ids.stride(0),
+        topk_ids.stride(1),
         BLOCK_SIZE_N=block_n,
         BLOCK_SIZE_KW=block_kw,
         TOP_K=top_k,
@@ -163,15 +199,29 @@ def _fused_experts_decode_nvfp4(
 
     ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
     gemm_fn(
-        hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
-        ic1, topk_weights, topk_ids, apply_router_weight_on_input, False,
+        hidden_states,
+        gate_up_packed,
+        gate_up_scale,
+        gate_up_global,
+        ic1,
+        topk_weights,
+        topk_ids,
+        apply_router_weight_on_input,
+        False,
     )
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
     gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     gemm_fn(
-        ic2, down_packed, down_scale, down_global,
-        ic3, topk_weights, topk_ids, not apply_router_weight_on_input, True,
+        ic2,
+        down_packed,
+        down_scale,
+        down_global,
+        ic3,
+        topk_weights,
+        topk_ids,
+        not apply_router_weight_on_input,
+        True,
     )
     out = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(ic3, out)
@@ -196,10 +246,19 @@ def fused_experts_decode_nvfp4_marlin(
     """Decode inline-NVFP4 MoE using the Marlin-style int32 wide-load GEMV."""
     return _fused_experts_decode_nvfp4(
         _decode_gemm_marlin,
-        hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
-        down_packed, down_scale, down_global,
-        topk_weights, topk_ids, activation, apply_router_weight_on_input,
-        act_alpha, act_limit,
+        hidden_states,
+        gate_up_packed,
+        gate_up_scale,
+        gate_up_global,
+        down_packed,
+        down_scale,
+        down_global,
+        topk_weights,
+        topk_ids,
+        activation,
+        apply_router_weight_on_input,
+        act_alpha,
+        act_limit,
     )
 
 
@@ -222,10 +281,19 @@ def fused_experts_decode_nvfp4_serial(
     A/B benchmarking against the marlin decode path; not on the production decode path."""
     return _fused_experts_decode_nvfp4(
         _decode_gemm,
-        hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
-        down_packed, down_scale, down_global,
-        topk_weights, topk_ids, activation, apply_router_weight_on_input,
-        act_alpha, act_limit,
+        hidden_states,
+        gate_up_packed,
+        gate_up_scale,
+        gate_up_global,
+        down_packed,
+        down_scale,
+        down_global,
+        topk_weights,
+        topk_ids,
+        activation,
+        apply_router_weight_on_input,
+        act_alpha,
+        act_limit,
     )
 
 
@@ -234,10 +302,22 @@ def _prefill_config(M: int) -> Dict[str, int]:
     # so it cannot be picked by triton.autotune; these were chosen by an offline sweep
     # over (BLOCK_M, BLOCK_N, BLOCK_KB, num_warps, num_stages) for the MiniMax-M2 shapes.
     if M <= 64:
-        return dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
-                    GROUP_SIZE_M=1, num_warps=8, num_stages=4)
-    return dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
-                GROUP_SIZE_M=8, num_warps=8, num_stages=4)
+        return dict(
+            BLOCK_SIZE_M=16,
+            BLOCK_SIZE_N=64,
+            BLOCK_SIZE_KB=32,
+            GROUP_SIZE_M=1,
+            num_warps=8,
+            num_stages=4,
+        )
+    return dict(
+        BLOCK_SIZE_M=32,
+        BLOCK_SIZE_N=64,
+        BLOCK_SIZE_KB=32,
+        GROUP_SIZE_M=8,
+        num_warps=8,
+        num_stages=4,
+    )
 
 
 def _prefill_gemm(
@@ -263,15 +343,32 @@ def _prefill_gemm(
         triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
     _prefill_nvfp4_moe_kernel[grid](
-        a, packed, scale, glob, c, topk_weights_flat, sorted_ids, expert_ids,
+        a,
+        packed,
+        scale,
+        glob,
+        c,
+        topk_weights_flat,
+        sorted_ids,
+        expert_ids,
         num_tokens_post_padded,
         _e2m1_lut(a.device.index),
-        N, K, EM, num_valid_tokens,
-        a.stride(0), a.stride(1),
-        packed.stride(0), packed.stride(1), packed.stride(2),
-        scale.stride(0), scale.stride(1), scale.stride(2),
-        glob.stride(0), glob.stride(1),
-        c.stride(1), c.stride(2),
+        N,
+        K,
+        EM,
+        num_valid_tokens,
+        a.stride(0),
+        a.stride(1),
+        packed.stride(0),
+        packed.stride(1),
+        packed.stride(2),
+        scale.stride(0),
+        scale.stride(1),
+        scale.stride(2),
+        glob.stride(0),
+        glob.stride(1),
+        c.stride(1),
+        c.stride(2),
         topk_weights_flat.stride(0),
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=kernel_top_k,
@@ -312,17 +409,37 @@ def fused_experts_nvfp4(
 
     ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
     _prefill_gemm(
-        hidden_states, gate_up_packed, gate_up_scale, gate_up_global, ic1,
-        tw, sorted_ids, expert_ids, ntpp, num_valid, top_k,
-        apply_router_weight_on_input, cfg,
+        hidden_states,
+        gate_up_packed,
+        gate_up_scale,
+        gate_up_global,
+        ic1,
+        tw,
+        sorted_ids,
+        expert_ids,
+        ntpp,
+        num_valid,
+        top_k,
+        apply_router_weight_on_input,
+        cfg,
     )
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
     gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     _prefill_gemm(
-        ic2, down_packed, down_scale, down_global, ic3,
-        tw, sorted_ids, expert_ids, ntpp, num_valid, 1,
-        not apply_router_weight_on_input, cfg,
+        ic2,
+        down_packed,
+        down_scale,
+        down_global,
+        ic3,
+        tw,
+        sorted_ids,
+        expert_ids,
+        ntpp,
+        num_valid,
+        1,
+        not apply_router_weight_on_input,
+        cfg,
     )
     out = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(ic3, out)

@@ -102,10 +102,21 @@ def _hf_config(quantization_config: dict | None = None) -> RawConfigShim:
         "model_type": "glm5_next",
         "text_config": _text_config(),
         "vision_config": {
-            "model_type": "glm5_next_vision", "depth": 24, "hidden_size": 1024, "num_heads": 16, "intermediate_size": 4096,
-            "projection_intermediate_size": 10240, "out_hidden_size": 4096, "in_channels": 3, "patch_size": 14,
-            "temporal_patch_size": 2, "spatial_merge_size": 2, "rms_norm_eps": 1e-5, "swiglu_limit": 10.0,
-            "attention_bias": True, "hidden_act": "silu",
+            "model_type": "glm5_next_vision",
+            "depth": 24,
+            "hidden_size": 1024,
+            "num_heads": 16,
+            "intermediate_size": 4096,
+            "projection_intermediate_size": 10240,
+            "out_hidden_size": 4096,
+            "in_channels": 3,
+            "patch_size": 14,
+            "temporal_patch_size": 2,
+            "spatial_merge_size": 2,
+            "rms_norm_eps": 1e-5,
+            "swiglu_limit": 10.0,
+            "attention_bias": True,
+            "hidden_act": "silu",
         },
         "image_token_id": 154854,
     }
@@ -132,12 +143,21 @@ _CT_MIXED_QUANT = {
     "format": "mixed-precision",
     "config_groups": {
         "group_0": {
-            "targets": ["re:.*\\.layers\\.(?:[3-9]|[1-3][0-9]|4[0-4])\\.mlp\\.experts\\..*(gate|up|down)_proj$"],
-            "weights": {"num_bits": 4, "type": "float", "group_size": 16, "strategy": "tensor_group"},
+            "targets": [
+                "re:.*\\.layers\\.(?:[3-9]|[1-3][0-9]|4[0-4])\\.mlp\\.experts\\..*(gate|up|down)_proj$"
+            ],
+            "weights": {
+                "num_bits": 4,
+                "type": "float",
+                "group_size": 16,
+                "strategy": "tensor_group",
+            },
             "format": "nvfp4-pack-quantized",
         },
         "group_1": {
-            "targets": ["re:.*\\.layers\\.45\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"],
+            "targets": [
+                "re:.*\\.layers\\.45\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"
+            ],
             "weights": {"num_bits": 8, "type": "float", "strategy": "block"},
             "format": "float-quantized",
         },
@@ -216,7 +236,10 @@ def test_vision_section_parses_into_the_tower_config():
     # the merger lands in the text width, so the soft tokens scatter into the embeddings unprojected
     assert cfg.vision_config.out_hidden_size == cfg.hidden_size
     # a text-only engine hands the parser a config without the section
-    assert parse_config(RawConfigShim({**_hf_config().to_dict(), "vision_config": None})).vision_config is None
+    assert (
+        parse_config(RawConfigShim({**_hf_config().to_dict(), "vision_config": None})).vision_config
+        is None
+    )
     # the tower implements the clamped SwiGLU only
     data = _hf_config().to_dict()
     data["vision_config"]["hidden_act"] = "gelu"
@@ -296,7 +319,12 @@ def test_compressed_tensors_mixed_precision_reads_the_expert_group():
         "config_groups": {
             "group_0": {
                 "targets": ["re:.*self_attn.*_proj$"],
-                "weights": {"num_bits": 4, "type": "float", "group_size": 16, "strategy": "tensor_group"},
+                "weights": {
+                    "num_bits": 4,
+                    "type": "float",
+                    "group_size": 16,
+                    "strategy": "tensor_group",
+                },
                 "format": "nvfp4-pack-quantized",
             },
             "group_1": {
@@ -320,17 +348,18 @@ def test_expert_source_spec_selection():
     )
 
     ct = _NVFP4_CT_SOURCE_SPEC
-    m = ct.key_pattern.match(
-        "model.language_model.layers.5.mlp.experts.7.gate_proj.weight_packed"
-    )
+    m = ct.key_pattern.match("model.language_model.layers.5.mlp.experts.7.gate_proj.weight_packed")
     assert m and m.group("kind") == "weight_packed"
     assert ct.kind_map["weight_packed"] == "weight"
     assert ct.kind_map["weight_global_scale"] == "weight_scale_2"
     assert ct.global_reciprocal
     # W4A16 serving never consumes the calibrated activation scale.
-    assert ct.key_pattern.match(
-        "model.language_model.layers.5.mlp.experts.7.gate_proj.input_global_scale"
-    ) is None
+    assert (
+        ct.key_pattern.match(
+            "model.language_model.layers.5.mlp.experts.7.gate_proj.input_global_scale"
+        )
+        is None
+    )
     assert _NVFP4_SOURCE_SPEC.kind_map is None
     assert not _NVFP4_SOURCE_SPEC.global_reciprocal
 

@@ -47,9 +47,15 @@ def _group_norm(x, weight, eps, groups):
 def _mtp_config():
     from freetoken.models.config import with_mtp_layer
 
-    cfg = parse_config(toy_hf_config(mtp={
-        "num_hidden_layers": 1, "hybrid": True, "layer_types": ["full_attention"],
-    }))
+    cfg = parse_config(
+        toy_hf_config(
+            mtp={
+                "num_hidden_layers": 1,
+                "hybrid": True,
+                "layer_types": ["full_attention"],
+            }
+        )
+    )
     return with_mtp_layer(cfg, cfg.num_layers)
 
 
@@ -77,7 +83,10 @@ def test_mtp_construction_and_forward_contract(monkeypatch, enabled):
     ids = torch.tensor([2, 3, 4], device=device)
     batch = SimpleNamespace(mm_embeds=None)
     hidden = model.model.forward(ids, batch)
-    target_residual = model.model.embed_tokens.forward(ids).repeat(1, cfg.qwen4_args.hc_count) + 0.125 * cfg.num_layers
+    target_residual = (
+        model.model.embed_tokens.forward(ids).repeat(1, cfg.qwen4_args.hc_count)
+        + 0.125 * cfg.num_layers
+    )
     torch.testing.assert_close(hidden, model.model.hyper_connection_mixer.mix(target_residual)[0])
     if not enabled:
         assert model.mtp is None and model.model._last_residual is None
@@ -96,14 +105,20 @@ def test_mtp_construction_and_forward_contract(monkeypatch, enabled):
     assert "mtp.hyper_connection_mixer.hc_norm.weight" in keys
     assert not any(name.startswith("mtp.embed") or "_last_residual" in name for name in keys)
     residual = torch.randn(
-        3, cfg.hidden_size * head.hc_count, device=device,
+        3,
+        cfg.hidden_size * head.hc_count,
+        device=device,
         generator=torch.Generator(device=device).manual_seed(172),
     )
     norm_r = _group_norm(residual, head.pre_fc_norm_hidden.weight, cfg.rms_norm_eps, head.hc_count)
-    projected_r = F.linear(norm_r.unflatten(-1, (head.hc_count, cfg.hidden_size)), head.fc_hidden.weight).flatten(-2)
+    projected_r = F.linear(
+        norm_r.unflatten(-1, (head.hc_count, cfg.hidden_size)), head.fc_hidden.weight
+    ).flatten(-2)
     embedded = F.embedding(ids, model.model.embed_tokens.weight)
     norm_e = _group_norm(embedded, head.pre_fc_norm_embedding.weight, cfg.rms_norm_eps, 1)
-    expected = projected_r + F.linear(norm_e, head.fc_embedding.weight).repeat(1, head.hc_count) + 0.125
+    expected = (
+        projected_r + F.linear(norm_e, head.fc_embedding.weight).repeat(1, head.hc_count) + 0.125
+    )
     result = head.forward(residual, ids, batch)
     torch.testing.assert_close(result, expected)
     torch.testing.assert_close(head.to_head(result), head.hyper_connection_mixer.mix(expected)[0])
@@ -121,21 +136,37 @@ def test_mtp_quantization_uses_target_experts_and_draft_dense_prefixes():
 
     cfg = replace(_mtp_config(), quant=RecordingQuant())
     quant = _MTPQuantConfig(cfg)
-    assert quant.get_quant_method(SimpleNamespace(quant_layer_kind=LayerKind.MOE), "mtp.layers.0.mlp.experts") == "model.layers.0.mlp.experts"
-    assert quant.get_quant_method(SimpleNamespace(quant_layer_kind=LayerKind.LINEAR), "mtp.fc_hidden") == "mtp.fc_hidden"
+    assert (
+        quant.get_quant_method(
+            SimpleNamespace(quant_layer_kind=LayerKind.MOE), "mtp.layers.0.mlp.experts"
+        )
+        == "model.layers.0.mlp.experts"
+    )
+    assert (
+        quant.get_quant_method(SimpleNamespace(quant_layer_kind=LayerKind.LINEAR), "mtp.fc_hidden")
+        == "mtp.fc_hidden"
+    )
 
 
-@pytest.mark.parametrize("changes", [
-    {"enabled": False}, {"hybrid": False}, {"layer_types": ("linear_attention",)},
-    {"use_hidden_state_from_layer": 0}, {"rope_theta": 42.0},
-])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"enabled": False},
+        {"hybrid": False},
+        {"layer_types": ("linear_attention",)},
+        {"use_hidden_state_from_layer": 0},
+        {"rope_theta": 42.0},
+    ],
+)
 def test_mtp_rejects_unsupported_checkpoint_geometry(changes):
     from dataclasses import replace
 
     from freetoken.models.qwen4_exp.model import Qwen4ExpMTP
 
     cfg = _mtp_config()
-    cfg = replace(cfg, qwen4_args=replace(cfg.qwen4_args, mtp=replace(cfg.qwen4_args.mtp, **changes)))
+    cfg = replace(
+        cfg, qwen4_args=replace(cfg.qwen4_args, mtp=replace(cfg.qwen4_args.mtp, **changes))
+    )
     with pytest.raises(ValueError, match="Qwen4 MTP"):
         Qwen4ExpMTP(cfg, cfg.num_layers, embedding=BaseOP())
 
@@ -250,7 +281,9 @@ def _hf_shift_right(tokens, shift, eos):
 def _hf_ngram_ids(tokens, context, args, multipliers, sizes, offsets):
     """HF Qwen4ExpTextNGramEmbedding id computation over a dense [B, L] batch."""
     history = torch.cat([context, tokens], dim=-1)
-    shifted = [_hf_shift_right(history, s, args.ngram_boundary_token_id) for s in range(args.ngram_size)]
+    shifted = [
+        _hf_shift_right(history, s, args.ngram_boundary_token_id) for s in range(args.ngram_size)
+    ]
     blocks = []
     for ngram in range(2, args.ngram_size + 1):
         start = (ngram - 2) * args.heads_per_ngram
@@ -349,9 +382,9 @@ def test_ple_forward_matches_hf():
         ).unflatten(-1, (hc, hidden))
         value = F.linear(embed, layer.value_proj.weight)
         rows = R[offset : offset + len(tokens)]
-        query = _group_norm(
-            rows, layer.norm_query.weight, config.rms_norm_eps, hc
-        ).unflatten(-1, (hc, hidden))
+        query = _group_norm(rows, layer.norm_query.weight, config.rms_norm_eps, hc).unflatten(
+            -1, (hc, hidden)
+        )
         gate = (key * query).sum(-1, keepdim=True) / math.sqrt(hidden)
         gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
         gated = (gate * value.unsqueeze(-2)).flatten(-2)
@@ -407,11 +440,17 @@ def _hf_attention(x, attn, config, positions):
     qg, k, v = qkv.split(attn._qkv_split, dim=-1)
     qg = qg.view(-1, num_q, dim * 2)
     q, gate = qg[..., :dim], qg[..., dim:].reshape(-1, num_q * dim)
-    q = _hf_rope(_plus_one_rmsnorm(q, attn.q_norm.weight, config.rms_norm_eps), positions,
-                 config.rotary_config.rotary_dim, config.rotary_config.base)
+    q = _hf_rope(
+        _plus_one_rmsnorm(q, attn.q_norm.weight, config.rms_norm_eps),
+        positions,
+        config.rotary_config.rotary_dim,
+        config.rotary_config.base,
+    )
     k = _hf_rope(
         _plus_one_rmsnorm(k.view(-1, num_kv, dim), attn.k_norm.weight, config.rms_norm_eps),
-        positions, config.rotary_config.rotary_dim, config.rotary_config.base,
+        positions,
+        config.rotary_config.rotary_dim,
+        config.rotary_config.base,
     )
     v = v.view(-1, num_kv, dim)
     rep = num_q // num_kv
@@ -419,7 +458,8 @@ def _hf_attention(x, attn, config, positions):
     scores = scores * dim**-0.5
     mask = torch.arange(x.shape[0], device=x.device) > positions.unsqueeze(-1)
     out = torch.einsum(
-        "hqk,khd->qhd", scores.masked_fill(mask, float("-inf")).softmax(-1),
+        "hqk,khd->qhd",
+        scores.masked_fill(mask, float("-inf")).softmax(-1),
         v.repeat_interleave(rep, 1).float(),
     ).to(x.dtype)
     return F.linear(out.reshape(-1, num_q * dim) * torch.sigmoid(gate), attn.o_proj.weight)
@@ -439,7 +479,7 @@ def test_qsa_layer_matches_hf_dense():
     _fill(attn, torch.Generator(device=device).manual_seed(7))
 
     seq_len = 24
-    x = (torch.randn(seq_len, config.hidden_size, device=device, dtype=dtype) * 0.5)
+    x = torch.randn(seq_len, config.hidden_size, device=device, dtype=dtype) * 0.5
     positions = torch.arange(seq_len, device=device, dtype=torch.int64)
     req = SimpleNamespace(extend_len=seq_len, cached_len=0, table_idx=1)
     batch = SimpleNamespace(
@@ -457,7 +497,9 @@ def test_qsa_layer_matches_hf_dense():
     raw = F.linear(x, attn.indexer.index_qk_proj.weight)
     assert index.q.shape == (seq_len, args.index_n_heads, args.index_head_dim)
     assert index.k.shape == (seq_len, args.index_head_dim)
-    assert torch.equal(index.q.reshape(seq_len, -1), raw[:, : args.index_n_heads * args.index_head_dim])
+    assert torch.equal(
+        index.q.reshape(seq_len, -1), raw[:, : args.index_n_heads * args.index_head_dim]
+    )
     assert torch.equal(index.k, raw[:, args.index_n_heads * args.index_head_dim :])
     assert index.q_norm_weight.data_ptr() == attn.indexer.q_layernorm.weight.data_ptr()
 
@@ -516,7 +558,10 @@ def test_shared_gate_kernels_match_torch(num_tokens, hidden, dtype):
 
     fused = shared_gate_mul_add(routed, shared, shared_gate_sigmoid(x, weight.view(-1)))
     eager = routed + shared * torch.sigmoid(F.linear(x, weight))
-    ref = routed.float() + shared.float() * torch.sigmoid(x.float() @ weight.float().view(-1))[:, None]
+    ref = (
+        routed.float()
+        + shared.float() * torch.sigmoid(x.float() @ weight.float().view(-1))[:, None]
+    )
 
     assert fused.dtype == dtype and fused.shape == routed.shape
     torch.testing.assert_close(fused, eager, rtol=2e-2, atol=2e-2)
@@ -552,7 +597,10 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
 
     num_slots, max_len = 4, 64
     pool = LinearStatePool(
-        config.linear_attention_group(), num_slots, dtype, device,
+        config.linear_attention_group(),
+        num_slots,
+        dtype,
+        device,
         slot_states=config.slot_states,
     )
     prompts = [[3, 4, EOS, 5, 6, 8], [2, EOS, 11, 12], [9, 10, 11, 12, 13]]
@@ -562,7 +610,10 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
     )
     reqs = [
         SimpleNamespace(
-            extend_len=len(p), cached_len=0, table_idx=i + 1, linear_slot_idx=None,
+            extend_len=len(p),
+            cached_len=0,
+            table_idx=i + 1,
+            linear_slot_idx=None,
             input_ids=torch.tensor(p, dtype=torch.int64),
         )
         for i, p in enumerate(prompts)
@@ -573,9 +624,15 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
     )
     positions = torch.cat([torch.arange(len(p)) for p in prompts]).to(device)
     batch = SimpleNamespace(
-        padded_reqs=reqs, reqs=reqs, size=len(reqs), is_prefill=True, is_decode=False,
+        padded_reqs=reqs,
+        reqs=reqs,
+        size=len(reqs),
+        is_prefill=True,
+        is_decode=False,
         input_ids=torch.tensor(flat, dtype=torch.int64, device=device),
-        positions=positions, get_attn_positions=lambda: positions, mm_embeds=None,
+        positions=positions,
+        get_attn_positions=lambda: positions,
+        mm_embeds=None,
         attn_metadata=SimpleNamespace(get_last_indices=lambda bs: last[:bs]),
     )
     with ctx.forward_batch(batch):
@@ -589,9 +646,15 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
         r.input_ids = torch.cat([r.input_ids, torch.tensor([14], dtype=torch.int64)])
     decode_positions = torch.tensor([len(p) for p in prompts], dtype=torch.int64, device=device)
     decode = SimpleNamespace(
-        padded_reqs=reqs, reqs=reqs, size=len(reqs), is_prefill=False, is_decode=True,
+        padded_reqs=reqs,
+        reqs=reqs,
+        size=len(reqs),
+        is_prefill=False,
+        is_decode=True,
         input_ids=torch.tensor([14] * len(reqs), dtype=torch.int64, device=device),
-        positions=decode_positions, get_attn_positions=lambda: decode_positions, mm_embeds=None,
+        positions=decode_positions,
+        get_attn_positions=lambda: decode_positions,
+        mm_embeds=None,
         attn_metadata=None,
     )
     with ctx.forward_batch(decode):

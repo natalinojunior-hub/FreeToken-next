@@ -27,7 +27,9 @@ logger = init_logger(__name__)
 SPEC_TIMING_ENV = "FREETOKEN_DEBUG_SPEC_TIMING"
 
 
-def _spec_mrope_positions(req: Req, cached_len: int, device_len: int, device: torch.device) -> torch.Tensor:
+def _spec_mrope_positions(
+    req: Req, cached_len: int, device_len: int, device: torch.device
+) -> torch.Tensor:
     """Build the three-axis RoPE positions for a manually assembled draft batch."""
     full = req.mrope_positions_full
     if full is not None and device_len <= full.shape[1]:
@@ -44,6 +46,48 @@ def _spec_mrope_positions(req: Req, cached_len: int, device_len: int, device: to
 class SchedulerSpecMixin:
     """Mixed into Scheduler. Needs self.spec_mtp/token_pool/cache_manager/engine/decode_manager
     /eos_token_ids/toolcall_anchor_id/finished_reqs/_prepare_batch (see scheduler.py)."""
+
+    def warmup_mtp_draft_kv(self, req: Req) -> None:
+        """Populate the draft head's KV cache over the prefill window.
+
+        Resolves EXP-025 / EXP-050 gap: warms up the draft KV slot over prompt tokens
+        so initial draft steps have full context instead of starting cold with ~0% accept rate.
+        """
+        if self.spec_mtp <= 0:
+            return
+        model = getattr(self.engine, "model", None)
+        mtp = getattr(model, "mtp", None)
+        if mtp is None:
+            return
+        r_last = getattr(getattr(model, "model", None), "_last_residual", None)
+        if r_last is None or r_last.numel() == 0:
+            return
+
+        d = req.device_len
+        win_len = min(r_last.shape[0], d)
+        if win_len <= 0:
+            return
+
+        start_pos = d - win_len
+        tok_window = self.token_pool[req.table_idx, start_pos:d]
+        r_window = r_last[-win_len:]
+
+        old_cached, old_device = req.cached_len, req.device_len
+        try:
+            req.cached_len, req.device_len = start_pos, d
+            wb = Batch(reqs=[req], phase="prefill")
+            wb.padded_reqs = [req]
+            wb.positions = torch.arange(start_pos, d, dtype=torch.int32, device=self.device)
+            if self._model_is_mrope:
+                wb.mrope_positions = _spec_mrope_positions(req, start_pos, d, self.device)
+            wb.out_loc = self.engine.page_table[req.table_idx, start_pos:d]
+            wb.input_ids = tok_window
+            wb.spec_logits_indices = torch.tensor([win_len - 1], device=self.device)
+            self.engine.attn_backend.prepare_metadata(wb)
+            with self.engine.ctx.forward_batch(wb):
+                mtp.forward(r_window, tok_window, wb)
+        finally:
+            req.cached_len, req.device_len = old_cached, old_device
 
     def _spec_eligible_req(self) -> Req | None:
         if self.spec_mtp <= 0:
@@ -147,7 +191,8 @@ class SchedulerSpecMixin:
                 finished = hit_length or hit_eos or matched_stop is not None
                 finish_reason = (
                     ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished else None
+                    if finished
+                    else None
                 )
                 if (
                     next_token == self.toolcall_anchor_id
@@ -155,11 +200,16 @@ class SchedulerSpecMixin:
                     and not finished
                 ):
                     req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(DetokenizeMsg(
-                    uid=req.uid, next_token=next_token, finished=finished,
-                    finish_reason=finish_reason, matched_stop=matched_stop,
-                    stop_strs=req.sampling_params.stop_strs or None,
-                ))
+                reply.append(
+                    DetokenizeMsg(
+                        uid=req.uid,
+                        next_token=next_token,
+                        finished=finished,
+                        finish_reason=finish_reason,
+                        matched_stop=matched_stop,
+                        stop_strs=req.sampling_params.stop_strs or None,
+                    )
+                )
                 if finished:
                     finished_now = True
                     break
@@ -184,7 +234,23 @@ class SchedulerSpecMixin:
         req = self._spec_eligible_req()
         if req is None:
             return False
-        k = min(self.spec_mtp, req.remain_len - 1)
+        from freetoken.scheduler.adaptive_mtp import resolve_adaptive_k
+
+        cache = getattr(self.engine, "moe_offload_cache", None)
+        slots_per_layer = None
+        if cache is not None and getattr(cache, "num_layers", 0) > 0:
+            slots_per_layer = cache.cache_size / cache.num_layers
+        cfg = getattr(self.engine.model, "_config", None) or getattr(
+            self.engine.model, "config", None
+        )
+        top_k = getattr(cfg, "num_experts_per_tok", 10)
+
+        k = resolve_adaptive_k(
+            req,
+            self.spec_mtp,
+            moe_slots_per_layer=slots_per_layer,
+            top_k_experts=top_k,
+        )
         if k <= 0:
             return False
 
@@ -219,9 +285,7 @@ class SchedulerSpecMixin:
             db.padded_reqs = [req]
             db.positions = torch.tensor([d - 1 + i], dtype=torch.int32, device=self.device)
             if self._model_is_mrope:
-                db.mrope_positions = _spec_mrope_positions(
-                    req, d - 1 + i, d + i, self.device
-                )
+                db.mrope_positions = _spec_mrope_positions(req, d - 1 + i, d + i, self.device)
             db.out_loc = self.engine.page_table[req.table_idx, d - 1 + i : d + i]
             db.input_ids = tok_prev
             db.spec_logits_indices = torch.arange(1, device=self.device)
@@ -279,39 +343,44 @@ class SchedulerSpecMixin:
             self.decode_manager.filter_reqs([req])
             return True
 
-
         if committed <= k:
-            # Partial/full reject, request still live: undo GDN/PLE state and re-forward the
-            # committed tokens as a plain prefill to re-derive the next chain's seed residual
-            # (the draft KV wrote garbage past keep_len; _last_residual only holds the last
-            # forward's rows).
-            if snap_slot is not None:
-                pool.copy_from(snap_slot, self._linear_slot(req))
-            self._restore_qsa_state(req)
-            start = d - 1
-            phase = "decode" if committed == 1 else "prefill"
-            rb = Batch(reqs=[req], phase=phase)
-            if rb.is_decode:
-                rb.padded_reqs = [req]
-            # The replay re-forwards ALREADY-COMMITTED positions, so it needs the pre-commit
-            # window lengths -- but they must not survive it: keep_len/keep_len+1 (set above)
-            # are this step's true post-commit state. Leaving the replay's lengths in place
-            # rewinds the request one token behind input_ids, so the next step re-drafts the
-            # previous token AND re-applies position start to a GDN state that already has it
-            # (build_fla_metadata sets has_initial_state = cached_len > 0).
-            keep_cached, keep_device = req.cached_len, req.device_len
-            req.cached_len = start
-            req.device_len = start + committed
-            # This window's pages were already allocated by the verify step's own
-            # _prepare_batch (which used device_len=d+k >= start+committed) -- re-running
-            # allocate_paged on the rewound (start, start+committed) pair would, at a page
-            # boundary, hand back a FRESH page and orphan the real one already there (see the
-            # matching comment on _prepare_batch's skip_alloc parameter).
-            rfi = self._prepare_batch(rb, skip_alloc=True)
-            rb.input_ids = self.token_pool[rfi.input_tuple]
-            self.engine.forward_batch(rb, rfi.sample_args)  # sampled token discarded
-            req.cached_len, req.device_len = keep_cached, keep_device
-            mark("gdn_replay")
+            checkpoints = getattr(vb, "gdn_checkpoints", None)
+            target_step = committed - 1
+            if checkpoints is not None and target_step in checkpoints and pool is not None:
+                # Phase 10 Pillar 2 Zero-Replay GDN: restore recurrent + conv states from verify checkpoint
+                # ponytail: single-slot restore is O(num_layers); add batched restore if spec decode expands beyond batch=1.
+                step_ckpts = checkpoints[target_step]
+                slot = self._linear_slot(req)
+                for li, (rec_s, conv_s) in step_ckpts.items():
+                    pool.recurrent_states[li, slot].copy_(rec_s)
+                    pool.conv_states[li, slot].copy_(conv_s)
+                # Seed residual for the next draft chain from verify forward
+                last_res = getattr(model.model, "_last_residual", None)
+                if last_res is not None and last_res.shape[0] >= committed:
+                    model.model._last_residual = last_res[committed - 1 : committed].clone()
+                self._restore_qsa_state(req)
+                req.cached_len = keep_cached
+                req.device_len = keep_device
+                mark("zero_replay_gdn")
+            else:
+                # Fallback replay path if checkpoints are not available
+                if snap_slot is not None:
+                    pool.copy_from(snap_slot, self._linear_slot(req))
+                self._restore_qsa_state(req)
+                start = d - 1
+                phase = "decode" if committed == 1 else "prefill"
+                rb = Batch(reqs=[req], phase=phase)
+                if rb.is_decode:
+                    rb.padded_reqs = [req]
+                req.cached_len = start
+                req.device_len = start + committed
+                rfi = self._prepare_batch(rb, skip_alloc=True)
+                rb.input_ids = self.token_pool[rfi.input_tuple]
+                rout = self.engine.forward_batch(rb, rfi.sample_args)
+                rout.copy_done_event.synchronize()
+                req.cached_len = keep_cached
+                req.device_len = keep_device
+                mark("gdn_replay")
 
         self.cache_manager.cache_req(req, finished=False)
         mark("cache_req")

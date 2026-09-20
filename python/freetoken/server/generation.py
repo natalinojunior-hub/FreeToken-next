@@ -116,7 +116,9 @@ class GenDone:
     cached_tokens: int = 0
 
 
-GenEvent = ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta | GenDone
+GenEvent = (
+    ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta | GenDone
+)
 
 
 @dataclass
@@ -137,11 +139,13 @@ class GenSpec:
     into a GenSpec (like vLLM's to_sampling_params + _preprocess_chat) and the
     primitive consumes ONLY this — no wire request type reaches the engine path."""
 
-    messages: list[dict[str, Any]]                       # normalized, template-ready
+    messages: list[dict[str, Any]]  # normalized, template-ready
     sampling_params: SamplingParams
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
-    template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
-    parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
+    template_tools: list[dict[str, Any]] | None = None  # tools the model sees (TokenizeMsg.tools)
+    parser_tools: list[dict[str, Any]] | None = (
+        None  # tools for FunctionCallParser; None disables parsing
+    )
 
     @property
     def parse_tools(self) -> bool:
@@ -279,7 +283,9 @@ def split_tool_lists(
     if not all_tool_dicts:
         return None, None
     if selected_name:
-        template = [t for t in all_tool_dicts if (t.get("function") or {}).get("name") == selected_name]
+        template = [
+            t for t in all_tool_dicts if (t.get("function") or {}).get("name") == selected_name
+        ]
     else:
         template = all_tool_dicts
     return template, all_tool_dicts
@@ -421,7 +427,11 @@ def _split_reasoning(text: str, spec: GenSpec, state: Any) -> tuple[str, str]:
 def _leaked_special_tokens(state: Any) -> list[str]:
     """Special-token strings to strip from output. Empty (no-op) unless the dsv4
     reasoning parser is configured, so non-dsv4 output is untouched."""
-    return DSV4_SPECIAL_TOKENS if getattr(state.config, "reasoning_parser", None) == "deepseekv32" else []
+    return (
+        DSV4_SPECIAL_TOKENS
+        if getattr(state.config, "reasoning_parser", None) == "deepseekv32"
+        else []
+    )
 
 
 def _make_tool_parser(spec: GenSpec, state: Any) -> FunctionCallParser:
@@ -550,8 +560,12 @@ async def generate_events(
         raise
     finally:
         _record_generation(
-            source=source, stream=True, start=start,
-            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, error=error,
+            source=source,
+            stream=True,
+            start=start,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            error=error,
             first_token_at=first_token_at,
         )
 
@@ -572,7 +586,9 @@ async def generate_full(
         raise
     finally:
         _record_generation(
-            source=source, stream=False, start=start,
+            source=source,
+            stream=False,
+            start=start,
             prompt_tokens=result.prompt_tokens if result else 0,
             completion_tokens=result.completion_tokens if result else 0,
             error=error,
@@ -671,9 +687,13 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
                         "params": "",
                         "ordinal": calls_emitted,
                     }
-                    out.append(ToolCallStart(
-                        tool_index=calls_emitted, name=frag.name, args_prefix_stable=frag_stable,
-                    ))
+                    out.append(
+                        ToolCallStart(
+                            tool_index=calls_emitted,
+                            name=frag.name,
+                            args_prefix_stable=frag_stable,
+                        )
+                    )
                 if frag.parameters:
                     open_call["params"] += frag.parameters
                     out.append(
@@ -769,8 +789,11 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
             yield ContentDelta(strip_special_tokens(pending, specials))
 
     yield GenDone(
-        finish_reason, prompt_tokens, completion_tokens,
-        matched_stop=engine_matched_stop, cached_tokens=cached_tokens,
+        finish_reason,
+        prompt_tokens,
+        completion_tokens,
+        matched_stop=engine_matched_stop,
+        cached_tokens=cached_tokens,
     )
 
 

@@ -52,7 +52,13 @@ def test_successful_tokenization_does_not_account_prompt_before_admission():
     class Tokenizer:
         def tokenize(self, messages):
             (msg,) = messages
-            return [UserMsg(uid=msg.uid, input_ids=torch.tensor([10, 11, 12], dtype=torch.int32), sampling_params=msg.sampling_params)]
+            return [
+                UserMsg(
+                    uid=msg.uid,
+                    input_ids=torch.tensor([10, 11, 12], dtype=torch.int32),
+                    sampling_params=msg.sampling_params,
+                )
+            ]
 
     backend, errors = _tokenize_requests(Tokenizer(), [_tokenize_msg(1)], _Logger())
     assert [msg.uid for msg in backend] == [1]
@@ -66,12 +72,16 @@ def test_tokenization_failure_and_empty_prompt_are_terminal_without_usage():
             (msg,) = messages
             if msg.uid == 2:
                 raise ValueError("bad template")
-            return [UserMsg(uid=msg.uid, input_ids=torch.empty(0, dtype=torch.int32), sampling_params=msg.sampling_params)]
+            return [
+                UserMsg(
+                    uid=msg.uid,
+                    input_ids=torch.empty(0, dtype=torch.int32),
+                    sampling_params=msg.sampling_params,
+                )
+            ]
 
     logger = _Logger()
-    backend, errors = _tokenize_requests(
-        Tokenizer(), [_tokenize_msg(2), _tokenize_msg(3)], logger
-    )
+    backend, errors = _tokenize_requests(Tokenizer(), [_tokenize_msg(2), _tokenize_msg(3)], logger)
     assert backend == []
     assert [reply.uid for reply in errors] == [2, 3]
     assert all(reply.finished and reply.prompt_tokens_delta == 0 for reply in errors)

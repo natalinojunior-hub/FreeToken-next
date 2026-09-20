@@ -78,9 +78,7 @@ def test_prepare_stop_waits_for_a_natural_terminal_reply():
             )
 
         finisher = asyncio.create_task(finish())
-        result = await prepare_stop_accounting(
-            state, drain_timeout_s=0.2, abort_timeout_s=0.1
-        )
+        result = await prepare_stop_accounting(state, drain_timeout_s=0.2, abort_timeout_s=0.1)
         await finisher
         return state, result
 
@@ -93,9 +91,7 @@ def test_prepare_stop_waits_for_a_natural_terminal_reply():
 def test_prepare_stop_aborts_after_bounded_drain_and_waits_for_terminal_ack():
     state = _state()
     state.stats.on_new_user(5)
-    result = asyncio.run(
-        prepare_stop_accounting(state, drain_timeout_s=0.0, abort_timeout_s=0.1)
-    )
+    result = asyncio.run(prepare_stop_accounting(state, drain_timeout_s=0.0, abort_timeout_s=0.1))
     assert result["drain_complete"] is True
     assert state.stats.active == 0
     assert state.stats.completed == 0  # an aborted request is terminal, not completed
@@ -110,9 +106,7 @@ def test_missing_abort_terminal_fails_closed_and_keeps_admission_shut():
 
     state.abort_user = abort_without_ack
     with pytest.raises(AccountingDrainError, match="abort barrier timed out"):
-        asyncio.run(
-            prepare_stop_accounting(state, drain_timeout_s=0.0, abort_timeout_s=0.01)
-        )
+        asyncio.run(prepare_stop_accounting(state, drain_timeout_s=0.0, abort_timeout_s=0.01))
     assert state.maintenance_state == "stopping"
     assert state.stats.active == 1
     assert not hasattr(state, "_sealed_accounting")

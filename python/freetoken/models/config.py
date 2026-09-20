@@ -34,7 +34,9 @@ def detect_expert_quant(hf_config: Any) -> str:
         groups = get("config_groups") or {}
         groups = [g or {} for g in (groups.values() if isinstance(groups, dict) else [])]
         # groups that target the experts decide; only a generic ["Linear"] group falls back to all of them
-        expert_groups = [g for g in groups if any("experts" in str(t) for t in (g.get("targets") or []))]
+        expert_groups = [
+            g for g in groups if any("experts" in str(t) for t in (g.get("targets") or []))
+        ]
         for g in expert_groups or groups:
             if "nvfp4" in str(g.get("format") or "").lower():
                 return "nvfp4"
@@ -63,7 +65,7 @@ def detect_compressed_tensors_nvfp4(hf_config: Any) -> bool:
     # the first NVFP4 group would accept a mixed {nvfp4, mxfp4} checkpoint (and the
     # error would depend on the groups' key order).
     saw_nvfp4 = False
-    for g in (groups.values() if isinstance(groups, dict) else []):
+    for g in groups.values() if isinstance(groups, dict) else []:
         w = (g or {}).get("weights") or {}
         if int(w.get("num_bits", 0) or 0) != 4 or str(w.get("type", "")).lower() != "float":
             continue
@@ -401,8 +403,7 @@ class ModelConfig:
     @property
     def has_linear_attention(self) -> bool:
         return any(
-            isinstance(group, LinearGatedDeltaGroupConfig)
-            for group in self.attention_groups
+            isinstance(group, LinearGatedDeltaGroupConfig) for group in self.attention_groups
         )
 
     def default_full_attention_group(self) -> FullAttentionGroupConfig:
@@ -419,16 +420,13 @@ class ModelConfig:
         matches = [group for group in groups if group.owns_layer(layer_id)]
         if len(matches) != 1:
             raise ValueError(
-                f"Expected exactly one attention group for layer {layer_id}, "
-                f"got {len(matches)}"
+                f"Expected exactly one attention group for layer {layer_id}, got {len(matches)}"
             )
         return matches[0]
 
     def swa_attention_group(self) -> SWAAttentionGroupConfig | None:
         groups = [
-            group
-            for group in self.attention_groups
-            if isinstance(group, SWAAttentionGroupConfig)
+            group for group in self.attention_groups if isinstance(group, SWAAttentionGroupConfig)
         ]
         if len(groups) > 1:
             raise ValueError("Expected at most one SWA attention group")

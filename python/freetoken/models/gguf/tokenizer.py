@@ -23,6 +23,7 @@ _TOKENIZER_ARCH = {
     "qwen35moe": "qwen2",
     "qwen35": "qwen2",
     "qwen3moe": "qwen2",
+    "qwen4exp": "qwen2",
     # tokenizer.ggml.model is gpt2 (BPE), pre joyai-llm, 129280 entries. The llama
     # converter is sentencepiece-shaped and encodes a space as U+2581; a GPT2 BPE
     # vocab uses the Ġ prefix instead, so that mapping silently DROPS every space on
@@ -41,6 +42,7 @@ _STOP_TOKENS: dict[str, tuple[str, ...]] = {
     # Dense sibling: same vocab and same chat markers as the MoE variant.
     "qwen35": ("<|im_end|>", "<|endoftext|>"),
     "qwen3moe": ("<|im_end|>", "<|endoftext|>"),
+    "qwen4exp": ("<|im_end|>", "<|endoftext|>"),
     # Read from the vocab: eos id 1 is the document end, <|EOT|> (128805) ends a
     # chat turn. <｜User｜> is deliberately not a stop -- the template emits it
     # before the model speaks, not after.
@@ -56,9 +58,7 @@ def load_gguf_tokenizer(model_path: str):
     arch = gguf_architecture(model_path)
     conv_arch = _TOKENIZER_ARCH.get(arch, arch)
     tok_dict: dict[str, Any] = {
-        k[len("tokenizer.ggml.") :]: v
-        for k, v in meta.items()
-        if k.startswith("tokenizer.ggml.")
+        k[len("tokenizer.ggml.") :]: v for k, v in meta.items() if k.startswith("tokenizer.ggml.")
     }
     fast, _extra = convert_gguf_tokenizer(conv_arch, tok_dict)
 

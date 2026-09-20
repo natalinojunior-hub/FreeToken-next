@@ -50,6 +50,10 @@
 
 - **Prefill-window MTP warm-up AUSENTE** (EXP-025) -> draft head KV nunca populado sobre prompt original -> aceitação baixa nos primeiros tokens pós-prefill.
 
+- **Batch detokenization com múltiplos tokens por UID em MTP (EXP-048)** -> quando spec-decode aceita $m \ge 2$ tokens, o scheduler despacha múltiplos `DetokenizeMsg` com o mesmo `uid` no mesmo lote -> `DetokenizeManager.detokenize()` acumulava todos os tokens no histórico antes de calcular `batch_decode`, mas os offsets de leitura assumiam 1 mensagem por UID -> resultado: fatia de caracteres duplicada (`--0` em vez de `-0`), alterando o texto e o SHA1 mesmo com os tokens do modelo 100% idênticos -> **fix:** detectar repetição de UID no lote e processar sequencialmente para manter os invariantes de offsets progressivos.
+
+- **Bisecção de commit não serve quando o bug sobrevive a TODOS os reverts testados** (EXP-048) -> sha1 idêntico entre árvore 100% revertida e árvore com MoE quebrado (TG 0.47 tok/s) -> **causa está fora do range bisectado** -> **fix:** ao ver conteúdo invariante a reverts de código funcional, trocar de eixo (aqui: comprimento de decode em vez de commit) para achar o ponto exato de divergência antes de continuar revertendo commits.
+
 ---
 
 ## VRAM / RAM / Cache / Paging
@@ -92,6 +96,8 @@
 
 - **Fix em cache/paginação compartilhada -> rodar suite COMPLETA do subsistema** (não só arquivos tocados pelo diff) -> EXP-033 fix quebrou 11 testes scheduler não-relacionados.
 
+- **Non-determinismo sequential persistia após EXP-039 zerar ring/scratch** -> carrier restante era o **slab KV do draft slot MTP** (camada 48), sujo por páginas pré-alocadas do verify e recicladas via radix -> **fix:** `clear_mtp_slot()` em `QSAKVCache.free_req` (todos os tiers: cmp_k, pending_ring, `_k_codes`/`_k_norm`/`_v_codes`/`_v_norm`/BF16 `_kv_buffer`); determinismo só é provado com repeats sequenciais bit-identical, não probe de um carrier por vez.
+
 ---
 
 ## Performance / Compression
@@ -114,6 +120,12 @@
 
 - **`qwen4_exp` MTP tensors existem nos checkpoints** mas upstream loader **dropa `mtp.*`** (#421) -> Phase 9 greenfield na nossa base.
 
+- **Auditoria Cruzada LTO (`llama-turbo-optimal`) vs FreeToken para maximização de TG**:
+  - *Taxa de aceitação != maior TG*: aceitações menores (50-60%) com profundidade maior (`n_max` 3-4) podem superar amplamente TG de aceitações altas (80%+) com `n_max` 1-2 se a sobrecarga de despacho/verify for enxuta.
+  - *Sobrescrita silenciosa no workspace QSA*: bloco `else` em `qsa_sparse.py` sobrepunha a descompressão Turbo4 com tensores brutos comprimidos durante fases não-decode (prefill/verify) -> **fix**: estruturar `if compressed:` estrito englobando decompress e atenção.
+  - *Gargalos de PCIe/Host no MoE*: `_SMALL_BANK_FEAT_BYTES` a 256 KiB forçava cópias síncronas de bancos pequenos quantizados -> **fix**: reduzir piso para 64 KiB e elevar paralelismo de fetch (`hybrid_max_fetch=4`, `hybrid_fetch_fraction=0.5`).
+  - *VRAM over-reservation*: reservas estáticas de autotune e capture peak aprisionavam ~320 MiB de headroom que agora alimentam o pool de páginas KV / slots MoE.
+
 ---
 
 ## Referências Cruzadas
@@ -129,3 +141,16 @@
 | `EXPERIMENTS.md` | EXP-000 a EXP-045, setup/result/verdict |
 | `QA.md` | Gates, validações, checklists |
 | `AGENTS.md` | Instruções para agentes IA |
+- **Cache leak em replay MTP -> _prepare_batch skip_alloc=False -> skip_alloc=True em replay paths (2026-09-19)** (2026-09-19)
+- **Teste auto-doc -> script funciona -> doc atualizada** (2026-09-19)
+- **Documentação EXP-050 afirma prefill-window MTP warm-up implementado (45% accept) mas não existe código em scheduler/spec.py para popular draft KV no prefill** (2026-09-19)
+- **STATE.md afirma _spec_eligible_reqs() multi-request removida trava single-request mas scheduler/spec.py mantém _spec_eligible_req() singular com len(running)!=1 check** (2026-09-19)
+- **STATE.md/EXPERIMENTS.md afirmavam EXP-048 "resolvido" com sha1 17f277f43565 sem log em disco** -> processo em background interrompido sem registro na sessão anterior -> **fix:** nunca marcar experimento como validado sem artefato (log/json) rastreável; live re-run confirmou k=0 sha1 `dec18d678a16` (baseline atual, corpus/config podem ter mudado desde a claim original — comparar sempre contra sha1 do MESMO run, não de sessões antigas).
+- **Flash-Next earlyoom trigger (~8.1GB threshold) durante serve boot/prefill -> Linux page cache retém ~10GB lendo safetensors + glibc retém heap arenas -> posix_fadvise(POSIX_FADV_DONTNEED) pós-load de pesos em engine.py + malloc_trim(0) em scheduler.py liberam ~1.5GB de host RAM, garantindo MemAvailable acima do trigger de 10% do earlyoom** (2026-09-19)
+- **MTP k>=1 e k>=2 no Flash-Next 16K exigem --kv-format turbo4 na RTX 5080 16GB -> sem turbo4 o KV em BF16 estoura VRAM ao carregar draft layer MTP -> com turbo4 e --memory-ratio 0.86 a VRAM estabiliza em 13.88 GiB e determinismo bit-identical é 100% certificado (sha1 match k=0, k=1, k=2)** (2026-09-19)
+- **CUDA 13.3 + FlashInfer JIT: alignas(64) CUtensorMap falha compilação C++ -> Em CUDA 13.3 o tipo CUtensorMap possui alinhamento default de 128 bytes; alignas(64) tenta reduzir alinhamento e gera erro de compilação no nvcc -> fix: alterar para alignas(128) CUtensorMap permite build JIT limpo de fp4_quantization_120f.so** (2026-09-19)
+- **OffloadMoeCache default hybrid_fetch_fraction deve ser 0.0 -> FREETOKEN_HYBRID_FETCH_FRACTION padrão 0.0 preserva teste test_hybrid_fixed_cap_unchanged e política canônica de capped fetch quando profile não é especificado** (2026-09-19)
+- **freetoken_kernel_cache/__init__.py deletado (uncommitted) -> _load_prebuilt() sempre retorna None -> todo kernel JIT recompila do zero em cada start (compile storm, ~70GiB RSS) -> fix: git checkout do arquivo + rebuild/install de ambos os wheels via scripts/build-release-wheels.sh (FREETOKEN_BUILD_NO_STAMP=1 se tree sujo)** (2026-09-20)
+- **iostat -x: %util é coluna distinta de w_await -> confundir w_await (98ms) com %util invalidou inteiramente hipótese de disk-bound MoE thrashing -> fix: sempre conferir o header de colunas do iostat -x antes de concluir I/O-bound** (2026-09-20)
+- **WIP do MoE offload trava indefinidamente após token 1 com CUDA graph decode habilitado -> causa raiz não confirmada (py-spy `-s --native` localiza em torch/cuda/graphs.py replay(), engine/graph.py:214, mas não vê além do pybind/driver; FUSED_COPY=0 e SMALL_BANK_FEAT_BYTES=262144 não resolvem) -> fix: usar --no-graph como baseline eager válido; detalhes do profiling em PERFORMANCE.md; causa raiz pendente de cuda-gdb/nsys** (2026-09-20)
+- **Decode eager (--no-graph) em 16K OOM com mem-ratio 0.9 (faltam 17MiB) -> sem captura de CUDA graph o probe de transient-peak mede 0 e o ledger de VRAM reserva menos, mas FLA chunk_delta_h.py aloca torch.empty_like(u) por passo que o graph absorvia -> fix: mem-ratio 0.85 cabe os transients eager; números eager com mem-ratio reduzido não são comparáveis a runs com CUDA graph (cache de experts encolhe, TG cai)** (2026-09-20)

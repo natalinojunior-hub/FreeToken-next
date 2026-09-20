@@ -301,7 +301,11 @@ class ShellStats:
     def tok_s(self, now: float | None = None) -> float:
         if self.first_token_at is None or self.completion_tokens == 0:
             return 0.0
-        end_time = self.finished_at if self.finished_at is not None else (time.time() if now is None else now)
+        end_time = (
+            self.finished_at
+            if self.finished_at is not None
+            else (time.time() if now is None else now)
+        )
         elapsed = max(end_time - self.first_token_at, 1e-9)
         return self.completion_tokens / elapsed
 
@@ -314,7 +318,9 @@ class ShellStats:
         cache_status = f"cache {self.cache_size} {self.cache_policy}"
         if self.cache_rate is not None:
             cache_status += f" {format_percent(self.cache_rate)}"
-        token_status = f"↓{self.prompt_tokens} ↑{self.completion_tokens} {self.tok_s(now):.1f} tok/s"
+        token_status = (
+            f"↓{self.prompt_tokens} ↑{self.completion_tokens} {self.tok_s(now):.1f} tok/s"
+        )
         segments = [prefix, token_status, cache_status]
         if self.kv_total_pages > 0:
             kv_pct = format_percent(self.kv_used_pages / self.kv_total_pages)
@@ -380,11 +386,14 @@ async def _handle_cache_command(
         for part in (
             _target("moe", f"{command.moe} slots", command.moe) if command.moe is not None else "",
             _target("kv", format_tokens(num_pages, page_size), num_pages)
-            if num_pages is not None else "",
+            if num_pages is not None
+            else "",
             _target("mamba", f"{command.mamba} slots", command.mamba)
-            if command.mamba is not None else "",
+            if command.mamba is not None
+            else "",
             _target("swa", format_tokens(num_swa_pages, swa_page_size), num_swa_pages)
-            if num_swa_pages is not None else "",
+            if num_swa_pages is not None
+            else "",
         )
         if part
     )
@@ -440,11 +449,7 @@ def _help_text(think_gears: Tuple[str, ...], pools: CachePools) -> str:
     """``/help``, written against the served model: the thinking gears come from the server (a
     model with no controllable thinking says so rather than offering a command that no-ops), and
     ``/cache`` lists only the pools this model has."""
-    think = (
-        f"/think [{'|'.join(think_gears)}|toggle|status]"
-        if think_gears
-        else "/think"
-    )
+    think = f"/think [{'|'.join(think_gears)}|toggle|status]" if think_gears else "/think"
     think_help = (
         "switch the model's thinking gear"
         if think_gears

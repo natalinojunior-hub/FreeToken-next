@@ -17,8 +17,16 @@ _TL = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl
 
 
 @triton.jit
-def _swiglu_kernel(gate_ptr, up_ptr, out_ptr, N, limit, BLOCK: tl.constexpr,
-                   HAS_LIMIT: tl.constexpr, OUT: tl.constexpr):
+def _swiglu_kernel(
+    gate_ptr,
+    up_ptr,
+    out_ptr,
+    N,
+    limit,
+    BLOCK: tl.constexpr,
+    HAS_LIMIT: tl.constexpr,
+    OUT: tl.constexpr,
+):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < N
     g = tl.load(gate_ptr + offs, mask=mask, other=0.0).to(tl.float32)
@@ -30,15 +38,23 @@ def _swiglu_kernel(gate_ptr, up_ptr, out_ptr, N, limit, BLOCK: tl.constexpr,
     tl.store(out_ptr + offs, (g * u).to(OUT), mask=mask)
 
 
-def fused_swiglu(gate: torch.Tensor, up: torch.Tensor, limit: float,
-                 out_dtype: torch.dtype) -> torch.Tensor:
+def fused_swiglu(
+    gate: torch.Tensor, up: torch.Tensor, limit: float, out_dtype: torch.dtype
+) -> torch.Tensor:
     """``silu(clamp(gate, max=limit)) * clamp(up, -limit, limit)`` -> ``out_dtype``."""
     out = torch.empty_like(gate, dtype=out_dtype)
     N = gate.numel()
     BLOCK = 512
     _swiglu_kernel[(triton.cdiv(N, BLOCK),)](
-        gate, up, out, N, float(limit), BLOCK=BLOCK,
-        HAS_LIMIT=limit > 0, OUT=_TL[out_dtype], num_warps=4,
+        gate,
+        up,
+        out,
+        N,
+        float(limit),
+        BLOCK=BLOCK,
+        HAS_LIMIT=limit > 0,
+        OUT=_TL[out_dtype],
+        num_warps=4,
     )
     return out
 

@@ -46,13 +46,17 @@ class Req:
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---
-    linear_slot_idx: int | None = None              # live GDN state slot (sglang mamba_pool_idx)
+    linear_slot_idx: int | None = None  # live GDN state slot (sglang mamba_pool_idx)
     mamba_ping_pong: tuple[int, int] | None = None  # 2 donatable track slots under overlap
-    mamba_next_track_idx: int = 0                   # which ping-pong slot is the next snapshot dst (0/1)
-    mamba_last_track_seqlen: int | None = None      # chunk-aligned committed len of the last snapshot
-    mamba_restore_src: int | None = None            # on a prefix hit: tree snapshot slot to COW into the live slot (first chunk only)
-    swa_evicted_seqlen: int = 0                      # SWA radix: positions < this had their swa KV freed (slid out of window) during decode
-    decode_batch_idx: int = 0                        # SWA radix: # of decode forwards done; the proactive free_swa skips the first (overlap guard)
+    mamba_next_track_idx: int = 0  # which ping-pong slot is the next snapshot dst (0/1)
+    mamba_last_track_seqlen: int | None = None  # chunk-aligned committed len of the last snapshot
+    mamba_restore_src: int | None = (
+        None  # on a prefix hit: tree snapshot slot to COW into the live slot (first chunk only)
+    )
+    swa_evicted_seqlen: int = (
+        0  # SWA radix: positions < this had their swa KV freed (slid out of window) during decode
+    )
+    decode_batch_idx: int = 0  # SWA radix: # of decode forwards done; the proactive free_swa skips the first (overlap guard)
     # Set once, at the first sampled tool-call opener token (scheduler detection): the state
     # length just after that token (its index + 1). A client-side rewrite of the echoed tool
     # call diverges strictly after this point, so it is the deepest reuse boundary that
@@ -108,7 +112,6 @@ class Req:
         )
 
 
-
 @dataclass
 class Batch:
     reqs: List[Req]
@@ -158,6 +161,10 @@ class Batch:
     # step whose extend_len > 1 makes the usual "last row of each request" derivation wrong.
     # None (the default) keeps every existing prefill/decode path byte-identical.
     spec_logits_indices: torch.Tensor | None = field(default=None, init=False)
+    # GDN state checkpoints for zero-replay speculative verification.
+    # List of (recurrent_states, conv_states) per step when spec_logits_indices is set.
+    # Each element is a tuple of tensors cloned from the linear_state_pool at that step.
+    gdn_checkpoints: list | None = field(default=None, init=False)
 
     @property
     def is_prefill(self) -> bool:

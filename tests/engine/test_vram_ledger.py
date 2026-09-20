@@ -126,9 +126,7 @@ def test_pool_budget_is_the_ceiling_minus_everything_non_negotiable():
     # headroom reads the ceiling; uncommitted reads the card. They differ by exactly the
     # reserve, and conflating them is what made --memory-ratio look like a safety policy.
     assert ledger.headroom_bytes() == ledger.ceiling_bytes - ledger.held_bytes()
-    assert ledger.uncommitted_bytes() == (
-        16 * _GIB - ledger.held_bytes() - ledger.reserve_bytes
-    )
+    assert ledger.uncommitted_bytes() == (16 * _GIB - ledger.held_bytes() - ledger.reserve_bytes)
     assert ledger.headroom_bytes() - ledger.uncommitted_bytes() == (
         ledger.ceiling_bytes - ledger.baseline_free + ledger.reserve_bytes
     )
@@ -163,9 +161,7 @@ def test_graph_capture_shapes_follow_the_capture_helper():
     assert graph_capture_shapes(8) == 4  # + 8
     assert graph_capture_shapes(24) == 6  # 1, 2, 4, 8, 16, 24
     assert graph_capture_peak_bytes(1) == GRAPH_CAPTURE_PEAK
-    assert graph_capture_peak_bytes(8) == (
-        GRAPH_CAPTURE_PEAK + 3 * GRAPH_CAPTURE_EXTRA_SHAPE
-    )
+    assert graph_capture_peak_bytes(8) == (GRAPH_CAPTURE_PEAK + 3 * GRAPH_CAPTURE_EXTRA_SHAPE)
 
 
 def test_gdn_prefill_peak_scales_with_the_chunk_and_the_state_geometry():
@@ -195,14 +191,17 @@ def test_modelled_reserves_only_price_what_the_model_actually_has():
     assert "transient:gdn-prefill" not in plain
     assert "transient:gdn-prefill" in hybrid
     assert "transient:mm-encoder" not in hybrid
-    assert "transient:mm-encoder" in names(
-        prefill_tokens=8192, hidden_size=2048, mm_encoder=True)
-    assert "transient:dequant-scratch" not in names(
-        prefill_tokens=8192, hidden_size=2048)
+    assert "transient:mm-encoder" in names(prefill_tokens=8192, hidden_size=2048, mm_encoder=True)
+    assert "transient:dequant-scratch" not in names(prefill_tokens=8192, hidden_size=2048)
     # Every line is conditional except the named fragmentation reserve: an account with no
     # reserve at all is not an account, it is a promise the allocator cannot keep.
-    assert names(prefill_tokens=0, hidden_size=0, cuda_graph_max_bs=None,
-                 autotune=False, backend_workspace=False) == {"reserve:fragmentation"}
+    assert names(
+        prefill_tokens=0,
+        hidden_size=0,
+        cuda_graph_max_bs=None,
+        autotune=False,
+        backend_workspace=False,
+    ) == {"reserve:fragmentation"}
     assert "reserve:fragmentation" in plain
 
 
@@ -225,16 +224,23 @@ def test_decide_splits_the_budget_and_prices_the_context_targets():
     ledger = _ledger(baseline=16 * _GIB, ratio=1.0, weights=8 * _GIB)
     ledger.charge("cache:gdn-state", 1 * _GIB, Kind.PERSISTENT)
     plan = ledger.decide(
-        cache_per_page=4 * _MIB, page_tokens=64, per_expert_bytes=2 * _MIB,
-        num_experts=64, total_experts=64, prefill_overlap=False, kv_reserve_tokens=4096,
-        fixed_cache_bytes=256 * _MIB, contexts=(16384, 131072, 1048576),
+        cache_per_page=4 * _MIB,
+        page_tokens=64,
+        per_expert_bytes=2 * _MIB,
+        num_experts=64,
+        total_experts=64,
+        prefill_overlap=False,
+        kv_reserve_tokens=4096,
+        fixed_cache_bytes=256 * _MIB,
+        contexts=(16384, 131072, 1048576),
     )
     assert plan.pool_budget_bytes == ledger.pool_budget_bytes(256 * _MIB)
     assert plan.expert_bytes == plan.moe_cache_size * 2 * _MIB
     assert plan.kv_budget_bytes == plan.pool_budget_bytes - plan.expert_bytes
     assert plan.usable_tokens == plan.num_pages * plan.page_tokens
     assert required_bytes(plan.moe_cache_size, plan.num_pages, 2 * _MIB, 4 * _MIB) <= (
-        plan.pool_budget_bytes)
+        plan.pool_budget_bytes
+    )
     rows = {c.tokens: c for c in plan.contexts}
     # A context has to fit in what the split LEFT, not in the whole pool budget: the expert
     # cache is not optional on a MoE model, it is where decode throughput lives. 16K costs
@@ -243,8 +249,7 @@ def test_decide_splits_the_budget_and_prices_the_context_targets():
     assert rows[16384].fits and rows[16384].kv_bytes <= plan.kv_budget_bytes
     assert not rows[131072].fits
     assert not rows[1048576].fits
-    assert rows[1048576].shortfall_bytes == (
-        rows[1048576].kv_bytes - plan.kv_budget_bytes)
+    assert rows[1048576].shortfall_bytes == (rows[1048576].kv_bytes - plan.kv_budget_bytes)
     assert rows[131072].pages == 131072 // 64  # page_tokens 64, exact division
     text = plan.report()
     assert "128K" in text and "1M" in text and "expert slots" in text
@@ -260,9 +265,15 @@ def test_a_compressed_kv_format_is_the_only_thing_that_makes_long_context_fit():
     # tiering, without paging, and without touching the expert cache. This is why the plan
     # prints the rows: the answer is known before the money is spent.
     ledger = _ledger(baseline=16 * _GIB, ratio=1.0, weights=9 * _GIB)
-    kwargs = dict(page_tokens=64, per_expert_bytes=2 * _MIB, num_experts=64,
-                  total_experts=64, prefill_overlap=False, kv_reserve_tokens=0,
-                  contexts=(131072,))
+    kwargs = dict(
+        page_tokens=64,
+        per_expert_bytes=2 * _MIB,
+        num_experts=64,
+        total_experts=64,
+        prefill_overlap=False,
+        kv_reserve_tokens=0,
+        contexts=(131072,),
+    )
     bf16 = ledger.decide(cache_per_page=8 * _MIB, **kwargs)
     compressed = ledger.decide(cache_per_page=2 * _MIB, **kwargs)
     assert not bf16.contexts[0].fits
@@ -276,8 +287,13 @@ def test_context_demand_prices_the_trade_the_other_way_round():
     ledger = _ledger(baseline=16 * _GIB, ratio=1.0, weights=8 * _GIB)
     ledger.charge("cache:gdn-state", 1 * _GIB, Kind.PERSISTENT)
     plan = ledger.decide(
-        cache_per_page=1 * _MIB, page_tokens=64, per_expert_bytes=2 * _MIB,
-        num_experts=64, total_experts=2560, prefill_overlap=False, kv_reserve_tokens=4096,
+        cache_per_page=1 * _MIB,
+        page_tokens=64,
+        per_expert_bytes=2 * _MIB,
+        num_experts=64,
+        total_experts=2560,
+        prefill_overlap=False,
+        kv_reserve_tokens=4096,
         contexts=(131072,),
     )
     assert not plan.contexts[0].fits  # the MoE-first split starved KV
@@ -294,8 +310,12 @@ def test_context_demand_prices_the_trade_the_other_way_round():
 def test_context_demand_says_no_when_no_expert_cache_survives():
     # 1M of KV leaves nothing for experts: infeasible, not "0 slots and hope it is fast".
     demand = context_demand(
-        pool_budget_bytes=8 * _GIB, cache_per_page=4 * _MIB, page_tokens=64,
-        per_expert_bytes=2 * _MIB, tokens=1048576, expert_floor=64,
+        pool_budget_bytes=8 * _GIB,
+        cache_per_page=4 * _MIB,
+        page_tokens=64,
+        per_expert_bytes=2 * _MIB,
+        tokens=1048576,
+        expert_floor=64,
     )
     assert not demand.feasible and demand.expert_slots == 0
     assert "not fundable" in demand.describe()
@@ -304,8 +324,12 @@ def test_context_demand_says_no_when_no_expert_cache_survives():
 def test_plan_for_context_inverts_the_priority_and_refuses_the_unaffordable():
     ledger = _ledger(baseline=16 * _GIB, ratio=1.0, weights=4 * _GIB)
     geometry = dict(
-        cache_per_page=2 * _MIB, page_tokens=64, per_expert_bytes=2 * _MIB,
-        num_experts=64, total_experts=4096, prefill_overlap=True,
+        cache_per_page=2 * _MIB,
+        page_tokens=64,
+        per_expert_bytes=2 * _MIB,
+        num_experts=64,
+        total_experts=4096,
+        prefill_overlap=True,
     )
     greedy = ledger.decide(kv_reserve_tokens=4096, **geometry)
     bought = ledger.plan_for_context(131072, **geometry)
@@ -315,7 +339,8 @@ def test_plan_for_context_inverts_the_priority_and_refuses_the_unaffordable():
     assert bought.moe_cache_size < greedy.moe_cache_size
     assert bought.expert_bytes < greedy.expert_bytes
     assert required_bytes(bought.moe_cache_size, bought.num_pages, 2 * _MIB, 2 * _MIB) <= (
-        bought.pool_budget_bytes)
+        bought.pool_budget_bytes
+    )
     assert bought.demands[0].kv_bytes == (131072 // 64 + 1) * 2 * _MIB
     # 1M of KV needs 32 GiB against this budget: refused in bytes, naming the expert floor that
     # made it impossible rather than starting a server that cannot hold its own prompt.
@@ -327,15 +352,23 @@ def test_auto_plan_shrinks_only_once_the_reserve_beats_the_ratio_cap():
     # Modelled on a 16 GiB card holding an 8 GiB dense slice: 4 MiB per KV page, 2 MiB per
     # expert slot, and a 8192-token KV floor that is 128 pages at page_size 64.
     kwargs = dict(
-        baseline_free=16 * _GIB, weights_bytes=8 * _GIB, cache_per_page=4 * _MIB,
-        fixed_cache_size=0, per_expert_bytes=2 * _MIB, num_experts=64, total_experts=2560,
-        prefill_overlap=True, kv_reserve_tokens=4096, page_size=64,
+        baseline_free=16 * _GIB,
+        weights_bytes=8 * _GIB,
+        cache_per_page=4 * _MIB,
+        fixed_cache_size=0,
+        per_expert_bytes=2 * _MIB,
+        num_experts=64,
+        total_experts=2560,
+        prefill_overlap=True,
+        kv_reserve_tokens=4096,
+        page_size=64,
     )
     for ratio in (0.9, 0.95):
         # The cap binds at every shipped ratio, so the reserve must not move the plan.
         cap = resolve_moe_cache_auto(memory_ratio=ratio, **kwargs)
         with_reserve = resolve_moe_cache_auto(
-            memory_ratio=ratio, reserve_bytes=TRITON_AUTOTUNE_ARENA, **kwargs)
+            memory_ratio=ratio, reserve_bytes=TRITON_AUTOTUNE_ARENA, **kwargs
+        )
         assert cap == with_reserve
     uncapped = resolve_moe_cache_auto(memory_ratio=1.0, **kwargs)
     reserve = 40 * 4 * _MIB  # 40 pages' worth of modelled peak
@@ -373,11 +406,21 @@ def test_calibration_reading_is_never_a_consumer():
     # engine would bill itself for its own bookkeeping: on the first dense-GGUF run that made
     # the account claim 29 GiB committed on a 15.51 GiB card, and a zero pool budget.
     ledger = _ledger(ratio=1.0)
-    before = (ledger.ceiling_bytes, ledger.pool_budget_bytes(), ledger.headroom_bytes(),
-              ledger.reserve_bytes, ledger.total())
+    before = (
+        ledger.ceiling_bytes,
+        ledger.pool_budget_bytes(),
+        ledger.headroom_bytes(),
+        ledger.reserve_bytes,
+        ledger.total(),
+    )
     ledger.charge("measured:allocator-held", 14 * _GIB, Kind.MEASURED, "torch holds this")
-    assert (ledger.ceiling_bytes, ledger.pool_budget_bytes(), ledger.headroom_bytes(),
-            ledger.reserve_bytes, ledger.total()) == before
+    assert (
+        ledger.ceiling_bytes,
+        ledger.pool_budget_bytes(),
+        ledger.headroom_bytes(),
+        ledger.reserve_bytes,
+        ledger.total(),
+    ) == before
     # A measured peak only ratchets the floor UP. A quiet window never claws the modelled
     # reserve back -- the model is allowed to be conservative -- and committed bytes are always
     # priced against the modelled reserve, so the two can never double-count the same byte.
@@ -387,10 +430,12 @@ def test_calibration_reading_is_never_a_consumer():
     ledger.charge(MEASURED_PEAK_LINE, 4 * _GIB, Kind.MEASURED, "peak since the probe")
     assert ledger.reserve_bytes == 4 * _GIB
     assert ledger.ceiling_bytes < before[0]
-    assert (ledger.engine_committed_bytes() + ledger.modelled_reserve_bytes
-            == ledger.total(exclude=NEGOTIABLE))
-    assert ledger.held_bytes() == ledger.total((Kind.IMMUTABLE, Kind.PERSISTENT,
-                                                Kind.SEMI_PERSISTENT))
+    assert ledger.engine_committed_bytes() + ledger.modelled_reserve_bytes == ledger.total(
+        exclude=NEGOTIABLE
+    )
+    assert ledger.held_bytes() == ledger.total(
+        (Kind.IMMUTABLE, Kind.PERSISTENT, Kind.SEMI_PERSISTENT)
+    )
     assert ledger.bytes_of("measured:allocator-held") == 14 * _GIB
     text = ledger.report()
     assert "measured:allocator-held" in text and "measured:transient-peak" in text
@@ -403,8 +448,15 @@ def test_report_prints_every_line_and_the_two_tightening_bounds():
     ledger.charge("cache:kv", 3 * _GIB, Kind.PERSISTENT, note="usable pages + dummy")
     ledger.charge("cache:expert", 2 * _GIB, Kind.PERSISTENT, note="slots")
     text = ledger.report()
-    for name in ("weights:model", "cache:kv", "cache:expert", "transient:autotune",
-                 "graph:capture-peak", "workspace:attention", "reserve:fragmentation"):
+    for name in (
+        "weights:model",
+        "cache:kv",
+        "cache:expert",
+        "transient:autotune",
+        "graph:capture-peak",
+        "workspace:attention",
+        "reserve:fragmentation",
+    ):
         assert name in text, name
     assert "committed" in text and "pool budget" in text and "headroom" in text
     assert "usable pages + dummy" in text
@@ -412,7 +464,9 @@ def test_report_prints_every_line_and_the_two_tightening_bounds():
 
 def test_ledger_rejects_a_plan_that_exceeds_its_own_ceiling():
     ledger = VramLedger(
-        device_total_bytes=8 * _GIB, baseline_free=8 * _GIB, memory_ratio=1.0,
+        device_total_bytes=8 * _GIB,
+        baseline_free=8 * _GIB,
+        memory_ratio=1.0,
     )
     ledger.charge("weights:model", 7 * _GIB, Kind.IMMUTABLE)
     ledger.charge("reserve:fragmentation", FRAGMENTATION_RESERVE, Kind.RESERVE)

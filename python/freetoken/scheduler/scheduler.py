@@ -83,16 +83,23 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         # window/cmp/idx shadows via swa_pool, Gemma's swa via swa_pool, GDN state via
         # linear_state_pool. No model supplies its own manager.
         self.cache_manager = CacheManager(
-            self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type,
+            self.engine.num_pages,
+            config.page_size,
+            self.engine.page_table,
+            config.cache_type,
             linear_state_pool=self.engine.linear_state_pool,
             swa_pool=self.engine.kv_cache,
             sliding_window_size=next(
                 (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
                 None,
-            ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
+            )
+            or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
         self.decode_manager = DecodeManager(config.page_size)
-        self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
+        self._bidirectional_mm = any(
+            getattr(g, "bidirectional_mm_blocks", False)
+            for g in config.model_config.attention_groups
+        )
         self.prefill_manager = PrefillManager(
             self.cache_manager,
             self.table_manager,
@@ -154,7 +161,9 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             if config.max_running_req != 1:
                 raise ValueError("--spec-mtp > 0 supports single-request serving only for now.")
             if getattr(self.engine.model, "mtp", None) is None:
-                raise ValueError("--spec-mtp > 0 requires a checkpoint with a registered MTP layer.")
+                raise ValueError(
+                    "--spec-mtp > 0 requires a checkpoint with a registered MTP layer."
+                )
         self._model_is_mrope = config.model_config.model_is_mrope
         self._warned_cut_image = False
         self.status_reporter = SchedulerStatusReporter(
@@ -164,15 +173,24 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
+        import gc
+
+        gc.collect()
+        try:
+            import ctypes
+
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
         if hasattr(self, "_spec_snapshot_slots"):
-            assert (
-                len(self._spec_snapshot_slots) == 0
-            ), f"leaked spec snapshot slots in idle: {self._spec_snapshot_slots}"
+            assert len(self._spec_snapshot_slots) == 0, (
+                f"leaked spec snapshot slots in idle: {self._spec_snapshot_slots}"
+            )
 
     @torch.inference_mode()
     def rebuild_cache(
@@ -195,7 +213,9 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
         self.engine.rebuild_runtime_cache(
-            moe_cache_size=moe_cache_size, num_pages=num_pages, num_mamba_slots=num_mamba_slots,
+            moe_cache_size=moe_cache_size,
+            num_pages=num_pages,
+            num_mamba_slots=num_mamba_slots,
             num_swa_pages=num_swa_pages,
         )
         if num_pages is not None or num_mamba_slots is not None or num_swa_pages is not None:
@@ -217,7 +237,8 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         _chunk_cap = self.cache_manager.prefill_chunk_budget
         self.prefill_budget = (
             min(self.config.max_extend_tokens, _chunk_cap)
-            if _chunk_cap else self.config.max_extend_tokens
+            if _chunk_cap
+            else self.config.max_extend_tokens
         )
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
@@ -245,8 +266,10 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
         # no last batch to process, no pending prefill, no running decode. finished_reqs is
         # NOT a gate — those requests are already freed (no live GPU/page resources).
-        if self._pending_rebuild is not None and last_data is None and not (
-            self.prefill_manager.runnable or self.decode_manager.runnable
+        if (
+            self._pending_rebuild is not None
+            and last_data is None
+            and not (self.prefill_manager.runnable or self.decode_manager.runnable)
         ):
             self._execute_pending_rebuild()
 
@@ -372,9 +395,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
                 hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
+                hit_eos = not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
                 matched_stop = (
                     self._match_stop_str(req)
                     if not hit_eos and req.sampling_params.stop_strs
@@ -418,6 +439,8 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
                     # rather than re-read the freed page-table row (and on hybrid, deref the
                     # None'd GDN ping-pong slots).
                     self.cache_manager.cache_req(req, finished=False)
+                    if self.spec_mtp > 0:
+                        self.warmup_mtp_draft_kv(req)
 
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
@@ -596,8 +619,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
                 # is freed immediately -- deferring would leak until its next batch, which
                 # strict prefill-priority puts arbitrarily far away.
                 inflight = (
-                    self._last_data is not None
-                    and req_to_free in self._last_data[0].batch.reqs
+                    self._last_data is not None and req_to_free in self._last_data[0].batch.reqs
                 )
                 if inflight:
                     req_to_free.aborted = True
@@ -614,7 +636,9 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             # reject them cleanly rather than ship hang-prone half-wired paths.
             if not self.cache_manager.supports_runtime_rebuild:
                 self._reply_rebuild(
-                    msg.request_id, "unsupported", "this model's cache does not support runtime rebuild"
+                    msg.request_id,
+                    "unsupported",
+                    "this model's cache does not support runtime rebuild",
                 )
             elif msg.mode != "if_idle":
                 self._reply_rebuild(
@@ -784,8 +808,12 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             num_swa_pages = max(0, int(getattr(eng.kv_cache, "swa_num_tokens", 0) or 0) - 1)
         return dict(
             num_pages=eng.num_pages,
-            moe_cache_size=eng.moe_offload_cache.cache_size if eng.moe_offload_cache is not None else None,
-            num_mamba_slots=(eng.linear_state_pool.num_slots - 1) if eng.linear_state_pool is not None else None,
+            moe_cache_size=eng.moe_offload_cache.cache_size
+            if eng.moe_offload_cache is not None
+            else None,
+            num_mamba_slots=(eng.linear_state_pool.num_slots - 1)
+            if eng.linear_state_pool is not None
+            else None,
             num_swa_pages=num_swa_pages,
         )
 
@@ -832,7 +860,8 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             # so they can back the new token -- this is what bounds the per-request swa
             # footprint during decode. (no-op unless the model is SWA / paged swa pool.)
             self.cache_manager.maybe_free_swa_out_of_window(
-                batch.reqs, forward_iter=self._forward_iter)
+                batch.reqs, forward_iter=self._forward_iter
+            )
             for req in batch.reqs:
                 req.decode_batch_idx += 1
         else:
@@ -869,8 +898,10 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
                 # the old keying = input_mapping's table_idx column (already staged, no H2D).
                 if self.cache_manager.is_hybrid:
                     pool = self.engine.linear_state_pool
-                    slots = [r.linear_slot_idx if r.linear_slot_idx is not None
-                             else pool.padding_slot for r in batch.padded_reqs]
+                    slots = [
+                        r.linear_slot_idx if r.linear_slot_idx is not None else pool.padding_slot
+                        for r in batch.padded_reqs
+                    ]
                     batch.linear_table_idx = torch.tensor(
                         slots, dtype=torch.int32, device="cpu", pin_memory=True
                     ).to(self.device, non_blocking=True)
@@ -898,9 +929,17 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         if plan:
             batch.mm_encoder_jobs = jobs
             batch.mm_gather_plan = plan
-            batch.mm_rows = torch.tensor(rows, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
-            batch.mm_block_ends = torch.tensor(block_ends, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
-        if self._bidirectional_mm and not self._warned_cut_image and (cut := cut_image_spans(batch.padded_reqs)):
+            batch.mm_rows = torch.tensor(rows, dtype=torch.int64, pin_memory=True).to(
+                self.device, non_blocking=True
+            )
+            batch.mm_block_ends = torch.tensor(block_ends, dtype=torch.int32, pin_memory=True).to(
+                self.device, non_blocking=True
+            )
+        if (
+            self._bidirectional_mm
+            and not self._warned_cut_image
+            and (cut := cut_image_spans(batch.padded_reqs))
+        ):
             # only a bidirectional image span loses context when cut, and only an image longer than the chunk still gets cut
             lo, hi = cut[0]
             self._warned_cut_image = True

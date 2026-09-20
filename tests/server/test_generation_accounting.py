@@ -1,6 +1,7 @@
 """The shared generation layer logs each request with its real token totals, so accounting is
 independent of which endpoint served it — covering what the HTTP middleware can't record for a
 stream (it fires before the totals are known)."""
+
 from __future__ import annotations
 
 import asyncio
@@ -80,9 +81,17 @@ def _spec() -> GenSpec:
 
 def _row(*, ttft_ms: int | None) -> request_ring.RequestRecord:
     return request_ring.RequestRecord(
-        ts="2026-01-01T00:00:00Z", method="POST", path="/v1/messages", status=200,
-        model="unit-model", duration_ms=1000, ttft_ms=ttft_ms, prompt_tokens=1,
-        completion_tokens=1, stream=True, error=None,
+        ts="2026-01-01T00:00:00Z",
+        method="POST",
+        path="/v1/messages",
+        status=200,
+        model="unit-model",
+        duration_ms=1000,
+        ttft_ms=ttft_ms,
+        prompt_tokens=1,
+        completion_tokens=1,
+        stream=True,
+        error=None,
     )
 
 
@@ -93,7 +102,9 @@ def _last_row() -> dict:
 
 def test_non_stream_records_the_request_with_real_token_totals():
     request_ring.reset()
-    st = FakeState([_ack(prompt=5, completion=1, out="a"), _ack(completion=2, out="bc", finished=True)])
+    st = FakeState(
+        [_ack(prompt=5, completion=1, out="a"), _ack(completion=2, out="bc", finished=True)]
+    )
     result = asyncio.run(generate_full(42, _spec(), st, source="/v1/chat/completions"))
     assert (result.prompt_tokens, result.completion_tokens) == (5, 3)
     row = _last_row()
@@ -106,7 +117,9 @@ def test_non_stream_records_the_request_with_real_token_totals():
 
 def test_stream_records_the_totals_from_gendone():
     request_ring.reset()
-    st = FakeState([_ack(prompt=7, completion=1, out="x"), _ack(completion=4, out="yz", finished=True)])
+    st = FakeState(
+        [_ack(prompt=7, completion=1, out="x"), _ack(completion=4, out="yz", finished=True)]
+    )
 
     async def drain():
         done = None
@@ -124,7 +137,9 @@ def test_stream_records_the_totals_from_gendone():
 
 def test_stream_still_records_the_row_when_the_client_disconnects_mid_stream():
     request_ring.reset()
-    st = FakeState([_ack(prompt=9, completion=2, out="p"), _ack(completion=2, out="q", finished=True)])
+    st = FakeState(
+        [_ack(prompt=9, completion=2, out="p"), _ack(completion=2, out="q", finished=True)]
+    )
 
     async def abort_after_first():
         gen = generate_events(42, _spec(), st, source="/v1/responses")
@@ -160,7 +175,9 @@ def test_no_source_opts_out_of_recording():
 
 def test_stream_records_a_ttft_within_the_request_duration():
     request_ring.reset()
-    st = FakeState([_ack(prompt=3, completion=1, out="a"), _ack(completion=1, out="b", finished=True)])
+    st = FakeState(
+        [_ack(prompt=3, completion=1, out="a"), _ack(completion=1, out="b", finished=True)]
+    )
 
     async def drain():
         async for _ev in generate_events(42, _spec(), st, source="/v1/messages"):

@@ -40,9 +40,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
     rope_type = rope.get("rope_type", rope.get("type", "default"))
     rope_scaling = None if rope_type in (None, "default") else rope
 
-    partial = rope.get(
-        "partial_rotary_factor", getattr(hf_config, "partial_rotary_factor", 1.0)
-    )
+    partial = rope.get("partial_rotary_factor", getattr(hf_config, "partial_rotary_factor", 1.0))
     rotary_dim = int(head_dim * partial)
 
     num_experts = (

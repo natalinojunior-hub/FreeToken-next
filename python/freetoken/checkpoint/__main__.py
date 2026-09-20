@@ -36,15 +36,26 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     p.add_argument("--model", required=True, help="source HF safetensors checkpoint dir")
     p.add_argument("--out", required=True, help="output FTW checkpoint dir")
     p.add_argument("--dtype", choices=sorted(_DTYPES), default="bfloat16")
-    p.add_argument("--moe-backend", default="offload",
-                   help="offload (experts -> banks) or e.g. triton (experts stay dense)")
-    p.add_argument("--quant-backend", type=_parse_quant_backend, default=None,
-                   help="kernel per quantized layer type, as for ft serve; the expert banks are packed for the "
-                        "chosen MoE kernel and the server picks that kernel back up from the FTW")
+    p.add_argument(
+        "--moe-backend",
+        default="offload",
+        help="offload (experts -> banks) or e.g. triton (experts stay dense)",
+    )
+    p.add_argument(
+        "--quant-backend",
+        type=_parse_quant_backend,
+        default=None,
+        help="kernel per quantized layer type, as for ft serve; the expert banks are packed for the "
+        "chosen MoE kernel and the server picks that kernel back up from the FTW",
+    )
     p.add_argument("--shard-gib", type=float, default=8.0, help="max shard size in GiB")
-    p.add_argument("--gpu", type=single_gpu_arg, default=None,
-                   help="GPU for the repack: a GPU UUID (GPU-xxxx..., as nvidia-smi -L prints) or "
-                        "an nvidia-smi index (default: the first visible GPU)")
+    p.add_argument(
+        "--gpu",
+        type=single_gpu_arg,
+        default=None,
+        help="GPU for the repack: a GPU UUID (GPU-xxxx..., as nvidia-smi -L prints) or "
+        "an nvidia-smi index (default: the first visible GPU)",
+    )
     ns = p.parse_args(argv)
 
     # same as ft serve --gpu: resolve, then bind by UUID at CUDA init
@@ -58,16 +69,22 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     shard_limit -= shard_limit % 4096  # keep aligned
     t = time.perf_counter()
     index = convert_checkpoint(
-        ns.model, ns.out, dtype=_DTYPES[ns.dtype],
-        moe_backend=ns.moe_backend, quant_backend=ns.quant_backend, shard_limit=shard_limit, device=device,
+        ns.model,
+        ns.out,
+        dtype=_DTYPES[ns.dtype],
+        moe_backend=ns.moe_backend,
+        quant_backend=ns.quant_backend,
+        shard_limit=shard_limit,
+        device=device,
     )
     dt = time.perf_counter() - t
     c = index["counts"]
     gib = index["total_bytes"] / (1 << 30)
     print(f"\nwrote FTW checkpoint -> {ns.out}")
     print(f"  tensors: {c['weight']} weight + {c['experts_bank']} experts_bank")
-    print(f"  FTW: {gib:.2f} GiB across {len(index['shards'])} shard(s) "
-          f"(<= {ns.shard_gib} GiB each)")
+    print(
+        f"  FTW: {gib:.2f} GiB across {len(index['shards'])} shard(s) (<= {ns.shard_gib} GiB each)"
+    )
     print(f"  quant_format: {index['quant_format']}  fingerprint={index['fingerprint']}")
     print(f"  converted in {dt:.1f}s")
     return 0

@@ -299,8 +299,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
                     torch.cuda.synchronize(self.device)
                 print(
                     f"[qsa-timing] layer={layer_id} T={q.shape[0]} {stage} "
-                    f"{time.perf_counter() - started:.3f}s"
-                    + (" [capture]" if capturing else ""),
+                    f"{time.perf_counter() - started:.3f}s" + (" [capture]" if capturing else ""),
                     flush=True,
                 )
 
@@ -354,7 +353,16 @@ class QSASparseAttnBackend(BaseAttnBackend):
             v_codes, v_norm = self.kvcache.v_slab(layer_id)
 
             selected_pages = None
-            if batch.is_decode and indices is not None:
+            capturing = torch.cuda.is_current_stream_capturing()
+            if (
+                not capturing
+                and (
+                    batch.is_decode
+                    or getattr(batch, "spec_logits_indices", None) is not None
+                    or q.shape[0] <= 8
+                )
+                and indices is not None
+            ):
                 valid = indices[indices >= 0]
                 if valid.numel() > 0:
                     logical_p = valid // self.page_size
@@ -372,7 +380,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
                 seq_lens=md.seq_lens,
                 workspace_k=self._ws_k,
                 workspace_v=self._ws_v,
-                book3=self.kvcache.book3,
+                book3=self.kvcache.is_book3(layer_id, "k")
+                if hasattr(self.kvcache, "is_book3")
+                else self.kvcache.book3,
                 selected_pages=selected_pages,
             )
             mark("decompress")
@@ -411,7 +421,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
             rope_positions = rope_positions.to(torch.int32)
             self.kvcache.rope_positions.index_copy_(0, out_loc, rope_positions.t().contiguous())
             # groups are ratio-aligned within a page, so the group start is the slot rounded down
-            first_pos = self.kvcache.rope_positions.index_select(0, out_loc - out_loc % self.ratio).t()
+            first_pos = self.kvcache.rope_positions.index_select(
+                0, out_loc - out_loc % self.ratio
+            ).t()
             md.rope_rows = torch.arange(out_loc.numel(), dtype=torch.int32, device=self.device)
             md.q_rope_cache = self._index_rope_rows(rope_positions)
             md.k_rope_cache = self._index_rope_rows(first_pos)
@@ -428,9 +440,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         ends = md.cu_seqlens.to(torch.int64).index_select(0, req + 1)
         keep = rows >= ends - self.ring_capacity
         ring_row = slots * self.ring_capacity + positions % self.ring_capacity
-        md.ring_rows = torch.where(keep, ring_row, torch.full_like(ring_row, -1)).to(
-            torch.int32
-        )
+        md.ring_rows = torch.where(keep, ring_row, torch.full_like(ring_row, -1)).to(torch.int32)
 
     def _update_index_cache(self, index, md: QSASparseMetadata, slot: int) -> None:
         """Compress each closing group into the slab, then refresh the pending ring."""

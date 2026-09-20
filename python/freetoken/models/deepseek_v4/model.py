@@ -45,12 +45,28 @@ from .moe import Expert, Gate  # noqa: F401
 class Block(BaseOP):
     """Decoder block with manifold-constrained Hyper-Connections (4 residual streams)."""
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args, *, strategy: str = "offload", decode_target: str = "gpu", quant_config=None, prefix: str = ""):
+    def __init__(
+        self,
+        layer_id: int,
+        args: DeepseekV4Args,
+        *,
+        strategy: str = "offload",
+        decode_target: str = "gpu",
+        quant_config=None,
+        prefix: str = "",
+    ):
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
         self.dim = args.dim
         self.attn = Attention(layer_id, args, quant_config=quant_config, prefix=f"{prefix}.attn")
-        self.ffn = MoE(layer_id, args, strategy=strategy, decode_target=decode_target, quant_config=quant_config, prefix=f"{prefix}.ffn")
+        self.ffn = MoE(
+            layer_id,
+            args,
+            strategy=strategy,
+            decode_target=decode_target,
+            quant_config=quant_config,
+            prefix=f"{prefix}.ffn",
+        )
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
         self.hc_mult = hc_mult = args.hc_mult
@@ -71,10 +87,17 @@ class Block(BaseOP):
         rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = F.linear(xf, hc_fn) * rsqrt
         pre, post, comb = hc_split_sinkhorn(
-            mixes.view(-1, mixes.size(-1)), hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps
+            mixes.view(-1, mixes.size(-1)),
+            hc_scale,
+            hc_base,
+            self.hc_mult,
+            self.hc_sinkhorn_iters,
+            self.hc_eps,
         )
         M = shape[0] * shape[1]
-        y = hc_pre_combine(xf.view(M, self.hc_mult, self.dim), pre, dtype).view(*shape[:2], self.dim)
+        y = hc_pre_combine(xf.view(M, self.hc_mult, self.dim), pre, dtype).view(
+            *shape[:2], self.dim
+        )
         return y, post.view(M, self.hc_mult), comb.view(M, self.hc_mult, self.hc_mult)
 
     def hc_post(self, x, residual, post, comb):
@@ -122,15 +145,37 @@ class Block(BaseOP):
 
 
 class Transformer(BaseOP):
-    def __init__(self, args: DeepseekV4Args, quant_config=None, *, strategy: str = "offload", decode_target: str = "gpu", prefix: str = ""):
+    def __init__(
+        self,
+        args: DeepseekV4Args,
+        quant_config=None,
+        *,
+        strategy: str = "offload",
+        decode_target: str = "gpu",
+        prefix: str = "",
+    ):
         self.args = args
         self.norm_eps = args.norm_eps
         self.hc_eps = args.hc_eps
         self.hc_mult = hc_mult = args.hc_mult
         self.embed = VocabParallelEmbedding(args.vocab_size, args.dim)
-        self.layers = OPList([Block(i, args, strategy=strategy, decode_target=decode_target, quant_config=quant_config, prefix=f"{prefix}.layers.{i}") for i in range(args.n_layers)])
+        self.layers = OPList(
+            [
+                Block(
+                    i,
+                    args,
+                    strategy=strategy,
+                    decode_target=decode_target,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.layers.{i}",
+                )
+                for i in range(args.n_layers)
+            ]
+        )
         self.norm = RMSNorm(args.dim, self.norm_eps)
-        self.head = ParallelLMHead(args.vocab_size, args.dim, quant_config=quant_config, prefix=f"{prefix}.head")
+        self.head = ParallelLMHead(
+            args.vocab_size, args.dim, quant_config=quant_config, prefix=f"{prefix}.head"
+        )
         hc_dim = hc_mult * args.dim
         self.hc_head_fn = torch.empty(hc_mult, hc_dim, dtype=torch.float32)
         self.hc_head_base = torch.empty(hc_mult, dtype=torch.float32)
@@ -148,10 +193,15 @@ class Transformer(BaseOP):
         mixes = F.linear(xf, self.hc_head_fn) * rsqrt
         pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
         M = shape[0] * shape[1]
-        return hc_pre_combine(xf.view(M, self.hc_mult, dim), pre.view(M, self.hc_mult), dtype).view(*shape[:2], dim)
+        return hc_pre_combine(xf.view(M, self.hc_mult, dim), pre.view(M, self.hc_mult), dtype).view(
+            *shape[:2], dim
+        )
 
     def prefill_batched(
-        self, input_ids: torch.Tensor, segments, flat_positions: torch.Tensor,
+        self,
+        input_ids: torch.Tensor,
+        segments,
+        flat_positions: torch.Tensor,
     ) -> torch.Tensor:
         # Ragged batched prefill (bs >= 1). ``input_ids`` is [1, T] -- the requests' NEW tokens
         # concatenated (cu_seqlens, no padding); each request starts at its own cached_len
@@ -209,7 +259,13 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
     def __init__(self, config):
         self._config = config
         self._args: DeepseekV4Args = config.dsv4_args
-        self.model = Transformer(self._args, config.quant, strategy=config.moe_strategy, decode_target=config.decode_target, prefix="model")
+        self.model = Transformer(
+            self._args,
+            config.quant,
+            strategy=config.moe_strategy,
+            decode_target=config.decode_target,
+            prefix="model",
+        )
         self._bound = False
 
         # A GGUF checkpoint carries native block-quantized weights, so the dense/fp8
@@ -253,7 +309,9 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
             # concatenated tokens; attention runs per segment so the carry / slot maps never
             # cross requests.
             return self.model.prefill_batched(
-                input_ids.view(1, -1), md.segments, batch.positions.long(),
+                input_ids.view(1, -1),
+                md.segments,
+                batch.positions.long(),
             )
         # DECODE (bs>=1): per-row position (GPU int tensor -> no host syncs / graph safe). The
         # compressed staging cap is the max position any row reaches (eager); a static max_seq-1

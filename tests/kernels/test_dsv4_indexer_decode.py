@@ -35,8 +35,9 @@ def _build(positions, n_stage, seed=0):
     snap = torch.full((b, n_stage * RATIO), -1, dtype=torch.int64, device="cuda")
     for i, p in enumerate(positions):
         if p >= 0:
-            snap[i, : p + 1] = torch.randint(0, POOL_ROWS * RATIO, (p + 1,), device="cuda",
-                                             dtype=torch.int64, generator=g)
+            snap[i, : p + 1] = torch.randint(
+                0, POOL_ROWS * RATIO, (p + 1,), device="cuda", dtype=torch.int64, generator=g
+            )
     valid = torch.tensor([(p + 1) // RATIO for p in positions], device="cuda", dtype=torch.int64)
     return q, w, snap, valid
 
@@ -71,7 +72,7 @@ def test_basic(pool):
 def test_live_prefix_only(pool):
     """Everything past the per-row live count must be -inf, whatever the staged width."""
     got, _, valid = _check(pool, [800], 4096)
-    assert torch.isinf(got[0, int(valid[0]):]).all() and (got[0, int(valid[0]):] < 0).all()
+    assert torch.isinf(got[0, int(valid[0]) :]).all() and (got[0, int(valid[0]) :] < 0).all()
     assert torch.isfinite(got[0, : int(valid[0])]).all()
 
 

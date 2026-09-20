@@ -32,7 +32,9 @@ class Glm5NextVisionPatchEmbed(BaseOP):
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         x = pixel_values.view(-1, *self._shape).to(self.proj.weight.dtype)
-        return F.conv3d(x, self.proj.weight, self.proj.bias, stride=self._shape[1:]).view(x.shape[0], -1)
+        return F.conv3d(x, self.proj.weight, self.proj.bias, stride=self._shape[1:]).view(
+            x.shape[0], -1
+        )
 
 
 class Glm5NextVisionAttention(BaseOP):
@@ -44,7 +46,9 @@ class Glm5NextVisionAttention(BaseOP):
         self.q_norm = RMSNorm(self.head_dim, eps=vc.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=vc.rms_norm_eps)
 
-    def forward(self, x: torch.Tensor, cache: torch.Tensor, positions: torch.Tensor, lengths: List[int]) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, cache: torch.Tensor, positions: torch.Tensor, lengths: List[int]
+    ) -> torch.Tensor:
         from freetoken.kernel.triton.rope import apply_rope_with_cos_sin_cache_inplace
 
         S, H, D = x.shape[0], self.num_heads, self.head_dim
@@ -56,7 +60,11 @@ class Glm5NextVisionAttention(BaseOP):
         # bidirectional attention within each image; images never attend across
         outs = [
             F.scaled_dot_product_attention(qs, ks, vs)
-            for qs, ks, vs in zip(torch.split(q, lengths, dim=2), torch.split(k, lengths, dim=2), torch.split(v, lengths, dim=2))
+            for qs, ks, vs in zip(
+                torch.split(q, lengths, dim=2),
+                torch.split(k, lengths, dim=2),
+                torch.split(v, lengths, dim=2),
+            )
         ]
         o = outs[0] if len(outs) == 1 else torch.cat(outs, dim=2)
         return self.proj.forward(o[0].transpose(0, 1).reshape(S, H * D))
@@ -67,9 +75,13 @@ class Glm5NextVisionBlock(BaseOP):
         self.norm1 = RMSNorm(vc.hidden_size, eps=vc.rms_norm_eps)
         self.norm2 = RMSNorm(vc.hidden_size, eps=vc.rms_norm_eps)
         self.attn = Glm5NextVisionAttention(vc)
-        self.mlp = Glm5NextGatedMLP(vc.hidden_size, vc.intermediate_size, vc.swiglu_limit, has_bias=vc.attention_bias)
+        self.mlp = Glm5NextGatedMLP(
+            vc.hidden_size, vc.intermediate_size, vc.swiglu_limit, has_bias=vc.attention_bias
+        )
 
-    def forward(self, x: torch.Tensor, cache: torch.Tensor, positions: torch.Tensor, lengths: List[int]) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, cache: torch.Tensor, positions: torch.Tensor, lengths: List[int]
+    ) -> torch.Tensor:
         x = x + self.attn.forward(self.norm1.forward(x), cache, positions, lengths)
         return x + self.mlp.forward(self.norm2.forward(x))
 
@@ -104,7 +116,9 @@ class Glm5NextVisionModel(BaseOP):
     def place_weights(self, mode: str) -> None:
         """gpu: every tensor resident; host: block tensors in pinned banks streamed two blocks at a time (patch embedding, downsample and merger stay resident)."""
         if mode == "host" and self._streamer is None:
-            self._streamer = BlockWeightStreamer(self.blocks.op_list, self.patch_embed.proj.weight.device)
+            self._streamer = BlockWeightStreamer(
+                self.blocks.op_list, self.patch_embed.proj.weight.device
+            )
         elif mode == "gpu" and self._streamer is not None:
             self._streamer.unstream()
             self._streamer = None
@@ -116,13 +130,17 @@ class Glm5NextVisionModel(BaseOP):
             return enumerate(self.blocks.op_list)
         return self._streamer.blocks(self.blocks.op_list)
 
-    def _rope_table(self, grid: torch.Tensor, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    def _rope_table(
+        self, grid: torch.Tensor, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         from transformers.vision_utils import get_vision_position_ids
 
         if self._inv_freq is None or self._inv_freq.device != device:
             # fp32 like the reference; head_dim/2 angles, one quarter of the head each for the row and the column index, pairs (i, i + head_dim/2) share an angle
             half = (self._vc.hidden_size // self._vc.num_heads) // 2
-            self._inv_freq = 1.0 / (10000.0 ** (torch.arange(0, half, 2, dtype=torch.float32, device=device) / half))
+            self._inv_freq = 1.0 / (
+                10000.0 ** (torch.arange(0, half, 2, dtype=torch.float32, device=device) / half)
+            )
         pos_ids = get_vision_position_ids(grid, self._vc.spatial_merge_size)
         freqs = (pos_ids.unsqueeze(-1) * self._inv_freq).flatten(1)
         # per-token rope rows [cos | sin] consumed by the NeoX kernel via positions=arange
@@ -144,7 +162,9 @@ class Glm5NextVisionModel(BaseOP):
         x = self.post_layernorm.forward(x)
         m = vc.spatial_merge_size
         x = x.view(-1, m, m, vc.hidden_size).permute(0, 3, 1, 2)
-        x = F.conv2d(x, self.downsample.weight, self.downsample.bias, stride=m).view(-1, vc.out_hidden_size)
+        x = F.conv2d(x, self.downsample.weight, self.downsample.bias, stride=m).view(
+            -1, vc.out_hidden_size
+        )
         return self.merger.forward(x)
 
 

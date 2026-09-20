@@ -73,11 +73,15 @@ def iter_weights(
                     raw = f.get_tensor(raw_name)
                     if is_expert:
                         if tp_info.size > 1:
-                            raise NotImplementedError("Qwen3-VL-MoE experts are not tensor-parallel sharded")
+                            raise NotImplementedError(
+                                "Qwen3-VL-MoE experts are not tensor-parallel sharded"
+                            )
                         yield name, _linear_layout(raw)
                         continue
                     if name.startswith("visual.") and tp_info.size > 1:
-                        raise NotImplementedError("Qwen VL vision tower weights are not tensor-parallel sharded")
+                        raise NotImplementedError(
+                            "Qwen VL vision tower weights are not tensor-parallel sharded"
+                        )
                     tensor = shard_tensor(
                         name,
                         raw,
@@ -91,7 +95,9 @@ def iter_weights(
     yield from iter_merged_tensors(tensors(), _MERGE_RULES, model_name="qwen3_vl")
 
 
-def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+def iter_vision_weights(
+    model_path: str, device: torch.device
+) -> Iterator[tuple[str, torch.Tensor]]:
     """The vision tower alone, named as iter_weights names it."""
     for file in iter_weight_files(model_path):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:

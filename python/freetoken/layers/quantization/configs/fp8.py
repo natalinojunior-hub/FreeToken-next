@@ -33,7 +33,9 @@ class Fp8BlockConfig(QuantConfig):
         super().__init__(name_map, unquantized)
         block = tuple(int(x) for x in (q.get("weight_block_size") or ()))
         if q.get("weight_per_tensor") or block != (FP8_BLOCK, FP8_BLOCK):
-            raise NotImplementedError(f"fp8 checkpoint with weight_block_size={block} per_tensor={q.get('weight_per_tensor')} is not supported; only 128x128 blocks are")
+            raise NotImplementedError(
+                f"fp8 checkpoint with weight_block_size={block} per_tensor={q.get('weight_per_tensor')} is not supported; only 128x128 blocks are"
+            )
         # transformers skips lm_head when the checkpoint gives no list
         not_convert = tuple(q.get("modules_to_not_convert") or ("lm_head",))
         self.not_convert = name_set(not_convert)

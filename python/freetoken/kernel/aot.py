@@ -74,7 +74,6 @@ def _index_spec(element_size: int, num_splits: int) -> KernelSpec:
     return KernelSpec(name=_make_name("index", *args), build=build)
 
 
-
 def _fast_index_copy_spec(feature_size: int) -> KernelSpec:
     from .fast_index_copy import default_worker_args
 

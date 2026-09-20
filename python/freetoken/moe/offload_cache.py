@@ -12,7 +12,12 @@ from flashlib.kernels.slot_cache import N_STATS, Stat
 # instead of one per bank). Set FREETOKEN_FUSED_COPY=0 to force the legacy per-bank path
 # (kept for A/B profiling). Falls back to per-bank automatically if a bank's row bytes or
 # base address are not 16-byte aligned.
-_FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0", "false", "no", "off"}
+_FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 
 # cudaMemcpyBatchAsync silently degrades to a SYNCHRONOUS copy when a batch mixes
 # large entries with sub-~256KB entries on registered host memory (H100 + CUDA 13.0,
@@ -23,7 +28,7 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 # Banks whose rows are smaller than this ship as ONE whole-layer entry (their
 # whole layer is tiny) and are excluded from the hit gather, so every per-run
 # entry the batch sees is >= this size.
-_SMALL_BANK_FEAT_BYTES = 256 * 1024
+_SMALL_BANK_FEAT_BYTES = int(os.getenv("FREETOKEN_SMALL_BANK_FEAT_BYTES", str(64 * 1024)))
 
 from freetoken.utils import init_logger
 
@@ -91,10 +96,14 @@ from freetoken.kernel.aot_models import fp8_block_scale_pad
 # keyed by the config-time format tag (expert_quant / moe_weight_format), not quant_format: "mxfp4" sizes the mxfp4_triton banks, "nvfp4" also covers its repacked variants
 _BANK_BYTES_PER_EXPERT = {
     "bf16": lambda H, I: 3 * I * H * 2,
-    "fp8_block": lambda H, I: 3 * I * H + (
-        (2 * I // 128) * fp8_block_scale_pad(2 * I // 128, H // 128)
-        + (H // 128) * fp8_block_scale_pad(H // 128, I // 128)
-    ) * 2,
+    "fp8_block": lambda H, I: (
+        3 * I * H
+        + (
+            (2 * I // 128) * fp8_block_scale_pad(2 * I // 128, H // 128)
+            + (H // 128) * fp8_block_scale_pad(H // 128, I // 128)
+        )
+        * 2
+    ),
     "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
@@ -104,6 +113,13 @@ _BANK_BYTES_PER_EXPERT = {
 # vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert
 # dimension; moe_align_block_size requires round_up(experts, 32) < 1024, i.e. <= 992.
 MARLIN_MAX_CACHE_SIZE = 992
+
+
+@dataclass
+class ExpertBank:
+    weight: torch.Tensor
+    quant_type: str
+    shape: tuple[int, ...]
 
 
 @dataclass
@@ -127,12 +143,9 @@ class OffloadMoeCache:
     # prefill). The format names its bank layout (_BANK_SCHEMAS) and which kernels
     # may read the banks; the cache machinery itself is layout-agnostic.
     quant_format: str = "bf16"
-    # For quant_format == "gguf": the (gate_up, down) ggml types of the two banks. Unlike
-    # every other format, "gguf" does not imply a row stride -- the checkpoint picks a ggml
-    # type per tensor -- so the MoE kernels need the types handed to them at dispatch.
-    # Per-bank (each bank owns its own slot pool) but NOT per-layer: one pool is shared by
-    # all layers and moe_vec.cuh addresses it with no padding allowance.
-    gguf_expert_types: tuple[int, int] | None = None
+    # For quant_format == "gguf": the (gate_up, down) ggml types of the two banks.
+    # Can be a single tuple (uniform) or a list of tuples per layer (Phase 7 exact geometry).
+    gguf_expert_types: tuple[int, int] | list[tuple[int, int]] | None = None
     # Decode mode + bank layout; per-layer CPU routing is cpu_layer_ids. "gpu":
     # GPU-tiled banks, all decode on GPU (stream misses over PCIe into the slot
     # cache, GEMM on GPU). "cpu": native (CPU-readable) banks + a CPU executor;
@@ -146,13 +159,13 @@ class OffloadMoeCache:
     # hybrid only: max experts fetched over PCIe per (layer, decode step); the rest
     # of that step's misses are computed on the CPU. 0 -> never fetch (CPU does every
     # miss, the GPU cache stays cold); large -> behaves like pure offload.
-    hybrid_max_fetch: int = 1
+    hybrid_max_fetch: int = int(os.getenv("FREETOKEN_HYBRID_MAX_FETCH", "4"))
     # hybrid only: when > 0, replaces the fixed cap with a per-step fraction -- fetch
     # ~fraction * misses experts over PCIe (rounded to whichever integer balances the
     # overlap best), the CPU computes the rest. The engine sets it to the benched
     # pcie_bw / cpu_bw ratio so the PCIe fetch and the CPU overflow GEMV take equal
     # time (perfect overlap): fetched : cpu = pcie : cpu - pcie.
-    hybrid_fetch_fraction: float = 0.0
+    hybrid_fetch_fraction: float = float(os.getenv("FREETOKEN_HYBRID_FETCH_FRACTION", "0.0"))
     # bank layout from the expert kernel (a BankSpec per role); when given it replaces the _BANK_SCHEMAS lookup and the slot cap comes from max_slots
     layout: dict | None = None
     max_slots: int | None = None
@@ -216,11 +229,15 @@ class OffloadMoeCache:
         # slot caches, keyed by the format's bank schema (attached by
         # set_bank_sources). The GPU slot cache stays one unified pool per bank.
         if self.layout is not None:
-            self.bank_schema = tuple(role for role, spec in self.layout.items() if not spec.resident)
+            self.bank_schema = tuple(
+                role for role, spec in self.layout.items() if not spec.resident
+            )
         else:
             self.bank_schema = _BANK_SCHEMAS[self.quant_format]
         self.bank_sources: dict[str, list[torch.Tensor]] = {}
-        self.bank_caches: dict[str, torch.Tensor] = {}
+        self.bank_caches: dict[Any, torch.Tensor] = {}
+        # Phase 7 exact geometry keying: (bank_idx, role, quant_type) -> (shape, dtype)
+        self.expert_geometry: dict[tuple[int, str, str], tuple[tuple[int, ...], torch.dtype]] = {}
         # per-layer host residency: the GPU movement paths require "pinned"; LOCKED/PAGEABLE layers decode on the CPU executor and prefill via copy_missing's pageable branch
         # _unpinned_layers is the derived id set the hot paths test against
         self.layer_residency: list[str] = []
@@ -249,9 +266,13 @@ class OffloadMoeCache:
         # Per-layer counterparts of the scalars above (indexed by MoE-layer id). Same
         # device-side accumulation (graph-safe: layer_id is a static index per graph node),
         # so one req's per-layer miss rate is readable via decode_miss_stats_per_layer().
-        self.stat_missing_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
+        self.stat_missing_layer = torch.zeros(
+            self.num_layers, dtype=torch.int64, device=self.device
+        )
         self.stat_active_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
-        self.stat_fetched_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
+        self.stat_fetched_layer = torch.zeros(
+            self.num_layers, dtype=torch.int64, device=self.device
+        )
         self.stat_steps_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
         # Opt-in decode routing histogram (per layer, per expert) for cache-skew
         # analysis. Accumulated in ``ensure_experts`` from the raw expert ids before the
@@ -301,6 +322,54 @@ class OffloadMoeCache:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
 
+    def _get_layer_quant_type(self, layer_id: int, role: str) -> str:
+        if self.quant_format == "gguf" and self.gguf_expert_types is not None:
+            from freetoken.models.gguf.dequant import GGML_NAME
+
+            types = self.gguf_expert_types
+            if isinstance(types, list) or (
+                isinstance(types, tuple) and isinstance(types[0], (tuple, list))
+            ):
+                t_gate_up, t_down = types[layer_id]
+            else:
+                t_gate_up, t_down = types
+            qt = t_gate_up if "gate" in role or "up" in role else t_down
+            return GGML_NAME.get(qt, str(qt))
+        return self.quant_format.upper()
+
+    def get_expert(self, bank: int, role: str, quant_type: str | int) -> ExpertBank:
+        from freetoken.moe.expert_banks import validate_pool_key
+
+        key = validate_pool_key((bank, role, quant_type))
+        if key not in self.expert_geometry:
+            raise KeyError(
+                f"expert_geometry / geometria inválida: {key!r}. "
+                f"MoE pool key mismatch: expected (bank, role, type)"
+            )
+        bank_idx, role_name, qt = key
+        weight = self.bank_sources[role_name][bank_idx]
+        return ExpertBank(weight=weight, quant_type=qt, shape=tuple(weight.shape))
+
+    def put_expert(
+        self,
+        bank: int,
+        role: str,
+        quant_type: str | int,
+        bank_data: torch.Tensor | ExpertBank,
+    ) -> None:
+        from freetoken.moe.expert_banks import validate_pool_key
+
+        key = validate_pool_key((bank, role, quant_type))
+        bank_idx, role_name, qt = key
+        tensor = bank_data.weight if isinstance(bank_data, ExpertBank) else bank_data
+        self.bank_sources[role_name][bank_idx] = tensor
+        self.expert_geometry[key] = (tuple(tensor.shape), tensor.dtype)
+
+    def prefetch_next(self, req: int | None = None) -> None:
+        """Prefetch next layer buffer for prefill double-buffering."""
+        if req is not None and self.prefill_overlap:
+            self.prefetch_prefill_layer(req)
+
     def set_bank_sources(
         self,
         sources: dict[str, list[torch.Tensor]],
@@ -331,9 +400,7 @@ class OffloadMoeCache:
         sources = {name: by_role[canonical_role(name)] for name in self.bank_schema}
         residency = layer_residency or [HostResidency.PINNED.value] * self.num_layers
         assert len(residency) == self.num_layers, (len(residency), self.num_layers)
-        unpinned = frozenset(
-            i for i, r in enumerate(residency) if r != HostResidency.PINNED.value
-        )
+        unpinned = frozenset(i for i, r in enumerate(residency) if r != HostResidency.PINNED.value)
         if unpinned:
             if not unpinned <= self.cpu_layer_ids:
                 raise ValueError(
@@ -348,6 +415,7 @@ class OffloadMoeCache:
                 )
         self._unpinned_layers = unpinned
         self.layer_residency = list(residency)
+        self.expert_geometry = {}
         for name in self.bank_schema:
             per_layer = sources[name]
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
@@ -359,18 +427,45 @@ class OffloadMoeCache:
                         f"bank {name!r} rows are {tuple(head.shape[1:])} {head.dtype} but the expert kernel's layout "
                         f"wants {tuple(spec.shape)} {spec.dtype}; the banks were packed for another kernel"
                     )
+            is_uniform = all(s.shape == head.shape and s.dtype == head.dtype for s in per_layer)
             for layer_id, source in enumerate(per_layer):
                 assert source.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
                 assert source.size(0) == self.num_experts, (name, layer_id, source.shape)
-                assert source.shape == head.shape and source.dtype == head.dtype, (
-                    name, layer_id, source.shape, source.dtype,
-                )
+                if is_uniform:
+                    assert source.shape == head.shape and source.dtype == head.dtype, (
+                        name,
+                        layer_id,
+                        source.shape,
+                        source.dtype,
+                    )
+                qt = self._get_layer_quant_type(layer_id, name)
+                key = (layer_id, name, qt)
+                self.expert_geometry[key] = (tuple(source.shape), source.dtype)
             self.bank_sources[name] = list(per_layer)
-            self.bank_caches[name] = torch.empty(
-                (self.cache_size, *head.shape[1:]),
-                dtype=head.dtype,
-                device=self.device,
-            )
+            if is_uniform:
+                c = torch.empty(
+                    (self.cache_size, *head.shape[1:]),
+                    dtype=head.dtype,
+                    device=self.device,
+                )
+                self.bank_caches[name] = c
+                for layer_id in range(self.num_layers):
+                    qt = self._get_layer_quant_type(layer_id, name)
+                    self.bank_caches[(layer_id, name, qt)] = c
+            else:
+                geom_caches: dict[tuple, torch.Tensor] = {}
+                for layer_id, source in enumerate(per_layer):
+                    g = (tuple(source.shape[1:]), source.dtype)
+                    if g not in geom_caches:
+                        geom_caches[g] = torch.empty(
+                            (self.cache_size, *source.shape[1:]),
+                            dtype=source.dtype,
+                            device=self.device,
+                        )
+                    c = geom_caches[g]
+                    qt = self._get_layer_quant_type(layer_id, name)
+                    self.bank_caches[(layer_id, name, qt)] = c
+                self.bank_caches[name] = next(iter(geom_caches.values()))
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()
         if self.prefill_overlap:
@@ -414,6 +509,10 @@ class OffloadMoeCache:
         dst_ptrs, feats = [], []
         layer_src_ptrs = [[] for _ in range(self.num_layers)]
         for per_layer, cache in self.banks:
+            if any(
+                s.shape != per_layer[0].shape or s.dtype != per_layer[0].dtype for s in per_layer
+            ):
+                return  # mixed geometry across layers: use per-bank copy
             feat = math.prod(per_layer[0].shape[1:]) * per_layer[0].element_size()
             if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
                 return  # leave fused disabled; copy_missing uses the per-bank path
@@ -434,8 +533,7 @@ class OffloadMoeCache:
             feats.append(feat)
         self._copy_dst_ptrs = torch.tensor(dst_ptrs, dtype=torch.int64, device=self.device)
         self._copy_src_ptrs = [
-            torch.tensor(ptrs, dtype=torch.int64, device=self.device)
-            for ptrs in layer_src_ptrs
+            torch.tensor(ptrs, dtype=torch.int64, device=self.device) for ptrs in layer_src_ptrs
         ]
         self._copy_feat_bytes = torch.tensor(feats, dtype=torch.int64, device=self.device)
         self._copy_dst_ptrs_host = dst_ptrs
@@ -467,7 +565,11 @@ class OffloadMoeCache:
                 f"moe_cache_size={cache_size} exceeds the expert kernel's slot limit of {self.max_slots}; "
                 f"pass --moe-cache-size {self.max_slots} or less, or let the default kernel serve the experts"
             )
-        if self.layout is None and self.quant_format == "nvfp4_marlin" and cache_size > MARLIN_MAX_CACHE_SIZE:
+        if (
+            self.layout is None
+            and self.quant_format == "nvfp4_marlin"
+            and cache_size > MARLIN_MAX_CACHE_SIZE
+        ):
             raise ValueError(
                 f"moe_cache_size={cache_size} exceeds the marlin backend's slot limit of "
                 f"{MARLIN_MAX_CACHE_SIZE} (vLLM moe_align_block_size caps padded experts at "
@@ -503,10 +605,29 @@ class OffloadMoeCache:
             torch.cuda.empty_cache()
         # 3. Reallocate the slot cache from the retained host sources.
         for name in self.bank_schema:
-            head = self.bank_sources[name][0]
-            self.bank_caches[name] = torch.empty(
-                (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
-            )
+            per_layer = self.bank_sources[name]
+            head = per_layer[0]
+            is_uniform = all(s.shape == head.shape and s.dtype == head.dtype for s in per_layer)
+            if is_uniform:
+                c = torch.empty((cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device)
+                self.bank_caches[name] = c
+                for layer_id in range(self.num_layers):
+                    qt = self._get_layer_quant_type(layer_id, name)
+                    self.bank_caches[(layer_id, name, qt)] = c
+            else:
+                geom_caches: dict[tuple, torch.Tensor] = {}
+                for layer_id, source in enumerate(per_layer):
+                    g = (tuple(source.shape[1:]), source.dtype)
+                    if g not in geom_caches:
+                        geom_caches[g] = torch.empty(
+                            (cache_size, *source.shape[1:]),
+                            dtype=source.dtype,
+                            device=self.device,
+                        )
+                    c = geom_caches[g]
+                    qt = self._get_layer_quant_type(layer_id, name)
+                    self.bank_caches[(layer_id, name, qt)] = c
+                self.bank_caches[name] = next(iter(geom_caches.values()))
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
         # 4. Reallocate cache_size-shaped bookkeeping; reset the slot map (cold start).
@@ -592,9 +713,7 @@ class OffloadMoeCache:
         ``layer_id`` -- are ever read by the grouped GEMM."""
         if self.gate_up_alpha is None:
             return None
-        idx = layer_id * self.num_experts + (
-            self.id_of_slot.clamp(min=0).long() % self.num_experts
-        )
+        idx = layer_id * self.num_experts + (self.id_of_slot.clamp(min=0).long() % self.num_experts)
         return self.gate_up_alpha[idx], self.down_alpha[idx]
 
     def alphas_for_layer(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -607,19 +726,44 @@ class OffloadMoeCache:
         hi = lo + self.num_experts
         return self.gate_up_alpha[lo:hi], self.down_alpha[lo:hi]
 
-    def bank_views(self, n: int | None = None) -> tuple[torch.Tensor, ...]:
+    def bank_views(
+        self, n: int | None = None, layer_id: int | None = None
+    ) -> tuple[torch.Tensor, ...]:
         """Per-bank cache views in registration order: the full ``[S]`` slot cache
-        (decode), or its first ``n`` slots (materialized layer)."""
+        (decode), or its first ``n`` slots (materialized layer). Supports per-layer exact geometry (Phase 7)."""
         assert self.banks, "set_bank_sources must register the banks first"
-        if n is None:
-            return tuple(cache for _, cache in self.banks)
-        return tuple(cache[:n] for _, cache in self.banks)
+        if layer_id is None:
+            layer_id = self._pending_src_layer if self._pending_src_layer is not None else 0
+        views = []
+        for name in self.bank_schema:
+            qt = self._get_layer_quant_type(layer_id, name)
+            key = (layer_id, name, qt)
+            c = self.bank_caches.get(key, self.bank_caches.get(name))
+            views.append(c if n is None else c[:n])
+        return tuple(views)
 
     def _init_prefill_overlap_buffers(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
         self._prefill_buffer_has_release_event = [False, False]
+        # Check if bank sources have non-uniform geometry across layers
+        self._is_uniform_geometry = all(
+            all(s.shape == per_layer[0].shape and s.dtype == per_layer[0].dtype for s in per_layer)
+            for per_layer in self.bank_sources.values()
+        )
+        if not self._is_uniform_geometry:
+            # When geometry varies across layers (e.g. mixed Q4_K/Q3_K/Q8_0 GGUF MoE),
+            # fixed-shape prefill overlap buffers cannot hold all layer geometries.
+            # Disable prefill overlap and fall back to synchronous per-layer materialize.
+            logger.info(
+                "MoE banks have non-uniform layer geometry; disabling prefill overlap "
+                "(falling back to per-layer materialize)"
+            )
+            self.prefill_overlap = False
+            self.prefill_bank_buffers = []
+            return
+
         # The double buffers borrow the slot cache's first 2 * num_experts slots
         # (one full expert layer per buffer), one view per registered bank.
         self.prefill_bank_buffers = [
@@ -924,7 +1068,9 @@ class OffloadMoeCache:
         """Hybrid stats: full miss count (pre-cap), the PCIe-fetched count (capped), and
         the active count. The CPU computes (missing - fetched) experts. Device-side;
         accumulates both the scalar totals and the per-layer breakdown."""
-        assert 0 <= layer_id < self.num_layers, f"layer_id {layer_id} out of range [0, {self.num_layers})"
+        assert 0 <= layer_id < self.num_layers, (
+            f"layer_id {layer_id} out of range [0, {self.num_layers})"
+        )
         missing = self.num_missing_full.sum()
         fetched = self.num_indices.sum()
         active = self.active_mask.sum()
@@ -978,14 +1124,16 @@ class OffloadMoeCache:
         per_layer = []
         for L in range(self.num_layers):
             s, m, a, f = steps[L], missing[L], active[L], fetched[L]
-            per_layer.append({
-                "layer": L,
-                "steps": s,
-                "active_per_step": (a / s) if s else 0.0,
-                "missing_per_step": (m / s) if s else 0.0,
-                "miss_rate": (m / a) if a else 0.0,
-                "fetched_per_step": (f / s) if s else 0.0,
-            })
+            per_layer.append(
+                {
+                    "layer": L,
+                    "steps": s,
+                    "active_per_step": (a / s) if s else 0.0,
+                    "missing_per_step": (m / s) if s else 0.0,
+                    "miss_rate": (m / a) if a else 0.0,
+                    "fetched_per_step": (f / s) if s else 0.0,
+                }
+            )
         return {"per_layer": per_layer}
 
     def decode_routing_stats(self) -> dict:
@@ -1031,18 +1179,16 @@ class OffloadMoeCache:
                     f"pageable materialize (position == expert id); ensure_experts's "
                     f"LRU slot remap cannot be honored without a device alias"
                 )
-            # the only copy a non-pinned layer ever needs is the non-overlap prefill materialize, which schedules the whole layer into slots [0, num_experts) with position == expert id -- a plain synchronous pageable H2D copy
-            # never CUDA-graph captured: prefill is not captured, and decode never reaches this branch (it routes to the CPU executor)
-            for per_layer, cache in self.banks:
+            for name in self.bank_schema:
+                per_layer = self.bank_sources[name]
+                qt = self._get_layer_quant_type(layer_id, name)
+                key = (layer_id, name, qt)
+                cache = self.bank_caches.get(key, self.bank_caches[name])
                 cache[: self.num_experts].copy_(per_layer[layer_id])
             return
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
-            # One launch copies the missing rows for every bank (instead of one launch per
-            # bank). evict_slots/src_indices/num_indices are shared across banks;
-            # src_indices holds layer-local expert rows, resolved against this layer's
-            # source pointers (layer_id is a static int per captured graph node).
             fast_index_copy_multi_jit(
                 self._copy_dst_ptrs,
                 self._copy_src_ptrs[layer_id],
@@ -1055,7 +1201,11 @@ class OffloadMoeCache:
 
         from freetoken.kernel import fast_index_copy_jit
 
-        for per_layer, cache in self.banks:
+        for name in self.bank_schema:
+            per_layer = self.bank_sources[name]
+            qt = self._get_layer_quant_type(layer_id, name)
+            key = (layer_id, name, qt)
+            cache = self.bank_caches.get(key, self.bank_caches[name])
             fast_index_copy_jit(
                 cache,
                 self.evict_slots,

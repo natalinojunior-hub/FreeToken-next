@@ -50,7 +50,12 @@ class CompressorBackendMixin:
         return self.pool.cmp_rows(self.pool.full_loc_map[ti, block_starts], ratio)
 
     def decode_compress_rows(
-        self, rows: torch.Tensor, pos: torch.Tensor, ratio: int, layer_id: int, tier: str,
+        self,
+        rows: torch.Tensor,
+        pos: torch.Tensor,
+        ratio: int,
+        layer_id: int,
+        tier: str,
         completed: torch.Tensor,
     ) -> torch.Tensor:
         """Per-row decode store destination: the completed block's arithmetic row, or the row's
@@ -112,15 +117,29 @@ class CompressorBackendMixin:
         return ring.get_blocks(self.ring_page_base(window_slots, ring_size))
 
     def write_carry_blocks(
-        self, layer_id: int, tier: str, window_slots: torch.Tensor, ring_size: int,
+        self,
+        layer_id: int,
+        tier: str,
+        window_slots: torch.Tensor,
+        ring_size: int,
         blocks: torch.Tensor,
     ) -> None:
         ring = self.compress_state_ring(layer_id, tier)
         ring.set_blocks(self.ring_page_base(window_slots, ring_size), blocks)
 
     def write_boundary_carries(
-        self, *, layer_id: int, tier: str, ratio: int, overlap: bool, ring_size: int,
-        ape: torch.Tensor, kv: torch.Tensor, score: torch.Tensor, lo: int, hi: int,
+        self,
+        *,
+        layer_id: int,
+        tier: str,
+        ratio: int,
+        overlap: bool,
+        ring_size: int,
+        ape: torch.Tensor,
+        kv: torch.Tensor,
+        score: torch.Tensor,
+        lo: int,
+        hi: int,
         window_slots: torch.Tensor,
     ) -> None:
         """Persist the carry at EVERY window-page boundary in ``(lo, hi]``, so any future radix
@@ -143,8 +162,8 @@ class CompressorBackendMixin:
             ws = int(window_slots[B - 1 - lo].item())
             if overlap:
                 blk_kv, blk_ss = empty_kv.clone(), empty_ss.clone()
-                blk_kv[:ratio] = kv[0, B - ratio - lo: B - lo]
-                blk_ss[:ratio] = score[0, B - ratio - lo: B - lo] + ape
+                blk_kv[:ratio] = kv[0, B - ratio - lo : B - lo]
+                blk_ss[:ratio] = score[0, B - ratio - lo : B - lo] + ape
                 kv_score = torch.cat([blk_kv, blk_ss], dim=-1)
             else:
                 kv_score = torch.cat([empty_kv, empty_ss], dim=-1)

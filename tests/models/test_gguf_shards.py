@@ -105,8 +105,9 @@ def _split_kvs(no: int, count: int, total_tensors: int) -> list[bytes]:
     ]
 
 
-def _make_split(tmp_path: Path, base: str, per_shard: list[list[str]], *,
-                declared_count: int | None = None) -> list[Path]:
+def _make_split(
+    tmp_path: Path, base: str, per_shard: list[list[str]], *, declared_count: int | None = None
+) -> list[Path]:
     """Write a split set; returns the shard paths in order."""
     n = len(per_shard)
     declared = declared_count if declared_count is not None else n
@@ -114,8 +115,11 @@ def _make_split(tmp_path: Path, base: str, per_shard: list[list[str]], *,
     paths = []
     for i, names in enumerate(per_shard):
         p = tmp_path / f"{base}-{i + 1:05d}-of-{n:05d}.gguf"
-        kvs = (_full_kvs() + _split_kvs(0, declared, total)) if i == 0 \
+        kvs = (
+            (_full_kvs() + _split_kvs(0, declared, total))
+            if i == 0
             else _split_kvs(i, declared, total)
+        )
         _write_gguf(p, kvs, [(nm, 8) for nm in names])
         paths.append(p)
     return paths

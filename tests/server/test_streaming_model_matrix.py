@@ -96,7 +96,7 @@ CALL_BLOCKS = {
     "muse_glimmer": (
         "<|start|>assistant to=read<|message|><atem:function_calls>\n"
         '<atem:invoke name="read">\n'
-        "<atem:parameter name=\"filePath\">/tmp/test_calc.py</atem:parameter>\n"
+        '<atem:parameter name="filePath">/tmp/test_calc.py</atem:parameter>\n'
         "</atem:invoke>\n</atem:function_calls><|eot|>"
     ),
 }
@@ -171,8 +171,9 @@ def _random_chunks(text: str, seed: int) -> list[str]:
 
 
 def _stream_events(chunks, tool, reasoning=None, finish_reason=None):
-    state = FakeState(chunks, tool_call_parser=tool, reasoning_parser=reasoning,
-                      finish_reason=finish_reason)
+    state = FakeState(
+        chunks, tool_call_parser=tool, reasoning_parser=reasoning, finish_reason=finish_reason
+    )
 
     async def run():
         return [ev async for ev in generate_events(42, _spec(), state)]
@@ -287,8 +288,7 @@ def _reasoning_fixture(name):
         # segment is a bare header continuation.
         text = (
             f" to=self<|message|>{THINKING}<|eom|>"
-            f"<|start|>assistant to=user<|message|>{ANSWER}<|eom|>"
-            + CALL_BLOCKS[tool]
+            f"<|start|>assistant to=user<|message|>{ANSWER}<|eom|>" + CALL_BLOCKS[tool]
         )
         return tool, reasoning, text
     text = f"{think_open}{THINKING}{think_close}{ANSWER} {CALL_BLOCKS[tool]}"
@@ -327,9 +327,9 @@ def _sse_frames(agen):
             raw = frame.decode() if isinstance(frame, bytes) else frame
             for line in raw.split("\n"):
                 if line.startswith("event:"):
-                    etype = line[len("event:"):].strip()
+                    etype = line[len("event:") :].strip()
                 elif line.startswith("data:"):
-                    payload = line[len("data:"):].strip()
+                    payload = line[len("data:") :].strip()
                     if payload != "[DONE]":
                         data = json.loads(payload)
             out.append((etype, data))
@@ -367,12 +367,14 @@ def test_reasoning_anthropic_entrypoint(name):
     frames = _sse_frames(A.anthropic_event_stream(_aiter(gen_events), "m", 1))
 
     thinking = "".join(
-        d["delta"]["thinking"] for t, d in frames
+        d["delta"]["thinking"]
+        for t, d in frames
         if t == "content_block_delta" and d["delta"].get("type") == "thinking_delta"
     )
     assert thinking.strip() == THINKING
     content = "".join(
-        d["delta"]["text"] for t, d in frames
+        d["delta"]["text"]
+        for t, d in frames
         if t == "content_block_delta" and d["delta"].get("type") == "text_delta"
     )
     assert content.strip() == ANSWER
@@ -380,7 +382,8 @@ def test_reasoning_anthropic_entrypoint(name):
     assert [s["content_block"]["type"] for s in starts] == ["thinking", "text", "tool_use"]
     assert [s["index"] for s in starts] == [0, 1, 2]
     tool_json = "".join(
-        d["delta"]["partial_json"] for t, d in frames
+        d["delta"]["partial_json"]
+        for t, d in frames
         if t == "content_block_delta" and d["delta"].get("type") == "input_json_delta"
     )
     assert json.loads(tool_json) == READ_ARGS
@@ -402,8 +405,7 @@ def test_reasoning_chat_entrypoint(name):
     content = "".join(d.get("content", "") or "" for d in deltas)
     assert content.strip() == ANSWER
     args = "".join(
-        tc["function"].get("arguments", "")
-        for d in deltas for tc in d.get("tool_calls", [])
+        tc["function"].get("arguments", "") for d in deltas for tc in d.get("tool_calls", [])
     )
     assert json.loads(args) == READ_ARGS
     finish = [c.get("finish_reason") for _, d in frames if d for c in d.get("choices", [])]
@@ -440,7 +442,7 @@ ARGS_STREAMING_BLOCKS = {
     "muse_glimmer": (
         "<|start|>assistant to=read<|message|><atem:function_calls>\n"
         '<atem:invoke name="read">\n'
-        f"<atem:parameter name=\"filePath\">{LONG_VALUE}</atem:parameter>\n"
+        f'<atem:parameter name="filePath">{LONG_VALUE}</atem:parameter>\n'
         "</atem:invoke>\n</atem:function_calls><|eot|>"
     ),
 }
@@ -551,7 +553,11 @@ def test_two_calls_get_output_ordinals():
         ),
         (  # tag-block family: unterminated block recovered by closing it
             "glm47",
-            ["Checking. ", "<tool_call>read\n", "<arg_key>filePath</arg_key><arg_value>/a</arg_value>\n"],
+            [
+                "Checking. ",
+                "<tool_call>read\n",
+                "<arg_key>filePath</arg_key><arg_value>/a</arg_value>\n",
+            ],
             {"filePath": "/a"},
         ),
     ],
@@ -577,13 +583,18 @@ def test_dsv4_reasoning_then_tool_block_streams_and_orders_correctly():
         "</｜DSML｜invoke>\n"
         "</｜DSML｜function_calls>"
     )
-    chunks = ["Let me think. ", *[block[i : i + 40] for i in range(0, len(block), 40)], "\n\nAll checked."]
+    chunks = [
+        "Let me think. ",
+        *[block[i : i + 40] for i in range(0, len(block), 40)],
+        "\n\nAll checked.",
+    ]
     events = _stream_events(chunks, "deepseekv32", "deepseekv32")
     kinds = [type(ev).__name__ for ev in events]
     start_idx = kinds.index("ToolCallStart")
     close_idx = kinds.index("ToolCallsDelta")
     trailing_idx = next(
-        i for i, ev in enumerate(events)
+        i
+        for i, ev in enumerate(events)
         if isinstance(ev, ContentDelta) and "All checked." in ev.text
     )
     assert start_idx < close_idx < trailing_idx
@@ -664,8 +675,17 @@ def test_empty_arguments_call_emitted_exactly_once(tool, block):
 
 @pytest.mark.parametrize(
     "family",
-    ["qwen25", "qwen3_coder", "glm47", "gemma4", "minimax", "minimax_m3",
-     "deepseekv32", "gpt_oss", "muse_glimmer"],
+    [
+        "qwen25",
+        "qwen3_coder",
+        "glm47",
+        "gemma4",
+        "minimax",
+        "minimax_m3",
+        "deepseekv32",
+        "gpt_oss",
+        "muse_glimmer",
+    ],
 )
 def test_call_then_trailing_text_in_one_chunk_keeps_order(family):
     # Worst case: the whole generation arrives as ONE chunk. Text after the call
@@ -679,10 +699,12 @@ def test_call_then_trailing_text_in_one_chunk_keeps_order(family):
     assert json.loads(calls[0].parameters) == READ_ARGS
     kinds = [type(ev).__name__ for ev in events]
     close_i = kinds.index("ToolCallsDelta")
-    pre_i = next(i for i, ev in enumerate(events)
-                 if isinstance(ev, ContentDelta) and "Pre." in ev.text)
-    post_i = next(i for i, ev in enumerate(events)
-                  if isinstance(ev, ContentDelta) and "Post text." in ev.text)
+    pre_i = next(
+        i for i, ev in enumerate(events) if isinstance(ev, ContentDelta) and "Pre." in ev.text
+    )
+    post_i = next(
+        i for i, ev in enumerate(events) if isinstance(ev, ContentDelta) and "Post text." in ev.text
+    )
     assert pre_i < close_i < post_i
 
 

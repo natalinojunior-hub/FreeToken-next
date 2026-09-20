@@ -38,9 +38,15 @@ class Glm4MoeAttention(BaseOP):
         self.kv_attn_dim = self.num_kv_heads * head_dim
         self.head_dim = head_dim
 
-        self.q_proj = LinearDF11(config.hidden_size, self.qo_attn_dim, has_bias=config.has_attn_bias)
-        self.k_proj = LinearDF11(config.hidden_size, self.kv_attn_dim, has_bias=config.has_attn_bias)
-        self.v_proj = LinearDF11(config.hidden_size, self.kv_attn_dim, has_bias=config.has_attn_bias)
+        self.q_proj = LinearDF11(
+            config.hidden_size, self.qo_attn_dim, has_bias=config.has_attn_bias
+        )
+        self.k_proj = LinearDF11(
+            config.hidden_size, self.kv_attn_dim, has_bias=config.has_attn_bias
+        )
+        self.v_proj = LinearDF11(
+            config.hidden_size, self.kv_attn_dim, has_bias=config.has_attn_bias
+        )
         self.o_proj = LinearDF11(self.qo_attn_dim, config.hidden_size, has_bias=False)
 
         if config.use_qk_norm:

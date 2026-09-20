@@ -73,15 +73,26 @@ def _apply_vision_rope(
 
 
 class VisionAttention(BaseOP):
-    def __init__(self, vc: VisionConfig, *, quant_config: QuantConfig | None = None, prefix: str = ""):
+    def __init__(
+        self, vc: VisionConfig, *, quant_config: QuantConfig | None = None, prefix: str = ""
+    ):
         self.num_heads = div_even(vc.num_heads, get_tp_info().size)
         self.head_dim = vc.hidden_size // vc.num_heads
         self.qkv = LinearQKVMerged(
-            vc.hidden_size, self.head_dim, vc.num_heads, vc.num_heads, has_bias=True,
-            quant_config=quant_config, prefix=f"{prefix}.qkv",
+            vc.hidden_size,
+            self.head_dim,
+            vc.num_heads,
+            vc.num_heads,
+            has_bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv",
         )
         self.proj = LinearOProj(
-            vc.hidden_size, vc.hidden_size, has_bias=True, quant_config=quant_config, prefix=f"{prefix}.proj"
+            vc.hidden_size,
+            vc.hidden_size,
+            has_bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj",
         )
 
     def attend(
@@ -109,12 +120,22 @@ class VisionAttention(BaseOP):
 
 
 class VisionMLP(BaseOP):
-    def __init__(self, vc: VisionConfig, *, quant_config: QuantConfig | None = None, prefix: str = ""):
+    def __init__(
+        self, vc: VisionConfig, *, quant_config: QuantConfig | None = None, prefix: str = ""
+    ):
         self.linear_fc1 = LinearColParallelMerged(
-            vc.hidden_size, [vc.intermediate_size], has_bias=True, quant_config=quant_config, prefix=f"{prefix}.linear_fc1"
+            vc.hidden_size,
+            [vc.intermediate_size],
+            has_bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.linear_fc1",
         )
         self.linear_fc2 = LinearRowParallel(
-            vc.intermediate_size, vc.hidden_size, has_bias=True, quant_config=quant_config, prefix=f"{prefix}.linear_fc2"
+            vc.intermediate_size,
+            vc.hidden_size,
+            has_bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.linear_fc2",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -124,7 +145,9 @@ class VisionMLP(BaseOP):
         out = torch.empty_like(x)
         for lo in range(0, x.shape[0], _MLP_ROWS):
             rows = x[lo : lo + _MLP_ROWS]
-            out[lo : lo + _MLP_ROWS] = self.linear_fc2.forward(F.gelu(self.linear_fc1.forward(rows), approximate="tanh"))
+            out[lo : lo + _MLP_ROWS] = self.linear_fc2.forward(
+                F.gelu(self.linear_fc1.forward(rows), approximate="tanh")
+            )
         return out
 
 
@@ -136,7 +159,9 @@ _POS_ROWS = 16384
 
 
 class VisionBlock(BaseOP):
-    def __init__(self, vc: VisionConfig, *, quant_config: QuantConfig | None = None, prefix: str = ""):
+    def __init__(
+        self, vc: VisionConfig, *, quant_config: QuantConfig | None = None, prefix: str = ""
+    ):
         self.norm1 = VisionLayerNorm(vc.hidden_size)
         self.norm2 = VisionLayerNorm(vc.hidden_size)
         self.attn = VisionAttention(vc, quant_config=quant_config, prefix=f"{prefix}.attn")
@@ -152,7 +177,9 @@ class VisionBlock(BaseOP):
         self, x: torch.Tensor, cache: torch.Tensor, positions: torch.Tensor, lengths: List[int]
     ) -> torch.Tensor:
         # each temporary dies inside the next call: norm out in the qkv GEMM, qkv in attention, its output in proj
-        o = self.attn.attend(self.attn.qkv.forward(self.norm1.forward(x)), cache, positions, lengths)
+        o = self.attn.attend(
+            self.attn.qkv.forward(self.norm1.forward(x)), cache, positions, lengths
+        )
         return self.attn.proj.forward(o)
 
 
@@ -197,10 +224,18 @@ class VisionPatchMerger(BaseOP):
         # the DeepStack mergers normalize the 2x2-merged vector, the final merger each patch
         self.norm = VisionLayerNorm(merged if use_postshuffle_norm else vc.hidden_size)
         self.linear_fc1 = LinearColParallelMerged(
-            merged, [merged], has_bias=True, quant_config=quant_config, prefix=f"{prefix}.linear_fc1"
+            merged,
+            [merged],
+            has_bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.linear_fc1",
         )
         self.linear_fc2 = LinearRowParallel(
-            merged, vc.out_hidden_size, has_bias=True, quant_config=quant_config, prefix=f"{prefix}.linear_fc2"
+            merged,
+            vc.out_hidden_size,
+            has_bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.linear_fc2",
         )
         self._merged = merged
         self._postshuffle_norm = use_postshuffle_norm
@@ -219,17 +254,25 @@ class Qwen3VLVisionModel(BaseOP):
     Columns past out_hidden are the DeepStack side features in deepstack_visual_indexes order.
     """
 
-    def __init__(self, vc: VisionConfig, *, quant_config: QuantConfig | None = None, prefix: str = "visual"):
+    def __init__(
+        self, vc: VisionConfig, *, quant_config: QuantConfig | None = None, prefix: str = "visual"
+    ):
         self.patch_embed = VisionConv3dPatchEmbed(vc)
         self.pos_embed = _EmbeddingParams(vc.num_position_embeddings, vc.hidden_size)
         self.blocks = OPList(
-            [VisionBlock(vc, quant_config=quant_config, prefix=f"{prefix}.blocks.{i}") for i in range(vc.depth)]
+            [
+                VisionBlock(vc, quant_config=quant_config, prefix=f"{prefix}.blocks.{i}")
+                for i in range(vc.depth)
+            ]
         )
         self.merger = VisionPatchMerger(vc, quant_config=quant_config, prefix=f"{prefix}.merger")
         self.deepstack_merger_list = OPList(
             [
                 VisionPatchMerger(
-                    vc, use_postshuffle_norm=True, quant_config=quant_config, prefix=f"{prefix}.deepstack_merger_list.{k}"
+                    vc,
+                    use_postshuffle_norm=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.deepstack_merger_list.{k}",
                 )
                 for k in range(len(vc.deepstack_visual_indexes))
             ]
@@ -275,7 +318,9 @@ class Qwen3VLVisionModel(BaseOP):
                 acc += F.embedding(idx[:, k], table).float() * w[:, k, None]
             x[lo : lo + _POS_ROWS].add_(acc.to(x.dtype))
 
-    def _rope_table(self, grid: torch.Tensor, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    def _rope_table(
+        self, grid: torch.Tensor, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         from transformers.vision_utils import get_vision_position_ids
 
         if self._inv_freq is None or self._inv_freq.device != device:
@@ -283,7 +328,11 @@ class Qwen3VLVisionModel(BaseOP):
             # kept in the model dtype (bf16) on purpose; fp32 here would change the rope numerics
             inv_dim = self._inv_dim
             self._inv_freq = (
-                1.0 / (10000.0 ** (torch.arange(0, inv_dim, 2, dtype=torch.float32, device=device) / inv_dim))
+                1.0
+                / (
+                    10000.0
+                    ** (torch.arange(0, inv_dim, 2, dtype=torch.float32, device=device) / inv_dim)
+                )
             ).to(self.pos_embed.weight.dtype)
         pos_ids = get_vision_position_ids(grid, self._vc.spatial_merge_size)
         # long * bf16 -> bf16 freqs on purpose; fp32 freqs would round differently
@@ -293,7 +342,9 @@ class Qwen3VLVisionModel(BaseOP):
         positions = torch.arange(pos_ids.shape[0], dtype=torch.int32, device=device)
         return cache, positions
 
-    def _embed(self, pixel_values: torch.Tensor, grid_thw: List[List[int]]) -> tuple[torch.Tensor, tuple]:
+    def _embed(
+        self, pixel_values: torch.Tensor, grid_thw: List[List[int]]
+    ) -> tuple[torch.Tensor, tuple]:
         """Patch embeddings with the position table added, and the attention inputs every block takes."""
         from transformers.vision_utils import get_vision_cu_seqlens
 
@@ -305,7 +356,10 @@ class Qwen3VLVisionModel(BaseOP):
         return x, (cache, positions, torch.diff(get_vision_cu_seqlens(grid)).tolist())
 
     def _encode(
-        self, pixel_values: torch.Tensor, grid_thw: List[List[int]], groups: torch.Tensor | None = None
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: List[List[int]],
+        groups: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Pixels through the patch embedding and the block stack; with ``groups`` each DeepStack tap's merged feature is copied into groups[1 + k]."""
         taps = self._vc.deepstack_visual_indexes
@@ -314,7 +368,9 @@ class Qwen3VLVisionModel(BaseOP):
             x = blk.forward(x, *attn)
             if groups is not None and i in taps:
                 k = taps.index(i)
-                groups[1 + k].copy_(self.deepstack_merger_list.op_list[k].forward(x), non_blocking=True)
+                groups[1 + k].copy_(
+                    self.deepstack_merger_list.op_list[k].forward(x), non_blocking=True
+                )
         return x
 
     @staticmethod
@@ -339,7 +395,9 @@ class Qwen3VLVisionModel(BaseOP):
         # the merger outputs leave the GPU as they are produced and come back after the last block, so only the block working set is resident while the blocks run
         rows = pixel_values.shape[0] // vc.spatial_merge_size**2
         groups = torch.empty(
-            (1 + len(taps), rows, vc.out_hidden_size), dtype=self.pos_embed.weight.dtype, device="cpu",
+            (1 + len(taps), rows, vc.out_hidden_size),
+            dtype=self.pos_embed.weight.dtype,
+            device="cpu",
             pin_memory=torch.cuda.is_available(),
         )
         x = self._encode(pixel_values, grid_thw, groups)

@@ -32,14 +32,21 @@ def _init_tp():
         set_tp_info(rank=0, size=1)
 
 
-def _bf16_offload_layer(layer_id: int, num_experts: int, top_k: int, hidden_size: int, intermediate_size: int):
+def _bf16_offload_layer(
+    layer_id: int, num_experts: int, top_k: int, hidden_size: int, intermediate_size: int
+):
     """A bf16 offload layer on the fused kernel."""
     from freetoken.layers.moe import OffloadMoELayer
     from freetoken.layers.quantization import NoQuantConfig
 
     return OffloadMoELayer(
-        layer_id, num_experts, top_k, hidden_size, intermediate_size,
-        quant_config=NoQuantConfig(), prefix=f"model.layers.{layer_id}.mlp.experts",
+        layer_id,
+        num_experts,
+        top_k,
+        hidden_size,
+        intermediate_size,
+        quant_config=NoQuantConfig(),
+        prefix=f"model.layers.{layer_id}.mlp.experts",
     )
 
 
@@ -76,17 +83,29 @@ def test_dummy_expert_banks_follow_the_kernel_layout(monkeypatch):
         if layer is None:
             from freetoken.layers.moe import OffloadMoELayer
 
-            layer = OffloadMoELayer(0, E, 2, H, I, quant_config=quant, prefix="model.layers.0.mlp.experts")
+            layer = OffloadMoELayer(
+                0, E, 2, H, I, quant_config=quant, prefix="model.layers.0.mlp.experts"
+            )
         return layer
 
     bf16 = _bound(None)
     banks = build_expert_banks(bf16.quant_method, L, None, device=torch.device("cpu"), dummy=True)
     assert banks.kind is QuantKind.NONE and set(banks.sources) == {"gate_up", "down"}
-    assert len(banks.sources["gate_up"]) == L and all(t.shape == (E, 2 * I, H) for t in banks.sources["gate_up"])
+    assert len(banks.sources["gate_up"]) == L and all(
+        t.shape == (E, 2 * I, H) for t in banks.sources["gate_up"]
+    )
     assert all(t.shape == (E, H, I) for t in banks.sources["down"])
 
     set_quant_backend(QuantBackend.parse("moe.nvfp4=triton"))
-    quant = QuantConfig.from_hf({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["lm_head"]}})
+    quant = QuantConfig.from_hf(
+        {
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "NVFP4",
+                "ignore": ["lm_head"],
+            }
+        }
+    )
     nvfp4 = _bound(quant)
     banks = build_expert_banks(nvfp4.quant_method, L, None, device=torch.device("cpu"), dummy=True)
     assert banks.kind is QuantKind.NVFP4 and banks.kernel == "triton"
@@ -123,7 +142,10 @@ def test_streamed_expert_banks_keep_only_inflight_layers():
         pieces.append((layer_id, 0, 2, {"gate_up": values, "down": values + 10}))
 
     banks = build_expert_banks(
-        FakeMethod(), 3, pieces, device=torch.device("cpu"),
+        FakeMethod(),
+        3,
+        pieces,
+        device=torch.device("cpu"),
         layer_sink=lambda layer_id, layer_banks: seen.append((layer_id, sorted(layer_banks))),
     )
     assert banks.streamed
@@ -143,7 +165,9 @@ def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypa
         "freetoken.layers.moe.fused_topk",
         lambda *, hidden_states, gating_output, topk, renormalize: (topk_weights, topk_ids),
     )
-    monkeypatch.setattr(cache, "materialize_layer", lambda layer_id: calls.setdefault("layer_id", layer_id))
+    monkeypatch.setattr(
+        cache, "materialize_layer", lambda layer_id: calls.setdefault("layer_id", layer_id)
+    )
     monkeypatch.setattr(cache, "copy_missing", lambda: calls.setdefault("copied", True))
 
     def fake_fused(
@@ -186,7 +210,9 @@ def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(mo
     _init_tp()
     num_layers = 3
     num_experts = 4
-    layers = [_bf16_offload_layer(layer_id, num_experts, 2, 8, 16) for layer_id in range(num_layers)]
+    layers = [
+        _bf16_offload_layer(layer_id, num_experts, 2, 8, 16) for layer_id in range(num_layers)
+    ]
     cache = OffloadMoeCache(
         num_layers=num_layers,
         num_experts=num_experts,
@@ -194,12 +220,16 @@ def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(mo
         device=torch.device("cpu"),
         prefill_overlap=True,
     )
-    gate_up_source = list(torch.arange(num_layers * num_experts * 32 * 8, dtype=torch.float32).reshape(
-        num_layers * num_experts, 32, 8
-    ).split(num_experts))
-    down_source = list(torch.arange(num_layers * num_experts * 8 * 16, dtype=torch.float32).reshape(
-        num_layers * num_experts, 8, 16
-    ).split(num_experts))
+    gate_up_source = list(
+        torch.arange(num_layers * num_experts * 32 * 8, dtype=torch.float32)
+        .reshape(num_layers * num_experts, 32, 8)
+        .split(num_experts)
+    )
+    down_source = list(
+        torch.arange(num_layers * num_experts * 8 * 16, dtype=torch.float32)
+        .reshape(num_layers * num_experts, 8, 16)
+        .split(num_experts)
+    )
     cache.set_bank_sources({"gate_up": gate_up_source, "down": down_source})
     for layer in layers:
         layer.offload_cache = cache
@@ -307,12 +337,16 @@ def test_prefill_overlap_prefetch_invalidates_borrowed_unified_cache_slots():
         device=torch.device("cpu"),
         prefill_overlap=True,
     )
-    gate_up_source = list(torch.arange(num_layers * num_experts * 32 * 8, dtype=torch.float32).reshape(
-        num_layers * num_experts, 32, 8
-    ).split(num_experts))
-    down_source = list(torch.arange(num_layers * num_experts * 8 * 16, dtype=torch.float32).reshape(
-        num_layers * num_experts, 8, 16
-    ).split(num_experts))
+    gate_up_source = list(
+        torch.arange(num_layers * num_experts * 32 * 8, dtype=torch.float32)
+        .reshape(num_layers * num_experts, 32, 8)
+        .split(num_experts)
+    )
+    down_source = list(
+        torch.arange(num_layers * num_experts * 8 * 16, dtype=torch.float32)
+        .reshape(num_layers * num_experts, 8, 16)
+        .split(num_experts)
+    )
     cache.set_bank_sources({"gate_up": gate_up_source, "down": down_source})
 
     old_layers = torch.tensor([2, 2, 1, 1], dtype=torch.int32)
@@ -436,7 +470,6 @@ def test_offload_moe_layer_decode_forward_uses_remapped_slot_ids(monkeypatch):
     assert calls["topk_weights"] is topk_weights
     assert calls["topk_ids"].dtype == torch.int32
     assert calls["topk_ids"].tolist() == [[5, 0]]
-
 
 
 def test_lru_gpu_cache_assigns_unique_slots_for_large_miss_batch():
@@ -623,10 +656,14 @@ def test_nvfp4_materialize_keeps_bookkeeping_consistent_across_requests():
         {
             "gate_up_packed": pinned(bank(OUT, IN // 2, torch.uint8)),
             "gate_up_scale": pinned(bank(OUT, IN // 16, torch.float8_e4m3fn)),
-            "gate_up_global": pinned([t.squeeze(-1).contiguous() for t in bank(OUT, 1, torch.float16)]),
+            "gate_up_global": pinned(
+                [t.squeeze(-1).contiguous() for t in bank(OUT, 1, torch.float16)]
+            ),
             "down_packed": pinned(bank(OUT, IN // 2, torch.uint8)),
             "down_scale": pinned(bank(OUT, IN // 16, torch.float8_e4m3fn)),
-            "down_global": pinned([t.squeeze(-1).contiguous() for t in bank(OUT, 1, torch.float16)]),
+            "down_global": pinned(
+                [t.squeeze(-1).contiguous() for t in bank(OUT, 1, torch.float16)]
+            ),
         }
     )
     cache.reset()
@@ -699,7 +736,10 @@ def test_offload_cache_rebuild_disables_prefill_overlap_when_too_small():
 
     _init_tp()
     cache = OffloadMoeCache(
-        num_layers=1, num_experts=4, cache_size=8, device=torch.device("cpu"),
+        num_layers=1,
+        num_experts=4,
+        cache_size=8,
+        device=torch.device("cpu"),
         prefill_overlap=True,
     )
     cache.set_bank_sources({"gate_up": [torch.randn(4, 32, 8)], "down": [torch.randn(4, 8, 16)]})
@@ -717,7 +757,10 @@ def test_offload_cache_rebuild_keeps_overlap_at_boundary():
 
     _init_tp()
     cache = OffloadMoeCache(
-        num_layers=1, num_experts=4, cache_size=8, device=torch.device("cpu"),
+        num_layers=1,
+        num_experts=4,
+        cache_size=8,
+        device=torch.device("cpu"),
         prefill_overlap=True,
     )
     cache.set_bank_sources({"gate_up": [torch.randn(4, 32, 8)], "down": [torch.randn(4, 8, 16)]})
@@ -733,8 +776,11 @@ def test_offload_cache_validate_rebuild_enforces_marlin_cap_and_floor():
 
     _init_tp()
     marlin = OffloadMoeCache(
-        num_layers=1, num_experts=8, cache_size=16,
-        device=torch.device("cpu"), quant_format="nvfp4_marlin",
+        num_layers=1,
+        num_experts=8,
+        cache_size=16,
+        device=torch.device("cpu"),
+        quant_format="nvfp4_marlin",
     )
     with pytest.raises(ValueError, match="992"):
         marlin.validate_rebuild(MARLIN_MAX_CACHE_SIZE + 1)
@@ -753,8 +799,11 @@ def _make_split_cache(num_layers=2, locked=(1,), prefill_overlap=False, device="
     _init_tp()
     dev = torch.device(device)
     cache = OffloadMoeCache(
-        num_layers=num_layers, num_experts=4, cache_size=8,
-        device=dev, prefill_overlap=prefill_overlap,
+        num_layers=num_layers,
+        num_experts=4,
+        cache_size=8,
+        device=dev,
+        prefill_overlap=prefill_overlap,
     )
     cache.cpu_layer_ids = frozenset(locked)
     src_dev = dev if dev.type == "cuda" else torch.device("cpu")
@@ -784,7 +833,10 @@ def test_set_bank_sources_locked_layer_requires_cpu_layer_ids():
 
     _init_tp()
     cache = OffloadMoeCache(
-        num_layers=2, num_experts=4, cache_size=8, device=torch.device("cpu"),
+        num_layers=2,
+        num_experts=4,
+        cache_size=8,
+        device=torch.device("cpu"),
     )
     sources = {
         "gate_up": [torch.randn(4, 32, 8) for _ in range(2)],
@@ -804,7 +856,10 @@ def test_set_bank_sources_locked_layer_rejects_prefill_overlap():
 
     _init_tp()
     cache = OffloadMoeCache(
-        num_layers=2, num_experts=4, cache_size=8, device=torch.device("cpu"),
+        num_layers=2,
+        num_experts=4,
+        cache_size=8,
+        device=torch.device("cpu"),
         prefill_overlap=True,
     )
     cache.cpu_layer_ids = frozenset({1})
@@ -928,7 +983,8 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
     assert plan.actual == {1: hb.HostResidency.PAGEABLE.value}
     echoed = _echo_residency(ExpertBanks("bf16", {}), labels, plan)
     assert echoed.layer_residency == [
-        hb.HostResidency.PINNED.value, hb.HostResidency.PAGEABLE.value,
+        hb.HostResidency.PINNED.value,
+        hb.HostResidency.PAGEABLE.value,
     ]
 
     monkeypatch.setattr(hb, "_os_lock_failed", False)

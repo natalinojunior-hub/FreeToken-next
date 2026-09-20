@@ -80,16 +80,12 @@ def _compare_and_swap(x, ids, flip, i: tl.constexpr, n_dims: tl.constexpr):
 
 
 @triton.jit
-def _bitonic_merge(
-    x, ids, stage: tl.constexpr, order: tl.constexpr, n_dims: tl.constexpr
-):
+def _bitonic_merge(x, ids, stage: tl.constexpr, order: tl.constexpr, n_dims: tl.constexpr):
     n_outer: tl.constexpr = x.numel >> n_dims
     tl.static_assert(stage <= n_dims)
     if order == 2:
         shape: tl.constexpr = [n_outer * 2 ** (n_dims - 1 - stage), 2, 2**stage]
-        flip = tl.reshape(
-            tl.broadcast_to(tl.arange(0, 2)[None, :, None], shape), x.shape
-        )
+        flip = tl.reshape(tl.broadcast_to(tl.arange(0, 2)[None, :, None], shape), x.shape)
     else:
         flip = order
     for i in tl.static_range(stage):
@@ -113,9 +109,14 @@ def _index_block_score_kernel(
     prefix_lens,  # [batch] context length before this chunk's queries
     num_idx_heads,
     head_dim: tl.constexpr,
-    stride_q_n, stride_q_h, stride_q_d,
-    stride_ik_r, stride_ik_d,
-    stride_s_h, stride_s_n, stride_s_k,
+    stride_q_n,
+    stride_q_h,
+    stride_q_d,
+    stride_ik_r,
+    stride_ik_d,
+    stride_s_h,
+    stride_s_n,
+    stride_s_k,
     stride_br_b,
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
@@ -160,9 +161,7 @@ def _index_block_score_kernel(
         # qk causal mask below discards. If that zero-init invariant ever changes,
         # this load (and the decode score kernel's) must gain a pos mask.
         k = tl.load(
-            ik_ptr
-            + (base + off_k[None, :]) * stride_ik_r
-            + off_d[:, None] * stride_ik_d,
+            ik_ptr + (base + off_k[None, :]) * stride_ik_r + off_d[:, None] * stride_ik_d,
         )
         qk = tl.dot(q, k)
         if q_start < i + BLOCK_SIZE_K:
@@ -171,8 +170,7 @@ def _index_block_score_kernel(
         s_ptrs = (
             score_ptr
             + pid_h * stride_s_h
-            + (seq_start + pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q))
-            * stride_s_n
+            + (seq_start + pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) * stride_s_n
             + blk * stride_s_k
         )
         q_store_mask = (pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) < q_len
@@ -204,8 +202,12 @@ def _topk_index_kernel(
     topk,
     init_blocks: tl.constexpr,
     local_blocks: tl.constexpr,
-    stride_s_h, stride_s_n, stride_s_k,
-    stride_ti_h, stride_ti_n, stride_ti_t,
+    stride_s_h,
+    stride_s_n,
+    stride_s_k,
+    stride_ti_h,
+    stride_ti_n,
+    stride_ti_t,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
 ):
@@ -220,12 +222,7 @@ def _topk_index_kernel(
         return
     off_k = tl.arange(0, BLOCK_SIZE_K)
     off_t = tl.arange(0, BLOCK_SIZE_T)
-    s_ptrs = (
-        s_ptr
-        + (seq_start + pid_q) * stride_s_n
-        + pid_h * stride_s_h
-        + off_k * stride_s_k
-    )
+    s_ptrs = s_ptr + (seq_start + pid_q) * stride_s_n + pid_h * stride_s_h + off_k * stride_s_k
     topk_score = tl.full((BLOCK_SIZE_K,), -1e30, dtype=tl.float32)
     topk_idx = tl.full((BLOCK_SIZE_K,), 0, dtype=tl.int32)
     left_half_mask = tl.arange(0, BLOCK_SIZE_K) < BLOCK_SIZE_K // 2
@@ -246,19 +243,13 @@ def _topk_index_kernel(
         topk_idx, last_topk_idx = (tl.where(causal_mask, i + off_k + 1, 0), topk_idx)
         n_dims: tl.constexpr = tl.standard._log2(BLOCK_SIZE_K)
         for j in tl.static_range(1, n_dims):
-            topk_score, topk_idx = _bitonic_merge(
-                topk_score, topk_idx.to(tl.int32), j, 2, n_dims
-            )
+            topk_score, topk_idx = _bitonic_merge(topk_score, topk_idx.to(tl.int32), j, 2, n_dims)
         if i != 0:
             topk_score, topk_idx = _bitonic_merge(
                 topk_score, topk_idx.to(tl.int32), n_dims, False, n_dims
             )
-            topk_score_new = last_topk_score * left_half_mask + topk_score * (
-                1 - left_half_mask
-            )
-            topk_idx_new = last_topk_idx * left_half_mask + topk_idx * (
-                1 - left_half_mask
-            )
+            topk_score_new = last_topk_score * left_half_mask + topk_score * (1 - left_half_mask)
+            topk_idx_new = last_topk_idx * left_half_mask + topk_idx * (1 - left_half_mask)
             topk_score, topk_idx = _bitonic_merge(
                 topk_score_new, topk_idx_new.to(tl.int32), n_dims, True, n_dims
             )
@@ -268,16 +259,10 @@ def _topk_index_kernel(
             )
     topk_mask = tl.arange(0, BLOCK_SIZE_K // BLOCK_SIZE_T) == 0
     topk_idx = tl.sum(
-        topk_mask[:, None]
-        * tl.reshape(topk_idx - 1, [BLOCK_SIZE_K // BLOCK_SIZE_T, BLOCK_SIZE_T]),
+        topk_mask[:, None] * tl.reshape(topk_idx - 1, [BLOCK_SIZE_K // BLOCK_SIZE_T, BLOCK_SIZE_T]),
         axis=0,
     )
-    ti_ptrs = (
-        ti_ptr
-        + (seq_start + pid_q) * stride_ti_n
-        + pid_h * stride_ti_h
-        + off_t * stride_ti_t
-    )
+    ti_ptrs = ti_ptr + (seq_start + pid_q) * stride_ti_n + pid_h * stride_ti_h + off_t * stride_ti_t
     store_mask = off_t < topk
     valid_mask = off_t < valid_blocks
     topk_idx = tl.where(store_mask & valid_mask, topk_idx, -1)
@@ -299,9 +284,14 @@ def _decode_index_score_kernel(
     head_dim: tl.constexpr,
     init_blocks,
     local_blocks,
-    stride_q_n, stride_q_h, stride_q_d,
-    stride_ik_r, stride_ik_d,
-    stride_s_h, stride_s_n, stride_s_k,
+    stride_q_n,
+    stride_q_h,
+    stride_q_d,
+    stride_ik_r,
+    stride_ik_d,
+    stride_s_h,
+    stride_s_n,
+    stride_s_k,
     stride_br_b,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     BLOCK_SIZE_H: tl.constexpr,  # >= 16 (padded index-head tile)
@@ -328,10 +318,7 @@ def _decode_index_score_kernel(
     br_row = block_rows_ptr + pid_r * stride_br_b
     local_start = tl.maximum(0, num_blocks - local_blocks)
     q = tl.load(
-        q_ptr
-        + pid_r * stride_q_n
-        + off_h[None, :] * stride_q_h
-        + off_d[:, None] * stride_q_d,
+        q_ptr + pid_r * stride_q_n + off_h[None, :] * stride_q_h + off_d[:, None] * stride_q_d,
         mask=h_mask[None, :],
         other=0.0,
     )  # [D, H16]
@@ -344,9 +331,7 @@ def _decode_index_score_kernel(
         # (unlike the K/V slabs), so unwritten tail rows dot to a finite 0 that
         # the pos_mask below discards. If that invariant changes, mask this load.
         k = tl.load(
-            ik_ptr
-            + (base + off_k[:, None]) * stride_ik_r
-            + off_d * stride_ik_d,
+            ik_ptr + (base + off_k[:, None]) * stride_ik_r + off_d * stride_ik_d,
         )  # [N, D]
         kq = tl.dot(k, q, out_dtype=tl.float32)  # [N, H16]
         kq = tl.where(pos_mask & h_mask[None, :], kq, float("-inf"))
@@ -376,9 +361,17 @@ def _topk_index_partial_kernel(
     seq_lens,  # [num_reqs]
     block_size: tl.constexpr,  # sparse block size (128)
     topk: tl.constexpr,
-    stride_s_h, stride_s_b, stride_s_k,
-    stride_ts_c, stride_ts_h, stride_ts_b, stride_ts_t,
-    stride_ti_c, stride_ti_h, stride_ti_b, stride_ti_t,
+    stride_s_h,
+    stride_s_b,
+    stride_s_k,
+    stride_ts_c,
+    stride_ts_h,
+    stride_ts_b,
+    stride_ts_t,
+    stride_ti_c,
+    stride_ti_h,
+    stride_ti_b,
+    stride_ti_t,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
 ):
@@ -402,12 +395,7 @@ def _topk_index_partial_kernel(
     off_k = tl.arange(0, BLOCK_SIZE_K)
     off_t = tl.arange(0, BLOCK_SIZE_T)
 
-    s_ptrs = (
-        s_ptr
-        + pid_b * stride_s_b
-        + pid_h * stride_s_h
-        + (chunk_start + off_k) * stride_s_k
-    )
+    s_ptrs = s_ptr + pid_b * stride_s_b + pid_h * stride_s_h + (chunk_start + off_k) * stride_s_k
 
     topk_score = tl.full((BLOCK_SIZE_K,), -1e30, dtype=tl.float32)
     topk_idx = tl.full((BLOCK_SIZE_K,), 0, dtype=tl.int32)
@@ -427,19 +415,13 @@ def _topk_index_partial_kernel(
         )
         n_dims: tl.constexpr = tl.standard._log2(BLOCK_SIZE_K)
         for j in tl.static_range(1, n_dims):
-            topk_score, topk_idx = _bitonic_merge(
-                topk_score, topk_idx.to(tl.int32), j, 2, n_dims
-            )
+            topk_score, topk_idx = _bitonic_merge(topk_score, topk_idx.to(tl.int32), j, 2, n_dims)
         if i != 0:
             topk_score, topk_idx = _bitonic_merge(
                 topk_score, topk_idx.to(tl.int32), n_dims, False, n_dims
             )
-            topk_score_new = last_topk_score * left_half_mask + topk_score * (
-                1 - left_half_mask
-            )
-            topk_idx_new = last_topk_idx * left_half_mask + topk_idx * (
-                1 - left_half_mask
-            )
+            topk_score_new = last_topk_score * left_half_mask + topk_score * (1 - left_half_mask)
+            topk_idx_new = last_topk_idx * left_half_mask + topk_idx * (1 - left_half_mask)
             topk_score, topk_idx = _bitonic_merge(
                 topk_score_new, topk_idx_new.to(tl.int32), n_dims, True, n_dims
             )
@@ -497,9 +479,17 @@ def _topk_index_merge_kernel(
     seq_lens,  # [num_reqs]
     block_size: tl.constexpr,
     topk: tl.constexpr,
-    stride_ts_c, stride_ts_h, stride_ts_b, stride_ts_t,
-    stride_ti_c, stride_ti_h, stride_ti_b, stride_ti_t,
-    stride_tif_h, stride_tif_b, stride_tif_t,
+    stride_ts_c,
+    stride_ts_h,
+    stride_ts_b,
+    stride_ts_t,
+    stride_ti_c,
+    stride_ti_h,
+    stride_ti_b,
+    stride_ti_t,
+    stride_tif_h,
+    stride_tif_b,
+    stride_tif_t,
     num_topk_chunks,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
@@ -528,9 +518,7 @@ def _topk_index_merge_kernel(
         + in_chunk_idx * stride_ti_t
     )
 
-    score = tl.load(ts_partial_ptr + score_offset, mask=valid, other=-1e30).to(
-        tl.float32
-    )
+    score = tl.load(ts_partial_ptr + score_offset, mask=valid, other=-1e30).to(tl.float32)
     score = tl.where(score != score, -1e30, score)
     idx = tl.load(ti_partial_ptr + idx_offset, mask=valid, other=0).to(tl.int32)
 
@@ -541,23 +529,15 @@ def _topk_index_merge_kernel(
 
     extract_mask = tl.arange(0, BLOCK_SIZE_K // BLOCK_SIZE_T) == 0
     topk_idx_final = tl.sum(
-        extract_mask[:, None]
-        * tl.reshape(idx - 1, [BLOCK_SIZE_K // BLOCK_SIZE_T, BLOCK_SIZE_T]),
+        extract_mask[:, None] * tl.reshape(idx - 1, [BLOCK_SIZE_K // BLOCK_SIZE_T, BLOCK_SIZE_T]),
         axis=0,
     )
 
     off_t = tl.arange(0, BLOCK_SIZE_T)
-    tif_ptrs = (
-        ti_final_ptr
-        + pid_h * stride_tif_h
-        + pid_b * stride_tif_b
-        + off_t * stride_tif_t
-    )
+    tif_ptrs = ti_final_ptr + pid_h * stride_tif_h + pid_b * stride_tif_b + off_t * stride_tif_t
     store_mask = off_t < topk
     topk_idx_final = tl.where(off_t < tl.minimum(topk, num_blocks), topk_idx_final, -1)
-    tl.store(
-        tif_ptrs, topk_idx_final.to(ti_final_ptr.dtype.element_ty), mask=store_mask
-    )
+    tl.store(tif_ptrs, topk_idx_final.to(ti_final_ptr.dtype.element_ty), mask=store_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -567,9 +547,7 @@ def _topk_index_merge_kernel(
 @triton.heuristics(
     {
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
-        "BLOCK_SIZE_H": lambda args: max(
-            16, triton.next_power_of_2(args["gqa_group_size"])
-        ),
+        "BLOCK_SIZE_H": lambda args: max(16, triton.next_power_of_2(args["gqa_group_size"])),
     }
 )
 @triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
@@ -588,11 +566,21 @@ def _gqa_sparse_fwd_kernel(
     head_dim,
     max_topk,
     sm_scale,
-    stride_qn, stride_qh, stride_qd,
-    stride_kr, stride_kh, stride_kd,
-    stride_vr, stride_vh, stride_vd,
-    stride_th, stride_tn, stride_tk,
-    stride_on, stride_oh, stride_od,
+    stride_qn,
+    stride_qh,
+    stride_qd,
+    stride_kr,
+    stride_kh,
+    stride_kd,
+    stride_vr,
+    stride_vh,
+    stride_vd,
+    stride_th,
+    stride_tn,
+    stride_tk,
+    stride_on,
+    stride_oh,
+    stride_od,
     stride_br_b,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     BLOCK_SIZE_D: tl.constexpr,
@@ -697,9 +685,7 @@ def _gqa_sparse_fwd_kernel(
 # ---------------------------------------------------------------------------
 @triton.heuristics(
     {
-        "BLOCK_SIZE_H": lambda args: max(
-            16, triton.next_power_of_2(args["gqa_group_size"])
-        ),
+        "BLOCK_SIZE_H": lambda args: max(16, triton.next_power_of_2(args["gqa_group_size"])),
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
     }
 )
@@ -718,12 +704,25 @@ def _gqa_sparse_decode_kernel(
     head_dim,
     max_topk,
     sm_scale,
-    stride_qn, stride_qh, stride_qd,
-    stride_kr, stride_kh, stride_kd,
-    stride_vr, stride_vh, stride_vd,
-    stride_th, stride_tn, stride_tk,
-    stride_o_c, stride_o_b, stride_o_h, stride_o_d,
-    stride_l_c, stride_l_b, stride_l_h,
+    stride_qn,
+    stride_qh,
+    stride_qd,
+    stride_kr,
+    stride_kh,
+    stride_kd,
+    stride_vr,
+    stride_vh,
+    stride_vd,
+    stride_th,
+    stride_tn,
+    stride_tk,
+    stride_o_c,
+    stride_o_b,
+    stride_o_h,
+    stride_o_d,
+    stride_l_c,
+    stride_l_b,
+    stride_l_h,
     stride_br_b,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     NUM_TOPK_CHUNKS: tl.constexpr,
@@ -829,18 +828,23 @@ def _gqa_sparse_decode_kernel(
     tl.store(lse_ptrs, lse_i.to(lse_ptr.dtype.element_ty), boundary_check=(0,))
 
 
-@triton.heuristics(
-    {"BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"])}
-)
+@triton.heuristics({"BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"])})
 @triton.jit
 def _merge_topk_attn_out_kernel(
     o_ptr,  # partials: [chunks, num_reqs, num_heads, head_dim]
     lse_ptr,  # partials (log2): [chunks, num_reqs, num_heads]
     out_ptr,  # merged out: [num_reqs, num_heads, head_dim]
     head_dim,
-    stride_o_c, stride_o_b, stride_o_h, stride_o_d,
-    stride_l_c, stride_l_b, stride_l_h,
-    stride_out_n, stride_out_h, stride_out_d,
+    stride_o_c,
+    stride_o_b,
+    stride_o_h,
+    stride_o_d,
+    stride_l_c,
+    stride_l_b,
+    stride_l_h,
+    stride_out_n,
+    stride_out_h,
+    stride_out_d,
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
 ):
@@ -863,9 +867,7 @@ def _merge_topk_attn_out_kernel(
     weights = tl.exp2(lse - lse_max)
     weights = weights / tl.sum(weights, axis=0)
     o_merged = tl.sum(o * weights[:, None], axis=0)
-    out_ptrs = (
-        out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d
-    )
+    out_ptrs = out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d
     tl.store(out_ptrs, o_merged.to(out_ptr.dtype.element_ty), mask=off_d < head_dim)
 
 
@@ -897,12 +899,23 @@ def m3_index_score_prefill(
     BLOCK_SIZE_Q = 64
     grid = (triton.cdiv(max_query_len, BLOCK_SIZE_Q), batch * num_idx_heads)
     _index_block_score_kernel[grid](
-        idx_q, ik_rows, score, block_rows,
-        cu_seqlens_q, seq_lens, prefix_lens,
-        num_idx_heads, head_dim,
-        idx_q.stride(0), idx_q.stride(1), idx_q.stride(2),
-        ik_rows.stride(0), ik_rows.stride(1),
-        score.stride(0), score.stride(1), score.stride(2),
+        idx_q,
+        ik_rows,
+        score,
+        block_rows,
+        cu_seqlens_q,
+        seq_lens,
+        prefix_lens,
+        num_idx_heads,
+        head_dim,
+        idx_q.stride(0),
+        idx_q.stride(1),
+        idx_q.stride(2),
+        ik_rows.stride(0),
+        ik_rows.stride(1),
+        score.stride(0),
+        score.stride(1),
+        score.stride(2),
         block_rows.stride(0),
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
@@ -924,17 +937,23 @@ def m3_index_topk_prefill(
     total_q, topk]`` int32 block ids (-1 pad)."""
     num_idx_heads, total_q = score.shape[0], score.shape[1]
     batch = cu_seqlens_q.shape[0] - 1
-    topk_idx = torch.empty(
-        (num_idx_heads, total_q, topk), dtype=torch.int32, device=score.device
-    )
+    topk_idx = torch.empty((num_idx_heads, total_q, topk), dtype=torch.int32, device=score.device)
     grid = (max_query_len, batch, num_idx_heads)
     _topk_index_kernel[grid](
-        score, topk_idx,
+        score,
+        topk_idx,
         SPARSE_BLOCK_SIZE,
-        cu_seqlens_q, prefix_lens,
-        topk, init_blocks, local_blocks,
-        score.stride(0), score.stride(1), score.stride(2),
-        topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
+        cu_seqlens_q,
+        prefix_lens,
+        topk,
+        init_blocks,
+        local_blocks,
+        score.stride(0),
+        score.stride(1),
+        score.stride(2),
+        topk_idx.stride(0),
+        topk_idx.stride(1),
+        topk_idx.stride(2),
     )
     return topk_idx
 
@@ -964,22 +983,32 @@ def m3_index_decode(
     target = max(1, min(MAX_NUM_KV_CHUNKS, TARGET_GRID // max(1, num_reqs)))
     num_kv_chunks = 1 << (target.bit_length() - 1)
     _decode_index_score_kernel[(num_reqs, num_kv_chunks)](
-        idx_q, ik_rows, score, block_rows, seq_lens,
-        num_idx_heads, head_dim,
-        init_blocks, local_blocks,
-        idx_q.stride(0), idx_q.stride(1), idx_q.stride(2),
-        ik_rows.stride(0), ik_rows.stride(1),
-        score.stride(0), score.stride(1), score.stride(2),
+        idx_q,
+        ik_rows,
+        score,
+        block_rows,
+        seq_lens,
+        num_idx_heads,
+        head_dim,
+        init_blocks,
+        local_blocks,
+        idx_q.stride(0),
+        idx_q.stride(1),
+        idx_q.stride(2),
+        ik_rows.stride(0),
+        ik_rows.stride(1),
+        score.stride(0),
+        score.stride(1),
+        score.stride(2),
         block_rows.stride(0),
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         BLOCK_SIZE_H=max(16, triton.next_power_of_2(num_idx_heads)),
         num_kv_chunks=num_kv_chunks,
-        num_warps=4, num_stages=2,
+        num_warps=4,
+        num_stages=2,
     )
 
-    topk_idx = torch.empty(
-        (num_idx_heads, num_reqs, topk), dtype=torch.int32, device=idx_q.device
-    )
+    topk_idx = torch.empty((num_idx_heads, num_reqs, topk), dtype=torch.int32, device=idx_q.device)
     TOPK_TARGET_GRID = 64
     MAX_NUM_TOPK_CHUNKS = 16
     topk_target = max(
@@ -989,32 +1018,59 @@ def m3_index_decode(
     block_size_t = triton.next_power_of_2(topk)
     ts_partial = torch.empty(
         (num_topk_chunks, num_idx_heads, num_reqs, block_size_t),
-        dtype=torch.float32, device=idx_q.device,
+        dtype=torch.float32,
+        device=idx_q.device,
     )
     ti_partial = torch.empty(
         (num_topk_chunks, num_idx_heads, num_reqs, block_size_t),
-        dtype=torch.int32, device=idx_q.device,
+        dtype=torch.int32,
+        device=idx_q.device,
     )
     # The chunk split is computed in-kernel from each row's LIVE block count
     # (device-read; the staged table width would serialize short contexts).
     _topk_index_partial_kernel[(num_reqs, num_idx_heads, num_topk_chunks)](
-        score, ts_partial, ti_partial, seq_lens,
-        SPARSE_BLOCK_SIZE, topk,
-        score.stride(0), score.stride(1), score.stride(2),
-        ts_partial.stride(0), ts_partial.stride(1), ts_partial.stride(2), ts_partial.stride(3),
-        ti_partial.stride(0), ti_partial.stride(1), ti_partial.stride(2), ti_partial.stride(3),
+        score,
+        ts_partial,
+        ti_partial,
+        seq_lens,
+        SPARSE_BLOCK_SIZE,
+        topk,
+        score.stride(0),
+        score.stride(1),
+        score.stride(2),
+        ts_partial.stride(0),
+        ts_partial.stride(1),
+        ts_partial.stride(2),
+        ts_partial.stride(3),
+        ti_partial.stride(0),
+        ti_partial.stride(1),
+        ti_partial.stride(2),
+        ti_partial.stride(3),
         # Fixed config (no autotune: decode is captured into CUDA graphs, and
         # autotune would benchmark at run time). 128 matches the reference's
         # smallest always-valid config.
         BLOCK_SIZE_K=128,
-        num_warps=4, num_stages=2,
+        num_warps=4,
+        num_stages=2,
     )
     _topk_index_merge_kernel[(num_reqs, num_idx_heads)](
-        ts_partial, ti_partial, topk_idx, seq_lens,
-        SPARSE_BLOCK_SIZE, topk,
-        ts_partial.stride(0), ts_partial.stride(1), ts_partial.stride(2), ts_partial.stride(3),
-        ti_partial.stride(0), ti_partial.stride(1), ti_partial.stride(2), ti_partial.stride(3),
-        topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
+        ts_partial,
+        ti_partial,
+        topk_idx,
+        seq_lens,
+        SPARSE_BLOCK_SIZE,
+        topk,
+        ts_partial.stride(0),
+        ts_partial.stride(1),
+        ts_partial.stride(2),
+        ts_partial.stride(3),
+        ti_partial.stride(0),
+        ti_partial.stride(1),
+        ti_partial.stride(2),
+        ti_partial.stride(3),
+        topk_idx.stride(0),
+        topk_idx.stride(1),
+        topk_idx.stride(2),
         num_topk_chunks=num_topk_chunks,
         num_warps=2,
     )
@@ -1043,17 +1099,39 @@ def m3_sparse_attn_prefill(
     gqa_group_size = num_heads // num_kv_heads
     grid = (max_query_len, num_kv_heads, batch)
     _gqa_sparse_fwd_kernel[grid](
-        q, k_rows, v_rows, topk_idx, output, block_rows,
-        cu_seqlens_q, seq_lens, prefix_lens,
-        num_kv_heads, gqa_group_size, head_dim, topk, sm_scale,
-        q.stride(0), q.stride(1), q.stride(2),
-        k_rows.stride(0), k_rows.stride(1), k_rows.stride(2),
-        v_rows.stride(0), v_rows.stride(1), v_rows.stride(2),
-        topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
-        output.stride(0), output.stride(1), output.stride(2),
+        q,
+        k_rows,
+        v_rows,
+        topk_idx,
+        output,
+        block_rows,
+        cu_seqlens_q,
+        seq_lens,
+        prefix_lens,
+        num_kv_heads,
+        gqa_group_size,
+        head_dim,
+        topk,
+        sm_scale,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k_rows.stride(0),
+        k_rows.stride(1),
+        k_rows.stride(2),
+        v_rows.stride(0),
+        v_rows.stride(1),
+        v_rows.stride(2),
+        topk_idx.stride(0),
+        topk_idx.stride(1),
+        topk_idx.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
         block_rows.stride(0),
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        num_warps=4, num_stages=2,
+        num_warps=4,
+        num_stages=2,
     )
 
 
@@ -1085,24 +1163,59 @@ def m3_sparse_attn_decode(
     )
     grid = (num_reqs * num_topk_chunks, num_kv_heads)
     _gqa_sparse_decode_kernel[grid](
-        q, k_rows, v_rows, topk_idx, o_partial, lse_partial, block_rows, seq_lens,
-        num_reqs, gqa_group_size, head_dim, max_topk, sm_scale,
-        q.stride(0), q.stride(1), q.stride(2),
-        k_rows.stride(0), k_rows.stride(1), k_rows.stride(2),
-        v_rows.stride(0), v_rows.stride(1), v_rows.stride(2),
-        topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
-        o_partial.stride(0), o_partial.stride(1), o_partial.stride(2), o_partial.stride(3),
-        lse_partial.stride(0), lse_partial.stride(1), lse_partial.stride(2),
+        q,
+        k_rows,
+        v_rows,
+        topk_idx,
+        o_partial,
+        lse_partial,
+        block_rows,
+        seq_lens,
+        num_reqs,
+        gqa_group_size,
+        head_dim,
+        max_topk,
+        sm_scale,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k_rows.stride(0),
+        k_rows.stride(1),
+        k_rows.stride(2),
+        v_rows.stride(0),
+        v_rows.stride(1),
+        v_rows.stride(2),
+        topk_idx.stride(0),
+        topk_idx.stride(1),
+        topk_idx.stride(2),
+        o_partial.stride(0),
+        o_partial.stride(1),
+        o_partial.stride(2),
+        o_partial.stride(3),
+        lse_partial.stride(0),
+        lse_partial.stride(1),
+        lse_partial.stride(2),
         block_rows.stride(0),
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         NUM_TOPK_CHUNKS=num_topk_chunks,
-        num_warps=4, num_stages=2,
+        num_warps=4,
+        num_stages=2,
     )
     _merge_topk_attn_out_kernel[(num_reqs, num_heads)](
-        o_partial, lse_partial, output, head_dim,
-        o_partial.stride(0), o_partial.stride(1), o_partial.stride(2), o_partial.stride(3),
-        lse_partial.stride(0), lse_partial.stride(1), lse_partial.stride(2),
-        output.stride(0), output.stride(1), output.stride(2),
+        o_partial,
+        lse_partial,
+        output,
+        head_dim,
+        o_partial.stride(0),
+        o_partial.stride(1),
+        o_partial.stride(2),
+        o_partial.stride(3),
+        lse_partial.stride(0),
+        lse_partial.stride(1),
+        lse_partial.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
         NUM_TOPK_CHUNKS=num_topk_chunks,
         num_warps=4,
     )

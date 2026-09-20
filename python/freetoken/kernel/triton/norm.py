@@ -42,9 +42,15 @@ def _num_warps(M: int) -> int:
 @triton.heuristics(_HEUR)
 @triton.jit
 def _rmsnorm_kernel(
-    OUT, X, W,
-    eps: tl.constexpr, H: tl.constexpr,
-    sxa, sxb, soa, sob,
+    OUT,
+    X,
+    W,
+    eps: tl.constexpr,
+    H: tl.constexpr,
+    sxa,
+    sxb,
+    soa,
+    sob,
     CONTIG: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -78,9 +84,15 @@ def _rmsnorm_kernel(
 @triton.heuristics(_HEUR)
 @triton.jit
 def _fused_add_rmsnorm_kernel(
-    X, R, W,
-    eps: tl.constexpr, H: tl.constexpr,
-    sxa, sxb, sra, srb,
+    X,
+    R,
+    W,
+    eps: tl.constexpr,
+    H: tl.constexpr,
+    sxa,
+    sxb,
+    sra,
+    srb,
     CONTIG: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -143,9 +155,21 @@ def _rmsnorm(input, weight, eps, out, gemma: bool):
     # 32k-CTA prefill grids the per-CTA gdc_wait poll costs more than it hides.
     pdl = contig and is_sm90_supported()
     _rmsnorm_kernel[(A, B)](
-        out, input, weight, eps, H, sxa, sxb, soa, sob,
-        CONTIG=contig, ENABLE_PDL=pdl, launch_pdl=pdl, GEMMA=gemma,
-        num_warps=_num_warps(A * B), num_stages=1,
+        out,
+        input,
+        weight,
+        eps,
+        H,
+        sxa,
+        sxb,
+        soa,
+        sob,
+        CONTIG=contig,
+        ENABLE_PDL=pdl,
+        launch_pdl=pdl,
+        GEMMA=gemma,
+        num_warps=_num_warps(A * B),
+        num_stages=1,
     )
     return out
 
@@ -171,9 +195,21 @@ def _fused_add_rmsnorm(input, residual, weight, eps, gemma: bool):
     contig = input.ndim == 2 and input.is_contiguous() and residual.is_contiguous()
     pdl = contig and is_sm90_supported()
     _fused_add_rmsnorm_kernel[(A, B)](
-        input, residual, weight, eps, H, sxa, sxb, sra, srb,
-        CONTIG=contig, ENABLE_PDL=pdl, launch_pdl=pdl, GEMMA=gemma,
-        num_warps=_num_warps(A * B), num_stages=1,
+        input,
+        residual,
+        weight,
+        eps,
+        H,
+        sxa,
+        sxb,
+        sra,
+        srb,
+        CONTIG=contig,
+        ENABLE_PDL=pdl,
+        launch_pdl=pdl,
+        GEMMA=gemma,
+        num_warps=_num_warps(A * B),
+        num_stages=1,
     )
 
 

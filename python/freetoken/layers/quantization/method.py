@@ -26,7 +26,9 @@ def select_kernel(candidates: Sequence[type], requested: str, cfg: Any):
         kernel = candidates[names.index(requested)]()
         reason = kernel.unusable_reason(cfg)
         if reason:
-            raise KernelSelectionError(f"kernel {requested!r} was requested but cannot run here: {reason}")
+            raise KernelSelectionError(
+                f"kernel {requested!r} was requested but cannot run here: {reason}"
+            )
         return kernel
     skipped: list[str] = []
     fallback = None
@@ -60,6 +62,7 @@ class QuantMethod(ABC):
     @property
     def scheme(self):
         return self.cfg.scheme
+
 
 def finalize_quant(root: Any) -> int:
     """Call ``quant_method.finalize(layer)`` on every layer under ``root``; returns the count."""

@@ -37,7 +37,9 @@ _E2M1 = torch.tensor(
 )
 
 
-def _dequant_ref(packed: torch.Tensor, scale: torch.Tensor, row_global: torch.Tensor) -> torch.Tensor:
+def _dequant_ref(
+    packed: torch.Tensor, scale: torch.Tensor, row_global: torch.Tensor
+) -> torch.Tensor:
     """[N, K//2] u8 + [N, K//16] e4m3 + [N] global -> [N, K] fp32 (low nibble first)."""
     n, k2 = packed.shape
     codes = torch.stack([packed & 0xF, packed >> 4], dim=-1).view(n, 2 * k2).long()
@@ -124,20 +126,35 @@ def _bound_layer(kernel: str):
     if try_get_tp_info() is None:
         set_tp_info(0, 1)
     set_quant_backend(QuantBackend.parse(f"moe.nvfp4={kernel}"))
-    quant = QuantConfig.from_hf({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["lm_head"]}})
-    return OffloadMoELayer(0, E, TOPK, H, I, quant_config=quant, prefix="model.layers.0.mlp.experts")
+    quant = QuantConfig.from_hf(
+        {
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "NVFP4",
+                "ignore": ["lm_head"],
+            }
+        }
+    )
+    return OffloadMoELayer(
+        0, E, TOPK, H, I, quant_config=quant, prefix="model.layers.0.mlp.experts"
+    )
 
 
 def _pieces(sources):
     for layer_id in range(L):
-        yield layer_id, 0, E, {
-            "gate_up": sources["gate_up_packed"][layer_id],
-            "gate_up_scale": sources["gate_up_scale"][layer_id],
-            "gate_up_global": sources["gate_up_global"][layer_id],
-            "down": sources["down_packed"][layer_id],
-            "down_scale": sources["down_scale"][layer_id],
-            "down_global": sources["down_global"][layer_id],
-        }
+        yield (
+            layer_id,
+            0,
+            E,
+            {
+                "gate_up": sources["gate_up_packed"][layer_id],
+                "gate_up_scale": sources["gate_up_scale"][layer_id],
+                "gate_up_global": sources["gate_up_global"][layer_id],
+                "down": sources["down_packed"][layer_id],
+                "down_scale": sources["down_scale"][layer_id],
+                "down_global": sources["down_global"][layer_id],
+            },
+        )
 
 
 def _packed_cache(device, kernel: str, *, seed=0, cache_size=S, prefill_overlap=False):
@@ -189,8 +206,17 @@ def test_marlin_prefill_matches_dequant_reference():
     g1, g2 = cache.alphas_for_layer(0)
     gu_p, gu_s, dn_p, dn_s = cache.bank_views(E)
     out = marlin_fused_experts(
-        hidden, gu_p, gu_s, g1, dn_p, dn_s, g2,
-        topk_weights, topk_ids, "silu", False,
+        hidden,
+        gu_p,
+        gu_s,
+        g1,
+        dn_p,
+        dn_s,
+        g2,
+        topk_weights,
+        topk_ids,
+        "silu",
+        False,
     )
     _assert_close(out, ref)
 
@@ -216,8 +242,17 @@ def test_marlin_decode_matches_dequant_reference_after_prefill_stomp():
         g1, g2 = cache.alphas_for_slots(layer_id)
         gu_p, gu_s, dn_p, dn_s = cache.bank_views()
         out = marlin_fused_experts(
-            hidden, gu_p, gu_s, g1, dn_p, dn_s, g2,
-            topk_weights, ids, "silu", False,
+            hidden,
+            gu_p,
+            gu_s,
+            g1,
+            dn_p,
+            dn_s,
+            g2,
+            topk_weights,
+            ids,
+            "silu",
+            False,
         )
         _assert_close(out, ref)
 
@@ -261,8 +296,17 @@ def test_marlin_overlap_prefill_matches_dequant_reference():
         g1, g2 = cache.alphas_for_layer(layer_id)
         ref = _ref_moe(ref_sources, layer_id, hidden, topk_weights, topk_ids)
         out = marlin_fused_experts(
-            hidden, gu_p, gu_s, g1, dn_p, dn_s, g2,
-            topk_weights, topk_ids, "silu", False,
+            hidden,
+            gu_p,
+            gu_s,
+            g1,
+            dn_p,
+            dn_s,
+            g2,
+            topk_weights,
+            topk_ids,
+            "silu",
+            False,
         )
         _assert_close(out, ref)
         cache.release_prefill_layer(layer_id)
@@ -280,8 +324,17 @@ def test_marlin_overlap_prefill_matches_dequant_reference():
     g1, g2 = cache.alphas_for_slots(0)
     gu_p, gu_s, dn_p, dn_s = cache.bank_views()
     out = marlin_fused_experts(
-        dec_hidden, gu_p, gu_s, g1, dn_p, dn_s, g2,
-        dec_weights, ids, "silu", False,
+        dec_hidden,
+        gu_p,
+        gu_s,
+        g1,
+        dn_p,
+        dn_s,
+        g2,
+        dec_weights,
+        ids,
+        "silu",
+        False,
     )
     _assert_close(out, ref)
 
@@ -318,8 +371,18 @@ def test_triton_overlap_prefill_matches_dequant_reference():
         gu_p, gu_s, gu_g, dn_p, dn_s, dn_g = cache.wait_prefill_layer(layer_id)
         ref = _ref_moe(sources, layer_id, hidden, topk_weights, topk_ids)
         out = fused_experts_nvfp4(
-            hidden, gu_p, gu_s, gu_g, dn_p, dn_s, dn_g,
-            topk_weights, topk_ids, E, "silu", False,
+            hidden,
+            gu_p,
+            gu_s,
+            gu_g,
+            dn_p,
+            dn_s,
+            dn_g,
+            topk_weights,
+            topk_ids,
+            E,
+            "silu",
+            False,
         )
         _assert_close(out, ref)
         cache.release_prefill_layer(layer_id)
@@ -346,8 +409,12 @@ def test_triton_swigluoai_matches_dequant_reference():
     banks = [
         sources[name][layer_id].to(device)
         for name in (
-            "gate_up_packed", "gate_up_scale", "gate_up_global",
-            "down_packed", "down_scale", "down_global",
+            "gate_up_packed",
+            "gate_up_scale",
+            "gate_up_global",
+            "down_packed",
+            "down_scale",
+            "down_global",
         )
     ]
     ref = _ref_moe(sources, layer_id, hidden, topk_weights, topk_ids, activation="swigluoai")
@@ -505,8 +572,13 @@ def test_dummy_nvfp4_banks_marlin_pack_gathers_zero_copy():
     assert torch.isfinite(banks.down_alpha.float()).all()
 
     cache = OffloadMoeCache(
-        num_layers=L, num_experts=E, cache_size=S, device=device, quant_format=banks.quant_format,
-        layout=banks.layout, max_slots=layer.quant_method.kernel.max_slots,
+        num_layers=L,
+        num_experts=E,
+        cache_size=S,
+        device=device,
+        quant_format=banks.quant_format,
+        layout=banks.layout,
+        max_slots=layer.quant_method.kernel.max_slots,
     )
     cache.set_bank_sources(banks.sources)
     cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)

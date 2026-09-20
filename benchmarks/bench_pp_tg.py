@@ -47,25 +47,50 @@ CHARS_PER_TOKEN = 4  # only used to size the text slice that gets tokenized
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--model", required=True, help="checkpoint dir / .ftw dir / .gguf path")
-    p.add_argument("--tokens", type=int, default=16384, help="prompt tokens (the context under test)")
+    p.add_argument(
+        "--tokens", type=int, default=16384, help="prompt tokens (the context under test)"
+    )
     p.add_argument("--decode", type=int, default=128, help="generated tokens per request")
     p.add_argument("--repeats", type=int, default=3, help="measured requests after warmup")
     p.add_argument("--warmups", type=int, default=2, help="untimed requests at full context")
     p.add_argument("--prompt-file", default=os.environ.get("FREETOKEN_NEXT_PROMPT", DEFAULT_CORPUS))
-    p.add_argument("--prompt-offset", type=int, default=0, help="token offset into the corpus slice")
+    p.add_argument(
+        "--prompt-offset", type=int, default=0, help="token offset into the corpus slice"
+    )
     p.add_argument("--mem-ratio", type=float, default=0.9)
     p.add_argument("--gpu", default=None, help="UUID or nvidia-smi index, as ft serve --gpu")
     p.add_argument("--no-graph", action="store_true", help="eager decode instead of CUDA graph")
-    p.add_argument("--sample", action="store_true", help="use the checkpoint's sampling instead of greedy")
-    p.add_argument("--serve-arg", dest="serve_args", action="append", default=[],
-                   help="extra flag for ft serve, verbatim (repeatable)")
+    p.add_argument(
+        "--sample", action="store_true", help="use the checkpoint's sampling instead of greedy"
+    )
+    p.add_argument(
+        "--serve-arg",
+        dest="serve_args",
+        action="append",
+        default=[],
+        help="extra flag for ft serve, verbatim (repeatable)",
+    )
     p.add_argument("--label", default="run", help="tag written into the output rows")
-    p.add_argument("--server-timeout", type=float, default=600, help="max seconds to wait for server startup (default: 600s)")
-    p.add_argument("--stall-timeout", type=float, default=45.0, help="max seconds between token arrivals during decode (default: 45s)")
+    p.add_argument(
+        "--server-timeout",
+        type=float,
+        default=600,
+        help="max seconds to wait for server startup (default: 600s)",
+    )
+    p.add_argument(
+        "--stall-timeout",
+        type=float,
+        default=45.0,
+        help="max seconds between token arrivals during decode (default: 45s)",
+    )
     p.add_argument("--json", dest="json_out", default=None, help="append result rows here")
-    p.add_argument("--keep-alive", action="store_true", help="leave the server running (manual probing)")
+    p.add_argument(
+        "--keep-alive", action="store_true", help="leave the server running (manual probing)"
+    )
     return p.parse_args(argv)
 
 
@@ -96,7 +121,7 @@ def build_prompt_text(model: str, path: str, tokens: int, offset: int) -> str:
     """
     text = Path(path).read_text(errors="replace")
     start = offset * tokens * CHARS_PER_TOKEN
-    chunk = text[start:start + tokens * CHARS_PER_TOKEN * 2] or text
+    chunk = text[start : start + tokens * CHARS_PER_TOKEN * 2] or text
     if not chunk.strip():
         sys.exit(f"[bench] corpus {path} exhausted at --prompt-offset {offset}")
     from freetoken.utils.hf import load_tokenizer
@@ -121,13 +146,24 @@ def build_prompt_text(model: str, path: str, tokens: int, offset: int) -> str:
 
 def serve_cmd(args: argparse.Namespace, port: int) -> list[str]:
     cmd = [
-        sys.executable, "-m", "freetoken.cli", "serve",
-        "--model", args.model,
-        "--host", "127.0.0.1", "--port", str(port),
-        "--max-running-requests", "1",
-        "--max-seq-len-override", str(args.tokens + args.decode + 64),
-        "--memory-ratio", str(args.mem_ratio),
-        "--cuda-graph-max-bs", "0" if args.no_graph else "1",
+        sys.executable,
+        "-m",
+        "freetoken.cli",
+        "serve",
+        "--model",
+        args.model,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--max-running-requests",
+        "1",
+        "--max-seq-len-override",
+        str(args.tokens + args.decode + 64),
+        "--memory-ratio",
+        str(args.mem_ratio),
+        "--cuda-graph-max-bs",
+        "0" if args.no_graph else "1",
     ]
     for extra in args.serve_args:
         cmd += extra.split()
@@ -149,11 +185,20 @@ class GpuSampler(threading.Thread):
     def run(self) -> None:
         while not self._stop_evt.is_set():
             try:
-                out = subprocess.run(
-                    ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
-                     "--format=csv,noheader,nounits"],
-                    capture_output=True, text=True, timeout=5,
-                ).stdout.strip().splitlines()[0]
+                out = (
+                    subprocess.run(
+                        [
+                            "nvidia-smi",
+                            "--query-gpu=utilization.gpu,memory.used",
+                            "--format=csv,noheader,nounits",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    .stdout.strip()
+                    .splitlines()[0]
+                )
                 u, m = (int(float(x)) for x in out.split(","))
                 self.util.append(u)
                 self.mem_mib.append(m)
@@ -180,8 +225,9 @@ def _tree_pids(pid: int) -> list[int]:
     while stack:
         cur = stack.pop()
         try:
-            out = subprocess.run(["ps", "-o", "pid=", "--ppid", str(cur)],
-                                 capture_output=True, text=True, timeout=5).stdout.split()
+            out = subprocess.run(
+                ["ps", "-o", "pid=", "--ppid", str(cur)], capture_output=True, text=True, timeout=5
+            ).stdout.split()
         except Exception:
             out = []
         for q in out:
@@ -212,7 +258,9 @@ def mem_available_gib() -> float:
     return 0.0
 
 
-def stream_completion(origin: str, model_id: str, prompt: str, args: argparse.Namespace, proc=None) -> dict:
+def stream_completion(
+    origin: str, model_id: str, prompt: str, args: argparse.Namespace, proc=None
+) -> dict:
     body = {
         "model": model_id,
         "prompt": prompt,
@@ -224,7 +272,8 @@ def stream_completion(origin: str, model_id: str, prompt: str, args: argparse.Na
     if not args.sample:
         body.update({"temperature": 0.0, "top_p": 1.0, "top_k": -1})
     req = urllib.request.Request(
-        f"{origin}/v1/completions", data=json.dumps(body).encode(),
+        f"{origin}/v1/completions",
+        data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
     )
     stamps: list[float] = []
@@ -241,19 +290,25 @@ def stream_completion(origin: str, model_id: str, prompt: str, args: argparse.Na
     stall_timeout = getattr(args, "stall_timeout", 45.0)
 
     if proc is not None:
+
         def _watch():
             last_heartbeat = time.monotonic()
             while not watch_stop.wait(0.5):
                 now = time.monotonic()
                 if proc.poll() is not None:
-                    print(f"\n[bench] server process died with exitcode {proc.returncode}", flush=True)
+                    print(
+                        f"\n[bench] server process died with exitcode {proc.returncode}", flush=True
+                    )
                     os._exit(1)
 
                 if in_prefill[0]:
                     elapsed_ttft = now - t0
                     if now - last_heartbeat >= 5.0:
                         last_heartbeat = now
-                        print(f"[bench-watchdog] prefill in progress: elapsed {elapsed_ttft:.1f}s / max {ttft_timeout:.1f}s", flush=True)
+                        print(
+                            f"[bench-watchdog] prefill in progress: elapsed {elapsed_ttft:.1f}s / max {ttft_timeout:.1f}s",
+                            flush=True,
+                        )
                     if elapsed_ttft > ttft_timeout:
                         err_msg = f"TTFT prefill timed out after {elapsed_ttft:.1f}s (max {ttft_timeout:.1f}s)! Server stalled or GPU deadlocked."
                         print(f"\n[bench] {err_msg}", flush=True)
@@ -266,7 +321,10 @@ def stream_completion(origin: str, model_id: str, prompt: str, args: argparse.Na
                     gap = now - last_event_time[0]
                     if now - last_heartbeat >= 5.0:
                         last_heartbeat = now
-                        print(f"[bench-watchdog] decoding: {token_count[0]}/{args.decode} tokens | elapsed {now - t0:.1f}s | last gap {gap:.2f}s", flush=True)
+                        print(
+                            f"[bench-watchdog] decoding: {token_count[0]}/{args.decode} tokens | elapsed {now - t0:.1f}s | last gap {gap:.2f}s",
+                            flush=True,
+                        )
                     if gap > stall_timeout:
                         err_msg = f"Token generation stalled! No token for {gap:.1f}s (stall-timeout: {stall_timeout:.1f}s) after token {token_count[0]}/{args.decode}."
                         print(f"\n[bench] {err_msg}", flush=True)
@@ -288,7 +346,7 @@ def stream_completion(origin: str, model_id: str, prompt: str, args: argparse.Na
                 line = raw.strip()
                 if not line or not line.startswith(b"data:"):
                     continue
-                payload = line[len(b"data:"):].strip()
+                payload = line[len(b"data:") :].strip()
                 if payload == b"[DONE]":
                     break
                 now = time.perf_counter()
@@ -296,8 +354,13 @@ def stream_completion(origin: str, model_id: str, prompt: str, args: argparse.Na
                 if chunk.get("usage"):
                     usage = chunk["usage"]
                 for choice in chunk.get("choices", []):
-                    text = choice.get("text") or (choice.get("delta") or {}).get("content")
-                    if text:
+                    delta = choice.get("delta") or {}
+                    text = choice.get("text")
+                    if text is None:
+                        text = delta.get("content")
+                    if text is None:
+                        text = delta.get("reasoning_content")
+                    if text is not None:
                         stamps.append(now)
                         pieces.append(text)
                         in_prefill[0] = False
@@ -323,7 +386,9 @@ def one_run(origin: str, model_id: str, prompt: str, args: argparse.Namespace, p
     prompt_tokens = usage["prompt_tokens"]
     completion = usage["completion_tokens"]
     if completion != args.decode:
-        print(f"[bench] WARNING: completion_tokens={completion} != --decode {args.decode}", flush=True)
+        print(
+            f"[bench] WARNING: completion_tokens={completion} != --decode {args.decode}", flush=True
+        )
     steps = completion - 1
     decode_time = stamps[-1] - stamps[0]
     ttft = stamps[0] - r["t0"]
@@ -352,6 +417,7 @@ def one_run(origin: str, model_id: str, prompt: str, args: argparse.Namespace, p
         "server_rss_gib": proc_rss_kib(proc.pid) / 2**20,
         "mem_available_gib": mem_available_gib(),
         "output_sha1": hashlib.sha1(r["text"].encode()).hexdigest()[:12],
+        "output_text": r["text"],
         **gpu,
     }
 
@@ -377,7 +443,10 @@ def wait_ready(origin: str, proc, log_path: str, timeout: float) -> None:
         now = time.monotonic()
         if now - last_print >= 5.0:
             last_print = now
-            print(f"[bench-watchdog] waiting for server readiness: {now - t0:.1f}s / {timeout:.0f}s (status: {last_health_str})", flush=True)
+            print(
+                f"[bench-watchdog] waiting for server readiness: {now - t0:.1f}s / {timeout:.0f}s (status: {last_health_str})",
+                flush=True,
+            )
         try:
             health = get_json(f"{origin}/health", timeout=3)
             last_health_str = str(health.get("maintenance") or health.get("status") or health)
@@ -424,28 +493,41 @@ def main(argv: list[str] | None = None) -> int:
     os.makedirs(tmp_dir, exist_ok=True)
     fd, log_path = tempfile.mkstemp(prefix="bench-pp-tg-", suffix=".log", dir=tmp_dir)
     cmd = serve_cmd(args, port)
-    print(f"[bench] serve: {' '.join(cmd)}\n[bench] prompt: {args.tokens} tokens, log: {log_path}", flush=True)
+    print(
+        f"[bench] serve: {' '.join(cmd)}\n[bench] prompt: {args.tokens} tokens, log: {log_path}",
+        flush=True,
+    )
 
     rows: list[dict] = []
+    env = dict(os.environ)
+    if any("--spec-mtp" in a for a in args.serve_args):
+        env["FREETOKEN_DISABLE_OVERLAP_SCHEDULING"] = "1"
     with os.fdopen(fd, "wb") as log_f:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                start_new_session=True)
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, env=env
+        )
         pump = threading.Thread(target=pump_output, args=(proc.stdout, log_f), daemon=True)
         pump.start()
         try:
             wait_ready(origin, proc, log_path, args.server_timeout)
             model_id = get_json(f"{origin}/v1/models")["data"][0]["id"]
             card = get_json(f"{origin}/v1/stats").get("model", {})
-            print(f"[bench] model_id={model_id} ctx={card.get('ctx')} attn={card.get('attn')} "
-                  f"moe={card.get('moe')}", flush=True)
+            print(
+                f"[bench] model_id={model_id} ctx={card.get('ctx')} attn={card.get('attn')} "
+                f"moe={card.get('moe')}",
+                flush=True,
+            )
             for _ in range(args.warmups):
                 stream_completion(origin, model_id, prompt, args, proc=proc)
             for i in range(args.repeats):
                 row = one_run(origin, model_id, prompt, args, proc)
                 rows.append(row)
-                print(f"[bench] run {i + 1}/{args.repeats}: PP {row['prefill_tok_s']:.1f}  "
-                      f"TG {row['decode_tok_s']:.2f}  TTFT {row['ttft_ms']:.0f} ms  "
-                      f"VRAM {row['vram_gib']:.2f} GiB", flush=True)
+                print(
+                    f"[bench] run {i + 1}/{args.repeats}: PP {row['prefill_tok_s']:.1f}  "
+                    f"TG {row['decode_tok_s']:.2f}  TTFT {row['ttft_ms']:.0f} ms  "
+                    f"VRAM {row['vram_gib']:.2f} GiB",
+                    flush=True,
+                )
             if args.keep_alive:
                 input("[bench] server up, press enter to stop: ")
         finally:
@@ -456,12 +538,17 @@ def main(argv: list[str] | None = None) -> int:
     if not rows:
         return 1
     summary = {
-        "label": args.label, "model": args.model, "n": len(rows),
+        "label": args.label,
+        "model": args.model,
+        "n": len(rows),
         "prompt_tokens": rows[0]["prompt_tokens"],
-        "PP_mean": mean(rows, "prefill_tok_s"), "PP_min": min(r["prefill_tok_s"] for r in rows),
-        "TG_mean": mean(rows, "decode_tok_s"), "TG_min": min(r["decode_tok_s"] for r in rows),
+        "PP_mean": mean(rows, "prefill_tok_s"),
+        "PP_min": min(r["prefill_tok_s"] for r in rows),
+        "TG_mean": mean(rows, "decode_tok_s"),
+        "TG_min": min(r["decode_tok_s"] for r in rows),
         "TTFT_mean": mean(rows, "ttft_ms"),
-        "itl_p50_mean": mean(rows, "itl_ms_p50"), "itl_p95_mean": mean(rows, "itl_ms_p95"),
+        "itl_p50_mean": mean(rows, "itl_ms_p50"),
+        "itl_p95_mean": mean(rows, "itl_ms_p95"),
         "vram_gib_mean": mean(rows, "vram_gib"),
         "gpu_util_mean": mean(rows, "gpu_util_mean"),
         "server_rss_gib_mean": mean(rows, "server_rss_gib"),
@@ -472,10 +559,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n==== [{args.label}] {summary['prompt_tokens']} tok / {args.decode} gen ====")
     print(f"  PP     mean {summary['PP_mean']:9.1f} tok/s   (min {summary['PP_min']:.1f})")
     print(f"  TG     mean {summary['TG_mean']:9.2f} tok/s   (min {summary['TG_min']:.2f})")
-    print(f"  TTFT   mean {summary['TTFT_mean']:9.1f} ms    ITL p50 {summary['itl_p50_mean']:.2f} "
-          f"/ p95 {summary['itl_p95_mean']:.2f} ms")
-    print(f"  VRAM   mean {summary['vram_gib_mean']:9.2f} GiB   GPU util {summary['gpu_util_mean']:.0f}%"
-          f"   RSS {summary['server_rss_gib_mean']:.1f} GiB")
+    print(
+        f"  TTFT   mean {summary['TTFT_mean']:9.1f} ms    ITL p50 {summary['itl_p50_mean']:.2f} "
+        f"/ p95 {summary['itl_p95_mean']:.2f} ms"
+    )
+    print(
+        f"  VRAM   mean {summary['vram_gib_mean']:9.2f} GiB   GPU util {summary['gpu_util_mean']:.0f}%"
+        f"   RSS {summary['server_rss_gib_mean']:.1f} GiB"
+    )
     print(f"  KV pages {summary['kv_total_pages']}  output sha1 {summary['output_sha1']}")
     if args.json_out:
         with open(args.json_out, "a") as f:

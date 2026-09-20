@@ -90,10 +90,6 @@ def reset_cache(cache) -> None:
     _reset_cache_gpu(cache)
 
 
-
-
-
-
 def _ensure_experts_hybrid_gpu(
     cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
 ) -> None:
@@ -291,8 +287,6 @@ def _materialize_layer_kernel(
     tl.store(num_indices_ptr, num_experts)
 
 
-
-
 @triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16"])
 def _ensure_experts_hybrid_kernel(
     expert_ids_ptr,
@@ -418,12 +412,12 @@ def _ensure_experts_hybrid_kernel(
 
 @triton.jit(do_not_specialize=["buffer_base"])
 def _prefill_hit_compact_kernel(
-    slot_ptr,     # [num_experts] int32: this layer's slot_for_id row
-    dst_ptr,      # [num_experts] int32 out: buffer rows, compacted
-    src_ptr,      # [num_experts] int32 out: cache slots, compacted
-    num_ptr,      # [1] int64 out: hit count
+    slot_ptr,  # [num_experts] int32: this layer's slot_for_id row
+    dst_ptr,  # [num_experts] int32 out: buffer rows, compacted
+    src_ptr,  # [num_experts] int32 out: cache slots, compacted
+    num_ptr,  # [1] int64 out: hit count
     buffer_base,  # buffer_id * num_experts
-    threshold,    # 2 * num_experts
+    threshold,  # 2 * num_experts
     num_experts,
     BLOCK: tl.constexpr,
 ):

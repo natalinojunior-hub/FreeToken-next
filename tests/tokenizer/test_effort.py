@@ -1,4 +1,5 @@
 """Unit tests for the reasoning-effort dialect layer (tokenizer/effort.py)."""
+
 from __future__ import annotations
 
 from freetoken.tokenizer.effort import (
@@ -15,7 +16,9 @@ QWEN38 = EffortProfile(
 DSV4_OFFICIAL = EffortProfile(
     supported=frozenset({"low", "high", "max"}), default="low", consumes_effort=True
 )
-IGNORES = EffortProfile(supported=frozenset(KNOWN_REASONING_EFFORTS), default=None, consumes_effort=False)
+IGNORES = EffortProfile(
+    supported=frozenset(KNOWN_REASONING_EFFORTS), default=None, consumes_effort=False
+)
 
 
 def test_in_vocabulary_values_pass_through():

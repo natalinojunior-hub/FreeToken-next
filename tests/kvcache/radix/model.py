@@ -15,6 +15,7 @@ equally-old LRU candidates was picked (ties are inherent -- see ``_pick_victim``
 bit; the window keeps no slot of its own, its KV rides the full page indices) and ``HybridModel``
 (an optional GDN snapshot slot per node) extend.
 """
+
 from __future__ import annotations
 
 from collections import Counter
@@ -63,8 +64,10 @@ def sizes(records: Iterable[Record], currency: Optional[str]) -> Dict[str, int]:
     an incremental counter bug on either side then has nothing to hide behind.
     """
     recs = list(records)
-    out = {"full_evictable": sum(r["length"] for r in recs if r["ref"] == 0),
-           "full_protected": sum(r["length"] for r in recs if r["ref"] > 0)}
+    out = {
+        "full_evictable": sum(r["length"] for r in recs if r["ref"] == 0),
+        "full_protected": sum(r["length"] for r in recs if r["ref"] > 0),
+    }
     if currency == "swa":
         live = [r for r in recs if not r["tomb"]]
         out["swa_evictable"] = sum(r["length"] for r in live if r["swa_ref"] == 0)
@@ -83,8 +86,17 @@ class MGroup:
     ``paths[i]`` is the page-aligned prefix ending at the i-th page, so ``paths[-1]`` names the
     node's end boundary; ``slots`` holds ``page_size`` slot ids per page, flattened."""
 
-    __slots__ = ("paths", "slots", "stamp", "ref", "tomb", "swa_ref", "swa_uuid",
-                 "mamba", "mamba_ref")
+    __slots__ = (
+        "paths",
+        "slots",
+        "stamp",
+        "ref",
+        "tomb",
+        "swa_ref",
+        "swa_uuid",
+        "mamba",
+        "mamba_ref",
+    )
 
     def __init__(self, paths: Sequence[Path], slots: Sequence[int], stamp: int):
         self.paths: List[Path] = list(paths)
@@ -103,13 +115,22 @@ class MGroup:
     start = property(lambda self: self.paths[0])
 
     def record(self) -> Record:
-        return {"length": self.length, "slots": tuple(self.slots), "ref": self.ref,
-                "tomb": self.tomb, "swa_ref": self.swa_ref, "swa_uuid": self.swa_uuid,
-                "mamba": self.mamba, "mamba_ref": self.mamba_ref}
+        return {
+            "length": self.length,
+            "slots": tuple(self.slots),
+            "ref": self.ref,
+            "tomb": self.tomb,
+            "swa_ref": self.swa_ref,
+            "swa_uuid": self.swa_uuid,
+            "mamba": self.mamba,
+            "mamba_ref": self.mamba_ref,
+        }
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return (f"MGroup(end={self.end}, len={self.length}, ref={self.ref}, tomb={self.tomb},"
-                f" swa_ref={self.swa_ref}, mamba={self.mamba})")
+        return (
+            f"MGroup(end={self.end}, len={self.length}, ref={self.ref}, tomb={self.tomb},"
+            f" swa_ref={self.swa_ref}, mamba={self.mamba})"
+        )
 
 
 class PageTrie:
@@ -145,7 +166,7 @@ class PageTrie:
         out: List[Path] = []
         cur: Path = ()
         for i in range(len(ids) // self.P):
-            nxt = self.kids.get(cur, {}).get(tuple(ids[i * self.P: (i + 1) * self.P]))
+            nxt = self.kids.get(cur, {}).get(tuple(ids[i * self.P : (i + 1) * self.P]))
             if nxt is None:
                 break
             out.append(nxt)
@@ -163,8 +184,9 @@ class PageTrie:
     def path_len(self, g: Optional[MGroup]) -> int:
         return 0 if g is None else len(g.end)
 
-    def add_group(self, parent: Optional[MGroup], keys: Sequence[Path],
-                  slots: Sequence[int], stamp: int) -> MGroup:
+    def add_group(
+        self, parent: Optional[MGroup], keys: Sequence[Path], slots: Sequence[int], stamp: int
+    ) -> MGroup:
         assert keys, "cannot add an empty node"
         base: Path = () if parent is None else parent.end
         paths, cur = [], base
@@ -192,7 +214,7 @@ class PageTrie:
         pre.ref, pre.tomb, pre.swa_ref, pre.swa_uuid = g.ref, g.tomb, g.swa_ref, g.swa_uuid
         g.swa_uuid = None
         g.paths = g.paths[n_pages:]
-        g.slots = g.slots[n_pages * self.P:]
+        g.slots = g.slots[n_pages * self.P :]
         for p in pre.paths:
             self.page_group[p] = pre
         self._groups.insert(self._groups.index(g), pre)
@@ -204,7 +226,7 @@ class PageTrie:
         assert self.is_leaf(g), f"refusing to remove non-leaf {g}"
         parent = self.parent_group(g)
         base: Path = () if parent is None else parent.end
-        del self.kids[base][g.start[len(base):]]
+        del self.kids[base][g.start[len(base) :]]
         for p in g.paths:
             del self.page_group[p]
             self.kids.pop(p, None)
@@ -219,15 +241,15 @@ class ExpMatch:
     cached_len: int
     indices: List[int]
     group: Optional[MGroup]
-    second: Optional[int] = None          # hybrid: the GDN snapshot slot to restore from
+    second: Optional[int] = None  # hybrid: the GDN snapshot slot to restore from
 
 
 @dataclass
 class ExpInsert:
     matched_len: int
-    freed: List[int]                      # what the cache itself returns (SWA only; [] elsewhere)
-    dups: List[int]                       # what the CALLER must free by convention (see _commit)
-    adopted: List[int]                    # supplied slots the tree took ownership of
+    freed: List[int]  # what the cache itself returns (SWA only; [] elsewhere)
+    dups: List[int]  # what the CALLER must free by convention (see _commit)
+    adopted: List[int]  # supplied slots the tree took ownership of
     second_exists: Optional[bool] = None  # hybrid dedup flag
 
 
@@ -289,7 +311,7 @@ class RefModel:
         return gs
 
     def _keys_of(self, ids: Sequence[int], start_tok: int, end_tok: int) -> List[Path]:
-        return [tuple(ids[t: t + self.P]) for t in range(start_tok, end_tok, self.P)]
+        return [tuple(ids[t : t + self.P]) for t in range(start_tok, end_tok, self.P)]
 
     # -- ops ----------------------------------------------------------------
     def match(self, ids: Sequence[int]) -> ExpMatch:
@@ -297,8 +319,9 @@ class RefModel:
         last = gs[-1] if gs else None
         return ExpMatch(self.trie.path_len(last), self.trie.path_slots(last), last)
 
-    def _commit(self, ids: Sequence[int], slots: Sequence[int],
-                reused_len: int) -> Tuple[Optional[MGroup], ExpInsert]:
+    def _commit(
+        self, ids: Sequence[int], slots: Sequence[int], reused_len: int
+    ) -> Tuple[Optional[MGroup], ExpInsert]:
         """Walk, then append whatever page-aligned suffix is missing.
 
         ``insert_prefix`` stores nothing for the already cached prefix, so the CALLER owns those
@@ -309,8 +332,9 @@ class RefModel:
         node = gs[-1] if gs else None
         matched = self.trie.path_len(node)
         if matched != insert_len:
-            node = self.trie.add_group(node, self._keys_of(ids, matched, insert_len),
-                                       slots[matched:], self._tic())
+            node = self.trie.add_group(
+                node, self._keys_of(ids, matched, insert_len), slots[matched:], self._tic()
+            )
         return node, ExpInsert(matched, [], slots[reused_len:matched], slots[matched:])
 
     def insert(self, ids: Sequence[int], slots: Sequence[int], reused_len: int = 0) -> ExpInsert:
@@ -349,8 +373,11 @@ class RefModel:
         for g in self.trie.groups():
             if slot in g.slots:
                 return g
-        raise _fail(tag, f"cache freed slot {slot} which the model does not own "
-                         f"(already freed, or never handed out)")
+        raise _fail(
+            tag,
+            f"cache freed slot {slot} which the model does not own "
+            f"(already freed, or never handed out)",
+        )
 
     def _pick_victim(self, cands: List[MGroup], victim: MGroup, tag: str) -> None:
         """Assert the observed victim is a legal LRU choice.
@@ -360,16 +387,22 @@ class RefModel:
         *specific* victim but one whose stamp is minimal among the live candidates -- which still
         fails loudly on any real LRU regression (a fresher node evicted first)."""
         if victim not in cands:
-            raise _fail(tag, f"evicted node end={victim.end} was not an eligible candidate "
-                             f"(eligible: {[g.end for g in cands]})")
+            raise _fail(
+                tag,
+                f"evicted node end={victim.end} was not an eligible candidate "
+                f"(eligible: {[g.end for g in cands]})",
+            )
         if victim.stamp != min(g.stamp for g in cands):
             older = [(g.end, g.stamp) for g in cands if g.stamp < victim.stamp]
-            raise _fail(tag, f"non-LRU victim end={victim.end} stamp={victim.stamp}; strictly "
-                             f"older candidates existed: {older}")
+            raise _fail(
+                tag,
+                f"non-LRU victim end={victim.end} stamp={victim.stamp}; strictly "
+                f"older candidates existed: {older}",
+            )
 
     def _take(self, obs: Sequence[int], pos: int, g: MGroup, tag: str, what: str) -> int:
         """Consume exactly ``g``'s slots from the observed stream."""
-        chunk = list(obs[pos: pos + g.length])
+        chunk = list(obs[pos : pos + g.length])
         if chunk != g.slots:
             raise _fail(tag, f"{what} freed {chunk} for node end={g.end}, model owns {g.slots}")
         return pos + g.length
@@ -377,8 +410,11 @@ class RefModel:
     @staticmethod
     def _drained(obs: Sequence[int], pos: int, tag: str, what: str) -> None:
         if pos != len(obs):
-            raise _fail(tag, f"{what} returned {len(obs) - pos} extra slot(s) {list(obs[pos:])} "
-                             f"the model did not predict")
+            raise _fail(
+                tag,
+                f"{what} returned {len(obs) - pos} extra slot(s) {list(obs[pos:])} "
+                f"the model did not predict",
+            )
 
     def _cascadable(self, g: MGroup) -> bool:
         """May an exposed unlocked leaf be reclaimed outright?  Only a node that can never serve a
@@ -389,13 +425,24 @@ class RefModel:
         """Consume the second-currency slots the cache reported for ``g`` (none by default)."""
         return pos
 
-    def _cascade(self, parent: Optional[MGroup], obs_kv: Sequence[int], pk: int,
-                 cands: List[MGroup], tag: str, label: str):
+    def _cascade(
+        self,
+        parent: Optional[MGroup],
+        obs_kv: Sequence[int],
+        pk: int,
+        cands: List[MGroup],
+        tag: str,
+        label: str,
+    ):
         """Reclaim exposed ancestors carrying no second-currency value.  Returns ``(first
         ancestor that survived, kv position, full tokens reclaimed)``."""
         got = 0
-        while (parent is not None and parent.ref == 0 and self.trie.is_leaf(parent)
-               and self._cascadable(parent)):
+        while (
+            parent is not None
+            and parent.ref == 0
+            and self.trie.is_leaf(parent)
+            and self._cascadable(parent)
+        ):
             self.events[f"{label}.cascade"] += 1
             pk = self._take(obs_kv, pk, parent, tag, f"{label} cascade")
             got += parent.length
@@ -411,19 +458,27 @@ class RefModel:
         freed, pk, ps = 0, 0, 0
         while freed < n and cands:
             if pk >= len(obs_kv):
-                raise _fail(tag, f"evict_full({n}) stopped after {freed} token(s) but "
-                                 f"{len(cands)} evictable leaf node(s) remained")
+                raise _fail(
+                    tag,
+                    f"evict_full({n}) stopped after {freed} token(s) but "
+                    f"{len(cands)} evictable leaf node(s) remained",
+                )
             victim = self._owner(obs_kv[pk], tag)
             self._pick_victim(cands, victim, tag)
             pk = self._take(obs_kv, pk, victim, tag, "evict_full kv")
             freed += victim.length
             ps = self._second_free(victim, obs_second, ps, tag)
             cands.remove(victim)
-            parent, pk, extra = self._cascade(self.trie.remove(victim), obs_kv, pk, cands,
-                                              tag, "evict_full")
+            parent, pk, extra = self._cascade(
+                self.trie.remove(victim), obs_kv, pk, cands, tag, "evict_full"
+            )
             freed += extra
-            if (parent is not None and parent.ref == 0 and self.trie.is_leaf(parent)
-                    and parent not in cands):
+            if (
+                parent is not None
+                and parent.ref == 0
+                and self.trie.is_leaf(parent)
+                and parent not in cands
+            ):
                 self.events["evict.parent_exposed"] += 1
                 cands.append(parent)
         self._drained(obs_kv, pk, tag, "evict_full kv")
@@ -448,7 +503,7 @@ class SWAModel(RefModel):
         """Reusable only up to a boundary behind which the live (tombstone-free) run covers the
         whole window; the run accumulates across nodes."""
         gs = self._cover(ids)
-        run = float("inf")                 # tombstone-free back to root => always reusable
+        run = float("inf")  # tombstone-free back to root => always reusable
         best_i, best_g = 0, None
         prev: Optional[MGroup] = None
         for i, g in enumerate(gs):
@@ -479,8 +534,14 @@ class SWAModel(RefModel):
             cur = self.trie.parent_group(cur)
 
     # -- insert -------------------------------------------------------------
-    def insert(self, ids: Sequence[int], slots: Sequence[int], reused_len: int = 0,
-               swa_evicted: int = 0, update_after: int = 0) -> ExpInsert:
+    def insert(
+        self,
+        ids: Sequence[int],
+        slots: Sequence[int],
+        reused_len: int = 0,
+        swa_evicted: int = 0,
+        update_after: int = 0,
+    ) -> ExpInsert:
         # ``reused_len`` is accepted only for signature uniformity with the other two models: SWA
         # takes the same frontier as ``update_kv_after_len`` and returns its duplicates explicitly,
         # so there is nothing for the caller-side dup convention to compute.
@@ -499,11 +560,11 @@ class SWAModel(RefModel):
             if partial:
                 g = self.trie.split(g, cov)
             match_len = cov * P
-            seg = slots[total: total + match_len]
+            seg = slots[total : total + match_len]
             if update_after < total + match_len:
                 if not g.tomb:
                     self.events["insert.dup_live"] += 1
-                    freed.extend(seg)                  # live node: the tree's slots are canonical
+                    freed.extend(seg)  # live node: the tree's slots are canonical
                 elif g.swa_ref != 0:
                     raise _fail("model.insert", f"tombstoned node end={g.end} holds a swa lock")
                 elif g.ref > 0:
@@ -513,15 +574,15 @@ class SWAModel(RefModel):
                     freed.extend(seg)
                 elif swa_evicted <= total:
                     self.events["insert.revive_whole"] += 1
-                    freed.extend(g.slots)              # branch 1: revive whole
+                    freed.extend(g.slots)  # branch 1: revive whole
                     g.slots = list(seg)
                     adopted.extend(seg)
                     g.tomb = False
                     g.stamp = self._stride_tick()
                 elif swa_evicted < total + match_len:
                     self.events["insert.revive_tail"] += 1
-                    start = swa_evicted - total         # branch 2: split, revive the live tail
-                    self.trie.split(g, start // P)      # head stays tombstone; g := live tail
+                    start = swa_evicted - total  # branch 2: split, revive the live tail
+                    self.trie.split(g, start // P)  # head stays tombstone; g := live tail
                     freed.extend(g.slots)
                     freed.extend(seg[:start])
                     g.slots = list(seg[start:])
@@ -530,7 +591,7 @@ class SWAModel(RefModel):
                     g.stamp = self._stride_tick()
                 else:
                     self.events["insert.keep_tombstone"] += 1
-                    freed.extend(seg)                  # branch 3: still wholly out-of-window
+                    freed.extend(seg)  # branch 3: still wholly out-of-window
             total += match_len
             node = g
             i += cov
@@ -541,15 +602,23 @@ class SWAModel(RefModel):
             boundary = max(0, min(swa_evicted, insert_len) - total)
             boundary = min(boundary, max(0, insert_len - total - P))  # never a tombstone leaf
             if boundary > 0:
-                node = self.trie.add_group(node, self._keys_of(ids, total, total + boundary),
-                                           slots[total: total + boundary], self._stride_tick())
+                node = self.trie.add_group(
+                    node,
+                    self._keys_of(ids, total, total + boundary),
+                    slots[total : total + boundary],
+                    self._stride_tick(),
+                )
                 node.tomb = True
                 self.events["insert.suffix_tombstone"] += 1
-                adopted.extend(slots[total: total + boundary])
+                adopted.extend(slots[total : total + boundary])
                 total += boundary
             if total < insert_len:
-                node = self.trie.add_group(node, self._keys_of(ids, total, insert_len),
-                                           slots[total:insert_len], self._stride_tick())
+                node = self.trie.add_group(
+                    node,
+                    self._keys_of(ids, total, insert_len),
+                    slots[total:insert_len],
+                    self._stride_tick(),
+                )
                 self.events["insert.suffix_live"] += 1
                 adopted.extend(slots[total:insert_len])
         # SWA returns its duplicates explicitly, so there is no caller-side dup convention.
@@ -573,19 +642,31 @@ class SWAModel(RefModel):
         tag = "model.inc_lock"
         if boundary is None:
             if uuid is not None:
-                raise _fail(tag, f"inc_lock returned swa_uuid={uuid} but the locked path "
-                                 f"({swa_locked} tokens) never covers the window {self.W}")
+                raise _fail(
+                    tag,
+                    f"inc_lock returned swa_uuid={uuid} but the locked path "
+                    f"({swa_locked} tokens) never covers the window {self.W}",
+                )
             return ExpLock(g, None)
         if uuid is None:
-            raise _fail(tag, f"inc_lock returned no swa_uuid although the swa lock covered "
-                             f"{swa_locked} >= window {self.W} at node end={boundary.end}")
+            raise _fail(
+                tag,
+                f"inc_lock returned no swa_uuid although the swa lock covered "
+                f"{swa_locked} >= window {self.W} at node end={boundary.end}",
+            )
         owner = self.uuid_owner.get(uuid)
         if boundary.swa_uuid is None and owner not in (None, boundary):
-            raise _fail(tag, f"swa_uuid={uuid} already names node end={owner.end}, "
-                             f"now returned for end={boundary.end}")
+            raise _fail(
+                tag,
+                f"swa_uuid={uuid} already names node end={owner.end}, "
+                f"now returned for end={boundary.end}",
+            )
         if boundary.swa_uuid not in (None, uuid):
-            raise _fail(tag, f"node end={boundary.end} owns swa_uuid={boundary.swa_uuid} but "
-                             f"inc_lock returned {uuid}")
+            raise _fail(
+                tag,
+                f"node end={boundary.end} owns swa_uuid={boundary.swa_uuid} but "
+                f"inc_lock returned {uuid}",
+            )
         boundary.swa_uuid = uuid
         self.uuid_owner[uuid] = boundary
         return ExpLock(g, uuid)
@@ -600,12 +681,12 @@ class SWAModel(RefModel):
             if dec_swa and not cur.tomb and cur.swa_ref > 0:
                 cur.swa_ref -= 1
                 if lock.uuid is not None and cur.swa_uuid == lock.uuid:
-                    dec_swa = False           # released exactly this reader's own window
+                    dec_swa = False  # released exactly this reader's own window
             cur = self.trie.parent_group(cur)
 
     # -- eviction -----------------------------------------------------------
     def _cascadable(self, g: MGroup) -> bool:
-        return g.tomb                        # a tombstone leaf can never be matched through again
+        return g.tomb  # a tombstone leaf can never be matched through again
 
     def _second_free(self, g: MGroup, obs: Sequence[int], pos: int, tag: str) -> int:
         return pos if g.tomb else self._take(obs, pos, g, tag, "evict_full swa")
@@ -617,8 +698,11 @@ class SWAModel(RefModel):
         freed, pk, ps = 0, 0, 0
         while freed < n and cands:
             if ps >= len(obs_swa):
-                raise _fail(tag, f"evict_swa({n}) stopped after {freed} token(s) with "
-                                 f"{len(cands)} unlocked live-swa node(s) still evictable")
+                raise _fail(
+                    tag,
+                    f"evict_swa({n}) stopped after {freed} token(s) with "
+                    f"{len(cands)} unlocked live-swa node(s) still evictable",
+                )
             victim = self._owner(obs_swa[ps], tag)
             self._pick_victim(cands, victim, tag)
             ps = self._take(obs_swa, ps, victim, tag, "evict_swa swa")
@@ -628,8 +712,9 @@ class SWAModel(RefModel):
             if self.trie.is_leaf(victim) and victim.ref == 0:
                 self.events["evict_swa.leaf_free"] += 1
                 pk = self._take(obs_kv, pk, victim, tag, "evict_swa kv")
-                _, pk, _ = self._cascade(self.trie.remove(victim), obs_kv, pk, cands,
-                                         tag, "evict_swa")
+                _, pk, _ = self._cascade(
+                    self.trie.remove(victim), obs_kv, pk, cands, tag, "evict_swa"
+                )
             else:
                 self.events["evict_swa.tombstone_in_place"] += 1
         self._drained(obs_kv, pk, tag, "evict_swa kv")
@@ -641,15 +726,16 @@ class SWAModel(RefModel):
         if keep_from <= 0:
             return []
         if keep_from % self.P:
-            raise PreconditionError("precondition.keep_from",
-                                    f"keep_from={keep_from} is not a multiple of page {self.P}")
-        self.match(ids[:keep_from])         # the implementation re-matches (splits + stamps) first
+            raise PreconditionError(
+                "precondition.keep_from",
+                f"keep_from={keep_from} is not a multiple of page {self.P}",
+            )
+        self.match(ids[:keep_from])  # the implementation re-matches (splits + stamps) first
         freed: List[int] = []
         node: Optional[MGroup] = None
         pos = 0
         while pos < keep_from:
-            cp = self.trie.child(() if node is None else node.end,
-                                 tuple(ids[pos: pos + self.P]))
+            cp = self.trie.child(() if node is None else node.end, tuple(ids[pos : pos + self.P]))
             if cp is None:
                 break
             g = self.trie.page_group[cp]
@@ -679,8 +765,9 @@ class HybridModel(RefModel):
         self.events["match.no_snapshot"] += 1
         return ExpMatch(0, [], None, None)
 
-    def insert(self, ids: Sequence[int], slots: Sequence[int], reused_len: int = 0,
-               *, mamba: int) -> ExpInsert:
+    def insert(
+        self, ids: Sequence[int], slots: Sequence[int], reused_len: int = 0, *, mamba: int
+    ) -> ExpInsert:
         node, exp = self._commit(ids, slots, reused_len)
         exp.second_exists = node is None or node.mamba is not None
         if exp.second_exists:
@@ -703,14 +790,17 @@ class HybridModel(RefModel):
 
     # -- eviction -----------------------------------------------------------
     def _cascadable(self, g: MGroup) -> bool:
-        return g.mamba is None               # no snapshot left => nothing can resume from it
+        return g.mamba is None  # no snapshot left => nothing can resume from it
 
     def _second_free(self, g: MGroup, obs: Sequence[int], pos: int, tag: str) -> int:
         if g.mamba is None:
             return pos
         if pos >= len(obs) or obs[pos] != g.mamba:
-            raise _fail(tag, f"expected snapshot slot {g.mamba} of node end={g.end} to be freed, "
-                             f"got {list(obs[pos:pos + 1]) or 'nothing'}")
+            raise _fail(
+                tag,
+                f"expected snapshot slot {g.mamba} of node end={g.end} to be freed, "
+                f"got {list(obs[pos : pos + 1]) or 'nothing'}",
+            )
         g.mamba = None
         g.mamba_ref = 0
         return pos + 1
@@ -722,12 +812,18 @@ class HybridModel(RefModel):
         freed, pk, pm = 0, 0, 0
         while freed < n and cands:
             if pm >= len(obs_mamba):
-                raise _fail(tag, f"evict_mamba({n}) stopped after {freed} snapshot(s) with "
-                                 f"{len(cands)} unlocked snapshot node(s) still evictable")
+                raise _fail(
+                    tag,
+                    f"evict_mamba({n}) stopped after {freed} snapshot(s) with "
+                    f"{len(cands)} unlocked snapshot node(s) still evictable",
+                )
             owners = [g for g in cands if g.mamba == obs_mamba[pm]]
             if not owners:
-                raise _fail(tag, f"evict_mamba freed snapshot slot {obs_mamba[pm]} which the model "
-                                 f"does not consider an eligible snapshot")
+                raise _fail(
+                    tag,
+                    f"evict_mamba freed snapshot slot {obs_mamba[pm]} which the model "
+                    f"does not consider an eligible snapshot",
+                )
             victim = owners[0]
             self._pick_victim(cands, victim, tag)
             cands.remove(victim)
@@ -736,8 +832,9 @@ class HybridModel(RefModel):
                 self.events["evict_mamba.leaf_free"] += 1
                 pk = self._take(obs_kv, pk, victim, tag, "evict_mamba kv")
                 pm = self._second_free(victim, obs_mamba, pm, tag)
-                _, pk, _ = self._cascade(self.trie.remove(victim), obs_kv, pk, cands,
-                                         tag, "evict_mamba")
+                _, pk, _ = self._cascade(
+                    self.trie.remove(victim), obs_kv, pk, cands, tag, "evict_mamba"
+                )
             else:
                 self.events["evict_mamba.tombstone_in_place"] += 1
                 pm = self._second_free(victim, obs_mamba, pm, tag)

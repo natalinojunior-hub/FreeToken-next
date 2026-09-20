@@ -12,8 +12,18 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 
 def _tiny_vc():
     return VisionConfig(
-        hidden_size=64, depth=2, num_heads=4, intermediate_size=128, projection_intermediate_size=96, out_hidden_size=48,
-        in_channels=3, patch_size=4, temporal_patch_size=2, spatial_merge_size=2, rms_norm_eps=1e-5, swiglu_limit=10.0,
+        hidden_size=64,
+        depth=2,
+        num_heads=4,
+        intermediate_size=128,
+        projection_intermediate_size=96,
+        out_hidden_size=48,
+        in_channels=3,
+        patch_size=4,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        rms_norm_eps=1e-5,
+        swiglu_limit=10.0,
         attention_bias=True,
     )
 
@@ -36,7 +46,9 @@ def test_tiny_tower_merges_four_patches_per_token():
     out = tower.forward(feature, [[1, 4, 4], [1, 8, 8]])
     assert out.shape == (4 + 16, 48) and out.dtype == torch.bfloat16
     keys = tower.state_dict()
-    assert keys["blocks.0.attn.qkv.bias"].shape == (192,) and keys["merger.post_projection_norm.bias"].shape == (48,)
+    assert keys["blocks.0.attn.qkv.bias"].shape == (192,) and keys[
+        "merger.post_projection_norm.bias"
+    ].shape == (48,)
     assert "merger.gate_proj.bias" not in keys and keys["downsample.weight"].shape == (48, 64, 2, 2)
 
 

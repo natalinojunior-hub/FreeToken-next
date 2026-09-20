@@ -103,7 +103,11 @@ def iter_nvfp4_expert_pieces(
         kind = _canon_kind(spec, match.group("kind"))
         if kind not in ("weight", "weight_scale", "weight_scale_2"):
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
-        wanted[name] = (bank_layer, int(match.group("expert")), spec.proj_to_role[proj] + _kind_suffix(kind))
+        wanted[name] = (
+            bank_layer,
+            int(match.group("expert")),
+            spec.proj_to_role[proj] + _kind_suffix(kind),
+        )
     expected = _num_moe_layers(config) * config.num_experts * 9
     if len(wanted) != expected:
         raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {expected}")
@@ -127,12 +131,16 @@ def iter_nvfp4_expert_pieces(
     def _parallel():
         from freetoken.models.weight import iter_expert_tensors_parallel
 
-        for name, tensor in iter_expert_tensors_parallel(folder, lambda n: n in wanted, workers=workers, chunk=chunk):
+        for name, tensor in iter_expert_tensors_parallel(
+            folder, lambda n: n in wanted, workers=workers, chunk=chunk
+        ):
             if wanted[name][2].endswith("_global"):
                 tensor = _ingest_global(spec, tensor)
             yield name, tensor
 
-    return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
+    return per_expert_pieces(
+        _parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9
+    )
 
 
 __all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]

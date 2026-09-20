@@ -42,9 +42,7 @@ class MiniMaxM3SparseMoeBlock(BaseOP):
         # per layer, ~180 MB across the 57 MoE layers -- accepted for selection
         # fidelity.
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
-        self.gate.weight = torch.empty(
-            config.num_experts, config.hidden_size, dtype=torch.float32
-        )
+        self.gate.weight = torch.empty(config.num_experts, config.hidden_size, dtype=torch.float32)
         # DeepSeek-style selection bias; fp32 in the checkpoint AND here.
         self.e_score_correction_bias = torch.empty(config.num_experts, dtype=torch.float32)
 

@@ -165,7 +165,9 @@ def test_chat_request_reasoning_replay_field_aliases():
 def test_chat_reasoning_effort_enables_thinking():
     spec = chat_request_to_genspec(chat_request(reasoning_effort="high"), {})
     assert spec.chat_template_kwargs == {
-        "enable_thinking": True, "thinking_mode": "enabled", "reasoning_effort": "high"
+        "enable_thinking": True,
+        "thinking_mode": "enabled",
+        "reasoning_effort": "high",
     }
 
     # an explicit thinking-related chat_template_kwargs key wins over the mapping
@@ -179,7 +181,9 @@ def test_chat_reasoning_effort_enables_thinking():
         chat_request(reasoning_effort="none", chat_template_kwargs={"custom_var": 1}), {}
     )
     assert spec.chat_template_kwargs == {
-        "enable_thinking": False, "thinking_mode": "disabled", "custom_var": 1
+        "enable_thinking": False,
+        "thinking_mode": "disabled",
+        "custom_var": 1,
     }
 
     # absent effort -> kwargs pass through untouched
@@ -199,13 +203,14 @@ def test_chat_reasoning_effort_broadcasts_every_toggle_spelling():
     on = chat_request(reasoning_effort="high")
     spec = chat_request_to_genspec(on, {})
     assert spec.chat_template_kwargs == {
-        "enable_thinking": True, "thinking_mode": "enabled", "reasoning_effort": "high"
+        "enable_thinking": True,
+        "thinking_mode": "enabled",
+        "reasoning_effort": "high",
     }
 
     off = chat_request(reasoning_effort="none")
     spec = chat_request_to_genspec(off, {})
     assert spec.chat_template_kwargs == {"enable_thinking": False, "thinking_mode": "disabled"}
-
 
 
 def test_glm_reasoning_parser_honors_disabled_thinking_with_tools():
@@ -227,12 +232,20 @@ def test_non_stream_chat_completion_returns_openai_tool_calls_and_sends_tools():
     output = '[TOOL_CALLS] [{"name":"get_weather","arguments":{"city":"Paris"}}]'
     state = FakeState(
         [
-            UserReply(uid=42, incremental_output=output, finished=True, prompt_tokens_delta=5, completion_tokens_delta=7),
+            UserReply(
+                uid=42,
+                incremental_output=output,
+                finished=True,
+                prompt_tokens_delta=5,
+                completion_tokens_delta=7,
+            ),
         ],
         tool_call_parser="mistral",
     )
 
-    response = run(handle_chat_completion(chat_request(), request=None, state=state, model_sampling={}))
+    response = run(
+        handle_chat_completion(chat_request(), request=None, state=state, model_sampling={})
+    )
 
     assert state.sent is not None
     assert state.sent.text == [{"role": "user", "content": "weather in Paris?"}]
@@ -253,7 +266,9 @@ def test_non_stream_chat_completion_length_truncation_overrides_tool_calls():
         [UserReply(uid=42, incremental_output=output, finished=True, finish_reason="length")],
         tool_call_parser="mistral",
     )
-    response = run(handle_chat_completion(chat_request(), request=None, state=state, model_sampling={}))
+    response = run(
+        handle_chat_completion(chat_request(), request=None, state=state, model_sampling={})
+    )
     assert response["choices"][0]["finish_reason"] == "length"
 
 
@@ -263,7 +278,9 @@ def test_non_stream_chat_completion_parses_configured_family_tool_shape():
         "<|channel|>commentary to=functions.glob <|constrain|>json<|message|>"
         '{"pattern":"**/*.py","path":"/tmp/ws"}'
     )
-    state = FakeState([UserReply(uid=42, incremental_output=output, finished=True)], tool_call_parser="gpt_oss")
+    state = FakeState(
+        [UserReply(uid=42, incremental_output=output, finished=True)], tool_call_parser="gpt_oss"
+    )
     req = ChatCompletionRequest(
         model="client-model",
         messages=[{"role": "user", "content": "inspect"}],
@@ -287,7 +304,13 @@ def test_stream_chat_completion_emits_chat_chunks_tool_delta_and_done():
     output = '[TOOL_CALLS] [{"name":"get_weather","arguments":{"city":"Paris"}}]'
     state = FakeState(
         [
-            UserReply(uid=42, incremental_output=output, finished=True, prompt_tokens_delta=5, completion_tokens_delta=7),
+            UserReply(
+                uid=42,
+                incremental_output=output,
+                finished=True,
+                prompt_tokens_delta=5,
+                completion_tokens_delta=7,
+            ),
         ],
         tool_call_parser="mistral",
     )
@@ -358,7 +381,15 @@ def test_completion_rejects_token_id_prompts():
 
 def test_completion_accepts_text_prompt():
     state = FakeState(
-        [UserReply(uid=42, incremental_output="hello", finished=True, prompt_tokens_delta=2, completion_tokens_delta=1)]
+        [
+            UserReply(
+                uid=42,
+                incremental_output="hello",
+                finished=True,
+                prompt_tokens_delta=2,
+                completion_tokens_delta=1,
+            )
+        ]
     )
 
     response = run(
@@ -397,34 +428,50 @@ def test_omitted_max_tokens_honors_server_default():
 
     chat_state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
     chat_state.config.max_output_tokens = 4096
-    run(handle_chat_completion(
-        ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}]),
-        request=None, state=chat_state, model_sampling={},
-    ))
+    run(
+        handle_chat_completion(
+            ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}]),
+            request=None,
+            state=chat_state,
+            model_sampling={},
+        )
+    )
     assert chat_state.sent.sampling_params.max_tokens == 4096
 
     cmpl_state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
     cmpl_state.config.max_output_tokens = 4096
-    run(handle_completion(
-        CompletionRequest(model="m", prompt="hi"),
-        request=None, state=cmpl_state, model_sampling={},
-    ))
+    run(
+        handle_completion(
+            CompletionRequest(model="m", prompt="hi"),
+            request=None,
+            state=cmpl_state,
+            model_sampling={},
+        )
+    )
     assert cmpl_state.sent.sampling_params.max_tokens == 4096
 
     # explicit value wins
     exp_state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
     exp_state.config.max_output_tokens = 4096
-    run(handle_completion(
-        CompletionRequest(model="m", prompt="hi", max_tokens=50),
-        request=None, state=exp_state, model_sampling={},
-    ))
+    run(
+        handle_completion(
+            CompletionRequest(model="m", prompt="hi", max_tokens=50),
+            request=None,
+            state=exp_state,
+            model_sampling={},
+        )
+    )
     assert exp_state.sent.sampling_params.max_tokens == 50
 
     fallback_state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
-    run(handle_chat_completion(
-        ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}]),
-        request=None, state=fallback_state, model_sampling={},
-    ))
+    run(
+        handle_chat_completion(
+            ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}]),
+            request=None,
+            state=fallback_state,
+            model_sampling={},
+        )
+    )
     assert fallback_state.sent.sampling_params.max_tokens == DEFAULT_MAX_OUTPUT_TOKENS
 
 
@@ -481,7 +528,9 @@ def test_dsv4_non_stream_splits_reasoning_and_tool_call():
     output = f"I should look up the weather.</think>Let me check.\n\n{_DSV4_TOOL_BLOCK}"
     state = _dsv4_state([UserReply(uid=42, incremental_output=output, finished=True)])
 
-    response = run(handle_chat_completion(chat_request(), request=None, state=state, model_sampling={}))
+    response = run(
+        handle_chat_completion(chat_request(), request=None, state=state, model_sampling={})
+    )
 
     choice = response["choices"][0]
     assert choice["finish_reason"] == "tool_calls"
@@ -497,7 +546,9 @@ def test_dsv4_non_stream_missing_end_token_before_tool_block():
     output = f"Looking it up now.\n\n{_DSV4_TOOL_BLOCK}"
     state = _dsv4_state([UserReply(uid=42, incremental_output=output, finished=True)])
 
-    response = run(handle_chat_completion(chat_request(), request=None, state=state, model_sampling={}))
+    response = run(
+        handle_chat_completion(chat_request(), request=None, state=state, model_sampling={})
+    )
 
     choice = response["choices"][0]
     assert choice["finish_reason"] == "tool_calls"
@@ -553,7 +604,9 @@ def test_dsv4_stream_emits_reasoning_then_tool_calls():
     ]
     state = _dsv4_state(replies)
 
-    events = parse_sse(run(_collect(stream_chat_completion_chunks(42, chat_request(stream=True), state))))
+    events = parse_sse(
+        run(_collect(stream_chat_completion_chunks(42, chat_request(stream=True), state)))
+    )
 
     reasoning = "".join(
         choice["delta"]["reasoning_content"]
@@ -623,7 +676,9 @@ def test_gptoss_non_stream_still_extracts_tool_call():
         tool_call_parser="gpt_oss",
         reasoning_parser="gpt_oss",
     )
-    response = run(handle_chat_completion(chat_request(), request=None, state=state, model_sampling={}))
+    response = run(
+        handle_chat_completion(chat_request(), request=None, state=state, model_sampling={})
+    )
     choice = response["choices"][0]
     assert choice["finish_reason"] == "tool_calls"
     tool_calls = choice["message"]["tool_calls"]
@@ -634,7 +689,9 @@ def test_gptoss_non_stream_still_extracts_tool_call():
 # ----------------------------------------------------------- cache report
 def _cache_hit_replies() -> list[UserReply]:
     return [
-        UserReply(uid=42, incremental_output="", finished=False, prompt_tokens_delta=5, cached_tokens=3),
+        UserReply(
+            uid=42, incremental_output="", finished=False, prompt_tokens_delta=5, cached_tokens=3
+        ),
         UserReply(uid=42, incremental_output="hi", finished=True, completion_tokens_delta=1),
     ]
 
@@ -642,21 +699,44 @@ def _cache_hit_replies() -> list[UserReply]:
 def test_non_stream_chat_usage_reports_cached_tokens_only_with_flag():
     state = FakeState(_cache_hit_replies())
     state.config.enable_cache_report = True
-    response = run(handle_chat_completion(chat_request(tools=None), request=None, state=state, model_sampling={}))
+    response = run(
+        handle_chat_completion(
+            chat_request(tools=None), request=None, state=state, model_sampling={}
+        )
+    )
     # prompt_tokens stays inclusive of the cached prefix; the details carry the split.
     assert response["usage"]["prompt_tokens"] == 5
     assert response["usage"]["prompt_tokens_details"] == {"cached_tokens": 3}
 
-    response = run(handle_chat_completion(chat_request(tools=None), request=None, state=FakeState(_cache_hit_replies()), model_sampling={}))
+    response = run(
+        handle_chat_completion(
+            chat_request(tools=None),
+            request=None,
+            state=FakeState(_cache_hit_replies()),
+            model_sampling={},
+        )
+    )
     assert "prompt_tokens_details" not in response["usage"]
 
 
 def test_non_stream_chat_usage_omits_details_on_zero_hit():
     state = FakeState(
-        [UserReply(uid=42, incremental_output="hi", finished=True, prompt_tokens_delta=5, completion_tokens_delta=1)]
+        [
+            UserReply(
+                uid=42,
+                incremental_output="hi",
+                finished=True,
+                prompt_tokens_delta=5,
+                completion_tokens_delta=1,
+            )
+        ]
     )
     state.config.enable_cache_report = True
-    response = run(handle_chat_completion(chat_request(tools=None), request=None, state=state, model_sampling={}))
+    response = run(
+        handle_chat_completion(
+            chat_request(tools=None), request=None, state=state, model_sampling={}
+        )
+    )
     assert "prompt_tokens_details" not in response["usage"]
 
 
@@ -677,7 +757,11 @@ def test_stream_chat_usage_chunk_carries_cached_tokens():
 # --------------------------------------------------------------- minimax think
 def test_minimax_http_non_stream_forces_implicit_reasoning_without_request_knob():
     state = FakeState(
-        [UserReply(uid=42, incremental_output="private thought</think>visible answer", finished=True)],
+        [
+            UserReply(
+                uid=42, incremental_output="private thought</think>visible answer", finished=True
+            )
+        ],
         reasoning_parser="minimax",
     )
     req = chat_request(tools=None)

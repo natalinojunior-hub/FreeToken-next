@@ -21,7 +21,11 @@ class _Cfg:
 
     def __init__(self, data: dict):
         for k, v in data.items():
-            setattr(self, k, _Cfg(v) if isinstance(v, dict) and k in ("text_config", "vision_config") else v)
+            setattr(
+                self,
+                k,
+                _Cfg(v) if isinstance(v, dict) and k in ("text_config", "vision_config") else v,
+            )
 
 
 def _vision_section() -> dict:
@@ -213,13 +217,17 @@ def test_registry_resolves_architecture():
     assert spec.module == "freetoken.models.muse_glimmer"
     assert spec.model_cls == "MuseGlimmerForConditionalGeneration"
     assert spec.mm_processor == "freetoken.mm.processors.muse_glimmer:MuseGlimmerMMProcessor"
-    assert [(e.kind, e.config_key, e.modalities) for e in spec.encoders] == [("vision", "vision_config", ("image",))]
+    assert [(e.kind, e.config_key, e.modalities) for e in spec.encoders] == [
+        ("vision", "vision_config", ("image",))
+    ]
 
 
 def test_aot_table_covers_the_checkpoints():
     from freetoken.kernel.aot_models import SUPPORTED_MODELS
 
-    entry = next(m for m in SUPPORTED_MODELS if m.architecture == "MuseGlimmerForConditionalGeneration")
+    entry = next(
+        m for m in SUPPORTED_MODELS if m.architecture == "MuseGlimmerForConditionalGeneration"
+    )
     assert entry.hidden_size == 6656
     assert entry.kv_groups == ((2, 128),)
     assert entry.expert_formats == ()  # dense
@@ -230,7 +238,12 @@ def test_weight_rename_and_fusion():
     import torch
 
     from freetoken.models.loader import ct_bf16_fuse
-    from freetoken.models.muse_glimmer.weight import _FUSIONS, _rename, _vision_name, _vision_tensors
+    from freetoken.models.muse_glimmer.weight import (
+        _FUSIONS,
+        _rename,
+        _vision_name,
+        _vision_tensors,
+    )
 
     # Text tower renamed, lm_head untouched; the image path lands under the wrapper's vision_tower.
     assert _rename("model.language_model.layers.0.self_attn.q_proj.weight") == (
@@ -239,18 +252,31 @@ def test_weight_rename_and_fusion():
     assert _rename("model.language_model.embed_tokens.weight") == "model.embed_tokens.weight"
     assert _rename("lm_head.weight") == "lm_head.weight"
     assert _vision_name("model.language_model.norm.weight") is None
-    assert _vision_name("model.vision_tower.layers.0.attn.q_proj.weight") == "vision_tower.layers.0.attn.q_proj.weight"
+    assert (
+        _vision_name("model.vision_tower.layers.0.attn.q_proj.weight")
+        == "vision_tower.layers.0.attn.q_proj.weight"
+    )
     assert _vision_name("model.vision_adapter.fc1.weight") == "vision_tower.adapter.fc1.weight"
     assert _vision_name("model.vision_projection.weight") == "vision_tower.projection.weight"
 
     # vision q/k/v fuse into attn.qkv in that order, biases like weights; other tensors pass through
     vbuf: dict = {}
     assert _vision_tensors("vision_tower.layers.0.attn.q_proj.bias", torch.zeros(2), vbuf) == []
-    assert _vision_tensors("vision_tower.layers.0.attn.v_proj.bias", torch.full((2,), 2.0), vbuf) == []
+    assert (
+        _vision_tensors("vision_tower.layers.0.attn.v_proj.bias", torch.full((2,), 2.0), vbuf) == []
+    )
     ((key, bias),) = _vision_tensors("vision_tower.layers.0.attn.k_proj.bias", torch.ones(2), vbuf)
-    assert key == "vision_tower.layers.0.attn.qkv.bias" and bias.tolist() == [0, 0, 1, 1, 2, 2] and not vbuf
-    ((key, weight),) = _vision_tensors("vision_tower.layers.0.attn.proj.weight", torch.zeros(2, 2), vbuf)
-    assert key == "vision_tower.layers.0.attn.proj.weight" and torch.equal(weight, torch.zeros(2, 2))
+    assert (
+        key == "vision_tower.layers.0.attn.qkv.bias"
+        and bias.tolist() == [0, 0, 1, 1, 2, 2]
+        and not vbuf
+    )
+    ((key, weight),) = _vision_tensors(
+        "vision_tower.layers.0.attn.proj.weight", torch.zeros(2, 2), vbuf
+    )
+    assert key == "vision_tower.layers.0.attn.proj.weight" and torch.equal(
+        weight, torch.zeros(2, 2)
+    )
 
     # q/k/v + the attention gate fuse into qkvg_proj in declaration order.
     buf: dict = {}
@@ -303,8 +329,12 @@ def _vision_checkpoint_tensors(hf) -> dict:
     H, I, P = vc.hidden_size, vc.intermediate_size, hf.projector_hidden_size
     bf16 = torch.bfloat16
     tensors = {
-        "model.vision_tower.patch_embedder.patch_embedding.weight": torch.randn(H, vc.patch_temporal * 3 * vc.patch_size**2, dtype=bf16),
-        "model.vision_tower.patch_embedder.position_embedding_table.weight": torch.randn(vc.pos_emb_height * vc.pos_emb_width, H, dtype=bf16),
+        "model.vision_tower.patch_embedder.patch_embedding.weight": torch.randn(
+            H, vc.patch_temporal * 3 * vc.patch_size**2, dtype=bf16
+        ),
+        "model.vision_tower.patch_embedder.position_embedding_table.weight": torch.randn(
+            vc.pos_emb_height * vc.pos_emb_width, H, dtype=bf16
+        ),
         "model.vision_tower.ln_pre.weight": torch.randn(H, dtype=bf16),
         "model.vision_tower.ln_pre.bias": torch.randn(H, dtype=bf16),
         "model.vision_tower.ln_post.weight": torch.randn(H, dtype=bf16),
@@ -383,9 +413,15 @@ def test_iter_weights_bf16_matches_model_state_dict(tmp_path, monkeypatch, inclu
 
     monkeypatch.setattr(w, "cached_load_hf_config", lambda _p: hf)
 
-    loaded = dict(iter_weights(
-        str(tmp_path), torch.device("cpu"), include_moe_experts=False, include_non_moe=True, include_vision=include_vision,
-    ))
+    loaded = dict(
+        iter_weights(
+            str(tmp_path),
+            torch.device("cpu"),
+            include_moe_experts=False,
+            include_non_moe=True,
+            include_vision=include_vision,
+        )
+    )
     if not include_vision:
         hf.vision_config = None  # what the engine's text-only model_config looks like
     model = MuseGlimmerForConditionalGeneration(parse_config(hf))
@@ -396,9 +432,17 @@ def test_iter_weights_bf16_matches_model_state_dict(tmp_path, monkeypatch, inclu
         assert loaded[k].shape == expected[k].shape, k
     if include_vision:
         v = "model.vision_tower.layers.1.attn."
-        assert torch.equal(loaded["vision_tower.layers.1.attn.qkv.weight"], torch.cat([tensors[v + f"{n}_proj.weight"] for n in "qkv"]))
-        assert torch.equal(loaded["vision_tower.layers.1.attn.qkv.bias"], torch.cat([tensors[v + f"{n}_proj.bias"] for n in "qkv"]))
-        assert torch.equal(loaded["vision_tower.projection.weight"], tensors["model.vision_projection.weight"])
+        assert torch.equal(
+            loaded["vision_tower.layers.1.attn.qkv.weight"],
+            torch.cat([tensors[v + f"{n}_proj.weight"] for n in "qkv"]),
+        )
+        assert torch.equal(
+            loaded["vision_tower.layers.1.attn.qkv.bias"],
+            torch.cat([tensors[v + f"{n}_proj.bias"] for n in "qkv"]),
+        )
+        assert torch.equal(
+            loaded["vision_tower.projection.weight"], tensors["model.vision_projection.weight"]
+        )
     # fusion order [q, k, v, gate] against the raw parts
     fused = loaded["model.layers.0.self_attn.qkvg_proj.weight"]
     p = "model.language_model.layers.0.self_attn."
@@ -445,9 +489,12 @@ def test_iter_weights_nvfp4_cross_shard_scales(tmp_path, monkeypatch):
     p = "model.language_model.layers.0."
     shard1 = {}
     for base, (o, i) in {
-        p + "self_attn.q_proj": (q, H), p + "self_attn.k_proj": (kv, H),
-        p + "self_attn.v_proj": (kv, H), p + "self_attn.gate_proj": (q, H),
-        p + "self_attn.o_proj": (q, H)[::-1], p + "mlp.gate_proj": (I, H),
+        p + "self_attn.q_proj": (q, H),
+        p + "self_attn.k_proj": (kv, H),
+        p + "self_attn.v_proj": (kv, H),
+        p + "self_attn.gate_proj": (q, H),
+        p + "self_attn.o_proj": (q, H)[::-1],
+        p + "mlp.gate_proj": (I, H),
         p + "mlp.up_proj": (I, H),
     }.items():
         shard1 |= nvfp4(base, o, i, 2.0)
@@ -461,8 +508,10 @@ def test_iter_weights_nvfp4_cross_shard_scales(tmp_path, monkeypatch):
         "lm_head.weight": torch.randn(128, H, dtype=torch.bfloat16),
     }
     for name in (
-        "input_layernorm", "post_attention_layernorm",
-        "pre_feedforward_layernorm", "post_feedforward_layernorm",
+        "input_layernorm",
+        "post_attention_layernorm",
+        "pre_feedforward_layernorm",
+        "post_feedforward_layernorm",
     ):
         shard1[p + name + ".weight"] = torch.randn(H, dtype=torch.bfloat16)
     # the image path stays bf16; layer 0's q_proj lands in shard 1 and its k/v in shard 2
@@ -470,16 +519,21 @@ def test_iter_weights_nvfp4_cross_shard_scales(tmp_path, monkeypatch):
     q_keys = {k for k in vision if ".layers.0.attn.q_proj." in k}
     shard1 |= {k: vision[k] for k in q_keys}
     shard2 |= {k: v for k, v in vision.items() if k not in q_keys}
-    _write_shards(tmp_path, {
-        "model-00001-of-00002.safetensors": shard1,
-        "model-00002-of-00002.safetensors": shard2,
-    })
+    _write_shards(
+        tmp_path,
+        {
+            "model-00001-of-00002.safetensors": shard1,
+            "model-00002-of-00002.safetensors": shard2,
+        },
+    )
     import freetoken.models.muse_glimmer.weight as w
 
     monkeypatch.setattr(w, "cached_load_hf_config", lambda _p: hf)
 
     loaded = dict(
-        iter_weights(str(tmp_path), torch.device("cpu"), include_moe_experts=False, include_non_moe=True)
+        iter_weights(
+            str(tmp_path), torch.device("cpu"), include_moe_experts=False, include_non_moe=True
+        )
     )
     qkvg = "model.layers.0.self_attn.qkvg_proj"
     assert loaded[qkvg + ".weight"].shape == (2 * q + 2 * kv, H // 2)
@@ -494,16 +548,32 @@ def test_iter_weights_nvfp4_cross_shard_scales(tmp_path, monkeypatch):
     assert loaded[dp + ".input_scale"].item() == pytest.approx(1.0)
     assert loaded[qkvg + ".input_scale"].shape == ()
     assert not any(k.endswith(".input_global_scale") for k in loaded)
-    expected_vision = {"vision_tower." + k for k in MuseGlimmerVisionModel(parse_vision_config(hf)).state_dict()}
+    expected_vision = {
+        "vision_tower." + k for k in MuseGlimmerVisionModel(parse_vision_config(hf)).state_dict()
+    }
     assert {k for k in loaded if k.startswith("vision_tower.")} == expected_vision
     v = "model.vision_tower.layers.0.attn."
-    assert torch.equal(loaded["vision_tower.layers.0.attn.qkv.weight"], torch.cat([vision[v + f"{n}_proj.weight"] for n in "qkv"]))
-    assert torch.equal(loaded["vision_tower.layers.0.attn.qkv.bias"], torch.cat([vision[v + f"{n}_proj.bias"] for n in "qkv"]))
+    assert torch.equal(
+        loaded["vision_tower.layers.0.attn.qkv.weight"],
+        torch.cat([vision[v + f"{n}_proj.weight"] for n in "qkv"]),
+    )
+    assert torch.equal(
+        loaded["vision_tower.layers.0.attn.qkv.bias"],
+        torch.cat([vision[v + f"{n}_proj.bias"] for n in "qkv"]),
+    )
     assert loaded["vision_tower.projection.weight"].dtype == torch.bfloat16
-    text_only = dict(iter_weights(
-        str(tmp_path), torch.device("cpu"), include_moe_experts=False, include_non_moe=True, include_vision=False,
-    ))
-    assert not any(k.startswith("vision_tower.") for k in text_only) and qkvg + ".weight" in text_only
+    text_only = dict(
+        iter_weights(
+            str(tmp_path),
+            torch.device("cpu"),
+            include_moe_experts=False,
+            include_non_moe=True,
+            include_vision=False,
+        )
+    )
+    assert (
+        not any(k.startswith("vision_tower.") for k in text_only) and qkvg + ".weight" in text_only
+    )
 
 
 def test_raw_config_shim_serves_unknown_model_type(tmp_path):
@@ -582,9 +652,13 @@ def test_model_state_dict_matches_loader_keys():
     hf_q = _hf_config(num_layers=4, quantized=True)
     qcfg = parse_config(hf_q)
     spec = get_model_spec("MuseGlimmerForConditionalGeneration")
-    object.__setattr__(qcfg, "quant", QuantConfig.from_hf(
-        hf_q, name_map=NameMap(roots=spec.checkpoint_roots, packed=spec.packed_modules_mapping)
-    ))
+    object.__setattr__(
+        qcfg,
+        "quant",
+        QuantConfig.from_hf(
+            hf_q, name_map=NameMap(roots=spec.checkpoint_roots, packed=spec.packed_modules_mapping)
+        ),
+    )
     qmodel = MuseGlimmerForCausalLM(qcfg)
     attn = qmodel.model.layers.op_list[0].self_attn
     mlp = qmodel.model.layers.op_list[0].mlp

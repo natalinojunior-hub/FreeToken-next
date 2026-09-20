@@ -72,7 +72,9 @@ def spec_rollback_lengths(start_pos: int, committed: int) -> tuple[int, int]:
     return keep_cached, keep_device
 
 
-def rebuild_conv_state(prev_state: torch.Tensor, conv_in: torch.Tensor, accepted: int) -> torch.Tensor:
+def rebuild_conv_state(
+    prev_state: torch.Tensor, conv_in: torch.Tensor, accepted: int
+) -> torch.Tensor:
     """Rebuild a linear-attention convolution state after accepting ``accepted`` rows."""
     width = prev_state.shape[-1]
     combined = torch.cat(

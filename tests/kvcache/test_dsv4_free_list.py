@@ -55,4 +55,3 @@ def test_free_list_reset():
     a.alloc(2)
     a.reset()
     assert a.available() == 4 * P
-

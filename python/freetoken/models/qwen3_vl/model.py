@@ -26,7 +26,9 @@ def deepstack_add(
 class Qwen3VLTextModel(Qwen3Model):
     def __init__(self, config: ModelConfig):
         super().__init__(config)
-        self._deepstack_levels = len(config.vision_config.deepstack_visual_indexes) if config.vision_config else 0
+        self._deepstack_levels = (
+            len(config.vision_config.deepstack_visual_indexes) if config.vision_config else 0
+        )
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         batch = get_global_ctx().batch
@@ -42,7 +44,9 @@ class Qwen3VLTextModel(Qwen3Model):
 class Qwen3VLMoeTextModel(Qwen3MoeModel):
     def __init__(self, config: ModelConfig):
         super().__init__(config)
-        self._deepstack_levels = len(config.vision_config.deepstack_visual_indexes) if config.vision_config else 0
+        self._deepstack_levels = (
+            len(config.vision_config.deepstack_visual_indexes) if config.vision_config else 0
+        )
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         batch = get_global_ctx().batch
@@ -61,7 +65,9 @@ class Qwen3VLForConditionalGeneration(QwenVLVisionMixin, Qwen3ForCausalLM):
     def __init__(self, config: ModelConfig):
         super().__init__(config)
         if config.is_multimodal:
-            self.visual = Qwen3VLVisionModel(config.vision_config, quant_config=config.quant, prefix="visual")
+            self.visual = Qwen3VLVisionModel(
+                config.vision_config, quant_config=config.quant, prefix="visual"
+            )
 
 
 class Qwen3VLMoeForConditionalGeneration(QwenVLVisionMixin, Qwen3MoeForCausalLM):
@@ -70,7 +76,9 @@ class Qwen3VLMoeForConditionalGeneration(QwenVLVisionMixin, Qwen3MoeForCausalLM)
     def __init__(self, config: ModelConfig):
         super().__init__(config)
         if config.is_multimodal:
-            self.visual = Qwen3VLVisionModel(config.vision_config, quant_config=config.quant, prefix="visual")
+            self.visual = Qwen3VLVisionModel(
+                config.vision_config, quant_config=config.quant, prefix="visual"
+            )
 
 
 __all__ = [

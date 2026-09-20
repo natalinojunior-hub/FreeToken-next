@@ -11,6 +11,7 @@ Currency seam: the secondary value + its eviction is the slot a future SWA compo
 into. This class is pool-agnostic -- it stores/returns slot ids and KV page indices; the
 caller (CacheManager / scheduler) does the actual LinearStatePool / KV-pool free.
 """
+
 from __future__ import annotations
 
 import heapq
@@ -41,20 +42,21 @@ class HybridCacheHandle(BaseCacheHandle):
 
 
 class HybridMatch(NamedTuple):
-    kv_indices: torch.Tensor      # reused KV page indices for [0:cached_len)
-    cached_len: int               # truncated to the deepest LIVE-snapshot boundary
-    mamba_value: Optional[int]    # GDN snapshot slot to restore from (None = cold start)
-    node: RadixTreeNode           # the matched node (lock target)
+    kv_indices: torch.Tensor  # reused KV page indices for [0:cached_len)
+    cached_len: int  # truncated to the deepest LIVE-snapshot boundary
+    mamba_value: Optional[int]  # GDN snapshot slot to restore from (None = cold start)
+    node: RadixTreeNode  # the matched node (lock target)
 
 
 class EvictResult(NamedTuple):
-    kv_indices: torch.Tensor      # KV page indices to free
-    mamba_slots: List[int]        # GDN state slots to free
+    kv_indices: torch.Tensor  # KV page indices to free
+    mamba_slots: List[int]  # GDN state slots to free
 
 
 class HybridRadixCache:
     def __init__(self, device: torch.device, page_size: int) -> None:
         from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
         # Snapshots land on ×CHUNK_SIZE boundaries; require them to be page-aligned so the KV
         # node boundary and the GDN-state boundary coincide (page_size in {1,2,4,8,16,32,64}).
         assert CHUNK_SIZE % page_size == 0, (
@@ -69,7 +71,7 @@ class HybridRadixCache:
         self.root.ref_count = 1  # root is always protected
         self.full_evictable = 0
         self.full_protected = 0
-        self.mamba_evictable = 0     # number of live, unlocked snapshots
+        self.mamba_evictable = 0  # number of live, unlocked snapshots
         self.mamba_protected = 0
 
     # ---------------------------------------------------------------- match / insert
@@ -87,8 +89,9 @@ class HybridRadixCache:
             cur = cur.parent
         return HybridMatch(self.empty, 0, None, self.root)
 
-    def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
-               mamba_value: int) -> Tuple[int, bool]:
+    def insert(
+        self, input_ids: torch.Tensor, kv_indices: torch.Tensor, mamba_value: int
+    ) -> Tuple[int, bool]:
         """Insert the committed KV prefix and DONATE ``mamba_value`` at the (page-aligned) end
         boundary node. Returns (matched_prefix_len, mamba_exist). If the boundary node already
         owns a live snapshot, returns mamba_exist=True and does not attach (caller frees the
@@ -103,10 +106,10 @@ class HybridRadixCache:
             self.full_evictable += new_node.length
             node = new_node
         if node.is_root():
-            return prefix_len, True   # root can't hold a snapshot; report exist so caller frees it
+            return prefix_len, True  # root can't hold a snapshot; report exist so caller frees it
         if node.mamba_value is not None:
-            return prefix_len, True                 # dedup: caller frees its donated slot
-        node.mamba_value = mamba_value              # fills a fresh node or a tombstone
+            return prefix_len, True  # dedup: caller frees its donated slot
+        node.mamba_value = mamba_value  # fills a fresh node or a tombstone
         if node.mamba_ref_count == 0:
             self.mamba_evictable += 1
         return prefix_len, False
@@ -201,6 +204,7 @@ class HybridRadixCache:
         """KV-page currency, for code that reads a BasePrefixCache size_info (metrics/usage).
         The GDN-snapshot currency is reported via mamba_evictable_size."""
         from .base import SizeInfo
+
         return SizeInfo(evictable_size=self.full_evictable, protected_size=self.full_protected)
 
     def check_integrity(self) -> None:
@@ -228,8 +232,12 @@ class HybridRadixCache:
         Keeps the 'a leaf always carries a live snapshot' invariant (sglang
         _iteratively_delete_tombstone_leaf). Returns (highest surviving ancestor, freed_tokens)."""
         freed = 0
-        while (parent.mamba_value is None and parent.is_leaf()
-               and parent.ref_count == 0 and not parent.is_root()):
+        while (
+            parent.mamba_value is None
+            and parent.is_leaf()
+            and parent.ref_count == 0
+            and not parent.is_root()
+        ):
             kv_out.append(parent.value)
             self.full_evictable -= parent.length
             freed += parent.length

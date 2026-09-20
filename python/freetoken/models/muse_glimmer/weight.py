@@ -31,7 +31,10 @@ _VISION_QKV_PARTS = (".attn.q_proj", ".attn.k_proj", ".attn.v_proj")
 # are disambiguated by the full suffix.
 _FUSIONS: dict[str, tuple[str, ...]] = {
     ".self_attn.qkvg_proj": (
-        ".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj", ".self_attn.gate_proj",
+        ".self_attn.q_proj",
+        ".self_attn.k_proj",
+        ".self_attn.v_proj",
+        ".self_attn.gate_proj",
     ),
     ".mlp.gate_up_proj": (".mlp.gate_proj", ".mlp.up_proj"),
 }
@@ -115,7 +118,9 @@ def iter_weights(
     assert not vision_buf, f"Incomplete vision qkv fusions: {list(vision_buf.keys())}"
 
 
-def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+def iter_vision_weights(
+    model_path: str, device: torch.device
+) -> Iterator[tuple[str, torch.Tensor]]:
     """The vision tower alone, named as iter_weights names it."""
     vision_buf: dict = {}
     for file in iter_weight_files(model_path):

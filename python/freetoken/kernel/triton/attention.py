@@ -135,10 +135,7 @@ def _paged_attention_kernel(
         if not skip_tile:
             slots = tl.load(indices_ptr + kv_start + offs_n, mask=offs_n < kv_len, other=0)
             k = tl.load(
-                k_ptr
-                + slots[:, None] * stride_ks
-                + kv_head * stride_kh
-                + offs_d[None, :],
+                k_ptr + slots[:, None] * stride_ks + kv_head * stride_kh + offs_d[None, :],
                 mask=(offs_n[:, None] < kv_len) & mask_d[None, :],
                 other=0.0,
             ).to(tl.float32)
@@ -152,10 +149,7 @@ def _paged_attention_kernel(
             p = tl.exp(scores - m_new)
 
             v = tl.load(
-                v_ptr
-                + slots[:, None] * stride_vs
-                + kv_head * stride_vh
-                + offs_d[None, :],
+                v_ptr + slots[:, None] * stride_vs + kv_head * stride_vh + offs_d[None, :],
                 mask=(offs_n[:, None] < kv_len) & mask_d[None, :],
                 other=0.0,
             ).to(tl.float32)
@@ -244,9 +238,7 @@ def _decode_grouped_stage1_kernel(
     effective_len = tl.maximum(0, effective_end - effective_start)
 
     kv_splits = tl.load(num_kv_splits_ptr + batch_id)
-    kv_len_per_split = (
-        tl.cdiv(tl.cdiv(effective_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
-    )
+    kv_len_per_split = tl.cdiv(tl.cdiv(effective_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
     split_start = kv_len_per_split * split_id
     split_end = tl.minimum(split_start + kv_len_per_split, effective_len)
 
@@ -273,8 +265,19 @@ def _decode_grouped_stage1_kernel(
                 # offs_d is in range (the pool only takes head_dim a multiple of 128, so
                 # BLOCK_D == D here); the tile helper derives the packed byte offsets itself.
                 k = turbo_k_tile(
-                    k_ptr, kn_ptr, cent_ptr, slots, kv_head, stride_ks, stride_kh,
-                    stride_knt, stride_knh, offs_d, mask_n, BOOK3, q.dtype,
+                    k_ptr,
+                    kn_ptr,
+                    cent_ptr,
+                    slots,
+                    kv_head,
+                    stride_ks,
+                    stride_kh,
+                    stride_knt,
+                    stride_knh,
+                    offs_d,
+                    mask_n,
+                    BOOK3,
+                    q.dtype,
                 )
             else:
                 k = tl.load(
@@ -287,8 +290,19 @@ def _decode_grouped_stage1_kernel(
 
             if COMPRESSED:
                 v = turbo_v_tile(
-                    v_ptr, vn_ptr, cent_ptr, slots, kv_head, stride_vs, stride_vh,
-                    stride_vnt, stride_vnh, offs_dv, mask_n, BOOK3, q.dtype,
+                    v_ptr,
+                    vn_ptr,
+                    cent_ptr,
+                    slots,
+                    kv_head,
+                    stride_vs,
+                    stride_vh,
+                    stride_vnt,
+                    stride_vnh,
+                    offs_dv,
+                    mask_n,
+                    BOOK3,
+                    q.dtype,
                 )
             else:
                 v = tl.load(
@@ -313,11 +327,7 @@ def _decode_grouped_stage1_kernel(
         )
         tl.store(mid_o_ptr + mid_offsets, out, mask=mask_h[:, None] & mask_dv[None, :])
 
-        lse_offsets = (
-            batch_id * stride_lse_b
-            + q_heads * stride_lse_h
-            + split_id * stride_lse_s
-        )
+        lse_offsets = batch_id * stride_lse_b + q_heads * stride_lse_h + split_id * stride_lse_s
         tl.store(mid_lse_ptr + lse_offsets, m_i + tl.log(l_i), mask=mask_h)
 
 
@@ -357,9 +367,7 @@ def _decode_stage2_kernel(
     effective_len = tl.maximum(0, effective_end - effective_start)
 
     kv_splits = tl.load(num_kv_splits_ptr + batch_id)
-    kv_len_per_split = (
-        tl.cdiv(tl.cdiv(effective_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
-    )
+    kv_len_per_split = tl.cdiv(tl.cdiv(effective_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
 
     offs_d = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < DV
@@ -461,9 +469,7 @@ def decode_paged_attention(
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
 
-    _decode_grouped_stage1_kernel[
-        (batch, triton.cdiv(num_q_heads, valid_block_h), max_kv_splits)
-    ](
+    _decode_grouped_stage1_kernel[(batch, triton.cdiv(num_q_heads, valid_block_h), max_kv_splits)](
         q,
         k_cache,
         v_cache,
@@ -637,15 +643,23 @@ def _extend_attention_kernel(
             slots = tl.load(kv_indices_ptr + kv_start + kv_offsets, mask=mask_n, other=0)
             if COMPRESSED:
                 k = turbo_k_tile(
-                    k_ptr, kn_ptr, cent_ptr, slots, kv_head, stride_ks, stride_kh,
-                    stride_knt, stride_knh, offs_d, mask_n, BOOK3, tl.bfloat16,
+                    k_ptr,
+                    kn_ptr,
+                    cent_ptr,
+                    slots,
+                    kv_head,
+                    stride_ks,
+                    stride_kh,
+                    stride_knt,
+                    stride_knh,
+                    offs_d,
+                    mask_n,
+                    BOOK3,
+                    tl.bfloat16,
                 )
             else:
                 k = tl.load(
-                    k_ptr
-                    + slots[None, :] * stride_ks
-                    + kv_head * stride_kh
-                    + offs_d[:, None],
+                    k_ptr + slots[None, :] * stride_ks + kv_head * stride_kh + offs_d[:, None],
                     mask=mask_n[None, :] & mask_d[:, None],
                     other=0.0,
                 )
@@ -660,15 +674,23 @@ def _extend_attention_kernel(
 
             if COMPRESSED:
                 v = turbo_v_tile(
-                    v_ptr, vn_ptr, cent_ptr, slots, kv_head, stride_vs, stride_vh,
-                    stride_vnt, stride_vnh, offs_dv, mask_n, BOOK3, tl.bfloat16,
+                    v_ptr,
+                    vn_ptr,
+                    cent_ptr,
+                    slots,
+                    kv_head,
+                    stride_vs,
+                    stride_vh,
+                    stride_vnt,
+                    stride_vnh,
+                    offs_dv,
+                    mask_n,
+                    BOOK3,
+                    tl.bfloat16,
                 )
             else:
                 v = tl.load(
-                    v_ptr
-                    + slots[:, None] * stride_vs
-                    + kv_head * stride_vh
-                    + offs_dv[None, :],
+                    v_ptr + slots[:, None] * stride_vs + kv_head * stride_vh + offs_dv[None, :],
                     mask=mask_n[:, None] & mask_dv[None, :],
                     other=0.0,
                 )
@@ -678,10 +700,7 @@ def _extend_attention_kernel(
 
     out = tl.where(l_i[:, None] == 0.0, 0.0, acc / l_i[:, None])
     tl.store(
-        o_ptr
-        + (q_start + offs_m[:, None]) * stride_ot
-        + q_head * stride_oh
-        + offs_dv[None, :],
+        o_ptr + (q_start + offs_m[:, None]) * stride_ot + q_head * stride_oh + offs_dv[None, :],
         out.to(o_ptr.dtype.element_ty),
         mask=mask_m[:, None] & mask_dv[None, :],
     )
@@ -753,10 +772,7 @@ def _extend_attention_split_kernel(
     q_abs_pos = prefix_len + offs_m
 
     q = tl.load(
-        q_ptr
-        + (q_start + offs_m[:, None]) * stride_qt
-        + q_head * stride_qh
-        + offs_d[None, :],
+        q_ptr + (q_start + offs_m[:, None]) * stride_qt + q_head * stride_qh + offs_d[None, :],
         mask=mask_m[:, None] & mask_d[None, :],
         other=0.0,
     )
@@ -787,8 +803,19 @@ def _extend_attention_split_kernel(
             slots = tl.load(kv_indices_ptr + kv_start + kv_offsets, mask=mask_n, other=0)
             if COMPRESSED:
                 k = turbo_k_tile(
-                    k_cache_ptr, kn_ptr, cent_ptr, slots, kv_head, stride_kcs, stride_kch,
-                    stride_knt, stride_knh, offs_d, mask_n, BOOK3, tl.bfloat16,
+                    k_cache_ptr,
+                    kn_ptr,
+                    cent_ptr,
+                    slots,
+                    kv_head,
+                    stride_kcs,
+                    stride_kch,
+                    stride_knt,
+                    stride_knh,
+                    offs_d,
+                    mask_n,
+                    BOOK3,
+                    tl.bfloat16,
                 )
             else:
                 k = tl.load(
@@ -810,8 +837,19 @@ def _extend_attention_split_kernel(
 
             if COMPRESSED:
                 v = turbo_v_tile(
-                    v_cache_ptr, vn_ptr, cent_ptr, slots, kv_head, stride_vcs, stride_vch,
-                    stride_vnt, stride_vnh, offs_dv, mask_n, BOOK3, tl.bfloat16,
+                    v_cache_ptr,
+                    vn_ptr,
+                    cent_ptr,
+                    slots,
+                    kv_head,
+                    stride_vcs,
+                    stride_vch,
+                    stride_vnt,
+                    stride_vnh,
+                    offs_dv,
+                    mask_n,
+                    BOOK3,
+                    tl.bfloat16,
                 )
             else:
                 v = tl.load(
@@ -882,10 +920,7 @@ def _extend_attention_split_kernel(
 
     out = tl.where(l_i[:, None] == 0.0, 0.0, acc / l_i[:, None])
     tl.store(
-        o_ptr
-        + (q_start + offs_m[:, None]) * stride_ot
-        + q_head * stride_oh
-        + offs_dv[None, :],
+        o_ptr + (q_start + offs_m[:, None]) * stride_ot + q_head * stride_oh + offs_dv[None, :],
         out.to(o_ptr.dtype.element_ty),
         mask=mask_m[:, None] & mask_dv[None, :],
     )
@@ -928,7 +963,11 @@ def extend_paged_attention(
         sinks = sinks.contiguous()
 
     if block_ends is not None:
-        assert block_ends.is_cuda and block_ends.dtype == torch.int32 and block_ends.numel() == num_q_tokens
+        assert (
+            block_ends.is_cuda
+            and block_ends.dtype == torch.int32
+            and block_ends.numel() == num_q_tokens
+        )
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
     block_ends_arg = block_ends if block_ends is not None else qo_indptr
@@ -946,7 +985,9 @@ def extend_paged_attention(
     # shared memory fits them, shrink on consumer GPUs (sm_89 ~99KB) where the default
     # 128x64 overflows once head_dim >= 256 (e.g. gemma4: SWA 256, full-attention 512).
     block_m, block_n = _select_extend_tile(
-        head_dim, block_d, _optin_smem_bytes(q.device.index),
+        head_dim,
+        block_d,
+        _optin_smem_bytes(q.device.index),
         pre_ampere=torch.cuda.get_device_capability(q.device.index)[0] < 8,
     )
     grid = (qo_indptr.numel() - 1, num_q_heads, triton.cdiv(max_q_len, block_m))

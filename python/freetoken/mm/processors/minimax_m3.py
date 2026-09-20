@@ -28,12 +28,16 @@ class MiniMaxM3MMProcessor(MMProcessor):
         super().__init__(model_path, mm)
         vc = hf_config.vision_config
         # the native config maps image_token_id onto the checkpoint's image_token_index
-        self.image_token_id = getattr(hf_config, "image_token_id", getattr(hf_config, "image_token_index", None))
+        self.image_token_id = getattr(
+            hf_config, "image_token_id", getattr(hf_config, "image_token_index", None)
+        )
         # the template renders one image token per image; the wrappers come from the replacement
         self.placeholder = [self.image_token_id]
         self.merge = _compression(vc, "spatial_merge_size")
         self.pixels_per_token = (vc.patch_size * self.merge) ** 2
-        self.patch_dim = vc.num_channels * _compression(vc, "temporal_patch_size") * vc.patch_size**2
+        self.patch_dim = (
+            vc.num_channels * _compression(vc, "temporal_patch_size") * vc.patch_size**2
+        )
 
     def get_mm_processor_kwargs(self, mm: MultimodalConfig) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"return_tensors": "pt"}
@@ -74,19 +78,25 @@ class MiniMaxM3MMProcessor(MMProcessor):
 
     def prompt_replacement(self, item: MMItem) -> PromptReplacement:
         t, h, w = item.grid_thw
-        full = [IMAGE_START_ID] + [self.image_token_id] * ((t * h * w) // (self.merge * self.merge)) + [IMAGE_END_ID]
+        full = (
+            [IMAGE_START_ID]
+            + [self.image_token_id] * ((t * h * w) // (self.merge * self.merge))
+            + [IMAGE_END_ID]
+        )
         return PromptReplacement.select_token_id(full, self.image_token_id)
 
     def dummy_items(self, dtype: torch.dtype, device: torch.device) -> list[MMItem]:
         merge = self.merge
-        return [MMItem(
-            modality="image",
-            hash=0,
-            pad_value=0,
-            offsets=[[0, 1]],
-            feature=torch.zeros(merge * merge, self.patch_dim, dtype=dtype, device=device),
-            model_specific_data={"grid_thw": [1, merge, merge]},
-        )]
+        return [
+            MMItem(
+                modality="image",
+                hash=0,
+                pad_value=0,
+                offsets=[[0, 1]],
+                feature=torch.zeros(merge * merge, self.patch_dim, dtype=dtype, device=device),
+                model_specific_data={"grid_thw": [1, merge, merge]},
+            )
+        ]
 
 
 __all__ = ["IMAGE_END_ID", "IMAGE_START_ID", "MiniMaxM3MMProcessor"]

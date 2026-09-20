@@ -125,27 +125,29 @@ class Glm5NextDSABackend(DSAAttnBackend):
             ).to(self.device, non_blocking=True)
             cu_cpu = md.qo_indptr_cpu
             cu_seqlens = cu_cpu.to(self.device, non_blocking=True)
-            token_to_req = torch.repeat_interleave(
-                torch.arange(len(reqs), dtype=torch.int32),
-                (cu_cpu[1:] - cu_cpu[:-1]).to(torch.int64),
-            ).pin_memory().to(self.device, non_blocking=True)
+            token_to_req = (
+                torch.repeat_interleave(
+                    torch.arange(len(reqs), dtype=torch.int32),
+                    (cu_cpu[1:] - cu_cpu[:-1]).to(torch.int64),
+                )
+                .pin_memory()
+                .to(self.device, non_blocking=True)
+            )
         slots = ring_slots.index_select(0, token_to_req.to(torch.int64))
         # page_size % kpool == 0, so out_loc % kp == position % kp: a group closes
         # exactly on position % kp == kp - 1. Non-closing rows land in the request's
         # scratch row (never scored).
         closing = positions % kp == kp - 1
-        cmp_rows = torch.where(
-            closing, out_loc // kp, self.kvcache.cmp_scratch_base + slots
-        ).to(torch.int32)
+        cmp_rows = torch.where(closing, out_loc // kp, self.kvcache.cmp_scratch_base + slots).to(
+            torch.int32
+        )
         # Ring refresh: only each request's last kp rows survive to the next forward
         # (one keeper per pos%kp residue -- deterministic, no write races).
         rows = torch.arange(t, device=self.device, dtype=torch.int64)
         ends = cu_seqlens.to(torch.int64).index_select(0, token_to_req.to(torch.int64) + 1)
         keep = rows >= ends - kp
         ring_row = slots * kp + positions % kp
-        ring_rows = torch.where(keep, ring_row, torch.full_like(ring_row, -1)).to(
-            torch.int32
-        )
+        ring_rows = torch.where(keep, ring_row, torch.full_like(ring_row, -1)).to(torch.int32)
         md.kpool_plan = KpoolPlan(cmp_rows, ring_rows, ring_slots, token_to_req, cu_seqlens)
         return md.kpool_plan
 
@@ -165,11 +167,17 @@ class Glm5NextDSABackend(DSAAttnBackend):
         tail_k, tail_g = self.kvcache.tail_k(slot), self.kvcache.tail_gate(slot)
         plan = self._plan_kpool_writes(md, batch, slot)
         kpool_compress_store(
-            k, gate,
-            tail_k.view(-1, k.shape[-1]), tail_g.view(-1, k.shape[-1]),
+            k,
+            gate,
+            tail_k.view(-1, k.shape[-1]),
+            tail_g.view(-1, k.shape[-1]),
             inputs.ape,
-            plan.ring_slots, plan.token_to_req, plan.cu_seqlens, batch.positions,
-            self.kvcache.index_k_cache(slot), plan.cmp_rows,
+            plan.ring_slots,
+            plan.token_to_req,
+            plan.cu_seqlens,
+            batch.positions,
+            self.kvcache.index_k_cache(slot),
+            plan.cmp_rows,
             self.kpool,
         )
         # After the compression read: the ring rows this forward overwrites are
@@ -194,9 +202,9 @@ class Glm5NextDSABackend(DSAAttnBackend):
 
         # History: pool pick p -> token positions p*kp + [0, kp).
         hist_pos = picks.unsqueeze(-1) * kp + offs  # [B, m, k_sel, kp]
-        hist_pos = torch.where(
-            picks.unsqueeze(-1) < 0, hist_pos.new_full((), -1), hist_pos
-        ).view(b, m, k_sel * kp)
+        hist_pos = torch.where(picks.unsqueeze(-1) < 0, hist_pos.new_full((), -1), hist_pos).view(
+            b, m, k_sel * kp
+        )
 
         # Tail: positions [n_pools*kp, q_pos] of each query's own request/step.
         n_pools = (q_pos + 1) // kp  # complete pools at this query
@@ -248,8 +256,13 @@ class Glm5NextDSABackend(DSAAttnBackend):
         return o.view(bs, self.num_heads, self.kv_lora_rank)
 
     def _select_prefill(
-        self, slot: int, q_idx: torch.Tensor, w: torch.Tensor,
-        rows: torch.Tensor, positions: torch.Tensor, start_pos: int,
+        self,
+        slot: int,
+        q_idx: torch.Tensor,
+        w: torch.Tensor,
+        rows: torch.Tensor,
+        positions: torch.Tensor,
+        start_pos: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-request causal top-k at pool granularity, expanded to token rows.
         ``start_pos`` is the request's cached_len (host int, no device sync)."""
@@ -274,8 +287,12 @@ class Glm5NextDSABackend(DSAAttnBackend):
             s1 = min(s0 + chunk, m)
             scores = self.dsa_prefill_logits(q_idx[s0:s1], k_pool, w[s0:s1])
             picks = self.indexer_select_prefill(
-                scores.unsqueeze(0), start_pos=start_pos + s0, seqlen=s1 - s0,
-                ratio=kp, topk=k_sel, offset=0,
+                scores.unsqueeze(0),
+                start_pos=start_pos + s0,
+                seqlen=s1 - s0,
+                ratio=kp,
+                topk=k_sel,
+                offset=0,
             )  # [1, s1-s0, k_sel] pool ids
             sel_c, cnt_c = self._expand_and_tail(
                 picks, rows.view(1, -1), positions[s0:s1].view(1, -1)

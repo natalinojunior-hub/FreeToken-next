@@ -97,9 +97,7 @@ def _hf_config_native(num_layers: int = 60) -> _Cfg:
     }
     text.hidden_act = "silu"
     delattr(text, "sparse_attention_config")
-    text.layer_types = ["full_attention"] * dense + ["minimax_m3_sparse"] * (
-        num_layers - dense
-    )
+    text.layer_types = ["full_attention"] * dense + ["minimax_m3_sparse"] * (num_layers - dense)
     text.index_n_heads = 4
     text.index_head_dim = 128
     text.index_block_size = 128
@@ -126,7 +124,10 @@ def test_parse_config_native_shape_matches_raw(monkeypatch):
     assert a.use_sparse and a.sparse_layer_ids == b.sparse_layer_ids
     assert a.moe_layer_ids == b.moe_layer_ids
     assert (a.index_dim, a.num_index_heads, a.topk_blocks, a.block_size) == (
-        b.index_dim, b.num_index_heads, b.topk_blocks, b.block_size,
+        b.index_dim,
+        b.num_index_heads,
+        b.topk_blocks,
+        b.block_size,
     )
     assert (a.init_blocks, a.local_blocks) == (b.init_blocks, b.local_blocks)
     assert (a.rope_theta, a.rotary_dim) == (b.rope_theta, b.rotary_dim)
@@ -215,29 +216,64 @@ def test_sparse_ablation_env(monkeypatch):
 
 def _vision_section(native: bool) -> _Cfg:
     section = {
-        "hidden_size": 1280, "num_hidden_layers": 32, "num_attention_heads": 16, "intermediate_size": 5120,
-        "num_channels": 3, "patch_size": 14, "hidden_act": "gelu", "layer_norm_eps": 1e-5,
+        "hidden_size": 1280,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 16,
+        "intermediate_size": 5120,
+        "num_channels": 3,
+        "patch_size": 14,
+        "hidden_act": "gelu",
+        "layer_norm_eps": 1e-5,
     }
     if native:
-        section.update(temporal_patch_size=2, spatial_merge_size=2, rope_parameters={"rope_theta": 10000.0, "rope_type": "axial"})
+        section.update(
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            rope_parameters={"rope_theta": 10000.0, "rope_type": "axial"},
+        )
     else:
-        section.update(rope_theta=10000.0, img_token_compression_config={"spatial_merge_size": 2, "temporal_patch_size": 2})
+        section.update(
+            rope_theta=10000.0,
+            img_token_compression_config={"spatial_merge_size": 2, "temporal_patch_size": 2},
+        )
     return _Cfg(section)
 
 
 def test_parse_config_vision_section_in_both_config_shapes(monkeypatch):
     monkeypatch.delenv("FREETOKEN_M3_MAX_LAYERS", raising=False)
     expected = VisionConfig(
-        hidden_size=1280, num_layers=32, num_heads=16, intermediate_size=5120, num_channels=3, patch_size=14, temporal_patch_size=2,
-        spatial_merge_size=2, layer_norm_eps=1e-5, rope_theta=10000.0, projector_hidden_size=6144, text_hidden_size=6144,
+        hidden_size=1280,
+        num_layers=32,
+        num_heads=16,
+        intermediate_size=5120,
+        num_channels=3,
+        patch_size=14,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        layer_norm_eps=1e-5,
+        rope_theta=10000.0,
+        projector_hidden_size=6144,
+        text_hidden_size=6144,
     )
     raw = _hf_config()
-    raw.vision_config, raw.image_token_index, raw.projector_hidden_size = _vision_section(native=False), 200025, 6144
+    raw.vision_config, raw.image_token_index, raw.projector_hidden_size = (
+        _vision_section(native=False),
+        200025,
+        6144,
+    )
     native = _hf_config_native()
-    native.vision_config, native.image_token_id, native.projector_hidden_size = _vision_section(native=True), 200025, 6144
+    native.vision_config, native.image_token_id, native.projector_hidden_size = (
+        _vision_section(native=True),
+        200025,
+        6144,
+    )
     for cfg in (raw, native):
         parsed = parse_config(cfg)
-        assert parsed.is_multimodal and parsed.vision_config == expected and parsed.image_token_id == 200025
+        assert (
+            parsed.is_multimodal
+            and parsed.vision_config == expected
+            and parsed.image_token_id == 200025
+        )
     # a text-only engine hands over a config without the section
     assert not parse_config(_hf_config()).is_multimodal
 
@@ -251,7 +287,9 @@ def test_registry_resolves_both_architectures():
     multimodal = get_model_spec("MiniMaxM3SparseForConditionalGeneration")
     assert multimodal.model_cls == "MiniMaxM3ForConditionalGeneration"
     assert multimodal.mm_processor == "freetoken.mm.processors.minimax_m3:MiniMaxM3MMProcessor"
-    assert [(e.kind, e.config_key, e.modalities) for e in multimodal.encoders] == [("vision", "vision_config", ("image",))]
+    assert [(e.kind, e.config_key, e.modalities) for e in multimodal.encoders] == [
+        ("vision", "vision_config", ("image",))
+    ]
     assert get_model_spec("MiniMaxM3SparseForCausalLM").encoders == ()
 
 
@@ -279,7 +317,17 @@ def test_nvfp4_experts_restricted_to_triton_for_swigluoai(monkeypatch):
     monkeypatch.setattr(backend, "device_capability", lambda: (12, 0))
     monkeypatch.setattr(backend, "is_vllm_installed", lambda: True)
     monkeypatch.setattr(backend, "is_flashinfer_installed", lambda: True)
-    cfg = MoEConfig(num_experts=256, hidden=6144, intermediate=3072, top_k=4, scheme=ModelOptConfig.SCHEMES["NVFP4"], strategy="offload", activation="swigluoai", alpha=1.702, limit=7.0)
+    cfg = MoEConfig(
+        num_experts=256,
+        hidden=6144,
+        intermediate=3072,
+        top_k=4,
+        scheme=ModelOptConfig.SCHEMES["NVFP4"],
+        strategy="offload",
+        activation="swigluoai",
+        alpha=1.702,
+        limit=7.0,
+    )
     assert select_kernel(Nvfp4MoEMethod.candidates, "auto", cfg).name == "triton"
     with pytest.raises(KernelSelectionError):
         select_kernel(Nvfp4MoEMethod.candidates, "marlin", cfg)

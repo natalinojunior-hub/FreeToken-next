@@ -2,6 +2,14 @@
 
 **Projeto:** freetoken-next | **Hardware:** RTX 5080 16GB | **Base:** FreeToken v0.1.3 (`cac247a`)
 
+**DIRETRIZ DE ESCOPO ATIVO:** 
+- **Métrica Soberana de Performance:** **TG (tok/s)** é a única métrica de sucesso para MTP/especulação. Taxa de aceitação (% acceptance) é puramente diagnóstica. Se subir $k$ (2, 3, 4+) elevar o TG, deve-se manter o $k$ maior mesmo com menor taxa percentual de aceitação. O único critério para recuar $k$ é queda no TG medido.
+- **Modelos Alvo Exclusivos (Família Flash Next):**
+  1. `Qwen 3.8 Flash Next NVFP4 Radix` (`/models/Qwen3.8-Flash-Next-NVFP4-Radix`).
+  2. `Qwen 3.8 Flash Next Unsloth IQ4_XS` (`/models/Qwen3.8-Flash-Next-Unsloth-IQ4_XS`).
+- **Bloqueio Temporário:** Todos os demais modelos (35B-A3B, Ornith, Tiel-Coder, etc.) estão bloqueados temporariamente para validações e testes.
+- **Testes Mínimos:** Executar apenas as 3 suítes mínimas canônicas (<60s).
+
 ---
 
 ## Gates de Fase (Roadmap)
@@ -27,19 +35,25 @@
 
 ---
 
-## Test Suite Gates
+## Test Suite Gates — Minimum Viable (Reduzido)
 
 ```bash
-# Suite rápida (pre-commit / CI)
-pytest tests -m "not slow" -q --basetemp=/models/desenvolvimento/tmp
-# Gate: 1839 passed, 206 skipped, 1 failed (flashinfer fp4_quantization_120f - env)
+# Smoke gate (pre-commit / CI) — < 60s
+pytest tests/scheduler/test_spec_reject_frees_pages.py tests/engine/test_spec.py \
+       tests/models/qwen4_exp/test_gdn.py -q --basetemp=/models/desenvolvimento/tmp
+# Gate: 14 tests pass (MTP spec + GDN + zero-replay)
 
-# Suite completa (pre-release)
-pytest tests -q --basetemp=/models/desenvolvimento/tmp
-# Gate: 0 failures regressivos (exceto flashinfer conhecido)
+# Validation gate (pre-release / major change) — < 5min
+pytest tests/scheduler/ tests/engine/ tests/models/qwen4_exp/ -q --basetemp=/models/desenvolvimento/tmp
+# Gate: 0 failures regressivos nos subsistemas core
 ```
 
-**Regra:** Fix em código compartilhado (cache/paginação/scheduler) -> rodar **suite completa do subsistema**, não só arquivos tocados.
+**Nova regra:** Apenas 3 suites canônicas obrigatórias:
+1. `test_spec_reject_frees_pages.py` — page accounting + GDN rollback
+2. `test_spec.py` — accept_drafts + rollback helpers
+3. `test_gdn.py` — prefill/decode equivalence + chunk rules
+
+Subsistemas com mudança -> rodar **sua suite própria**, não repo inteiro.
 
 ---
 
@@ -123,7 +137,7 @@ Both budget formulas price it
 - [ ] Same-arch GGUF row reports parity vs native
 - [ ] Blocked rows name blocker (não deletados)
 - [ ] `benchmarks/cert_matrix.py` green
-- [ ] `CHANGELOG.md` updated (se existir)
+- [ ] Release notes updated (se release tagged)
 - [ ] `ft --version` bump (se release tagged)
 
 ---

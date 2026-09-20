@@ -81,14 +81,18 @@ def _gemm_wave(device: torch.device) -> int:
     wave = _GEMM_WAVE.get(idx)
     if wave is None:
         props = torch.cuda.get_device_properties(idx)
-        blocks = max(1, min(
-            props.regs_per_multiprocessor // _GEMM_BLOCK_REGS,
-            props.shared_memory_per_multiprocessor // _GEMM_BLOCK_SMEM,
-            4,
-        ))
+        blocks = max(
+            1,
+            min(
+                props.regs_per_multiprocessor // _GEMM_BLOCK_REGS,
+                props.shared_memory_per_multiprocessor // _GEMM_BLOCK_SMEM,
+                4,
+            ),
+        )
         wave = props.multi_processor_count * blocks
         _GEMM_WAVE[idx] = wave
     return wave
+
 
 # Above this M the dequant-to-scratch + cuBLAS path wins (the in-K dot GEMM re-dequants
 # each weight tile M/BLOCK_M times; cuBLAS is ~4x its per-tile FLOP efficiency).
@@ -155,15 +159,21 @@ def _split8(a_vec, BLOCK_KW: tl.constexpr):
 # ======================================================================================
 @triton.jit
 def _nvfp4_gemv_kernel(
-    a_ptr,        # [K] activation (compute dtype), contiguous
-    packed_ptr,   # [N, K // 8] int32 (8 fp4 codes per word, nibble j -> k = 8*w + j)
-    scale_ptr,    # [N, K // 16] fp8-e4m3 per-16 block scale
-    gscale_ptr,   # [N] fp16 per-output-row global scale (weight_scale_2)
-    out_ptr,      # [N] out dtype
-    N, K,
-    stride_pn, stride_pkw,
-    stride_sn, stride_sblk,
-    BLOCK_N: tl.constexpr, BLOCK_KW: tl.constexpr, OUT: tl.constexpr, EVEN_K: tl.constexpr,
+    a_ptr,  # [K] activation (compute dtype), contiguous
+    packed_ptr,  # [N, K // 8] int32 (8 fp4 codes per word, nibble j -> k = 8*w + j)
+    scale_ptr,  # [N, K // 16] fp8-e4m3 per-16 block scale
+    gscale_ptr,  # [N] fp16 per-output-row global scale (weight_scale_2)
+    out_ptr,  # [N] out dtype
+    N,
+    K,
+    stride_pn,
+    stride_pkw,
+    stride_sn,
+    stride_sblk,
+    BLOCK_N: tl.constexpr,
+    BLOCK_KW: tl.constexpr,
+    OUT: tl.constexpr,
+    EVEN_K: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -190,7 +200,8 @@ def _nvfp4_gemv_kernel(
             w_mask = widx < K_WORDS
             word = tl.load(
                 p_base + widx[:, None] * stride_pkw,
-                mask=w_mask[:, None] & n_mask[None, :], other=0,
+                mask=w_mask[:, None] & n_mask[None, :],
+                other=0,
             )
             s_ptrs = s_base + (widx[:, None] // 2) * stride_sblk
             s_mask = w_mask[:, None] & n_mask[None, :]
@@ -223,19 +234,28 @@ def _nvfp4_gemv_kernel(
 
 @triton.jit
 def _nvfp4_gemv_splitk_kernel(
-    a_ptr,        # [K] activation (compute dtype), contiguous
-    packed_ptr,   # [N, K // 8] int32
-    scale_ptr,    # [N, K // 16] fp8-e4m3
-    gscale_ptr,   # [N] fp16 per-output-row global scale
-    part_ptr,     # [SPLIT_K, N] fp32 partial sums (pre-global-scale)
+    a_ptr,  # [K] activation (compute dtype), contiguous
+    packed_ptr,  # [N, K // 8] int32
+    scale_ptr,  # [N, K // 16] fp8-e4m3
+    gscale_ptr,  # [N] fp16 per-output-row global scale
+    part_ptr,  # [SPLIT_K, N] fp32 partial sums (pre-global-scale)
     counter_ptr,  # [cdiv(N, BLOCK_N)] int32 arrival counters, zeroed (self-resetting)
-    out_ptr,      # [N] out dtype
-    N, K, K_WORDS, tiles_per,
-    stride_pn, stride_pkw,
-    stride_sn, stride_sblk,
-    stride_partk, stride_partn,
-    BLOCK_N: tl.constexpr, BLOCK_KW: tl.constexpr, SPLIT_K: tl.constexpr,
-    OUT: tl.constexpr, EVEN_K: tl.constexpr,
+    out_ptr,  # [N] out dtype
+    N,
+    K,
+    K_WORDS,
+    tiles_per,
+    stride_pn,
+    stride_pkw,
+    stride_sn,
+    stride_sblk,
+    stride_partk,
+    stride_partn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_KW: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    OUT: tl.constexpr,
+    EVEN_K: tl.constexpr,
 ):
     """Split-K decode GEMV for small N: each ``(pid_n, pid_k)`` reduces ``tiles_per`` word-
     tiles of K into a partial sum; many more programs than the single-pass kernel -> fills
@@ -267,7 +287,8 @@ def _nvfp4_gemv_splitk_kernel(
             w_mask = widx < K_WORDS  # out-of-range words read 0 (safe; add nothing)
             word = tl.load(
                 p_base + widx[:, None] * stride_pkw,
-                mask=w_mask[:, None] & n_mask[None, :], other=0,
+                mask=w_mask[:, None] & n_mask[None, :],
+                other=0,
             )
             s_ptrs = s_base + (widx[:, None] // 2) * stride_sblk
             s_mask = w_mask[:, None] & n_mask[None, :]
@@ -307,8 +328,14 @@ def _nvfp4_gemv_splitk_kernel(
         tl.store(counter_ptr + pid_n, 0)  # leave zeroed for the next launch/replay
 
 
-def _gemv(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
-          gscale: torch.Tensor, out_dtype: torch.dtype, transposed: bool) -> torch.Tensor:
+def _gemv(
+    a: torch.Tensor,
+    packed_i32: torch.Tensor,
+    scale: torch.Tensor,
+    gscale: torch.Tensor,
+    out_dtype: torch.dtype,
+    transposed: bool,
+) -> torch.Tensor:
     """M==1 W4A16 GEMV. ``a`` [K] compute-dtype; ``packed_i32`` logical [N, K//8] int32
     (row-major or a K-major transposed view); ``scale`` logical [N, K//16] fp8; ``gscale``
     [N] fp16. Picks split-K so small ``N`` (shared expert) still fills the SMs; large ``N``
@@ -331,9 +358,21 @@ def _gemv(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
     if split_k == 1:  # large N (lm_head): single-pass full-K, direct global-scaled write
         even = K % (block_kw * 8) == 0
         _nvfp4_gemv_kernel[(triton.cdiv(N, _GEMV_BLOCK_N),)](
-            a, packed_i32, scale, gscale, out, N, K,
-            packed_i32.stride(0), packed_i32.stride(1), scale.stride(0), scale.stride(1),
-            BLOCK_N=_GEMV_BLOCK_N, BLOCK_KW=block_kw, OUT=out_tl, EVEN_K=even,
+            a,
+            packed_i32,
+            scale,
+            gscale,
+            out,
+            N,
+            K,
+            packed_i32.stride(0),
+            packed_i32.stride(1),
+            scale.stride(0),
+            scale.stride(1),
+            BLOCK_N=_GEMV_BLOCK_N,
+            BLOCK_KW=block_kw,
+            OUT=out_tl,
+            EVEN_K=even,
             num_warps=_GEMV_WARPS,
         )
         return out
@@ -344,11 +383,28 @@ def _gemv(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
     part = torch.empty((split_k, N), dtype=torch.float32, device=a.device)
     counters = _splitk_counters(n_blocks_n, a.device)
     _nvfp4_gemv_splitk_kernel[(n_blocks_n, split_k)](
-        a, packed_i32, scale, gscale, part, counters, out, N, K, K_WORDS, tiles_per,
-        packed_i32.stride(0), packed_i32.stride(1), scale.stride(0), scale.stride(1),
-        part.stride(0), part.stride(1),
-        BLOCK_N=sk_block_n, BLOCK_KW=_GEMV_SPLITK_BLOCK_KW, SPLIT_K=split_k,
-        OUT=out_tl, EVEN_K=even,
+        a,
+        packed_i32,
+        scale,
+        gscale,
+        part,
+        counters,
+        out,
+        N,
+        K,
+        K_WORDS,
+        tiles_per,
+        packed_i32.stride(0),
+        packed_i32.stride(1),
+        scale.stride(0),
+        scale.stride(1),
+        part.stride(0),
+        part.stride(1),
+        BLOCK_N=sk_block_n,
+        BLOCK_KW=_GEMV_SPLITK_BLOCK_KW,
+        SPLIT_K=split_k,
+        OUT=out_tl,
+        EVEN_K=even,
         num_warps=_GEMV_WARPS,
     )
     return out
@@ -386,20 +442,34 @@ def _nvfp4_pair_f16(v):
 
 @triton.jit
 def _nvfp4_gemm_kernel(
-    a_ptr,        # [M, K] activations
-    packed_ptr,   # logical [N, K // 8] int32 (row- or K-major via strides)
-    scale_ptr,    # logical [N, K // 16] fp8-e4m3
-    gscale_ptr,   # [N] fp16
-    c_ptr,        # [M, N] output (written when SPLIT_K == 1)
-    part_ptr,     # [SPLIT_K, M, N] fp32 partials (written when SPLIT_K > 1)
-    M, N, K, K_WORDS, tiles_per,
-    stride_am, stride_ak,
-    stride_pn, stride_pkw,
-    stride_sn, stride_sblk,
-    stride_cm, stride_cn,
-    stride_qk, stride_qm, stride_qn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_KW: tl.constexpr,
-    SPLIT_K: tl.constexpr, OUT: tl.constexpr, EVEN_K: tl.constexpr,
+    a_ptr,  # [M, K] activations
+    packed_ptr,  # logical [N, K // 8] int32 (row- or K-major via strides)
+    scale_ptr,  # logical [N, K // 16] fp8-e4m3
+    gscale_ptr,  # [N] fp16
+    c_ptr,  # [M, N] output (written when SPLIT_K == 1)
+    part_ptr,  # [SPLIT_K, M, N] fp32 partials (written when SPLIT_K > 1)
+    M,
+    N,
+    K,
+    K_WORDS,
+    tiles_per,
+    stride_am,
+    stride_ak,
+    stride_pn,
+    stride_pkw,
+    stride_sn,
+    stride_sblk,
+    stride_cm,
+    stride_cn,
+    stride_qk,
+    stride_qm,
+    stride_qn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_KW: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    OUT: tl.constexpr,
+    EVEN_K: tl.constexpr,
 ):
     pid_mn = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -415,12 +485,19 @@ def _nvfp4_gemm_kernel(
     offs_kw = tl.arange(0, BLOCK_KW)
     offs_ak = tl.arange(0, BLOCK_KW * 8)
     tile0 = pid_k * tiles_per
-    a_ptrs = a_ptr + offs_m[:, None] * stride_am \
-        + (tile0 * BLOCK_KW * 8 + offs_ak)[None, :] * stride_ak
-    b_ptrs = packed_ptr + offs_n[:, None] * stride_pn \
+    a_ptrs = (
+        a_ptr + offs_m[:, None] * stride_am + (tile0 * BLOCK_KW * 8 + offs_ak)[None, :] * stride_ak
+    )
+    b_ptrs = (
+        packed_ptr
+        + offs_n[:, None] * stride_pn
         + (tile0 * BLOCK_KW + offs_kw)[None, :] * stride_pkw
-    s_ptrs = scale_ptr + offs_n[:, None] * stride_sn \
+    )
+    s_ptrs = (
+        scale_ptr
+        + offs_n[:, None] * stride_sn
         + ((tile0 * BLOCK_KW + offs_kw)[None, :] // 2) * stride_sblk
+    )
 
     acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
     for t in range(tiles_per):
@@ -447,9 +524,7 @@ def _nvfp4_gemm_kernel(
         # stay exact (<= 6 significand bits, magnitudes in [2^-17, 2^15)), and the missing
         # 2^7 is restored by the fp32 epilogue's g * 128 -- bit-identical to scaling b by
         # 2^7 here, one fewer fp16 multiply per dot operand.
-        a0, a1, a2, a3, a4, a5, a6, a7 = _split8_rows(
-            a_tile.to(tl.float16), BLOCK_M, BLOCK_KW
-        )
+        a0, a1, a2, a3, a4, a5, a6, a7 = _split8_rows(a_tile.to(tl.float16), BLOCK_M, BLOCK_KW)
         b_lo, b_hi = _nvfp4_pair_f16(word)
         acc = tl.dot(b_lo * s128, tl.trans(a0), acc)
         acc = tl.dot(b_hi * s128, tl.trans(a4), acc)
@@ -474,8 +549,9 @@ def _nvfp4_gemm_kernel(
         c_ptrs = c_ptr + offs_m[None, :] * stride_cm + offs_n[:, None] * stride_cn
         tl.store(c_ptrs, acc.to(OUT), mask=io_mask)
     else:
-        q_ptrs = (part_ptr + pid_k * stride_qk + offs_m[None, :] * stride_qm
-                  + offs_n[:, None] * stride_qn)
+        q_ptrs = (
+            part_ptr + pid_k * stride_qk + offs_m[None, :] * stride_qm + offs_n[:, None] * stride_qn
+        )
         tl.store(q_ptrs, acc, mask=io_mask)
 
 
@@ -499,10 +575,19 @@ def _split8_rows(a_tile, ROWS: tl.constexpr, BLOCK_KW: tl.constexpr):
 
 @triton.jit
 def _nvfp4_gemm_splitk_reduce_kernel(
-    part_ptr, gscale_ptr, out_ptr, M, N, SPLIT_K: tl.constexpr,
-    stride_qk, stride_qm, stride_qn,
-    stride_om, stride_on,
-    BLOCK: tl.constexpr, OUT: tl.constexpr,
+    part_ptr,
+    gscale_ptr,
+    out_ptr,
+    M,
+    N,
+    SPLIT_K: tl.constexpr,
+    stride_qk,
+    stride_qm,
+    stride_qn,
+    stride_om,
+    stride_on,
+    BLOCK: tl.constexpr,
+    OUT: tl.constexpr,
 ):
     """Split-K reduce for the dot GEMM. Kept as a separate launch on purpose: fusing it
     into the GEMM (last-arriver pattern, as the GEMV does) costs more than it saves there
@@ -514,8 +599,9 @@ def _nvfp4_gemm_splitk_reduce_kernel(
     mask = offs < N
     acc = tl.zeros((BLOCK,), dtype=tl.float32)
     for k in tl.static_range(SPLIT_K):
-        acc += tl.load(part_ptr + k * stride_qk + pid_m * stride_qm + offs * stride_qn,
-                       mask=mask, other=0.0)
+        acc += tl.load(
+            part_ptr + k * stride_qk + pid_m * stride_qm + offs * stride_qn, mask=mask, other=0.0
+        )
     g = tl.load(gscale_ptr + offs, mask=mask, other=0.0).to(tl.float32) * 128.0
     tl.store(out_ptr + pid_m * stride_om + offs * stride_on, (acc * g).to(OUT), mask=mask)
 
@@ -537,15 +623,19 @@ def _pick_split_k_bm16(num_mn: int, num_tiles: int, wave: int) -> int:
     # A grid within ~15% of exactly one wave quantizes badly (one full wave + a tiny
     # straggler wave of full-length programs); take 2 waves when K can afford it.
     blocks = num_mn * split_k
-    if (0.85 * wave <= blocks <= 1.15 * wave
-            and split_k * 2 <= max_sk and num_tiles >= 10 * split_k):
+    if 0.85 * wave <= blocks <= 1.15 * wave and split_k * 2 <= max_sk and num_tiles >= 10 * split_k:
         split_k *= 2
     return split_k
 
 
-def _gemm_inkernel(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
-                   gscale: torch.Tensor, out_dtype: torch.dtype,
-                   transposed: bool) -> torch.Tensor:
+def _gemm_inkernel(
+    a: torch.Tensor,
+    packed_i32: torch.Tensor,
+    scale: torch.Tensor,
+    gscale: torch.Tensor,
+    out_dtype: torch.dtype,
+    transposed: bool,
+) -> torch.Tensor:
     """Batched-decode dot GEMM (M <= 64): weight read once, split-K keeps the SMs fed when
     ``M x N`` alone yields too few programs (shared-expert N at small M)."""
     M, K = a.shape
@@ -576,31 +666,60 @@ def _gemm_inkernel(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tenso
             split_k = even_k
     tiles_per = triton.cdiv(num_tiles, split_k)
     even = (K % (_GEMM_BLOCK_KW * 8) == 0) and (num_tiles == tiles_per * split_k)
-    part = (torch.empty((split_k, M, N), dtype=torch.float32, device=a.device)
-            if split_k > 1 else out)  # unused dummy when split_k == 1
+    part = (
+        torch.empty((split_k, M, N), dtype=torch.float32, device=a.device) if split_k > 1 else out
+    )  # unused dummy when split_k == 1
     _nvfp4_gemm_kernel[(num_mn, split_k)](
-        a, packed_i32, scale, gscale, out, part,
-        M, N, K, K_WORDS, tiles_per,
-        a.stride(0), a.stride(1),
-        packed_i32.stride(0), packed_i32.stride(1),
-        scale.stride(0), scale.stride(1),
-        out.stride(0), out.stride(1),
+        a,
+        packed_i32,
+        scale,
+        gscale,
+        out,
+        part,
+        M,
+        N,
+        K,
+        K_WORDS,
+        tiles_per,
+        a.stride(0),
+        a.stride(1),
+        packed_i32.stride(0),
+        packed_i32.stride(1),
+        scale.stride(0),
+        scale.stride(1),
+        out.stride(0),
+        out.stride(1),
         part.stride(0) if split_k > 1 else 0,
         part.stride(1) if split_k > 1 else 0,
         part.stride(2) if split_k > 1 else 0,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_KW=_GEMM_BLOCK_KW,
-        SPLIT_K=split_k, OUT=_TL_DTYPE[compute], EVEN_K=even,
-        num_warps=num_warps, num_stages=num_stages,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_KW=_GEMM_BLOCK_KW,
+        SPLIT_K=split_k,
+        OUT=_TL_DTYPE[compute],
+        EVEN_K=even,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     if split_k > 1:
         # Small blocks spread the reduce over more SMs (it is latency-bound, ~2.5us);
         # very wide N amortizes better with fewer, fatter blocks.
         r_block, r_warps = (128, 2) if N <= 8192 else (512, 8)
         _nvfp4_gemm_splitk_reduce_kernel[(M, triton.cdiv(N, r_block))](
-            part, gscale, out, M, N, split_k,
-            part.stride(0), part.stride(1), part.stride(2),
-            out.stride(0), out.stride(1),
-            BLOCK=r_block, OUT=_TL_DTYPE[compute], num_warps=r_warps,
+            part,
+            gscale,
+            out,
+            M,
+            N,
+            split_k,
+            part.stride(0),
+            part.stride(1),
+            part.stride(2),
+            out.stride(0),
+            out.stride(1),
+            BLOCK=r_block,
+            OUT=_TL_DTYPE[compute],
+            num_warps=r_warps,
         )
     return out
 
@@ -610,15 +729,19 @@ def _gemm_inkernel(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tenso
 # ======================================================================================
 @triton.jit
 def _nvfp4_dequant_rows_kernel(
-    packed_ptr,   # [N, K // 8] int32
-    scale_ptr,    # [N, K // 16] fp8-e4m3
-    gscale_ptr,   # [N] fp16
-    out_ptr,      # [N, K] compute dtype
+    packed_ptr,  # [N, K // 8] int32
+    scale_ptr,  # [N, K // 16] fp8-e4m3
+    gscale_ptr,  # [N] fp16
+    out_ptr,  # [N, K] compute dtype
     K_WORDS,
-    stride_pn, stride_pkw,
-    stride_sn, stride_sblk,
-    stride_on, stride_ok,
-    BLOCK_KW: tl.constexpr, OUT: tl.constexpr,
+    stride_pn,
+    stride_pkw,
+    stride_sn,
+    stride_sblk,
+    stride_on,
+    stride_ok,
+    BLOCK_KW: tl.constexpr,
+    OUT: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -644,15 +767,21 @@ def _nvfp4_dequant_rows_kernel(
 
 @triton.jit
 def _nvfp4_dequant_cols_kernel(
-    packed_ptr,   # K-major: element (n, kw) at kw * stride_pkw + n (stride_pn == 1)
+    packed_ptr,  # K-major: element (n, kw) at kw * stride_pkw + n (stride_pn == 1)
     scale_ptr,
-    gscale_ptr,   # [N] fp16
-    out_ptr,      # [n_rows, K] compute dtype, row-major
-    N, K_WORDS,
-    stride_pn, stride_pkw,
-    stride_sn, stride_sblk,
-    stride_on, stride_ok,
-    BLOCK_N: tl.constexpr, BLOCK_KW: tl.constexpr, OUT: tl.constexpr,
+    gscale_ptr,  # [N] fp16
+    out_ptr,  # [n_rows, K] compute dtype, row-major
+    N,
+    K_WORDS,
+    stride_pn,
+    stride_pkw,
+    stride_sn,
+    stride_sblk,
+    stride_on,
+    stride_ok,
+    BLOCK_N: tl.constexpr,
+    BLOCK_KW: tl.constexpr,
+    OUT: tl.constexpr,
 ):
     """Dequant for the K-major resident layout: loads coalesce along N, the [K-tile, N-tile]
     value block is transposed in-register, stores coalesce along K of the row-major scratch."""
@@ -665,7 +794,8 @@ def _nvfp4_dequant_cols_kernel(
 
     word = tl.load(
         packed_ptr + offs_kw[:, None] * stride_pkw + offs_n[None, :] * stride_pn,
-        mask=kw_mask[:, None] & n_mask[None, :], other=0,
+        mask=kw_mask[:, None] & n_mask[None, :],
+        other=0,
     )
     s_ptrs = scale_ptr + (offs_kw[:, None] // 2) * stride_sblk + offs_n[None, :] * stride_sn
     s_mask = kw_mask[:, None] & n_mask[None, :]
@@ -685,12 +815,18 @@ def _nvfp4_dequant_cols_kernel(
     offs_k = pid_k * BLOCK_KW * 8 + tl.arange(0, BLOCK_KW * 8)
     tl.store(
         out_ptr + offs_n[:, None] * stride_on + offs_k[None, :] * stride_ok,
-        vals_t, mask=n_mask[:, None] & (offs_k[None, :] < K_WORDS * 8),
+        vals_t,
+        mask=n_mask[:, None] & (offs_k[None, :] < K_WORDS * 8),
     )
 
 
-def _dequant_rows(packed_i32: torch.Tensor, scale: torch.Tensor, gscale: torch.Tensor,
-                  out: torch.Tensor, transposed: bool) -> None:
+def _dequant_rows(
+    packed_i32: torch.Tensor,
+    scale: torch.Tensor,
+    gscale: torch.Tensor,
+    out: torch.Tensor,
+    transposed: bool,
+) -> None:
     """Dequant logical ``packed_i32 [n, K//8]`` (+ scales) into preallocated ``out [n, K]``."""
     n = packed_i32.shape[0]
     K_WORDS = packed_i32.shape[1]
@@ -698,24 +834,51 @@ def _dequant_rows(packed_i32: torch.Tensor, scale: torch.Tensor, gscale: torch.T
     if transposed:
         BLOCK_N, BLOCK_KW = 64, 16
         _nvfp4_dequant_cols_kernel[(triton.cdiv(K_WORDS, BLOCK_KW), triton.cdiv(n, BLOCK_N))](
-            packed_i32, scale, gscale, out, n, K_WORDS,
-            packed_i32.stride(0), packed_i32.stride(1), scale.stride(0), scale.stride(1),
-            out.stride(0), out.stride(1),
-            BLOCK_N=BLOCK_N, BLOCK_KW=BLOCK_KW, OUT=_TL_DTYPE[out.dtype], num_warps=4,
+            packed_i32,
+            scale,
+            gscale,
+            out,
+            n,
+            K_WORDS,
+            packed_i32.stride(0),
+            packed_i32.stride(1),
+            scale.stride(0),
+            scale.stride(1),
+            out.stride(0),
+            out.stride(1),
+            BLOCK_N=BLOCK_N,
+            BLOCK_KW=BLOCK_KW,
+            OUT=_TL_DTYPE[out.dtype],
+            num_warps=4,
         )
         return
     BLOCK_KW = 128
     _nvfp4_dequant_rows_kernel[(n, triton.cdiv(K_WORDS, BLOCK_KW))](
-        packed_i32, scale, gscale, out, K_WORDS,
-        packed_i32.stride(0), packed_i32.stride(1), scale.stride(0), scale.stride(1),
-        out.stride(0), out.stride(1),
-        BLOCK_KW=BLOCK_KW, OUT=_TL_DTYPE[out.dtype], num_warps=4,
+        packed_i32,
+        scale,
+        gscale,
+        out,
+        K_WORDS,
+        packed_i32.stride(0),
+        packed_i32.stride(1),
+        scale.stride(0),
+        scale.stride(1),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_KW=BLOCK_KW,
+        OUT=_TL_DTYPE[out.dtype],
+        num_warps=4,
     )
 
 
-def _gemm_scratch(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
-                  gscale: torch.Tensor, out_dtype: torch.dtype,
-                  transposed: bool) -> torch.Tensor:
+def _gemm_scratch(
+    a: torch.Tensor,
+    packed_i32: torch.Tensor,
+    scale: torch.Tensor,
+    gscale: torch.Tensor,
+    out_dtype: torch.dtype,
+    transposed: bool,
+) -> torch.Tensor:
     """Dequant the weight to a bf16 scratch (N-chunked) and run cuBLAS. The dequant runs
     once at the memory roof, so at prefill M this sits within ~7% of a resident-bf16 GEMM
     while the weight stays FP4-resident."""
@@ -746,8 +909,14 @@ def _gemm_scratch(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor
     return out
 
 
-def _gemm(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
-          gscale: torch.Tensor, out_dtype: torch.dtype, transposed: bool) -> torch.Tensor:
+def _gemm(
+    a: torch.Tensor,
+    packed_i32: torch.Tensor,
+    scale: torch.Tensor,
+    gscale: torch.Tensor,
+    out_dtype: torch.dtype,
+    transposed: bool,
+) -> torch.Tensor:
     """M>1 W4A16 GEMM dispatch. Small M (batched decode, lm_head last-token batch) reads
     the packed weight directly in the dot GEMM (split-K when needed); larger M (prefill)
     goes dequant-to-scratch + cuBLAS."""
@@ -758,27 +927,36 @@ def _gemm(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
 
 
 def _linear_impl(
-    x: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
-    gscale: torch.Tensor, bias: torch.Tensor | None, out_dtype: torch.dtype,
+    x: torch.Tensor,
+    packed_i32: torch.Tensor,
+    scale: torch.Tensor,
+    gscale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
     transposed: bool,
 ) -> torch.Tensor:
     """Shared dispatch on a logical ``[N, K//8]`` int32 weight view (either storage order)."""
     *lead, K = x.shape
     N = packed_i32.shape[0]
     if x.numel() // K == 1:
-        out = _gemv(x.reshape(K), packed_i32, scale, gscale, out_dtype,
-                    transposed).reshape(*lead, N)
+        out = _gemv(x.reshape(K), packed_i32, scale, gscale, out_dtype, transposed).reshape(
+            *lead, N
+        )
     else:
-        out = _gemm(x.reshape(-1, K).contiguous(), packed_i32, scale, gscale, out_dtype,
-                    transposed).reshape(*lead, N)
+        out = _gemm(
+            x.reshape(-1, K).contiguous(), packed_i32, scale, gscale, out_dtype, transposed
+        ).reshape(*lead, N)
     if bias is not None:
         out = out + bias.to(out.dtype)
     return out
 
 
 def nvfp4_dense_linear(
-    x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
-    weight_global: torch.Tensor, bias: torch.Tensor | None = None,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global: torch.Tensor,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``y = x @ dequant(weight)^T`` on the checkpoint-native row-major layout.
     ``weight`` [N, K//2] uint8, ``weight_scale`` [N, K//16] fp8-e4m3, ``weight_global`` [N] fp16."""
@@ -800,14 +978,15 @@ def nvfp4_transpose_resident(weight: torch.Tensor, weight_scale: torch.Tensor):
 
 
 def nvfp4_dense_linear_t(
-    x: torch.Tensor, weight_t: torch.Tensor, scale_t: torch.Tensor,
-    weight_global: torch.Tensor, bias: torch.Tensor | None = None,
+    x: torch.Tensor,
+    weight_t: torch.Tensor,
+    scale_t: torch.Tensor,
+    weight_global: torch.Tensor,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``y = x @ dequant(W)^T`` on the K-major resident layout from
     :func:`nvfp4_transpose_resident` (``weight_t`` [K//8, N] int32, ``scale_t`` [K//16, N])."""
-    return _linear_impl(
-        x, weight_t.t(), scale_t.t(), weight_global, bias, x.dtype, transposed=True
-    )
+    return _linear_impl(x, weight_t.t(), scale_t.t(), weight_global, bias, x.dtype, transposed=True)
 
 
 __all__ = [

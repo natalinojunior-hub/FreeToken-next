@@ -41,6 +41,7 @@ from .reasoning_parser import (
 try:
     import orjson
 except ModuleNotFoundError:  # FreeToken does not require orjson.
+
     class _OrjsonCompat:
         @staticmethod
         def loads(value: str) -> Any:
@@ -55,7 +56,9 @@ if _LIGHTLLM_ENABLE_TOOL_NAME_CHECK is not None:
     FORWARD_UNKNOWN_TOOLS = _LIGHTLLM_ENABLE_TOOL_NAME_CHECK.upper() not in _TRUE_ENV_VALUES
 else:
     FORWARD_UNKNOWN_TOOLS = (
-        os.getenv("FREETOKEN_FORWARD_UNKNOWN_TOOLS", os.getenv("SGLANG_FORWARD_UNKNOWN_TOOLS", "True")).upper()
+        os.getenv(
+            "FREETOKEN_FORWARD_UNKNOWN_TOOLS", os.getenv("SGLANG_FORWARD_UNKNOWN_TOOLS", "True")
+        ).upper()
         in _TRUE_ENV_VALUES
     )
 
@@ -358,7 +361,9 @@ class BaseFormatDetector(ABC):
                     return params
         return {}
 
-    def _convert_param_value(self, value: str, param_name: str, param_config: Dict, func_name: str) -> Any:
+    def _convert_param_value(
+        self, value: str, param_name: str, param_config: Dict, func_name: str
+    ) -> Any:
         """Convert parameter value based on schema type. Safe alternative to eval()."""
         if value.lower() == "null":
             return None
@@ -367,7 +372,9 @@ class BaseFormatDetector(ABC):
             return value
 
         prop = param_config.get(param_name, {})
-        param_type = str(prop.get("type", "string")).strip().lower() if isinstance(prop, dict) else "string"
+        param_type = (
+            str(prop.get("type", "string")).strip().lower() if isinstance(prop, dict) else "string"
+        )
 
         if param_type in ("string", "str", "enum"):
             return value
@@ -394,7 +401,9 @@ class BaseFormatDetector(ABC):
                     return value
         return value
 
-    def _schema_param_type(self, param_name: str, param_config: Dict, missing: str = "string") -> str:
+    def _schema_param_type(
+        self, param_name: str, param_config: Dict, missing: str = "string"
+    ) -> str:
         """Normalized schema type for a parameter; ``missing`` when undeclared."""
         if param_name not in param_config:
             return missing
@@ -429,7 +438,6 @@ class BaseFormatDetector(ABC):
         if self.prev_tool_call_arr and residual.strip() in ("", self.tool_call_separator.strip()):
             return ""
         return residual
-
 
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -516,7 +524,9 @@ class BaseFormatDetector(ABC):
                             return StreamingParseResult(normal_text=normal_text)
                     return StreamingParseResult()
 
-                is_current_complete = _is_complete_json(current_text[start_idx : start_idx + end_idx])
+                is_current_complete = _is_complete_json(
+                    current_text[start_idx : start_idx + end_idx]
+                )
 
                 # Validate tool name if present
                 if (
@@ -552,7 +562,8 @@ class BaseFormatDetector(ABC):
                 function_name = current_tool_call.get("name")
 
                 if function_name and (
-                    function_name in self._tool_indices or _should_forward_unknown_tool(function_name)
+                    function_name in self._tool_indices
+                    or _should_forward_unknown_tool(function_name)
                 ):
                     # If this is a new tool (current_tool_id was -1), initialize it
                     if self.current_tool_id == -1:
@@ -593,14 +604,18 @@ class BaseFormatDetector(ABC):
                     cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
                     prev_arguments = None
                     if self.current_tool_id < len(self.prev_tool_call_arr):
-                        prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
+                        prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get(
+                            "arguments"
+                        )
 
                     argument_diff = None
 
                     # If the current tool's JSON is complete, send all remaining arguments
                     if is_current_complete:
                         argument_diff = cur_args_json[sent:]
-                        completing_tool_id = self.current_tool_id  # Save the ID of the tool that's completing
+                        completing_tool_id = (
+                            self.current_tool_id
+                        )  # Save the ID of the tool that's completing
 
                         # Only remove the processed portion, keep unprocessed content;
                         # also consume the block's closing tag so it can't jam the
@@ -609,7 +624,7 @@ class BaseFormatDetector(ABC):
                         if self.eot_token:
                             after = self._buffer.lstrip()
                             if after.startswith(self.eot_token):
-                                self._buffer = after[len(self.eot_token):]
+                                self._buffer = after[len(self.eot_token) :]
 
                         if self.current_tool_id < len(self.prev_tool_call_arr):
                             self.prev_tool_call_arr[self.current_tool_id].clear()
@@ -628,7 +643,9 @@ class BaseFormatDetector(ABC):
                     if argument_diff is not None:
                         # Use the correct tool_index: completing_tool_id for completed tools,
                         # current_tool_id for ongoing
-                        tool_index_to_use = completing_tool_id if is_current_complete else self.current_tool_id
+                        tool_index_to_use = (
+                            completing_tool_id if is_current_complete else self.current_tool_id
+                        )
                         res = StreamingParseResult(
                             calls=[
                                 ToolCallItem(
@@ -652,7 +669,6 @@ class BaseFormatDetector(ABC):
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult()
-
 
 
 class InvokeParamStreamMixin:
@@ -749,13 +765,13 @@ class InvokeParamStreamMixin:
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
                         normal_parts.append(release)
-                        self._buffer = buf[len(release):]
+                        self._buffer = buf[len(release) :]
                     break
                 if pos > 0:
                     normal_parts.append(buf[:pos])
                     self._buffer = buf[pos:]
                     continue
-                self._buffer = buf[len(self._ps_outer_open):]
+                self._buffer = buf[len(self._ps_outer_open) :]
                 self._ps_mode = "block"
                 continue
 
@@ -763,7 +779,7 @@ class InvokeParamStreamMixin:
                 inv = buf.find(self._ps_invoke_open_prefix)
                 close = buf.find(self._ps_outer_close) if self._ps_outer_close else -1
                 if close != -1 and (inv == -1 or close < inv):
-                    self._buffer = buf[close + len(self._ps_outer_close):]
+                    self._buffer = buf[close + len(self._ps_outer_close) :]
                     self._ps_mode = "idle"
                     continue
                 if inv != -1:
@@ -777,7 +793,7 @@ class InvokeParamStreamMixin:
                         self.prev_tool_call_arr.append({})
                     while len(self.streamed_args_for_tool) <= self.current_tool_id:
                         self.streamed_args_for_tool.append("")
-                    self._buffer = buf[m.end():]
+                    self._buffer = buf[m.end() :]
                     if func_name in self._tool_indices or _should_forward_unknown_tool(func_name):
                         calls.append(
                             ToolCallItem(
@@ -802,7 +818,7 @@ class InvokeParamStreamMixin:
                     else 0,
                 )
                 if len(buf) - hold > 0:
-                    self._buffer = buf[len(buf) - hold:]  # inter-invoke whitespace
+                    self._buffer = buf[len(buf) - hold :]  # inter-invoke whitespace
                 break
 
             if mode in ("invoke", "invoke_skip"):
@@ -815,14 +831,14 @@ class InvokeParamStreamMixin:
                         self.current_tool_id += 1
                         while len(self.streamed_args_for_tool) <= self.current_tool_id:
                             self.streamed_args_for_tool.append("")
-                    self._buffer = buf[e + len(self._ps_invoke_close):]
+                    self._buffer = buf[e + len(self._ps_invoke_close) :]
                     self._ps_mode = "block"
                     continue
                 if p != -1:
                     m = self._ps_param_open_re.search(buf, p)
                     if m is None:
                         break  # parameter tag still streaming
-                    self._buffer = buf[m.end():]
+                    self._buffer = buf[m.end() :]
                     if mode == "invoke_skip":
                         self._ps_mode = "pskip"
                         continue
@@ -846,7 +862,7 @@ class InvokeParamStreamMixin:
                     self._ends_with_partial_token(buf, self._ps_invoke_close),
                 )
                 if len(buf) - hold > 0:
-                    self._buffer = buf[len(buf) - hold:]  # whitespace between parameters
+                    self._buffer = buf[len(buf) - hold :]  # whitespace between parameters
                 break
 
             if mode == "pstr":
@@ -868,12 +884,12 @@ class InvokeParamStreamMixin:
                     if emit_now:
                         _emit(self._json_escape_chunk(emit_now))
                         self._ps_emitted_any = True
-                        self._buffer = buf[len(emit_now):]
+                        self._buffer = buf[len(emit_now) :]
                     break
                 tail = self._ps_trim_trailing(buf[:end])
                 _emit(self._json_escape_chunk(tail) + '"')
                 _update_prev()
-                self._buffer = buf[end + len(self._ps_param_close):]
+                self._buffer = buf[end + len(self._ps_param_close) :]
                 self._ps_mode = "invoke"
                 continue
 
@@ -891,7 +907,7 @@ class InvokeParamStreamMixin:
                         + json.dumps(converted, ensure_ascii=False)
                     )
                     _update_prev()
-                self._buffer = buf[end + len(self._ps_param_close):]
+                self._buffer = buf[end + len(self._ps_param_close) :]
                 self._ps_mode = "invoke" if mode == "pbuf" else "invoke_skip"
                 continue
 
@@ -924,7 +940,9 @@ class Qwen25Detector(BaseFormatDetector):
 
     Reference: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct?chat_template=default
     """
+
     toolcall_opener = "<tool_call>"
+
     def __init__(self):
         """
         Initializes the detector with necessary state variables.
@@ -961,7 +979,9 @@ class Qwen25Detector(BaseFormatDetector):
                 parsed_call = json.loads(match_result.strip())
                 calls.extend(self.parse_base_json(parsed_call, tools))
             except json.JSONDecodeError as e:
-                logger.warning(f"Failed to parse JSON part: {match_result}, JSON parse error: {str(e)}")
+                logger.warning(
+                    f"Failed to parse JSON part: {match_result}, JSON parse error: {str(e)}"
+                )
                 continue
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
@@ -984,7 +1004,9 @@ class Qwen25Detector(BaseFormatDetector):
                 result.normal_text = cleaned_text
             else:
                 # Check if buffer might contain partial end token at the end
-                partial_match_len = self._ends_with_partial_token(self._normal_text_buffer, end_token_without_newline)
+                partial_match_len = self._ends_with_partial_token(
+                    self._normal_text_buffer, end_token_without_newline
+                )
 
                 if partial_match_len:
                     # Keep potential partial match in buffer, return the rest
@@ -1060,7 +1082,9 @@ class MistralDetector(BaseFormatDetector):
                 function_call_arr = [function_call_arr]
             calls = self.parse_base_json(function_call_arr, tools)
         except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse JSON part: {json_array_str}, JSON parse error: {str(e)}")
+            logger.warning(
+                f"Failed to parse JSON part: {json_array_str}, JSON parse error: {str(e)}"
+            )
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
@@ -1116,7 +1140,9 @@ class Llama32Detector(BaseFormatDetector):
     <python_tag>{"name":"xxx", "arguments":{...}}
     ```
     """
+
     toolcall_opener = "<|python_tag|>"
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<|python_tag|>"
@@ -1155,7 +1181,9 @@ class Llama32Detector(BaseFormatDetector):
                 safe_idx = idx
             except json.JSONDecodeError as e:
                 # Find where next `{"name"` appears and try again
-                logger.warning(f"Failed to parse JSON part: {action_text[idx:]}, JSON parse error: {str(e)}")
+                logger.warning(
+                    f"Failed to parse JSON part: {action_text[idx:]}, JSON parse error: {str(e)}"
+                )
                 next_obj_start = action_text.find('{"name":', idx + 1)
                 if next_obj_start == -1:
                     break
@@ -1167,9 +1195,6 @@ class Llama32Detector(BaseFormatDetector):
         # Use safe_idx to avoid idx containing the last part of an invalid JSON object
         trailing_text = action_text[safe_idx:].strip() if safe_idx < action_text_len else ""
         return StreamingParseResult(normal_text=normal_text + trailing_text, calls=calls)
-
-
-
 
 
 class Glm47Detector(BaseFormatDetector):
@@ -1206,7 +1231,9 @@ class Glm47Detector(BaseFormatDetector):
 
     Reference: https://github.com/vllm-project/vllm/blob/main/vllm/tool_parsers/glm4_moe_tool_parser.py
     """
+
     toolcall_opener = "<tool_call>"
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<tool_call>"
@@ -1220,10 +1247,13 @@ class Glm47Detector(BaseFormatDetector):
         # Function name can be followed by newline OR directly by <arg_key>
         # Pattern: <tool_call>function_name(\n|<arg_key>)...
         self.func_detail_regex = re.compile(
-            r"<tool_call>([^<\n]+?)(?:\n|(?=<arg_key>)|(?=</tool_call>))(.*?)</tool_call>", re.DOTALL
+            r"<tool_call>([^<\n]+?)(?:\n|(?=<arg_key>)|(?=</tool_call>))(.*?)</tool_call>",
+            re.DOTALL,
         )
         # Extract arg_key/arg_value pairs
-        self.func_arg_regex = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL)
+        self.func_arg_regex = re.compile(
+            r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL
+        )
 
         self._last_arguments = ""
         self._normal_text_buffer = ""
@@ -1232,7 +1262,9 @@ class Glm47Detector(BaseFormatDetector):
         """Check if the text contains a GLM-4.7 format tool call."""
         return self.bot_token in text
 
-    def _parse_xml_arguments(self, arg_text: str, param_config: Dict | None = None, func_name: str = "") -> dict:
+    def _parse_xml_arguments(
+        self, arg_text: str, param_config: Dict | None = None, func_name: str = ""
+    ) -> dict:
         """
         Parse XML-style arguments into a dictionary.
 
@@ -1311,7 +1343,9 @@ class Glm47Detector(BaseFormatDetector):
                     )
                 )
             except Exception as e:
-                logger.warning(f"Failed to parse GLM-4.7 tool call: {match_result}, error: {str(e)}")
+                logger.warning(
+                    f"Failed to parse GLM-4.7 tool call: {match_result}, error: {str(e)}"
+                )
                 continue
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
@@ -1322,7 +1356,9 @@ class Glm47Detector(BaseFormatDetector):
     _G_VAL_CLOSE = "</arg_value>"
 
     def _g_reset(self) -> None:
-        self._g_mode = "idle"  # idle|name|invoke|invoke_skip|key|key_skip|preval|preval_skip|pstr|pbuf|pskip
+        self._g_mode = (
+            "idle"  # idle|name|invoke|invoke_skip|key|key_skip|preval|preval_skip|pstr|pbuf|pskip
+        )
         self._g_key = ""
         self._g_lead = "{"
         self._g_config: Dict = {}
@@ -1374,25 +1410,29 @@ class Glm47Detector(BaseFormatDetector):
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
                         normal_parts.append(release)
-                        self._buffer = buf[len(release):]
+                        self._buffer = buf[len(release) :]
                     break
                 if pos > 0:
                     normal_parts.append(buf[:pos])
                     self._buffer = buf[pos:]
                     continue
-                self._buffer = buf[len(self.bot_token):]
+                self._buffer = buf[len(self.bot_token) :]
                 self._g_mode = "name"
                 continue
 
             if mode == "name":
                 # The function name runs until a newline, the first <arg_key>, or
                 # the closing tag (whichever comes first).
-                ends = [p for p in (buf.find("\n"), buf.find(self._G_KEY_OPEN), buf.find(self.eot_token)) if p != -1]
+                ends = [
+                    p
+                    for p in (buf.find("\n"), buf.find(self._G_KEY_OPEN), buf.find(self.eot_token))
+                    if p != -1
+                ]
                 if not ends:
                     break  # name still streaming (names are short — hold)
                 cut = min(ends)
                 func_name = buf[:cut].strip()
-                self._buffer = buf[cut + 1:] if buf[cut] == "\n" else buf[cut:]
+                self._buffer = buf[cut + 1 :] if buf[cut] == "\n" else buf[cut:]
                 if self.current_tool_id == -1:
                     self.current_tool_id = 0
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -1427,11 +1467,11 @@ class Glm47Detector(BaseFormatDetector):
                         self.current_tool_id += 1
                         while len(self.streamed_args_for_tool) <= self.current_tool_id:
                             self.streamed_args_for_tool.append("")
-                    self._buffer = buf[e + len(self.eot_token):]
+                    self._buffer = buf[e + len(self.eot_token) :]
                     self._g_mode = "idle"
                     continue
                 if k != -1:
-                    self._buffer = buf[k + len(self._G_KEY_OPEN):]
+                    self._buffer = buf[k + len(self._G_KEY_OPEN) :]
                     self._g_mode = "key" if mode == "invoke" else "key_skip"
                     continue
                 hold = max(
@@ -1439,7 +1479,7 @@ class Glm47Detector(BaseFormatDetector):
                     self._ends_with_partial_token(buf, self.eot_token),
                 )
                 if len(buf) - hold > 0:
-                    self._buffer = buf[len(buf) - hold:]  # whitespace between elements
+                    self._buffer = buf[len(buf) - hold :]  # whitespace between elements
                 break
 
             if mode in ("key", "key_skip"):
@@ -1447,7 +1487,7 @@ class Glm47Detector(BaseFormatDetector):
                 if end == -1:
                     break  # keys are short — hold until complete
                 self._g_key = buf[:end].strip()
-                self._buffer = buf[end + len(self._G_KEY_CLOSE):]
+                self._buffer = buf[end + len(self._G_KEY_CLOSE) :]
                 self._g_mode = "preval" if mode == "key" else "preval_skip"
                 continue
 
@@ -1456,9 +1496,9 @@ class Glm47Detector(BaseFormatDetector):
                 if v == -1:
                     hold = self._ends_with_partial_token(buf, self._G_VAL_OPEN)
                     if len(buf) - hold > 0:
-                        self._buffer = buf[len(buf) - hold:]  # whitespace between key and value
+                        self._buffer = buf[len(buf) - hold :]  # whitespace between key and value
                     break
-                self._buffer = buf[v + len(self._G_VAL_OPEN):]
+                self._buffer = buf[v + len(self._G_VAL_OPEN) :]
                 if mode == "preval_skip":
                     self._g_mode = "pskip"
                     continue
@@ -1489,12 +1529,12 @@ class Glm47Detector(BaseFormatDetector):
                     emit_now = safe[: len(safe) - keep]
                     if emit_now:
                         _emit(self._json_escape_chunk(emit_now))
-                        self._buffer = buf[len(emit_now):]
+                        self._buffer = buf[len(emit_now) :]
                     break
                 tail = buf[:end].rstrip()
                 _emit(self._json_escape_chunk(tail) + '"')
                 _update_prev()
-                self._buffer = buf[end + len(self._G_VAL_CLOSE):]
+                self._buffer = buf[end + len(self._G_VAL_CLOSE) :]
                 self._g_mode = "invoke"
                 continue
 
@@ -1518,7 +1558,7 @@ class Glm47Detector(BaseFormatDetector):
                         + json.dumps(converted, ensure_ascii=False)
                     )
                     _update_prev()
-                self._buffer = buf[end + len(self._G_VAL_CLOSE):]
+                self._buffer = buf[end + len(self._G_VAL_CLOSE) :]
                 self._g_mode = "invoke" if mode == "pbuf" else "invoke_skip"
                 continue
 
@@ -1693,9 +1733,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             if fragment:
                 self.streamed_args_for_tool[self.current_tool_id] += fragment
                 calls.append(
-                    ToolCallItem(
-                        tool_index=self.current_tool_id, name=None, parameters=fragment
-                    )
+                    ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=fragment)
                 )
 
         def _update_prev_args() -> None:
@@ -1730,14 +1768,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
                                 release = release.replace(e_token, "")
                         if release:
                             normal_parts.append(release)
-                        self._buffer = buf[len(buf) - hold:] if hold else ""
+                        self._buffer = buf[len(buf) - hold :] if hold else ""
                     break
                 if pos > 0:
                     normal_parts.append(buf[:pos])
                     self._buffer = buf[pos:]
                     continue
                 opener = self.bot_token if buf.startswith(self.bot_token) else self.alt_bot_token
-                self._buffer = buf[len(opener):]
+                self._buffer = buf[len(opener) :]
                 self._in_function_calls = True
                 self._ds_mode = "block"
                 continue
@@ -1751,7 +1789,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         if buf[close : close + len(self.eot_token)] == self.eot_token
                         else self.alt_eot_token
                     )
-                    self._buffer = buf[close + len(matched):]
+                    self._buffer = buf[close + len(matched) :]
                     self._in_function_calls = False
                     self._ds_mode = "idle"
                     continue
@@ -1766,7 +1804,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         self.prev_tool_call_arr.append({})
                     while len(self.streamed_args_for_tool) <= self.current_tool_id:
                         self.streamed_args_for_tool.append("")
-                    self._buffer = buf[m.end():]
+                    self._buffer = buf[m.end() :]
                     if func_name in self._tool_indices or _should_forward_unknown_tool(func_name):
                         calls.append(
                             ToolCallItem(
@@ -1789,7 +1827,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self._ends_with_partial_token(buf, self.alt_eot_token),
                 )
                 if len(buf) - hold > 0:
-                    self._buffer = buf[len(buf) - hold:]  # inter-invoke whitespace
+                    self._buffer = buf[len(buf) - hold :]  # inter-invoke whitespace
                 break
 
             if self._ds_mode in ("invoke", "invoke_skip"):
@@ -1802,14 +1840,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         self.current_tool_id += 1
                         while len(self.streamed_args_for_tool) <= self.current_tool_id:
                             self.streamed_args_for_tool.append("")
-                    self._buffer = buf[e + len(self.invoke_end_token):]
+                    self._buffer = buf[e + len(self.invoke_end_token) :]
                     self._ds_mode = "block"
                     continue
                 if p != -1:
                     m = self.param_open_regex.search(buf, p)
                     if m is None:
                         break  # parameter tag still streaming
-                    self._buffer = buf[m.end():]
+                    self._buffer = buf[m.end() :]
                     if self._ds_mode == "invoke_skip":
                         self._ds_mode = "pskip"
                         continue
@@ -1828,7 +1866,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self._ends_with_partial_token(buf, self.invoke_end_token),
                 )
                 if len(buf) - hold > 0:
-                    self._buffer = buf[len(buf) - hold:]  # whitespace between parameters
+                    self._buffer = buf[len(buf) - hold :]  # whitespace between parameters
                 break
 
             if self._ds_mode == "pstr":
@@ -1841,7 +1879,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         self._buffer = buf[emit_len:]
                     break
                 _emit_args(json.dumps(buf[:end], ensure_ascii=False)[1:-1] + '"')
-                self._buffer = buf[end + len(self.param_end_token):]
+                self._buffer = buf[end + len(self.param_end_token) :]
                 _update_prev_args()
                 self._ds_mode = "invoke"
                 continue
@@ -1863,7 +1901,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         + json.dumps(parsed, ensure_ascii=False)
                     )
                     _update_prev_args()
-                self._buffer = buf[end + len(self.param_end_token):]
+                self._buffer = buf[end + len(self.param_end_token) :]
                 self._ds_mode = "invoke" if self._ds_mode == "pbuf" else "invoke_skip"
                 continue
 
@@ -1942,7 +1980,6 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
     def has_tool_call(self, text: str) -> bool:
         return "<function=" in text or self.bot_token in text
 
-
     def _parse_function_call(self, function_str: str, tools: List[Tool]) -> Optional[ToolCallItem]:
         """Parse a single <function=name>...</function> block into a ToolCallItem."""
         try:
@@ -1973,7 +2010,9 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
             if param_value.endswith("\n"):
                 param_value = param_value[:-1]
 
-            param_dict[param_name] = self._convert_param_value(param_value, param_name, param_config, func_name)
+            param_dict[param_name] = self._convert_param_value(
+                param_value, param_name, param_config, func_name
+            )
 
         return ToolCallItem(
             tool_index=tool_indices.get(func_name, 0),
@@ -1981,7 +2020,9 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
             parameters=json.dumps(param_dict, ensure_ascii=False),
         )
 
-    def _build_partial_arguments_json(self, func_name: str, partial_body: str, tools: List[Tool]) -> Optional[str]:
+    def _build_partial_arguments_json(
+        self, func_name: str, partial_body: str, tools: List[Tool]
+    ) -> Optional[str]:
         """Build the current argument JSON from a partial XML tool-call body."""
         param_matches = self.parameter_regex.findall(partial_body)
         if not param_matches:
@@ -2016,7 +2057,9 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
                 # Parameter tag is present but its value has not started streaming yet.
                 continue
 
-            param_dict[param_name] = self._convert_param_value(param_value, param_name, param_config, func_name)
+            param_dict[param_name] = self._convert_param_value(
+                param_value, param_name, param_config, func_name
+            )
 
         if not param_dict and not has_visible_value:
             return None
@@ -2050,7 +2093,9 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
 
 class Gemma4Detector(BaseFormatDetector):
     """FreeToken serving adapter for Gemma4's compact tool-call format."""
+
     toolcall_opener = "<|tool_call>"
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<|tool_call>"
@@ -2142,13 +2187,13 @@ class Gemma4Detector(BaseFormatDetector):
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
                         normal_parts.append(release)
-                        self._buffer = buf[len(release):]
+                        self._buffer = buf[len(release) :]
                     break
                 if pos > 0:
                     normal_parts.append(buf[:pos])
                     self._buffer = buf[pos:]
                     continue
-                self._buffer = buf[len(self.bot_token):]
+                self._buffer = buf[len(self.bot_token) :]
                 self._g4_mode = "header"
                 continue
 
@@ -2157,8 +2202,8 @@ class Gemma4Detector(BaseFormatDetector):
                 if brace == -1:
                     break  # header still streaming (short — hold)
                 header = buf[:brace].strip()
-                self._buffer = buf[brace + 1:]
-                func_name = header[len("call:"):].strip() if header.startswith("call:") else ""
+                self._buffer = buf[brace + 1 :]
+                func_name = header[len("call:") :].strip() if header.startswith("call:") else ""
                 if self.current_tool_id == -1:
                     self.current_tool_id = 0
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -2200,7 +2245,7 @@ class Gemma4Detector(BaseFormatDetector):
                 if colon == -1:
                     break  # key still streaming (short — hold)
                 self._g4_key = buf[:colon].strip()
-                self._buffer = buf[colon + 1:]
+                self._buffer = buf[colon + 1 :]
                 self._g4_mode = "dispatch"
                 continue
 
@@ -2213,7 +2258,7 @@ class Gemma4Detector(BaseFormatDetector):
                 if buf.startswith(Q):
                     self._args_started = True
                     _emit(lead + json.dumps(self._g4_key, ensure_ascii=False) + ':"')
-                    self._buffer = buf[len(Q):]
+                    self._buffer = buf[len(Q) :]
                     self._g4_mode = "pstr"
                     continue
                 if self._ends_with_partial_token(buf, Q) == len(buf):
@@ -2233,11 +2278,11 @@ class Gemma4Detector(BaseFormatDetector):
                     emit_now = buf[: len(buf) - hold] if hold else buf
                     if emit_now:
                         _emit(self._json_escape_chunk(emit_now))
-                        self._buffer = buf[len(emit_now):]
+                        self._buffer = buf[len(emit_now) :]
                     break
                 _emit(self._json_escape_chunk(buf[:end]) + '"')
                 _update_prev()
-                self._buffer = buf[end + len(Q):]
+                self._buffer = buf[end + len(Q) :]
                 self._g4_mode = "key_sep"
                 continue
 
@@ -2290,7 +2335,7 @@ class Gemma4Detector(BaseFormatDetector):
                 _update_prev()
                 self._g4_scanned = 0
                 if buf[term] == ",":
-                    self._buffer = buf[term + 1:]
+                    self._buffer = buf[term + 1 :]
                     self._g4_mode = "key"
                 else:
                     self._buffer = buf[term:]
@@ -2302,14 +2347,14 @@ class Gemma4Detector(BaseFormatDetector):
                 if pos == -1:
                     hold = self._ends_with_partial_token(buf, self.eot_token)
                     if len(buf) - hold > 0 and buf[: len(buf) - hold].strip() == "":
-                        self._buffer = buf[len(buf) - hold:]
+                        self._buffer = buf[len(buf) - hold :]
                         break
                     if hold:
                         break
                     # No closing marker and non-whitespace content: treat as done.
                     self._g4_mode = "idle"
                     continue
-                self._buffer = buf[pos + len(self.eot_token):]
+                self._buffer = buf[pos + len(self.eot_token) :]
                 self._g4_mode = "idle"
                 continue
 
@@ -2317,9 +2362,9 @@ class Gemma4Detector(BaseFormatDetector):
                 pos = buf.find(self.eot_token)
                 if pos == -1:
                     hold = self._ends_with_partial_token(buf, self.eot_token)
-                    self._buffer = buf[len(buf) - hold:] if hold else ""
+                    self._buffer = buf[len(buf) - hold :] if hold else ""
                     break
-                self._buffer = buf[pos + len(self.eot_token):]
+                self._buffer = buf[pos + len(self.eot_token) :]
                 self._g4_mode = "idle"
                 continue
 
@@ -2355,7 +2400,9 @@ class MiniMaxDetector(InvokeParamStreamMixin, BaseFormatDetector):
         self.bot_token = "<minimax:tool_call>"
         self.eot_token = "</minimax:tool_call>"
         self.invoke_regex = re.compile(r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>', re.DOTALL)
-        self.param_regex = re.compile(r'<parameter\s+name="([^"]+)"\s*>(.*?)</parameter>', re.DOTALL)
+        self.param_regex = re.compile(
+            r'<parameter\s+name="([^"]+)"\s*>(.*?)</parameter>', re.DOTALL
+        )
 
         # InvokeParamStreamMixin grammar
         self._ps_outer_open = "<minimax:tool_call>"
@@ -2400,7 +2447,6 @@ class MiniMaxDetector(InvokeParamStreamMixin, BaseFormatDetector):
                 )
             )
         return StreamingParseResult(normal_text=normal_text, calls=calls)
-
 
 
 class MiniMaxM3Detector(BaseFormatDetector):
@@ -2642,9 +2688,7 @@ class MiniMaxM3Detector(BaseFormatDetector):
             out["$text"] = stray.strip()
         return out
 
-    def _args_from_items(
-        self, func_name: str, items: List[tuple], tools: List[Tool]
-    ) -> Dict:
+    def _args_from_items(self, func_name: str, items: List[tuple], tools: List[Tool]) -> Dict:
         config = self._get_param_config(func_name, tools)
         args: Dict[str, Any] = {}
         for key, raw in items:
@@ -2769,9 +2813,7 @@ class MiniMaxM3Detector(BaseFormatDetector):
                 break
             normal_parts.append(text[pos:b])
             pos = self._parse_block(text, b + len(self.bot_token), tools, calls)
-        return StreamingParseResult(
-            normal_text="".join(normal_parts).strip(), calls=calls
-        )
+        return StreamingParseResult(normal_text="".join(normal_parts).strip(), calls=calls)
 
     # ---- streaming ------------------------------------------------------------------
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
@@ -2836,12 +2878,8 @@ class MiniMaxM3Detector(BaseFormatDetector):
                 break
             func_name = m.group(1)
             self._buffer = self.bot_token + body[end + len(self._invoke_close) :]
-            if func_name not in tool_indices and not _should_forward_unknown_tool(
-                func_name
-            ):
-                logger.warning(
-                    f"Model attempted to call undefined function: {func_name}"
-                )
+            if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
+                logger.warning(f"Model attempted to call undefined function: {func_name}")
                 continue
             args = self._args_from_items(func_name, items, tools)
             args_json = json.dumps(args, ensure_ascii=False)
@@ -2855,14 +2893,10 @@ class MiniMaxM3Detector(BaseFormatDetector):
                 "arguments": args,
             }
             calls.append(
-                ToolCallItem(
-                    tool_index=self.current_tool_id, name=func_name, parameters=""
-                )
+                ToolCallItem(tool_index=self.current_tool_id, name=func_name, parameters="")
             )
             calls.append(
-                ToolCallItem(
-                    tool_index=self.current_tool_id, name=None, parameters=args_json
-                )
+                ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=args_json)
             )
             self.streamed_args_for_tool[self.current_tool_id] = args_json
             continue
@@ -2971,7 +3005,7 @@ class GptOssDetector(BaseFormatDetector):
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
                         normal_parts.append(release)
-                        self._buffer = buf[len(release):]
+                        self._buffer = buf[len(release) :]
                     break
                 if pos > 0:
                     normal_parts.append(buf[:pos])
@@ -2981,7 +3015,7 @@ class GptOssDetector(BaseFormatDetector):
                 if msg == -1:
                     break  # header still streaming
                 header = buf[:msg]
-                self._buffer = buf[msg + len("<|message|>"):]
+                self._buffer = buf[msg + len("<|message|>") :]
                 m = self._name_regex.search(header) if "commentary" in header else None
                 func_name = m.group(1) if m else None
                 if func_name and (
@@ -2994,9 +3028,7 @@ class GptOssDetector(BaseFormatDetector):
                     while len(self.streamed_args_for_tool) <= self.current_tool_id:
                         self.streamed_args_for_tool.append("")
                     calls.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id, name=func_name, parameters=""
-                        )
+                        ToolCallItem(tool_index=self.current_tool_id, name=func_name, parameters="")
                     )
                     self.prev_tool_call_arr[self.current_tool_id] = {
                         "name": func_name,
@@ -3027,7 +3059,7 @@ class GptOssDetector(BaseFormatDetector):
                 break
             piece = buf[:pos]
             if tok in self._CLOSING_TOKENS:
-                self._buffer = buf[pos + len(tok):]
+                self._buffer = buf[pos + len(tok) :]
             else:
                 self._buffer = buf[pos:]  # an opener belongs to the NEXT block
             if self._mode == "tool_body":
@@ -3035,9 +3067,7 @@ class GptOssDetector(BaseFormatDetector):
                     self._args_acc += piece
                     self.streamed_args_for_tool[self.current_tool_id] += piece
                     calls.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id, name=None, parameters=piece
-                        )
+                        ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=piece)
                     )
                 parsed_args = _parse_first_json_value(self._args_acc)
                 self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
@@ -3055,7 +3085,6 @@ class GptOssDetector(BaseFormatDetector):
         if mode != "text" or any(op in residual for op in self._BLOCK_OPENERS):
             return ""
         return residual
-
 
 
 class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
@@ -3206,9 +3235,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
             else:
                 frag = "{}"  # invoke opened, no parameter emitted yet
             self.streamed_args_for_tool[self.current_tool_id] += frag
-            calls.append(
-                ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=frag)
-            )
+            calls.append(ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=frag))
             try:
                 parsed = json.loads(self.streamed_args_for_tool[self.current_tool_id])
             except (json.JSONDecodeError, ValueError):
@@ -3329,18 +3356,18 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
                         normal_parts.append(release)
-                        self._buffer = buf[len(release):]
+                        self._buffer = buf[len(release) :]
                     break
                 if pos > 0:
                     normal_parts.append(buf[:pos])
                     self._buffer = buf[pos:]
                     continue
                 if kind == "closer":
-                    self._buffer = buf[len(payload):]  # stray terminator: drop
+                    self._buffer = buf[len(payload) :]  # stray terminator: drop
                     continue
                 if kind == "inline":
                     self._enter_recipient(payload.group(1))
-                    self._buffer = buf[payload.end():]
+                    self._buffer = buf[payload.end() :]
                     continue
                 # kind == "start": parse the channel header. While the header-open
                 # seed is unconsumed it is the leftmost marker, so each consuming
@@ -3348,16 +3375,14 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                 # non-header is dropped, never delivered (the model never emitted it).
                 synthetic = self._synthetic_open
                 msg = buf.find(ATEM_MESSAGE)
-                if atem_marker_inside(
-                    buf, len(ATEM_START), msg if msg != -1 else len(buf)
-                ):
+                if atem_marker_inside(buf, len(ATEM_START), msg if msg != -1 else len(buf)):
                     # A control token inside the candidate: headers never contain
                     # markers, so this <|start|> is literal text (a synthetic
                     # seed is simply dropped) -- mirrors the reasoning parser.
                     if not synthetic:
                         normal_parts.append(ATEM_START)
                     self._synthetic_open = False
-                    self._buffer = buf[len(ATEM_START):]
+                    self._buffer = buf[len(ATEM_START) :]
                     continue
                 if msg == -1:
                     # +len(<|message|>) slack: a protocol-legal header whose marker
@@ -3369,7 +3394,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                         if not synthetic:
                             normal_parts.append(ATEM_START)
                         self._synthetic_open = False
-                        self._buffer = buf[len(ATEM_START):]
+                        self._buffer = buf[len(ATEM_START) :]
                         continue
                     break  # header still streaming
                 if msg - len(ATEM_START) > ATEM_HEADER_SPAN:
@@ -3379,12 +3404,12 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                     if not synthetic:
                         normal_parts.append(ATEM_START)
                     self._synthetic_open = False
-                    self._buffer = buf[len(ATEM_START):]
+                    self._buffer = buf[len(ATEM_START) :]
                     continue
-                m = ATEM_RECIPIENT_RE.search(buf[len(ATEM_START):msg])
+                m = ATEM_RECIPIENT_RE.search(buf[len(ATEM_START) : msg])
                 self._enter_recipient(m.group(1) if m else "user")
                 self._synthetic_open = False
-                self._buffer = buf[msg + len(ATEM_MESSAGE):]
+                self._buffer = buf[msg + len(ATEM_MESSAGE) :]
                 continue
 
             pos, kind, payload = self._channel_boundary(buf)
@@ -3392,7 +3417,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
             if self._ch_mode == "skip":
                 if pos == -1:
                     hold = atem_hold_len(buf)
-                    self._buffer = buf[len(buf) - hold:] if hold else ""
+                    self._buffer = buf[len(buf) - hold :] if hold else ""
                     break
                 # Drop the skipped body; transition exactly like text mode would.
                 self._buffer = buf[pos:]
@@ -3407,7 +3432,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                 atem_part = buf[: len(buf) - hold] if hold else buf
                 if not atem_part:
                     break
-                result = self._run_mixin(atem_part, buf[len(atem_part):], tools)
+                result = self._run_mixin(atem_part, buf[len(atem_part) :], tools)
                 self._drop_channel_prose(result.normal_text)
                 calls.extend(result.calls)
                 if self._buffer == buf:
@@ -3427,7 +3452,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
             # residue ahead of the boundary is markup debris and drops with it.
             calls.extend(self._finalize_truncated_invoke())
             if kind == "closer":
-                self._buffer = buf[pos + len(payload):]
+                self._buffer = buf[pos + len(payload) :]
                 self._ch_mode = "text"
                 # NOTE: the truncation mark (when finalize set it) survives the
                 # closer on purpose: on the production pipeline the broken
@@ -3437,7 +3462,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
                 # immediately while trailing closing tags are dropped.
             elif kind == "inline":
                 self._enter_recipient(payload.group(1))
-                self._buffer = buf[payload.end():]
+                self._buffer = buf[payload.end() :]
             else:  # abutting <|start|>: reprocess it in text mode
                 self._buffer = buf[pos:]
                 self._ch_mode = "text"
@@ -3455,7 +3480,7 @@ class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
         if ch_mode != "text" or ps_mode != "idle" or truncated:
             return ""
         if synthetic:
-            residual = residual[len(ATEM_START):]  # the seed: never model output
+            residual = residual[len(ATEM_START) :]  # the seed: never model output
         # At end of stream a <|start|> that never received its <|message|> is NOT
         # a header: deliver the text, drop only the marker(s). Any capped discard
         # here diverged from the layer above -- its span runs on raw bytes while
@@ -3595,7 +3620,11 @@ class FunctionCallParser:
                 normal = parsed_result.normal_text or ""
                 # Only plain text: an unterminated final block would make the
                 # "last closer" precede it and leak markup into content.
-                if tail.strip() and tail.strip() not in normal and not self.detector.has_tool_call(tail):
+                if (
+                    tail.strip()
+                    and tail.strip() not in normal
+                    and not self.detector.has_tool_call(tail)
+                ):
                     parsed_result.normal_text = normal + tail
             return parsed_result
         else:

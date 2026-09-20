@@ -9,7 +9,13 @@ import torch
 from freetoken.distributed import DistributedInfo
 from freetoken.layers.quantization import set_quant_config
 from freetoken.mm.config import ENCODER_SECTIONS, MultimodalConfig
-from freetoken.models.register import EncoderSpec, ModelSpec, _load_attr, checkpoint_quant_config, get_model_spec
+from freetoken.models.register import (
+    EncoderSpec,
+    ModelSpec,
+    _load_attr,
+    checkpoint_quant_config,
+    get_model_spec,
+)
 from freetoken.utils import cached_load_hf_config, init_logger
 
 if TYPE_CHECKING:
@@ -50,6 +56,9 @@ class EngineConfig:
     # shortfall when that context is not affordable. Opt-in, because it trades decode speed for
     # reach, and the trade is the operator's call until the plan can price it (see D-015).
     kv_reserve_context: bool = False
+    allow_rope_extend: bool = (
+        False  # auto-extend RoPE table past checkpoint max_position for 512K/1M
+    )
     moe_cache_policy: str = "lru"
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill

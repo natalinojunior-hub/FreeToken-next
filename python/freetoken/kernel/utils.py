@@ -33,6 +33,7 @@ def _cuda_cflags(extra: List[str]) -> List[str]:
     flags = DEFAULT_CUDA_CFLAGS + extra
     arch_list = os.getenv("TVM_FFI_CUDA_ARCH_LIST", "").split()
     if arch_list:
+
         def _rank(a: str) -> int:
             major, minor = a.rstrip("a").split(".")
             return int(major) * 100 + int(minor)
@@ -40,6 +41,8 @@ def _cuda_cflags(extra: List[str]) -> List[str]:
         cc = max(arch_list, key=_rank).rstrip("a").replace(".", "")
         flags = flags + [f"-gencode=arch=compute_{cc},code=compute_{cc}"]
     return flags
+
+
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool]
 
 

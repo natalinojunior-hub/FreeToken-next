@@ -5,7 +5,6 @@ test can break -- the rotated-domain bookkeeping (pre-rotated Q, no per-tile inv
 rotated back once) -- from quantization error.
 """
 
-
 import pytest
 import torch
 
@@ -16,7 +15,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a C
 
 def _splits(batch, num_q_heads, max_kv_splits, head_dim, device):
     return (
-        torch.empty(batch, num_q_heads, max_kv_splits, head_dim, dtype=torch.float32, device=device),
+        torch.empty(
+            batch, num_q_heads, max_kv_splits, head_dim, dtype=torch.float32, device=device
+        ),
         torch.empty(batch, num_q_heads, max_kv_splits, dtype=torch.float32, device=device),
         torch.full((batch,), max_kv_splits, dtype=torch.int32, device=device),
     )
@@ -39,7 +40,9 @@ def test_decode_on_codes_matches_decode_on_decoded_kv(book, q_heads, kv_heads):
     q = torch.randn(batch, q_heads, head_dim, device=device, dtype=torch.bfloat16)
     k = torch.randn(total, kv_heads, head_dim, device=device, dtype=torch.bfloat16)
     v = torch.randn(total, kv_heads, head_dim, device=device, dtype=torch.bfloat16)
-    indptr = torch.tensor([0] + list(torch.tensor(seq_lens).cumsum(0)), dtype=torch.int32, device=device)
+    indptr = torch.tensor(
+        [0] + list(torch.tensor(seq_lens).cumsum(0)), dtype=torch.int32, device=device
+    )
     indices = torch.arange(total, dtype=torch.int32, device=device)
     q_positions = torch.tensor([s - 1 for s in seq_lens], dtype=torch.int64, device=device)
 
@@ -50,8 +53,17 @@ def test_decode_on_codes_matches_decode_on_decoded_kv(book, q_heads, kv_heads):
 
     logits, lse, splits = _splits(batch, q_heads, max_kv_splits, head_dim, device)
     want = decode_paged_attention(
-        q, k_hat, v_hat, indptr, indices, q_positions, logits, lse, splits,
-        max_kv_splits, sm_scale,
+        q,
+        k_hat,
+        v_hat,
+        indptr,
+        indices,
+        q_positions,
+        logits,
+        lse,
+        splits,
+        max_kv_splits,
+        sm_scale,
     )
 
     # same values, reached the fused way: codes + norm, Q pre-rotated, output rotated back once
@@ -65,8 +77,17 @@ def test_decode_on_codes_matches_decode_on_decoded_kv(book, q_heads, kv_heads):
     )
     logits2, lse2, splits2 = _splits(batch, q_heads, max_kv_splits, head_dim, device)
     got_rot = decode_paged_attention(
-        q_rot, codes_k, codes_v, indptr, indices, q_positions, logits2, lse2, splits2,
-        max_kv_splits, sm_scale,
+        q_rot,
+        codes_k,
+        codes_v,
+        indptr,
+        indices,
+        q_positions,
+        logits2,
+        lse2,
+        splits2,
+        max_kv_splits,
+        sm_scale,
         turbo={"k_norm": norm_k, "v_norm": norm_v, "cent": cent, "book3": book == "turbo3"},
     )
     got = tk.inv_rotate(got_rot.reshape(-1, head_dim)).reshape(got_rot.shape).to(torch.bfloat16)
@@ -103,11 +124,17 @@ def test_extend_on_codes_matches_extend_on_decoded_kv():
     k = torch.randn(total, kv_heads, head_dim, device=device, dtype=torch.bfloat16)
     v = torch.randn(total, kv_heads, head_dim, device=device, dtype=torch.bfloat16)
     starts = [0] + list(torch.tensor(seq_lens).cumsum(0))[:-1]
-    qo_indptr = torch.tensor([0] + list(torch.tensor(q_lens).cumsum(0)), dtype=torch.int32, device=device)
-    kv_indptr = torch.tensor([0] + list(torch.tensor(seq_lens).cumsum(0)), dtype=torch.int32, device=device)
+    qo_indptr = torch.tensor(
+        [0] + list(torch.tensor(q_lens).cumsum(0)), dtype=torch.int32, device=device
+    )
+    kv_indptr = torch.tensor(
+        [0] + list(torch.tensor(seq_lens).cumsum(0)), dtype=torch.int32, device=device
+    )
     kv_indices = torch.arange(total, dtype=torch.int32, device=device)
     prefix = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
-    new_rows = lambda t: torch.cat([t[a + p : a + s] for a, p, s in zip(starts, prefix_lens, seq_lens)]).contiguous()
+    new_rows = lambda t: torch.cat(
+        [t[a + p : a + s] for a, p, s in zip(starts, prefix_lens, seq_lens)]
+    ).contiguous()
     k_extend, v_extend = new_rows(k), new_rows(v)
     assert k_extend.shape[0] == num_q
 
@@ -117,8 +144,17 @@ def test_extend_on_codes_matches_extend_on_decoded_kv():
     v_hat = tk.decode(vc, vn, book).reshape(total, kv_heads, head_dim).to(torch.bfloat16)
 
     want = extend_paged_attention(
-        q, k_hat, v_hat, qo_indptr, kv_indptr, kv_indices, prefix, max(q_lens), sm_scale,
-        k_extend=k_extend, v_extend=v_extend,
+        q,
+        k_hat,
+        v_hat,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        prefix,
+        max(q_lens),
+        sm_scale,
+        k_extend=k_extend,
+        v_extend=v_extend,
     )
 
     def rot(t):
@@ -128,8 +164,14 @@ def test_extend_on_codes_matches_extend_on_decoded_kv():
         rot(q),
         kc.reshape(total, kv_heads, -1).contiguous(),
         vc.reshape(total, kv_heads, -1).contiguous(),
-        qo_indptr, kv_indptr, kv_indices, prefix, max(q_lens), sm_scale,
-        k_extend=rot(k_extend), v_extend=rot(v_extend),
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        prefix,
+        max(q_lens),
+        sm_scale,
+        k_extend=rot(k_extend),
+        v_extend=rot(v_extend),
         turbo={
             "k_norm": kn.reshape(total, kv_heads, 1).contiguous(),
             "v_norm": vn.reshape(total, kv_heads, 1).contiguous(),
@@ -140,7 +182,9 @@ def test_extend_on_codes_matches_extend_on_decoded_kv():
     got = tk.inv_rotate(got_rot.reshape(-1, head_dim)).reshape(got_rot.shape).to(torch.bfloat16)
     assert torch.isfinite(got.float()).all()
     assert (got.float() - want.float()).abs().max().item() < 3e-2
-    cos = torch.nn.functional.cosine_similarity(got.float().flatten(), want.float().flatten(), dim=0).item()
+    cos = torch.nn.functional.cosine_similarity(
+        got.float().flatten(), want.float().flatten(), dim=0
+    ).item()
     assert cos > 0.9999, f"prefill on codes is a different attention ({cos})"
 
 

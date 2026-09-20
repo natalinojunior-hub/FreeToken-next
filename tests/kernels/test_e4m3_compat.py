@@ -44,8 +44,10 @@ def _native_cc() -> bool:
 # ======================================================================================
 # 1. Primitives vs the native fp8 unit (needs sm_89+ hardware for the reference).
 # ======================================================================================
-@pytest.mark.skipif(not torch.cuda.is_available() or not _native_cc(),
-                    reason="needs native fp8 (sm_89+) as reference")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _native_cc(),
+    reason="needs native fp8 (sm_89+) as reference",
+)
 class TestPrimitives:
     def test_decode_f32_bitexact(self):
         import triton
@@ -99,12 +101,28 @@ class TestPrimitives:
         grid = torch.sort(grid[~grid.isnan()]).values
         parts = [
             torch.empty(1 << 20, device="cuda").uniform_(-448, 448),
-            (torch.empty(1 << 20, device="cuda").uniform_(-14, 9).exp2()
-             * torch.where(torch.rand(1 << 20, device="cuda") < 0.5, -1.0, 1.0)),
-            grid,                          # every representable value
+            (
+                torch.empty(1 << 20, device="cuda").uniform_(-14, 9).exp2()
+                * torch.where(torch.rand(1 << 20, device="cuda") < 0.5, -1.0, 1.0)
+            ),
+            grid,  # every representable value
             (grid[1:] + grid[:-1]) * 0.5,  # every exact tie midpoint
-            torch.tensor([0.0, -0.0, 448.0, -448.0, 2**-6, 2**-6 - 2**-10, 2**-6 + 2**-10,
-                          2**-9, 2**-10, 3 * 2**-10, 5 * 2**-10], device="cuda"),
+            torch.tensor(
+                [
+                    0.0,
+                    -0.0,
+                    448.0,
+                    -448.0,
+                    2**-6,
+                    2**-6 - 2**-10,
+                    2**-6 + 2**-10,
+                    2**-9,
+                    2**-10,
+                    3 * 2**-10,
+                    5 * 2**-10,
+                ],
+                device="cuda",
+            ),
         ]
         x = torch.cat(parts).clamp(-448, 448).contiguous()
         y = torch.empty_like(x)
@@ -119,22 +137,30 @@ class TestPrimitives:
 def _emit_all(path: str) -> None:
     from freetoken.kernel.triton.e4m3_compat import e4m3_native
     from freetoken.kernel.triton.dsv4.fp8_linear import (
-        act_quant_fp8, act_quant_fp8_inplace, act_quant_fp8_roundtrip,
-        block_fp8_linear as dsv4_block_fp8_linear, fp4_act_quant_inplace,
+        act_quant_fp8,
+        act_quant_fp8_inplace,
+        act_quant_fp8_roundtrip,
+        block_fp8_linear as dsv4_block_fp8_linear,
+        fp4_act_quant_inplace,
     )
     from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
     from freetoken.kernel.triton.fp8_block_linear import (
-        block_fp8_linear, per_token_group_quant_fp8,
+        block_fp8_linear,
+        per_token_group_quant_fp8,
     )
     from freetoken.kernel.triton.fp8_blockscale_moe import (
-        fused_experts_decode_fp8_blockscale, fused_experts_fp8_blockscale,
+        fused_experts_decode_fp8_blockscale,
+        fused_experts_fp8_blockscale,
     )
     from freetoken.kernel.triton.nvfp4_linear import (
-        nvfp4_dense_linear, nvfp4_dense_linear_t, nvfp4_transpose_resident,
+        nvfp4_dense_linear,
+        nvfp4_dense_linear_t,
+        nvfp4_transpose_resident,
     )
     from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
     from freetoken.moe.fused_nvfp4 import (
-        fused_experts_decode_nvfp4_marlin, fused_experts_decode_nvfp4_serial,
+        fused_experts_decode_nvfp4_marlin,
+        fused_experts_decode_nvfp4_serial,
         fused_experts_nvfp4,
     )
 
@@ -152,13 +178,16 @@ def _emit_all(path: str) -> None:
     xi = torch.randn(16, 768, dtype=torch.bfloat16, device=dev)
     out["dsv4_inplace"] = act_quant_fp8_inplace(xi.clone()[:, :512], 64).cpu()
     out["dsv4_fp4"] = fp4_act_quant_inplace(
-        torch.randn(32, 128, dtype=torch.bfloat16, device=dev), 32).cpu()
+        torch.randn(32, 128, dtype=torch.bfloat16, device=dev), 32
+    ).cpu()
     wq = torch.randn(1024, 4096, device=dev).to(FP8)
     sq = torch.full((8, 32), 129, dtype=torch.uint8, device=dev).view(torch.float8_e8m0fnu)
-    out["dsv4_gemv"] = f32(dsv4_block_fp8_linear(
-        torch.randn(1, 4096, dtype=torch.bfloat16, device=dev), wq, sq))
-    out["dsv4_gemm"] = f32(dsv4_block_fp8_linear(
-        torch.randn(64, 4096, dtype=torch.bfloat16, device=dev), wq, sq))
+    out["dsv4_gemv"] = f32(
+        dsv4_block_fp8_linear(torch.randn(1, 4096, dtype=torch.bfloat16, device=dev), wq, sq)
+    )
+    out["dsv4_gemm"] = f32(
+        dsv4_block_fp8_linear(torch.randn(64, 4096, dtype=torch.bfloat16, device=dev), wq, sq)
+    )
 
     # per-tensor fp8 dense
     w = torch.randn(256, 512, device=dev).to(FP8)
@@ -171,7 +200,8 @@ def _emit_all(path: str) -> None:
     # generic block fp8 dense
     bs = torch.rand(2, 4, dtype=torch.bfloat16, device=dev) + 0.5
     aq_y, aq_s = per_token_group_quant_fp8(
-        torch.randn(37, 512, dtype=torch.bfloat16, device=dev) * 2)
+        torch.randn(37, 512, dtype=torch.bfloat16, device=dev) * 2
+    )
     out["blk_aq_y"], out["blk_aq_s"] = f32(aq_y), aq_s.cpu()
     out["blk_gemv"] = f32(block_fp8_linear(x1, w, bs))
     out["blk_gemm"] = f32(block_fp8_linear(xm, w, bs))
@@ -186,9 +216,11 @@ def _emit_all(path: str) -> None:
     tids = torch.tensor([[0, 2], [1, 3]], dtype=torch.int32, device=dev)
     tw = torch.rand(2, 2, dtype=torch.float32, device=dev)
     out["moe_decode_fp8"] = f32(
-        fused_experts_decode_fp8_blockscale(hidden, gu, gus, dn, dns, tw, tids))
+        fused_experts_decode_fp8_blockscale(hidden, gu, gus, dn, dns, tw, tids)
+    )
     out["moe_prefill_fp8"] = f32(
-        fused_experts_fp8_blockscale(hidden, gu, gus, dn, dns, tw, tids, E))
+        fused_experts_fp8_blockscale(hidden, gu, gus, dn, dns, tw, tids, E)
+    )
 
     # nvfp4 dense: row-major + transposed resident, gemv / in-kernel gemm / scratch gemm
     N, K = 128, 256
@@ -209,8 +241,9 @@ def _emit_all(path: str) -> None:
     pkc = torch.randint(0, 256, (E, 64, 128), dtype=torch.uint8, device=dev)
     scc = (torch.rand(E, 64, 16, device=dev) + 0.1).to(FP8)
     gc = (torch.rand(E, 64, device=dev) * 0.05 + 0.01).to(torch.float16)
-    out["nv_dequant"] = f32(dequant_nvfp4(
-        pkc, scc, gc, torch.tensor([1, 3], dtype=torch.int32, device=dev)))
+    out["nv_dequant"] = f32(
+        dequant_nvfp4(pkc, scc, gc, torch.tensor([1, 3], dtype=torch.int32, device=dev))
+    )
 
     # nvfp4 fused moe: marlin / serial decode + prefill
     S, H4, I4 = 4, 256, 128
@@ -221,12 +254,15 @@ def _emit_all(path: str) -> None:
     dns4 = (torch.rand(S, H4, I4 // 16, device=dev) + 0.1).to(FP8)
     dng = (torch.rand(S, H4, device=dev) * 0.05 + 0.01).to(torch.float16)
     hid4 = torch.randn(2, H4, dtype=torch.bfloat16, device=dev)
-    out["nv_moe_marlin"] = f32(fused_experts_decode_nvfp4_marlin(
-        hid4, gup, gus4, gug, dnp, dns4, dng, tw, tids))
-    out["nv_moe_serial"] = f32(fused_experts_decode_nvfp4_serial(
-        hid4, gup, gus4, gug, dnp, dns4, dng, tw, tids))
-    out["nv_moe_prefill"] = f32(fused_experts_nvfp4(
-        hid4, gup, gus4, gug, dnp, dns4, dng, tw, tids, S))
+    out["nv_moe_marlin"] = f32(
+        fused_experts_decode_nvfp4_marlin(hid4, gup, gus4, gug, dnp, dns4, dng, tw, tids)
+    )
+    out["nv_moe_serial"] = f32(
+        fused_experts_decode_nvfp4_serial(hid4, gup, gus4, gug, dnp, dns4, dng, tw, tids)
+    )
+    out["nv_moe_prefill"] = f32(
+        fused_experts_nvfp4(hid4, gup, gus4, gug, dnp, dns4, dng, tw, tids, S)
+    )
 
     torch.save(out, path)
 
@@ -246,8 +282,10 @@ def _child_env(tmp_path, **extra) -> dict:
 # 2. Forced-EMU vs native A/B across every wrapper.
 # ======================================================================================
 @pytest.mark.slow
-@pytest.mark.skipif(not torch.cuda.is_available() or not _native_cc(),
-                    reason="needs native fp8 (sm_89+) as reference")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _native_cc(),
+    reason="needs native fp8 (sm_89+) as reference",
+)
 def test_forced_emu_matches_native(tmp_path):
     native_pt = str(tmp_path / "native.pt")
     emu_pt = str(tmp_path / "emu.pt")
@@ -255,7 +293,9 @@ def test_forced_emu_matches_native(tmp_path):
     r = subprocess.run(
         [sys.executable, __file__, "emit", emu_pt],
         env=_child_env(tmp_path, FREETOKEN_FORCE_E4M3_EMU="1"),
-        capture_output=True, text=True, timeout=1200,
+        capture_output=True,
+        text=True,
+        timeout=1200,
     )
     assert r.returncode == 0, f"EMU emit failed:\n{r.stdout}\n{r.stderr}"
     a, b = torch.load(native_pt), torch.load(emu_pt)
@@ -278,9 +318,13 @@ def test_compile_gate_foreign_arch(arch, tmp_path):
         # pin the flag off so a developer's exported FORCE_EMU cannot dead-code
         # the native branch out of the sm_89/120 gates
         env=_child_env(tmp_path, FREETOKEN_FORCE_E4M3_EMU=""),
-        capture_output=True, text=True, timeout=1200,
+        capture_output=True,
+        text=True,
+        timeout=1200,
     )
-    assert r.returncode == 0, f"sm_{arch} compile gate failed:\n{r.stdout[-2000:]}\n{r.stderr[-4000:]}"
+    assert r.returncode == 0, (
+        f"sm_{arch} compile gate failed:\n{r.stdout[-2000:]}\n{r.stderr[-4000:]}"
+    )
 
 
 def _gate_main(arch: int) -> None:

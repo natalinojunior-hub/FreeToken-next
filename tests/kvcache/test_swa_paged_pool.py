@@ -5,6 +5,7 @@ the dense full->swa mapping with the slot-0 sentinel, alloc_swa + mapping-based
 translate, free_swa idempotence over the sentinel (no double-free), exhaustion,
 and the rebuild reset (mapping + free-list re-sized atomically with the buffer).
 """
+
 from __future__ import annotations
 
 import pytest
@@ -24,7 +25,9 @@ def _specs():
     from freetoken.models.config import KVCacheGroupSpec
 
     return (
-        KVCacheGroupSpec(name="full", layer_ids=(1,), num_kv_heads=1, head_dim=8, sliding_window=None),
+        KVCacheGroupSpec(
+            name="full", layer_ids=(1,), num_kv_heads=1, head_dim=8, sliding_window=None
+        ),
         KVCacheGroupSpec(name="swa", layer_ids=(0,), num_kv_heads=1, head_dim=8, sliding_window=4),
     )
 

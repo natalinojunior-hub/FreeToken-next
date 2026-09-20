@@ -37,6 +37,7 @@ from freetoken.models.config import (
 
 from .args import load_args
 
+
 def _text_config(hf_config: Any) -> Any:
     return getattr(hf_config, "text_config", None) or hf_config
 
@@ -69,7 +70,9 @@ def parse_vision_config(hf_config: Any) -> VisionConfig | None:
     if vc is None:
         return None
     if vc.hidden_act != "gelu":
-        raise NotImplementedError(f"minimax_m3 vision tower activation {vc.hidden_act!r}; only gelu is implemented")
+        raise NotImplementedError(
+            f"minimax_m3 vision tower activation {vc.hidden_act!r}; only gelu is implemented"
+        )
     # the native config moves rope_theta into rope_parameters; the checkpoint's own config keeps it flat
     rope_params = getattr(vc, "rope_parameters", None) or {}
     text_hidden_size = _text_config(hf_config).hidden_size
@@ -83,7 +86,9 @@ def parse_vision_config(hf_config: Any) -> VisionConfig | None:
         temporal_patch_size=_compression(vc, "temporal_patch_size"),
         spatial_merge_size=_compression(vc, "spatial_merge_size"),
         layer_norm_eps=vc.layer_norm_eps,
-        rope_theta=float(rope_params["rope_theta"] if "rope_theta" in rope_params else vc.rope_theta),
+        rope_theta=float(
+            rope_params["rope_theta"] if "rope_theta" in rope_params else vc.rope_theta
+        ),
         projector_hidden_size=getattr(hf_config, "projector_hidden_size", None) or text_hidden_size,
         text_hidden_size=text_hidden_size,
     )
@@ -138,8 +143,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # offload cache and the generic num_moe_layers arithmetic rely on that shape.
     first_k_dense = num_layers - len(args.moe_layer_ids)
     assert args.moe_layer_ids == tuple(range(first_k_dense, num_layers)), (
-        "MiniMax-M3 expects a contiguous dense prefix in moe_layer_freq, got "
-        f"{args.moe_layer_ids}"
+        f"MiniMax-M3 expects a contiguous dense prefix in moe_layer_freq, got {args.moe_layer_ids}"
     )
 
     rotary_config = RotaryConfig(
@@ -229,7 +233,9 @@ def parse_config(hf_config: Any) -> ModelConfig:
         m3_args=args,
         vision_config=parse_vision_config(hf_config),
         # the native config maps image_token_id onto the checkpoint's image_token_index
-        image_token_id=getattr(hf_config, "image_token_id", getattr(hf_config, "image_token_index", None)),
+        image_token_id=getattr(
+            hf_config, "image_token_id", getattr(hf_config, "image_token_index", None)
+        ),
     )
 
 

@@ -41,8 +41,11 @@ class Gemma4Attention(BaseOP):
             prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = LinearReplicated(
-            self.q_dim, config.hidden_size, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.o_proj",
+            self.q_dim,
+            config.hidden_size,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.o_proj",
         )
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -57,11 +60,7 @@ class Gemma4Attention(BaseOP):
             rotary_dim=rotary_config.rotary_dim,
             max_position=rotary_config.max_position,
             base=rotary_config.base,
-            rope_scaling=(
-                tuple(rotary_config.scaling.items())
-                if rotary_config.scaling
-                else None
-            ),
+            rope_scaling=(tuple(rotary_config.scaling.items()) if rotary_config.scaling else None),
         )
 
     def _apply_rope(

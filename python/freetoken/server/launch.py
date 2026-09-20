@@ -72,9 +72,7 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     if args.tp_info.is_primary():
         from freetoken.utils.progress import set_progress_sink
 
-        set_progress_sink(
-            lambda desc, done, total: ack_queue.put(("progress", desc, done, total))
-        )
+        set_progress_sink(lambda desc, done, total: ack_queue.put(("progress", desc, done, total)))
 
     with torch.inference_mode():
         try:

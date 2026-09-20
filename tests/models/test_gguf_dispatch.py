@@ -49,6 +49,7 @@ def mock_kernel_module(monkeypatch):
 
     def make_mmvq_kernel(call_log):
         """Mock ggml_mul_mat_vec_a8: GEMV kernel for small batch."""
+
         def kernel(qweight, x, qweight_type, out_features):
             call_log["ggml_mul_mat_vec_a8"] = {
                 "qweight_shape": qweight.shape,
@@ -58,10 +59,12 @@ def mock_kernel_module(monkeypatch):
             }
             batch_size = x.shape[0]
             return torch.randn(batch_size, out_features, dtype=x.dtype)
+
         return kernel
 
     def make_mmq_kernel(call_log):
         """Mock ggml_mul_mat_a8: MMQ kernel for large batch."""
+
         def kernel(qweight, x, qweight_type, out_features):
             call_log["ggml_mul_mat_a8"] = {
                 "qweight_shape": qweight.shape,
@@ -71,10 +74,12 @@ def mock_kernel_module(monkeypatch):
             }
             batch_size = x.shape[0]
             return torch.randn(batch_size, out_features, dtype=x.dtype)
+
         return kernel
 
     def make_dequant_kernel(call_log):
         """Mock ggml_dequantize: materializes weight into BF16."""
+
         def kernel(qweight, qweight_type, out_features, in_features, out_dtype):
             call_log["ggml_dequantize"] = {
                 "qweight_shape": qweight.shape,
@@ -84,6 +89,7 @@ def mock_kernel_module(monkeypatch):
                 "out_dtype": out_dtype,
             }
             return torch.randn(out_features, in_features, dtype=out_dtype)
+
         return kernel
 
     mock_module = ModuleType("freetoken.kernel.gguf")
@@ -130,11 +136,14 @@ class TestEmptyInput:
 class TestUnquantized:
     """Test unquantized paths (F32, F16, BF16)."""
 
-    @pytest.mark.parametrize("qweight_type,dtype", [
-        (GGML_F32, torch.float32),
-        (GGML_F16, torch.float16),
-        (GGML_BF16, torch.bfloat16),
-    ])
+    @pytest.mark.parametrize(
+        "qweight_type,dtype",
+        [
+            (GGML_F32, torch.float32),
+            (GGML_F16, torch.float16),
+            (GGML_BF16, torch.bfloat16),
+        ],
+    )
     def test_unquantized_never_calls_kernels(self, mock_kernel_module, qweight_type, dtype):
         """F32/F16/BF16 go through plain torch matmul, no kernel call."""
         out_features = 4096
@@ -159,13 +168,16 @@ class TestUnquantized:
 class TestSmallBatchMMVQ:
     """Test small-batch dispatch to ggml_mul_mat_vec_a8 (MMVQ)."""
 
-    @pytest.mark.parametrize("qweight_type", [
-        GGML_Q2_K,   # K-quant
-        GGML_Q4_K,   # K-quant
-        GGML_Q6_K,   # K-quant
-        GGML_IQ2_S,  # I-quant
-        GGML_IQ1_M,  # I-quant
-    ])
+    @pytest.mark.parametrize(
+        "qweight_type",
+        [
+            GGML_Q2_K,  # K-quant
+            GGML_Q4_K,  # K-quant
+            GGML_Q6_K,  # K-quant
+            GGML_IQ2_S,  # I-quant
+            GGML_IQ1_M,  # I-quant
+        ],
+    )
     def test_small_batch_uses_mmvq(self, mock_kernel_module, qweight_type):
         """Batch <= _MMVQ_SAFE in MMVQ_TYPES calls ggml_mul_mat_vec_a8."""
         out_features = 4096
@@ -192,11 +204,14 @@ class TestSmallBatchMMVQ:
 class TestLargeBatchStandardQuants:
     """Test large-batch K-quants and standard quants dispatch to ggml_mul_mat_a8 (MMQ)."""
 
-    @pytest.mark.parametrize("qweight_type", [
-        GGML_Q2_K,
-        GGML_Q4_K,
-        GGML_Q6_K,
-    ])
+    @pytest.mark.parametrize(
+        "qweight_type",
+        [
+            GGML_Q2_K,
+            GGML_Q4_K,
+            GGML_Q6_K,
+        ],
+    )
     def test_kquant_large_batch_takes_mmq(self, mock_kernel_module, qweight_type):
         """K-quants at large batch call ggml_mul_mat_a8."""
         out_features = 4096
@@ -223,10 +238,13 @@ class TestLargeBatchStandardQuants:
 class TestIQuantDispatch:
     """Test I-quant dispatch: they have MMVQ but NO MMQ kernels."""
 
-    @pytest.mark.parametrize("qweight_type", [
-        GGML_IQ2_S,  # enum=22
-        GGML_IQ1_M,  # enum=29
-    ])
+    @pytest.mark.parametrize(
+        "qweight_type",
+        [
+            GGML_IQ2_S,  # enum=22
+            GGML_IQ1_M,  # enum=29
+        ],
+    )
     def test_iquant_small_batch_takes_mmvq(self, mock_kernel_module, qweight_type):
         """I-quants with batch <= _MMVQ_SAFE call ggml_mul_mat_vec_a8."""
         out_features = 4096
@@ -247,10 +265,13 @@ class TestIQuantDispatch:
         assert call_info["qweight_type"] == qweight_type
         assert result.shape == (batch_size, out_features)
 
-    @pytest.mark.parametrize("qweight_type", [
-        GGML_IQ2_S,  # enum=22
-        GGML_IQ1_M,  # enum=29
-    ])
+    @pytest.mark.parametrize(
+        "qweight_type",
+        [
+            GGML_IQ2_S,  # enum=22
+            GGML_IQ1_M,  # enum=29
+        ],
+    )
     def test_iquant_large_batch_takes_dequant_path(self, mock_kernel_module, qweight_type):
         """I-quants have no MMQ kernel, so large batch falls back to dequant + matmul.
 

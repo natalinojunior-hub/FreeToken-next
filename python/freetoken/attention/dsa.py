@@ -54,11 +54,11 @@ class KpoolPlan(NamedTuple):
     """glm5_next kpool: one forward's slab/ring routing (layer-invariant; the
     first DSA layer plans, the rest reuse -- Glm5NextDSABackend._plan_kpool_writes)."""
 
-    cmp_rows: torch.Tensor      # [T] shadow row (closing) or scratch row
-    ring_rows: torch.Tensor     # [T] tail-ring row, -1 = masked off
-    ring_slots: torch.Tensor    # [n_req] Req.table_idx
+    cmp_rows: torch.Tensor  # [T] shadow row (closing) or scratch row
+    ring_rows: torch.Tensor  # [T] tail-ring row, -1 = masked off
+    ring_slots: torch.Tensor  # [n_req] Req.table_idx
     token_to_req: torch.Tensor  # [T]
-    cu_seqlens: torch.Tensor    # [n_req + 1]
+    cu_seqlens: torch.Tensor  # [n_req + 1]
 
 
 @dataclass(frozen=True)
@@ -67,6 +67,7 @@ class DSAIndexerInputs:
     per call (QSAIndexerInputs precedent): the backend holds no model parameters.
     ``gate``/``ape`` are the glm5_next kpool extras (None for GLM-5.2): the raw
     per-channel compression gate scores and the [kpool, Di] APE weight."""
+
     # fmt: off
     q:    torch.Tensor              # [T, Hi, Di]
     k:    torch.Tensor              # [T, Di]
@@ -199,8 +200,12 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
 
         return glm_dsa_sparse_attn(
-            q_cat, self.kvcache.latent_rows(layer_id), sel, self.sm_scale,
-            counts=cnt, d_v=self.kv_lora_rank,
+            q_cat,
+            self.kvcache.latent_rows(layer_id),
+            sel,
+            self.sm_scale,
+            counts=cnt,
+            d_v=self.kv_lora_rank,
         )
 
     def mla_forward(
@@ -259,8 +264,13 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
 
     # ----- prefill / extend (eager) ------------------------------------------------------
     def _select_prefill(
-        self, slot: int, q_idx: torch.Tensor, w: torch.Tensor,
-        rows: torch.Tensor, positions: torch.Tensor, start_pos: int,
+        self,
+        slot: int,
+        q_idx: torch.Tensor,
+        w: torch.Tensor,
+        rows: torch.Tensor,
+        positions: torch.Tensor,
+        start_pos: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-request causal top-k: ([1, m, K] physical rows, [1, m] counts).
         ``start_pos`` is the request's first query position -- a host int
@@ -278,8 +288,12 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
             scores = self.dsa_prefill_logits(q_idx[s0:s1], k_all, w[s0:s1])
             # Shared selection semantics (dsv4_indexer): token-granular == ratio 1.
             picks = self.indexer_select_prefill(
-                scores.unsqueeze(0), start_pos=start_pos + s0, seqlen=s1 - s0,
-                ratio=1, topk=k_sel, offset=0,
+                scores.unsqueeze(0),
+                start_pos=start_pos + s0,
+                seqlen=s1 - s0,
+                ratio=1,
+                topk=k_sel,
+                offset=0,
             )[0]
             sel[s0:s1] = self.dsa_map_rows(picks, rows.view(1, -1).expand(s1 - s0, -1))
         cnt = torch.clamp(positions + 1, max=k_sel).to(torch.int32)
@@ -299,7 +313,8 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
             md.sel[layer_id] = [
                 self._select_prefill(
                     self._idx_slot[layer_id],
-                    q_idx[qo[i] : qo[i + 1]], w[qo[i] : qo[i + 1]],
+                    q_idx[qo[i] : qo[i + 1]],
+                    w[qo[i] : qo[i + 1]],
                     page_table[r.table_idx, : r.device_len],
                     batch.positions[qo[i] : qo[i + 1]],
                     kv_lens[i] - (qo[i + 1] - qo[i]),  # cached_len == first position
@@ -322,7 +337,9 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
                 cnt = (batch.positions[qo[i] : qo[i + 1]] + 1).to(torch.int32).view(1, m)
             o[qo[i] : qo[i + 1]] = self._attend(
                 q_cat[qo[i] : qo[i + 1]].view(1, m, self.num_heads, self.latent_dim),
-                layer_id, sel, cnt,
+                layer_id,
+                sel,
+                cnt,
             ).view(m, self.num_heads, self.kv_lora_rank)
         return o
 
@@ -363,9 +380,7 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
 
     def prepare_for_replay(self, batch: Batch) -> None:
         assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
-        self._stage_decode(
-            batch, batch.padded_size, batch.active_table_idx.to(torch.int64)
-        )
+        self._stage_decode(batch, batch.padded_size, batch.active_table_idx.to(torch.int64))
 
     def reset_capture(self) -> None:
         super().reset_capture()

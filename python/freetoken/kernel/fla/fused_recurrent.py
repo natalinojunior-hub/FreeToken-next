@@ -122,9 +122,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             else:
                 i_t = 0
             # Load state index and check for invalid entries
-            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
-                tl.int64
-            )
+            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(tl.int64)
             # DIVERGENCE from upstream: vLLM treats slot 0 as its NULL_BLOCK_ID
             # sentinel (`state_idx <= 0`), which silently skips a real request that
             # keys state by raw table_idx == 0 (--cache-type naive). FreeToken's
@@ -159,9 +157,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                 # bit-for-bit (same tl.exp, same fp32 math; the intermediate
                 # gate value this replaces was stored/reloaded as fp32,
                 # which is lossless): y = lb / (1 + exp(-exp(A)*(g+bias))).
-                b_gk += tl.load(
-                    g_bias + i_h * K + o_k, mask=mask_k, other=0.0
-                ).to(tl.float32)
+                b_gk += tl.load(g_bias + i_h * K + o_k, mask=mask_k, other=0.0).to(tl.float32)
                 b_gk = LOWER_BOUND / (1.0 + tl.exp(-(b_a_log * b_gk)))
             b_h *= exp(b_gk[None, :])
         # [BV]
@@ -185,9 +181,9 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         # keep the states for multi-query tokens
         if INPLACE_FINAL_STATE:
             # Load state index and check for invalid entries
-            final_state_idx = tl.load(
-                ssm_state_indices + i_n * stride_indices_seq + i_t
-            ).to(tl.int64)
+            final_state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
+                tl.int64
+            )
             # DIVERGENCE from upstream: no slot-0 sentinel (see the load-side note).
             if final_state_idx >= 0:
                 p_ht = ht + final_state_idx * stride_final_state_token
@@ -389,15 +385,11 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if mixed_qkv.ndim != 2:
-        raise ValueError(
-            f"`mixed_qkv` must be a 2D tensor (got ndim={mixed_qkv.ndim})."
-        )
+        raise ValueError(f"`mixed_qkv` must be a 2D tensor (got ndim={mixed_qkv.ndim}).")
     if mixed_qkv.stride(-1) != 1:
         raise ValueError("`mixed_qkv` must be contiguous in the last dim.")
     if a.ndim != 2 or b.ndim != 2:
-        raise ValueError(
-            f"`a` and `b` must be 2D tensors (got a.ndim={a.ndim}, b.ndim={b.ndim})."
-        )
+        raise ValueError(f"`a` and `b` must be 2D tensors (got a.ndim={a.ndim}, b.ndim={b.ndim}).")
     if a.stride(-1) != 1 or b.stride(-1) != 1:
         raise ValueError("`a`/`b` must be contiguous in the last dim.")
     if A_log.ndim != 1 or dt_bias.ndim != 1:
@@ -435,9 +427,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         )
 
     if initial_state.ndim != 4:
-        raise ValueError(
-            f"`initial_state` must be a 4D tensor (got ndim={initial_state.ndim})."
-        )
+        raise ValueError(f"`initial_state` must be a 4D tensor (got ndim={initial_state.ndim}).")
     if initial_state.stride(-1) != 1:
         raise ValueError("`initial_state` must be contiguous in the last dim.")
     HV, V, K = initial_state.shape[-3:]
@@ -457,23 +447,17 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     qkv_dim = mixed_qkv.shape[1]
     qk_dim = qkv_dim - HV * V
     if qk_dim <= 0 or qk_dim % 2 != 0:
-        raise ValueError(
-            f"Invalid packed `mixed_qkv` last dim={qkv_dim} for HV={HV}, V={V}."
-        )
+        raise ValueError(f"Invalid packed `mixed_qkv` last dim={qkv_dim} for HV={HV}, V={V}.")
     q_dim = qk_dim // 2
     if q_dim % K != 0:
         raise ValueError(f"Invalid packed Q size {q_dim}: must be divisible by K={K}.")
     H = q_dim // K
     if H <= 0 or HV % H != 0:
-        raise ValueError(
-            f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}."
-        )
+        raise ValueError(f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}.")
 
     BK = triton.next_power_of_2(K)
     if triton.cdiv(K, BK) != 1:
-        raise ValueError(
-            f"Packed decode kernel only supports NK=1 (got K={K}, BK={BK})."
-        )
+        raise ValueError(f"Packed decode kernel only supports NK=1 (got K={K}, BK={BK}).")
     BV = min(triton.next_power_of_2(V), 32)
     num_stages = 3
     num_warps = 1

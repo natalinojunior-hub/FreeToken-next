@@ -105,8 +105,12 @@ class MoELayer(BaseOP):
     ) -> torch.Tensor:
         assert self.quant_method is not None
         return self.quant_method.apply(
-            hidden_states, topk_weights, topk_ids, self.quant_method.resident_view(self),
-            layer=self, is_prefill=get_global_ctx().batch.is_prefill,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            self.quant_method.resident_view(self),
+            layer=self,
+            is_prefill=get_global_ctx().batch.is_prefill,
         )
 
     def routed_forward(
@@ -299,7 +303,7 @@ class OffloadMoELayer(MoELayer):
             hidden_states,
             topk_weights,
             topk_ids,
-            views=cache.bank_views(),
+            views=cache.bank_views(layer_id=self.layer_id),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
@@ -334,9 +338,7 @@ class OffloadMoELayer(MoELayer):
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
         # PCIe fetch + GPU GEMM, serializing the two so an A/B isolates the overlap win.
-        cpu_routed_early = (
-            executor.decode_sync(pending) if not _HYBRID_OVERLAP else None
-        )
+        cpu_routed_early = executor.decode_sync(pending) if not _HYBRID_OVERLAP else None
 
         cache.copy_missing()
         gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
@@ -346,7 +348,7 @@ class OffloadMoELayer(MoELayer):
             hidden_states,
             gpu_w,
             gpu_slots,
-            views=cache.bank_views(),
+            views=cache.bank_views(layer_id=self.layer_id),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
@@ -387,7 +389,7 @@ class OffloadMoELayer(MoELayer):
             hidden_states,
             topk_weights,
             topk_ids,
-            views=cache.bank_views(self.num_experts),
+            views=cache.bank_views(self.num_experts, layer_id=self.layer_id),
             n=self.num_experts,
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
@@ -423,11 +425,15 @@ class OffloadMoELayer(MoELayer):
         is_prefill: bool,
     ) -> torch.Tensor:
         if self.quant_method is not None:
-            from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
+            from freetoken.moe.legacy_format import (
+                canonical_role,
+            )  # legacy_format imports this package
 
             view = ExpertView(
                 {canonical_role(name): t for name, t in zip(cache.bank_schema, views)},
-                slots=None if n is not None else topk_ids, n=n, alphas=alphas,
+                slots=None if n is not None else topk_ids,
+                n=n,
+                alphas=alphas,
             )
             return self.quant_method.apply(
                 hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill
@@ -443,11 +449,8 @@ class OffloadMoELayer(MoELayer):
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
         if fmt == "gguf":
-            # Same MMVQ grouped GEMV as q4_0, but the two banks carry whatever ggml types
-            # the checkpoint chose, one type per bank for the whole model. Published mixes
-            # violate that (Ornith APEX: gate_up Q3_K x30 + Q4_K x10; Tiel-Coder UD:
-            # down Q6_K x3 + IQ4_XS x37), which is why _gguf_banks refuses them at load --
-            # see ModelConfig.gguf_expert_types for the single-stride slot pool.
+            # Same MMVQ grouped GEMV as q4_0, supporting mixed ggml types across layers
+            # via exact-geometry per-layer pools (Phase 7).
             from freetoken.moe.fused_q4_0 import fused_experts_gguf
 
             gate_up, down = views
@@ -456,12 +459,25 @@ class OffloadMoELayer(MoELayer):
                 "quant_format 'gguf' requires gguf_expert_types on the offload cache "
                 "(set from ModelConfig.gguf_expert_types at cache construction)"
             )
-            t_gate_up, t_down = types
+            if isinstance(types, list) or (
+                isinstance(types, tuple) and isinstance(types[0], (tuple, list))
+            ):
+                t_gate_up, t_down = types[self.layer_id]
+            else:
+                t_gate_up, t_down = types
             return fused_experts_gguf(
-                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation,
-                quant_type=t_gate_up, down_quant_type=t_down,
+                hidden_states,
+                gate_up,
+                down,
+                topk_weights,
+                topk_ids,
+                self.activation,
+                quant_type=t_gate_up,
+                down_quant_type=t_down,
             )
-        raise AssertionError(f"offload experts without a quant method only serve q4_0/gguf banks, got {fmt!r}")
+        raise AssertionError(
+            f"offload experts without a quant method only serve q4_0/gguf banks, got {fmt!r}"
+        )
 
 
 def make_moe_layer(

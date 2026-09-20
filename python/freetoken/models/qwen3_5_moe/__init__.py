@@ -5,8 +5,15 @@ from .model import (
     Qwen3_5MoeForCausalLM,
     Qwen3_5MoeForConditionalGeneration,
 )
-from .weight import iter_expert_pieces, iter_vision_weights, iter_weights, iter_weights_parallel, nvfp4_expert_spec
+from .weight import (
+    iter_expert_pieces,
+    iter_vision_weights,
+    iter_weights,
+    iter_weights_parallel,
+    nvfp4_expert_spec,
+)
 from .gguf import parse_gguf_config, iter_gguf_weights
+
 # Resolved off this package by freetoken.moe.expert_banks._gguf_banks (the GGUF expert
 # layout is architecture-specific, so the provider looks it up via the model registry).
 from .gguf_experts import gguf_expert_types, load_gguf_expert_sources

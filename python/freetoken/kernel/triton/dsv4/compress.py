@@ -19,11 +19,21 @@ _TL = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl
 
 @triton.jit
 def _gated_pool_kernel(
-    kv_ptr, score_ptr, out_ptr, R, D,
-    stride_kb, stride_kr, stride_kd,
-    stride_sb, stride_sr, stride_sd,
-    stride_ob, stride_od,
-    BLOCK_D: tl.constexpr, OUT: tl.constexpr,
+    kv_ptr,
+    score_ptr,
+    out_ptr,
+    R,
+    D,
+    stride_kb,
+    stride_kr,
+    stride_kd,
+    stride_sb,
+    stride_sr,
+    stride_sd,
+    stride_ob,
+    stride_od,
+    BLOCK_D: tl.constexpr,
+    OUT: tl.constexpr,
 ):
     b = tl.program_id(0)
     offs = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
@@ -55,11 +65,22 @@ def gated_pool(kv: torch.Tensor, score: torch.Tensor, out_dtype: torch.dtype) ->
     BLOCK_D = 256
     grid = (B, triton.cdiv(D, BLOCK_D))
     _gated_pool_kernel[grid](
-        kv, score, out, R, D,
-        kv.stride(0), kv.stride(1), kv.stride(2),
-        score.stride(0), score.stride(1), score.stride(2),
-        out.stride(0), out.stride(1),
-        BLOCK_D=BLOCK_D, OUT=_TL[out_dtype], num_warps=4,
+        kv,
+        score,
+        out,
+        R,
+        D,
+        kv.stride(0),
+        kv.stride(1),
+        kv.stride(2),
+        score.stride(0),
+        score.stride(1),
+        score.stride(2),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_D=BLOCK_D,
+        OUT=_TL[out_dtype],
+        num_warps=4,
     )
     return out.unsqueeze(1)
 

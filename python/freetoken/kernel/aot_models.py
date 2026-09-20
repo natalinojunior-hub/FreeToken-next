@@ -145,7 +145,10 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=768,
         expert_formats=("bf16",),
         aliases=("Qwen/Qwen3-30B-A3B-Thinking-2507",),
-        arch_aliases=("Qwen3VLMoeForConditionalGeneration", "Qwen3MoeGGUFForCausalLM"),  # Qwen3-VL-30B-A3B: same text tower; GGUF native-quant variant
+        arch_aliases=(
+            "Qwen3VLMoeForConditionalGeneration",
+            "Qwen3MoeGGUFForCausalLM",
+        ),  # Qwen3-VL-30B-A3B: same text tower; GGUF native-quant variant
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B",
@@ -155,7 +158,10 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=8,
         moe_intermediate_size=512,
         expert_formats=("bf16",),
-        arch_aliases=("Qwen3_5MoeForCausalLM", "Qwen35MoeGGUFForCausalLM"),  # text-only release + GGUF native-quant variant of the same tower
+        arch_aliases=(
+            "Qwen3_5MoeForCausalLM",
+            "Qwen35MoeGGUFForCausalLM",
+        ),  # text-only release + GGUF native-quant variant of the same tower
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B-FP8",
@@ -205,6 +211,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=10,
         moe_intermediate_size=640,
         expert_formats=(*_NVFP4_FORMATS, "fp8_block"),
+        arch_aliases=("Qwen4ExpForCausalLM", "Qwen4ExpGGUFForCausalLM"),
     ),
     AotModel(
         name="google/gemma-4-26B-A4B-it",
@@ -340,7 +347,10 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         hidden_size=5120,
         kv_groups=((4, 256),),
         aliases=("Qwen/Qwen3.6-27B-FP8", "nvidia/Qwen3.6-27B-NVFP4"),
-        arch_aliases=("Qwen3_5ForCausalLM", "Qwen35GGUFForCausalLM"),  # text-only release + GGUF native-quant variant of the same tower
+        arch_aliases=(
+            "Qwen3_5ForCausalLM",
+            "Qwen35GGUFForCausalLM",
+        ),  # text-only release + GGUF native-quant variant of the same tower
     ),
     AotModel(
         name="google/gemma-4-12B-it",
@@ -415,7 +425,6 @@ def fast_index_copy_feature_sizes(model: AotModel) -> set[int]:
             expert_bank_row_bytes(fmt, model.hidden_size, model.moe_intermediate_size).values()
         )
     return sizes
-
 
 
 def aggregate_store_element_sizes() -> tuple[int, ...]:

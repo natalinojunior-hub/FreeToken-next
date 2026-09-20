@@ -32,14 +32,24 @@ def test_cache_rebuild_msg_roundtrip():
     msg = CacheRebuildMsg(request_id="abc", moe_cache_size=8, num_pages=1024, mode="if_idle")
     out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
     assert isinstance(out, CacheRebuildMsg)
-    assert (out.request_id, out.moe_cache_size, out.num_pages, out.mode) == ("abc", 8, 1024, "if_idle")
+    assert (out.request_id, out.moe_cache_size, out.num_pages, out.mode) == (
+        "abc",
+        8,
+        1024,
+        "if_idle",
+    )
 
 
 def test_cache_rebuild_backend_msg_roundtrip():
     msg = CacheRebuildBackendMsg(request_id="r1", moe_cache_size=None, num_pages=256, mode="drain")
     out = BaseBackendMsg.decoder(msg.encoder())
     assert isinstance(out, CacheRebuildBackendMsg)
-    assert (out.request_id, out.moe_cache_size, out.num_pages, out.mode) == ("r1", None, 256, "drain")
+    assert (out.request_id, out.moe_cache_size, out.num_pages, out.mode) == (
+        "r1",
+        None,
+        256,
+        "drain",
+    )
 
 
 def test_cache_rebuild_result_msg_roundtrip():
@@ -47,7 +57,11 @@ def test_cache_rebuild_result_msg_roundtrip():
     out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
     assert isinstance(out, CacheRebuildResultMsg)
     assert (out.request_id, out.status, out.moe_cache_size, out.num_pages, out.error) == (
-        "r2", "ok", 16, 512, None,
+        "r2",
+        "ok",
+        16,
+        512,
+        None,
     )
 
 
@@ -94,14 +108,24 @@ def test_user_reply_token_deltas_round_trip():
 
 def test_detokenize_msg_carries_kv_usage_round_trip():
     msg = DetokenizeMsg(
-        uid=3, next_token=42, finished=True,
-        kv_used_pages=10, kv_total_pages=256, gpu_mem_bytes=1 << 30,
-        mamba_used_slots=7, mamba_total_slots=64,
-        swa_used_tokens=8448, swa_total_tokens=76800,
+        uid=3,
+        next_token=42,
+        finished=True,
+        kv_used_pages=10,
+        kv_total_pages=256,
+        gpu_mem_bytes=1 << 30,
+        mamba_used_slots=7,
+        mamba_total_slots=64,
+        swa_used_tokens=8448,
+        swa_total_tokens=76800,
     )
     decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
     assert isinstance(decoded, DetokenizeMsg)
-    assert (decoded.kv_used_pages, decoded.kv_total_pages, decoded.gpu_mem_bytes) == (10, 256, 1 << 30)
+    assert (decoded.kv_used_pages, decoded.kv_total_pages, decoded.gpu_mem_bytes) == (
+        10,
+        256,
+        1 << 30,
+    )
     assert (decoded.mamba_used_slots, decoded.mamba_total_slots) == (7, 64)
     assert (decoded.swa_used_tokens, decoded.swa_total_tokens) == (8448, 76800)
 
@@ -111,15 +135,17 @@ def test_client_dicts_with_the_wire_tag_key_survive_intact():
     named ``__type__`` (a common discriminator) must not be read back as a serialized class --
     that used to kill the tokenizer worker on an unknown/incompatible name."""
     hostile = [
-        {"__type__": "AbortMsg"},                                    # a real class name
-        {"__type__": "NoSuchClassAnywhere"},                         # an unknown one
+        {"__type__": "AbortMsg"},  # a real class name
+        {"__type__": "NoSuchClassAnywhere"},  # an unknown one
         {"type": "object", "properties": {"__type__": {"type": "string"}}},
-        {"__raw_dict__": {"a": 1}},                                  # collides with the escape key
+        {"__raw_dict__": {"a": 1}},  # collides with the escape key
         {"deep": {"__type__": "AbortMsg", "l": [{"__type__": "x"}]}},
     ]
     for payload in hostile:
         msg = TokenizeMsg(
-            uid=1, text="hi", sampling_params=SamplingParams(),
+            uid=1,
+            text="hi",
+            sampling_params=SamplingParams(),
             chat_template_kwargs=payload,
             tools=[{"type": "function", "function": {"name": "f", "parameters": payload}}],
         )
@@ -182,7 +208,11 @@ def test_user_msg_with_mm_items_survives_the_wire():
     assert isinstance(out, UserMsg)
     got = out.mm_items[0]
     assert (got.hash, got.pad_value, got.offsets) == (0x1234ABCD, 1_000_000 + 0x1234ABCD, [[7, 11]])
-    assert got.num_tokens == 4 and got.grid_thw == [1, 4, 4]  # model_specific_data reads as attributes
+    assert got.num_tokens == 4 and got.grid_thw == [
+        1,
+        4,
+        4,
+    ]  # model_specific_data reads as attributes
     assert got.precomputed_embeddings is None
     assert torch.equal(got.feature, item.feature)
     assert out.mrope_positions.shape == (3, 16) and out.mrope_delta == -3
@@ -193,12 +223,19 @@ def test_mm_item_shape_rules():
     item = MMItem(modality="image", hash=1, pad_value=1, offsets=[[3, 5], [9, 12]], feature=t)
     item.validate()
     assert item.num_tokens == 5
-    assert getattr(item, "grid_thw", None) is None  # missing model-specific key -> AttributeError path
+    assert (
+        getattr(item, "grid_thw", None) is None
+    )  # missing model-specific key -> AttributeError path
     with pytest.raises(ValueError, match="half-open"):
         MMItem(modality="image", hash=1, pad_value=1, offsets=[[5, 5]], feature=t).validate()
     with pytest.raises(ValueError, match="exactly one"):
         MMItem(modality="image", hash=1, pad_value=1, offsets=[[0, 2]]).validate()
     with pytest.raises(ValueError, match="exactly one"):
         MMItem(
-            modality="image", hash=1, pad_value=1, offsets=[[0, 2]], feature=t, precomputed_embeddings=t
+            modality="image",
+            hash=1,
+            pad_value=1,
+            offsets=[[0, 2]],
+            feature=t,
+            precomputed_embeddings=t,
         ).validate()

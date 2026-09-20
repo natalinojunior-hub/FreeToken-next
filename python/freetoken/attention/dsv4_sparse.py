@@ -167,9 +167,12 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         )
 
     def prepare_metadata(self, batch: Batch) -> None:
-        last = torch.tensor(
-            [r.extend_len for r in batch.padded_reqs], dtype=torch.int32, device=self.device
-        ).cumsum_(0) - 1
+        last = (
+            torch.tensor(
+                [r.extend_len for r in batch.padded_reqs], dtype=torch.int32, device=self.device
+            ).cumsum_(0)
+            - 1
+        )
         if not batch.is_decode:
             # Segments tile the flat token stream per request: (offset, extend_len, table_idx,
             # start_pos). Built host-side here (the scheduler stream under overlap) from the
@@ -227,7 +230,10 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         return torch.where(win_cols < 0, torch.full_like(g, -1), g)
 
     def blocks_to_global(
-        self, blocks: torch.Tensor, ratio: int, ti: int | None = None,
+        self,
+        blocks: torch.Tensor,
+        ratio: int,
+        ti: int | None = None,
         rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compressed BLOCK indices (or -1) -> GLOBAL compressed rows: block b lives at
@@ -246,9 +252,15 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         self.pool.store_window(kv, layer_id, window_slots)
 
     def attend(
-        self, q: torch.Tensor, layer_id: int, topk_idxs: torch.Tensor, n_window: int,
-        attn_sink: torch.Tensor, softmax_scale: float,
-        cmp_counts: torch.Tensor | None = None, has_compression: bool = True,
+        self,
+        q: torch.Tensor,
+        layer_id: int,
+        topk_idxs: torch.Tensor,
+        n_window: int,
+        attn_sink: torch.Tensor,
+        softmax_scale: float,
+        cmp_counts: torch.Tensor | None = None,
+        has_compression: bool = True,
     ) -> torch.Tensor:
         """Paged sparse MLA attention over ``[window | compressed]`` global slots.
 
@@ -262,8 +274,14 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         # topk), so alias the window pool to keep the two-pool stride assert happy.
         cmp = pool.cmp_pool[layer_id] if has_compression else pool.window_pool[layer_id]
         return sparse_attn_paged(
-            q, pool.window_pool[layer_id], cmp, attn_sink,
-            topk_idxs.int(), n_window, softmax_scale, cmp_counts=cmp_counts,
+            q,
+            pool.window_pool[layer_id],
+            cmp,
+            attn_sink,
+            topk_idxs.int(),
+            n_window,
+            softmax_scale,
+            cmp_counts=cmp_counts,
         )
 
     # ----- internals --------------------------------------------------------------------
@@ -283,7 +301,8 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         w = min(src.shape[1], cap.full_snap.shape[1])
         cap.full_snap[:bs, :w].copy_(src[:bs, :w])
         batch.attn_metadata = DSV4AttnMetadata(
-            last_indices=cap.last_indices[:bs], full_snap=cap.full_snap[:bs],
+            last_indices=cap.last_indices[:bs],
+            full_snap=cap.full_snap[:bs],
             window_ar=self._window_ar,
         )
 

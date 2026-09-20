@@ -93,8 +93,14 @@ class LinearColParallelMerged(_LinearTPImpl):
         output_size = sum(output_sizes)
         tp_output_size = sum(tp_output_sizes)
         super().__init__(
-            input_size, output_size, input_size, tp_output_size, has_bias,
-            output_sizes=tp_output_sizes, quant_config=quant_config, prefix=prefix,
+            input_size,
+            output_size,
+            input_size,
+            tp_output_size,
+            has_bias,
+            output_sizes=tp_output_sizes,
+            quant_config=quant_config,
+            prefix=prefix,
         )
 
 
@@ -119,9 +125,18 @@ class LinearQKVMerged(_LinearTPImpl):
         local_isize = hidden_size
         local_osize = (local_num_qo + 2 * local_num_kv) * head_dim
         super().__init__(
-            full_isize, full_osize, local_isize, local_osize, has_bias,
-            output_sizes=[local_num_qo * head_dim, local_num_kv * head_dim, local_num_kv * head_dim],
-            quant_config=quant_config, prefix=prefix,
+            full_isize,
+            full_osize,
+            local_isize,
+            local_osize,
+            has_bias,
+            output_sizes=[
+                local_num_qo * head_dim,
+                local_num_kv * head_dim,
+                local_num_kv * head_dim,
+            ],
+            quant_config=quant_config,
+            prefix=prefix,
         )
 
 
@@ -143,8 +158,13 @@ class LinearOProj(_LinearTPImpl):
         self._comm = DistributedCommunicator()
         self._tp_size = tp_info.size
         super().__init__(
-            full_isize, full_osize, local_isize, local_osize, has_bias,
-            quant_config=quant_config, prefix=prefix,
+            full_isize,
+            full_osize,
+            local_isize,
+            local_osize,
+            has_bias,
+            quant_config=quant_config,
+            prefix=prefix,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -170,8 +190,13 @@ class LinearRowParallel(_LinearTPImpl):
         self._comm = DistributedCommunicator()
         self._tp_size = tp_info.size
         super().__init__(
-            input_size, output_size, local_input_size, local_output_size, has_bias,
-            quant_config=quant_config, prefix=prefix,
+            input_size,
+            output_size,
+            local_input_size,
+            local_output_size,
+            has_bias,
+            quant_config=quant_config,
+            prefix=prefix,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

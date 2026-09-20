@@ -78,8 +78,10 @@ def derive_think_gears(
     elif profile.default_state == "adaptive" and "adaptive" in gears:
         default = "adaptive"
     elif efforts.consumes_effort:
-        default = efforts.default if efforts.default in gears else (
-            "medium" if "medium" in gears else gears[-1]
+        default = (
+            efforts.default
+            if efforts.default in gears
+            else ("medium" if "medium" in gears else gears[-1])
         )
     else:
         default = "on" if "on" in gears else gears[-1]

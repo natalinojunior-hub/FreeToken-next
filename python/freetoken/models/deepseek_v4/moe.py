@@ -53,10 +53,18 @@ class Gate(BaseOP):
 class Expert(BaseOP):
     """Dense SwiGLU expert (the shared expert; routed experts are offloaded FP4)."""
 
-    def __init__(self, dim: int, inter_dim: int, swiglu_limit: float, *, quant_config=None, prefix: str = ""):
-        self.w1 = LinearColParallelMerged(dim, [inter_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w1")
-        self.w2 = LinearRowParallel(inter_dim, dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w2")
-        self.w3 = LinearColParallelMerged(dim, [inter_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w3")
+    def __init__(
+        self, dim: int, inter_dim: int, swiglu_limit: float, *, quant_config=None, prefix: str = ""
+    ):
+        self.w1 = LinearColParallelMerged(
+            dim, [inter_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w1"
+        )
+        self.w2 = LinearRowParallel(
+            inter_dim, dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w2"
+        )
+        self.w3 = LinearColParallelMerged(
+            dim, [inter_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w3"
+        )
         self.swiglu_limit = swiglu_limit
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -70,7 +78,16 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
     below the route crossover) and slot-cache / cpu / hybrid decode paths
     (per-route dequant GEMV)."""
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args, *, strategy: str = "offload", decode_target: str = "gpu", quant_config=None, prefix: str = ""):
+    def __init__(
+        self,
+        layer_id: int,
+        args: DeepseekV4Args,
+        *,
+        strategy: str = "offload",
+        decode_target: str = "gpu",
+        quant_config=None,
+        prefix: str = "",
+    ):
         super().__init__(
             layer_id=layer_id,
             num_experts=args.n_routed_experts,
@@ -101,9 +118,8 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
         cache = self.offload_cache
         assert cache is not None
         # unpinned (LOCKED) layers must take the base materialize path: their copy_missing is the whole-layer pageable branch with position == expert id, which ensure_experts's LRU slot remap would contradict (the GEMM would gather other experts' weights)
-        if (
-            hidden_states.shape[0] * self.top_k >= self.num_experts
-            or cache.is_unpinned_layer(self.layer_id)
+        if hidden_states.shape[0] * self.top_k >= self.num_experts or cache.is_unpinned_layer(
+            self.layer_id
         ):
             return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot
@@ -125,11 +141,33 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
 class MoE(BaseOP):
     """Sparse MoE: hash/score router -> offloaded MXFP4 routed experts + shared expert."""
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args, *, strategy: str = "offload", decode_target: str = "gpu", quant_config=None, prefix: str = ""):
+    def __init__(
+        self,
+        layer_id: int,
+        args: DeepseekV4Args,
+        *,
+        strategy: str = "offload",
+        decode_target: str = "gpu",
+        quant_config=None,
+        prefix: str = "",
+    ):
         self.dim = args.dim
         self.gate = Gate(layer_id, args)
-        self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit, quant_config=quant_config, prefix=f"{prefix}.shared_experts")
-        self.experts = DSV4OffloadMoELayer(layer_id, args, strategy=strategy, decode_target=decode_target, quant_config=quant_config, prefix=f"{prefix}.experts")
+        self.shared_experts = Expert(
+            args.dim,
+            args.moe_inter_dim,
+            args.swiglu_limit,
+            quant_config=quant_config,
+            prefix=f"{prefix}.shared_experts",
+        )
+        self.experts = DSV4OffloadMoELayer(
+            layer_id,
+            args,
+            strategy=strategy,
+            decode_target=decode_target,
+            quant_config=quant_config,
+            prefix=f"{prefix}.experts",
+        )
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()

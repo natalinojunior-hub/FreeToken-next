@@ -136,8 +136,12 @@ def compute_cache_floors(engine: "Engine") -> Dict[str, int]:
             return 0
         return int(_swa_pool_floor(config) + 1)
 
-    for key, fn in (("kv_tokens", _kv), ("moe_experts", _moe), ("mamba_slots", _mamba),
-                    ("swa_tokens", _swa)):
+    for key, fn in (
+        ("kv_tokens", _kv),
+        ("moe_experts", _moe),
+        ("mamba_slots", _mamba),
+        ("swa_tokens", _swa),
+    ):
         try:
             floors[key] = fn()
         except Exception:  # noqa: BLE001 -- best-effort; a bad read must never block readiness
@@ -152,8 +156,12 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
     mamba is the usable slot count (num_slots minus the reserved padding sink), matching the
     scheduler's reported totals. 0 for pools the model lacks; never raises."""
     pools = {
-        "num_pages": 0, "page_size": 0, "moe_cache_size": 0, "num_mamba_slots": 0,
-        "swa_page_size": 0, "num_swa_pages": 0,
+        "num_pages": 0,
+        "page_size": 0,
+        "moe_cache_size": 0,
+        "num_mamba_slots": 0,
+        "swa_page_size": 0,
+        "num_swa_pages": 0,
     }
     try:
         config = engine.config
@@ -172,7 +180,9 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
                     pools["num_swa_pages"] = max(0, int(sizes.n_win_pages) - 1)
             elif mc.has_swa_attention and config.cache_type == "swa_radix":
                 pools["swa_page_size"] = 1  # usable = pool tokens minus the slot-0 sentinel
-                pools["num_swa_pages"] = max(0, int(getattr(engine.kv_cache, "swa_num_tokens", 0) or 0) - 1)
+                pools["num_swa_pages"] = max(
+                    0, int(getattr(engine.kv_cache, "swa_num_tokens", 0) or 0) - 1
+                )
         moe = engine.moe_offload_cache
         if moe is not None:
             pools["moe_cache_size"] = int(moe.cache_size or 0)
@@ -209,7 +219,9 @@ def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
         _baseline = int(engine._baseline_free or 0)
         _weights = int(engine._weights_bytes or 0)
         _mr = float(cfg.memory_ratio) if cfg is not None else 1.0
-        meta["cache_budget_bytes"] = max(0, _net_budget(_mr, _baseline, _weights, 0)) if _baseline > 0 else 0
+        meta["cache_budget_bytes"] = (
+            max(0, _net_budget(_mr, _baseline, _weights, 0)) if _baseline > 0 else 0
+        )
     except Exception:  # noqa: BLE001 -- best-effort; readiness must not depend on this
         meta["cache_budget_bytes"] = 0
     return meta

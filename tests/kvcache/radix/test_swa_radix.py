@@ -16,6 +16,7 @@ only ever asked and checked.  Assertions here read the model's own nodes -- whic
 battery has already pinned to the implementation node-for-node -- plus closed-form values derived
 from the geometry, so a test can fail on either side of the comparison.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -98,8 +99,12 @@ def test_insert_tombstones_the_out_of_window_head(sess):
     assert _ev(sess)["insert.suffix_live"] == 1
     assert _lengths(sess, True) == [P]
     assert _lengths(sess, False) == [2 * P]
-    assert _sizes(sess) == {"full_evictable": 3 * P, "full_protected": 0,
-                            "swa_evictable": 2 * P, "swa_protected": 0}
+    assert _sizes(sess) == {
+        "full_evictable": 3 * P,
+        "full_protected": 0,
+        "swa_evictable": 2 * P,
+        "swa_protected": 0,
+    }
 
 
 @pytest.mark.parametrize("n_pages", [1, 2, 3])
@@ -108,7 +113,7 @@ def test_suffix_clamp_never_creates_a_tombstone_leaf(swa_spec, make_session, n_p
     the invariant ``evict_full``'s cascade and the windowed match both lean on."""
     s = make_session(swa_spec)
     P = s.P
-    s.do_insert(_seq(swa_spec, n_pages), swa_evicted=(n_pages + 3) * P)   # far past the commit
+    s.do_insert(_seq(swa_spec, n_pages), swa_evicted=(n_pages + 3) * P)  # far past the commit
     s.check()
 
     assert _lengths(s, True) == ([] if n_pages == 1 else [(n_pages - 1) * P])
@@ -123,8 +128,8 @@ def test_insert_revives_a_whole_tombstoned_node(sess):
     adopt the request's slots, hand the stale tree slots back, clear the tombstone."""
     P, wp = sess.P, _window_pages(sess.spec)
     ids = _chain(sess, wp + 1)
-    sess.do_match(ids)                       # stamp decreasing toward root -> N0 is the LRU
-    sess.do_evict_second(1)                  # tombstone N0 in place
+    sess.do_match(ids)  # stamp decreasing toward root -> N0 is the LRU
+    sess.do_evict_second(1)  # tombstone N0 in place
     assert _tombstoned(sess) == {tuple(ids[:P])}
 
     stale = list(_node(sess, ids, 1).slots)
@@ -134,9 +139,9 @@ def test_insert_revives_a_whole_tombstoned_node(sess):
 
     assert _ev(sess)["insert.revive_whole"] == 1
     assert _tombstoned(sess) == set()
-    assert _node(sess, ids, 1).slots == fresh[:P]        # adopted the request's live-swa slots
-    assert set(stale) <= set(exp.freed)                  # the sentinel-mapped tree slots came back
-    assert set(fresh[P:]) <= set(exp.freed)              # dups of the still-live nodes came back
+    assert _node(sess, ids, 1).slots == fresh[:P]  # adopted the request's live-swa slots
+    assert set(stale) <= set(exp.freed)  # the sentinel-mapped tree slots came back
+    assert set(fresh[P:]) <= set(exp.freed)  # dups of the still-live nodes came back
     assert _sizes(sess)["swa_evictable"] == (wp + 1) * P
 
 
@@ -146,21 +151,21 @@ def test_insert_splits_and_revives_the_live_tail(sess):
     P = sess.P
     ids = _seq(sess.spec, 4)
     first = sess.kv.take(len(ids))
-    sess.do_insert(ids, slots=first, swa_evicted=3 * P)     # tomb [0,3P) + live [3P,4P)
+    sess.do_insert(ids, slots=first, swa_evicted=3 * P)  # tomb [0,3P) + live [3P,4P)
     sess.check()
     assert _lengths(sess, True) == [3 * P]
 
     second = sess.kv.take(len(ids))
-    _, exp = sess.do_insert(ids, slots=second, swa_evicted=2 * P)   # frontier inside the tombstone
+    _, exp = sess.do_insert(ids, slots=second, swa_evicted=2 * P)  # frontier inside the tombstone
     sess.check()
 
     assert _ev(sess)["insert.revive_tail"] == 1
-    assert _lengths(sess, True) == [2 * P]                 # the head keeps BOTH tombstoned pages
-    tail = _node(sess, ids, 3)                             # the revived page is [2P, 3P)
-    assert not tail.tomb and tail.slots == second[2 * P: 3 * P]
-    assert set(first[2 * P: 3 * P]) <= set(exp.freed)      # the tail's stale tree slots came back
-    assert set(second[: 2 * P]) <= set(exp.freed)          # the head's dup came back (still tomb)
-    assert _sizes(sess)["swa_evictable"] == 2 * P          # the revived page + the live tail
+    assert _lengths(sess, True) == [2 * P]  # the head keeps BOTH tombstoned pages
+    tail = _node(sess, ids, 3)  # the revived page is [2P, 3P)
+    assert not tail.tomb and tail.slots == second[2 * P : 3 * P]
+    assert set(first[2 * P : 3 * P]) <= set(exp.freed)  # the tail's stale tree slots came back
+    assert set(second[: 2 * P]) <= set(exp.freed)  # the head's dup came back (still tomb)
+    assert _sizes(sess)["swa_evictable"] == 2 * P  # the revived page + the live tail
 
 
 def test_insert_keeps_a_still_out_of_window_tombstone(sess):
@@ -169,7 +174,7 @@ def test_insert_keeps_a_still_out_of_window_tombstone(sess):
     P, wp = sess.P, _window_pages(sess.spec)
     ids = _chain(sess, wp + 1)
     sess.do_match(ids)
-    sess.do_evict_second(1)                                # tombstone N0
+    sess.do_evict_second(1)  # tombstone N0
     stale = list(_node(sess, ids, 1).slots)
 
     fresh = sess.kv.take(len(ids))
@@ -191,9 +196,9 @@ def test_insert_refuses_to_revive_a_full_locked_tombstone(sess):
     P, wp = sess.P, _window_pages(sess.spec)
     n = wp + 2
     ids = _chain(sess, n)
-    held = sess.do_lock(ids)                     # full-pins the path, swa-pins the trailing window
+    held = sess.do_lock(ids)  # full-pins the path, swa-pins the trailing window
     assert held is not None
-    sess.do_evict_second(10 ** 6)                # tombstones the root-ward, swa-unlocked nodes
+    sess.do_evict_second(10**6)  # tombstones the root-ward, swa-unlocked nodes
     sess.check()
     assert _tombstoned(sess) == {tuple(ids[:P]), tuple(ids[: 2 * P])}
     pinned = {g.end: list(g.slots) for g in _groups(sess) if g.tomb}
@@ -206,12 +211,12 @@ def test_insert_refuses_to_revive_a_full_locked_tombstone(sess):
     assert _ev(sess)["insert.revive_whole"] == 0
     for end, slots in pinned.items():
         assert sess.model.trie.page_group[end].slots == slots
-    assert set(exp.freed) == set(fresh)          # ONLY the incoming dup, never the tree's value
+    assert set(exp.freed) == set(fresh)  # ONLY the incoming dup, never the tree's value
 
     sess.do_unlock(held)
     sess.do_insert(ids, slots=sess.kv.take(len(ids)), swa_evicted=0)
     sess.check()
-    assert _ev(sess)["insert.revive_whole"] == 2         # lock cleared -> reviving is safe again
+    assert _ev(sess)["insert.revive_whole"] == 2  # lock cleared -> reviving is safe again
     assert _tombstoned(sess) == set()
 
 
@@ -229,7 +234,7 @@ def test_insert_within_the_reused_prefix_frees_nothing(sess):
 
     assert got.matched_len == len(ids)
     assert got.freed == [] and exp.freed == []
-    assert _ev(sess)["insert.dup_live"] == before        # nothing was treated as a duplicate
+    assert _ev(sess)["insert.dup_live"] == before  # nothing was treated as a duplicate
     sess.do_unlock(held)
     sess.check()
 
@@ -239,16 +244,16 @@ def test_a_split_propagates_the_tombstone_to_both_halves(sess):
     BOTH halves tombstoned -- a live half would advertise swa KV that has already been freed."""
     P = sess.P
     ids = _seq(sess.spec, 3)
-    sess.do_insert(ids, swa_evicted=2 * P)                 # tomb [0,2P) + live [2P,3P)
-    other = ids[:P] + _seq(sess.spec, 1, start=9)          # shares page 0, diverges at page 1
+    sess.do_insert(ids, swa_evicted=2 * P)  # tomb [0,2P) + live [2P,3P)
+    other = ids[:P] + _seq(sess.spec, 1, start=9)  # shares page 0, diverges at page 1
 
     got, _ = sess.do_match(other)
     sess.check()
 
     assert _ev(sess)["node.split"] == 1
-    assert _lengths(sess, True) == [P, P]                  # both halves of the split tombstone
+    assert _lengths(sess, True) == [P, P]  # both halves of the split tombstone
     assert _lengths(sess, False) == [P]
-    assert got.cached_len == 0                             # ending at a tombstone is not reusable
+    assert got.cached_len == 0  # ending at a tombstone is not reusable
 
 
 def test_a_lock_handle_survives_a_split_at_its_window_boundary(sess):
@@ -257,12 +262,12 @@ def test_a_lock_handle_survives_a_split_at_its_window_boundary(sess):
     P, wp = sess.P, _window_pages(sess.spec)
     n = max(2, wp)
     ids = _seq(sess.spec, n)
-    sess.do_insert(ids)                                    # a single node of n pages
+    sess.do_insert(ids)  # a single node of n pages
     held = sess.do_lock(ids)
     assert held is not None and held[0].uuid is not None
     assert _sizes(sess)["swa_protected"] == n * P
 
-    other = ids[:P] + _seq(sess.spec, 1, start=9)          # diverges after page 0 -> splits it
+    other = ids[:P] + _seq(sess.spec, 1, start=9)  # diverges after page 0 -> splits it
     sess.do_match(other)
     sess.check()
     assert _ev(sess)["node.split"] == 1
@@ -283,7 +288,7 @@ def test_match_reuses_a_short_tombstone_free_prefix(sess):
     got, _ = sess.do_match(ids)
     sess.check()
 
-    assert got.cached_len == P                            # even though P may be < the window
+    assert got.cached_len == P  # even though P may be < the window
     assert _ev(sess)["match.windowed_truncation"] == 0
 
 
@@ -294,16 +299,16 @@ def test_match_truncates_until_the_live_run_covers_the_window(sess):
     wp = _window_pages(sess.spec)
     ids = _seq(sess.spec, wp + 1)
 
-    sess.do_insert(ids[: 2 * P], swa_evicted=P)           # tomb page 0 + live page 1
-    for k in range(3, wp + 2):                            # extend one live page at a time
-        sess.do_insert(ids[: k * P], swa_evicted=P)       # swa_evicted=P keeps the head tomb
+    sess.do_insert(ids[: 2 * P], swa_evicted=P)  # tomb page 0 + live page 1
+    for k in range(3, wp + 2):  # extend one live page at a time
+        sess.do_insert(ids[: k * P], swa_evicted=P)  # swa_evicted=P keeps the head tomb
     sess.check()
     assert _lengths(sess, True) == [P]
-    assert _lengths(sess, False) == [P] * wp              # the live run really spans wp nodes
+    assert _lengths(sess, False) == [P] * wp  # the live run really spans wp nodes
 
     for k in range(1, wp + 2):
         got, _ = sess.do_match(ids[: k * P])
-        live_run = (k - 1) * P                            # tokens between the tombstone and the end
+        live_run = (k - 1) * P  # tokens between the tombstone and the end
         assert got.cached_len == (k * P if live_run >= W else 0)
     sess.check()
     assert _ev(sess)["match.windowed_truncation"] > 0
@@ -321,19 +326,21 @@ def test_a_live_run_of_exactly_one_window_between_two_tombstones_is_reusable(ses
     """
     P, wp = sess.P, _window_pages(sess.spec)
     if wp == 1:
-        pytest.skip("page == window: the live node below the second tombstone already covers the "
-                    "window on its own, so the post-loop commit fires and takes the whole chain -- "
-                    "the boundary commit at the tombstone cannot be isolated in this geometry")
-    n = wp + 3                                            # tomb | wp live (== W) | tomb | live
+        pytest.skip(
+            "page == window: the live node below the second tombstone already covers the "
+            "window on its own, so the post-loop commit fires and takes the whole chain -- "
+            "the boundary commit at the tombstone cannot be isolated in this geometry"
+        )
+    n = wp + 3  # tomb | wp live (== W) | tomb | live
     ids = _chain(sess, n)
 
-    sess.do_trim(ids, P)                                  # node 1 -> tombstone
-    sess.do_match(ids[: (1 + wp) * P])                    # restamp 1..1+wp -> 2+wp is oldest live
-    sess.do_evict_second(1)                               # internal, so tombstoned in place
+    sess.do_trim(ids, P)  # node 1 -> tombstone
+    sess.do_match(ids[: (1 + wp) * P])  # restamp 1..1+wp -> 2+wp is oldest live
+    sess.do_evict_second(1)  # internal, so tombstoned in place
     sess.check()
 
     assert _tombstoned(sess) == {tuple(ids[:P]), tuple(ids[: (2 + wp) * P])}
-    assert _lengths(sess, False) == [P] * (wp + 1)        # the live run really is wp nodes
+    assert _lengths(sess, False) == [P] * (wp + 1)  # the live run really is wp nodes
 
     got, _ = sess.do_match(ids)
     # The run between the tombstones is wp * P == W exactly, so the boundary commits there. Under
@@ -374,11 +381,11 @@ def test_dec_lock_with_a_uuid_releases_only_its_own_window(sess):
     n = wp + 2
     ids = _chain(sess, n)
 
-    deep = sess.do_lock(ids)                              # window = the trailing wp nodes
-    shallow = sess.do_lock(ids[: wp * P])                 # window = the leading wp nodes
+    deep = sess.do_lock(ids)  # window = the trailing wp nodes
+    shallow = sess.do_lock(ids[: wp * P])  # window = the leading wp nodes
     assert deep is not None and shallow is not None
     assert deep[0].uuid is not None and shallow[0].uuid is not None
-    assert deep[0].uuid != shallow[0].uuid                # distinct boundary nodes, distinct ids
+    assert deep[0].uuid != shallow[0].uuid  # distinct boundary nodes, distinct ids
 
     swa_pinned = set(range(n - wp, n)) | set(range(wp))
     assert _sizes(sess)["swa_protected"] == len(swa_pinned) * P
@@ -386,7 +393,7 @@ def test_dec_lock_with_a_uuid_releases_only_its_own_window(sess):
 
     sess.do_unlock(deep)
     sess.check()
-    assert _sizes(sess)["swa_protected"] == wp * P        # exactly the shallow reader's window
+    assert _sizes(sess)["swa_protected"] == wp * P  # exactly the shallow reader's window
     assert _sizes(sess)["full_protected"] == wp * P
 
     sess.do_unlock(shallow)
@@ -405,10 +412,10 @@ def test_dec_lock_skip_swa_strands_the_window_lock(sess):
     sess.do_unlock(held, skip_swa=True)
 
     assert _sizes(sess)["full_protected"] == 0
-    assert _sizes(sess)["swa_protected"] == wp * P        # the window tier is stranded
-    check_counter_model(sess.ad)                          # bookkeeping itself stays consistent ...
+    assert _sizes(sess)["swa_protected"] == wp * P  # the window tier is stranded
+    check_counter_model(sess.ad)  # bookkeeping itself stays consistent ...
     check_model_agreement(sess.ad, sess.model)
-    with pytest.raises(InvariantViolation) as err:        # ... but the class invariant is broken
+    with pytest.raises(InvariantViolation) as err:  # ... but the class invariant is broken
         check_class_integrity(sess.ad)
     assert err.value.tag == "check_integrity"
 
@@ -423,18 +430,22 @@ def test_evict_full_takes_unlocked_leaves_only(sess):
     assert held is not None
     freed_before = set(sess.kv.free)
 
-    sess.do_evict_full(10 ** 6)                           # the only leaf is locked -> nothing goes
+    sess.do_evict_full(10**6)  # the only leaf is locked -> nothing goes
     sess.check()
     assert sess.kv.free == freed_before
     assert len(_groups(sess)) == 3
 
     sess.do_unlock(held)
-    sess.do_match(ids)                                    # N0 (root-most) is now the oldest node
-    sess.do_evict_full(P)                                 # ... yet the leaf N2 must be the victim
+    sess.do_match(ids)  # N0 (root-most) is now the oldest node
+    sess.do_evict_full(P)  # ... yet the leaf N2 must be the victim
     sess.check()
     assert {g.end for g in _groups(sess)} == {tuple(ids[:P]), tuple(ids[: 2 * P])}
-    assert _sizes(sess) == {"full_evictable": 2 * P, "full_protected": 0,
-                            "swa_evictable": 2 * P, "swa_protected": 0}
+    assert _sizes(sess) == {
+        "full_evictable": 2 * P,
+        "full_protected": 0,
+        "swa_evictable": 2 * P,
+        "swa_protected": 0,
+    }
 
 
 def test_evict_full_cascades_through_exposed_tombstone_leaves(sess):
@@ -444,17 +455,17 @@ def test_evict_full_cascades_through_exposed_tombstone_leaves(sess):
     P = sess.P
     ids = _chain(sess, 3)
     sess.do_match(ids)
-    sess.do_evict_second(2 * P)                           # tombstone N0 then N1, both internal
+    sess.do_evict_second(2 * P)  # tombstone N0 then N1, both internal
     sess.check()
     assert _lengths(sess, True) == [P, P]
 
-    sess.do_evict_full(P)                                 # pop leaf N2 -> cascade N1 -> N0
+    sess.do_evict_full(P)  # pop leaf N2 -> cascade N1 -> N0
     sess.check()
 
     assert _ev(sess)["evict_full.cascade"] == 2
     assert _groups(sess) == []
     assert _sizes(sess)["full_evictable"] == 0 and _sizes(sess)["swa_evictable"] == 0
-    assert sess.kv.in_use() == set()                      # nothing leaked on the way out
+    assert sess.kv.in_use() == set()  # nothing leaked on the way out
 
 
 # --------------------------------------------------------------------------- eviction: swa tier
@@ -472,12 +483,12 @@ def test_evict_swa_tombstones_an_internal_node_in_place(sess):
 
     assert _ev(sess)["evict_swa.tombstone_in_place"] == 1
     assert _tombstoned(sess) == {tuple(ids[:P])}
-    assert sess.kv.free == freed_before                   # no FULL slot was released
+    assert sess.kv.free == freed_before  # no FULL slot was released
     assert _sizes(sess)["swa_evictable"] == wp * P
 
-    got, _ = sess.do_match(ids)                           # the live tail covers the window ...
+    got, _ = sess.do_match(ids)  # the live tail covers the window ...
     assert got.cached_len == (wp + 1) * P
-    assert got.indices[:P] == head_slots                  # ... so the tombstone's full KV is served
+    assert got.indices[:P] == head_slots  # ... so the tombstone's full KV is served
 
 
 def test_evict_swa_frees_a_free_leaf_and_cascades(sess):
@@ -487,7 +498,7 @@ def test_evict_swa_frees_a_free_leaf_and_cascades(sess):
     ids = _chain(sess, 2)
     sess.do_match(ids)
 
-    sess.do_evict_second(2 * P)                           # tombstone N0, then free leaf N1
+    sess.do_evict_second(2 * P)  # tombstone N0, then free leaf N1
     sess.check()
 
     assert _ev(sess)["evict_swa.tombstone_in_place"] == 1
@@ -502,13 +513,13 @@ def test_evict_swa_victim_order_follows_match_recency(sess):
     with strictly decreasing timestamps toward the root, so the swa pass reclaims the root-most
     STALE node first -- never the freshly matched head."""
     P = sess.P
-    ids = _chain(sess, 4)                                 # insert-order recency: N0 oldest
-    sess.do_match(ids[: 2 * P])                           # re-stamp N0, N1 as the most recent
+    ids = _chain(sess, 4)  # insert-order recency: N0 oldest
+    sess.do_match(ids[: 2 * P])  # re-stamp N0, N1 as the most recent
 
     sess.do_evict_second(1)
     sess.check()
 
-    assert _tombstoned(sess) == {tuple(ids[: 3 * P])}     # N2, not N0
+    assert _tombstoned(sess) == {tuple(ids[: 3 * P])}  # N2, not N0
 
 
 def test_locked_window_survives_both_evictors(sess):
@@ -521,13 +532,13 @@ def test_locked_window_survives_both_evictors(sess):
     assert held is not None
     freed_before = set(sess.kv.free)
 
-    sess.do_evict_full(10 ** 6)
-    sess.do_evict_second(10 ** 6)
+    sess.do_evict_full(10**6)
+    sess.do_evict_second(10**6)
     sess.check()
 
-    assert sess.kv.free == freed_before                   # not one full slot was released
+    assert sess.kv.free == freed_before  # not one full slot was released
     assert _tombstoned(sess) == {tuple(ids[:P]), tuple(ids[: 2 * P])}
-    assert _lengths(sess, False) == [P] * wp              # the pinned window stayed live
+    assert _lengths(sess, False) == [P] * wp  # the pinned window stayed live
     assert _sizes(sess)["swa_protected"] == wp * P
 
     sess.do_unlock(held)
@@ -553,7 +564,7 @@ def test_swa_pressure_drains_every_slot_exactly_once(sess):
     sess.check()
 
     assert _groups(sess) == []
-    assert sess.kv.in_use() == set()                      # no leak, no double free (ledger-checked)
+    assert sess.kv.in_use() == set()  # no leak, no double free (ledger-checked)
 
 
 # --------------------------------------------------------------------------- retention
@@ -568,10 +579,10 @@ def test_finish_time_restamp_soft_pins_the_prompt_window(swa_spec, make_session)
         s = make_session(swa_spec)
         ids = _seq(swa_spec, prompt_pages + 2)
         prompt = ids[: prompt_pages * P]
-        s.do_insert(prompt)                               # prefill-boundary commit
-        s.do_request(ids, prompt_pages)                   # match -> lock -> finish insert -> unlock
+        s.do_insert(prompt)  # prefill-boundary commit
+        s.do_request(ids, prompt_pages)  # match -> lock -> finish insert -> unlock
         if restamp:
-            s.do_match(prompt)                            # the finish-time soft pin
+            s.do_match(prompt)  # the finish-time soft pin
         s.do_evict_second(1)
         s.check()
         got, _ = s.do_match(prompt)
@@ -590,17 +601,17 @@ def test_trim_head_swa_reclaims_the_head_and_keeps_the_window(sess):
     ids = _chain(sess, n)
     head_slots = list(_node(sess, ids, 1).slots) + list(_node(sess, ids, 2).slots)
 
-    sess.do_trim(ids, 2 * P)                              # keep_from = n - wp pages
+    sess.do_trim(ids, 2 * P)  # keep_from = n - wp pages
     sess.check()
 
     assert _ev(sess)["trim.tombstone"] == 2
     assert _tombstoned(sess) == {tuple(ids[:P]), tuple(ids[: 2 * P])}
     assert _sizes(sess)["swa_evictable"] == wp * P
-    assert _sizes(sess)["full_evictable"] == n * P        # not one full token was given up
+    assert _sizes(sess)["full_evictable"] == n * P  # not one full token was given up
 
-    got, _ = sess.do_match(ids)                           # the retained window still covers W ...
+    got, _ = sess.do_match(ids)  # the retained window still covers W ...
     assert got.cached_len == n * P
-    assert got.indices[: 2 * P] == head_slots             # ... and the trimmed head's KV is served
+    assert got.indices[: 2 * P] == head_slots  # ... and the trimmed head's KV is served
 
 
 def test_trim_head_swa_skips_locked_leaf_and_tombstoned_nodes(sess):
@@ -612,17 +623,17 @@ def test_trim_head_swa_skips_locked_leaf_and_tombstoned_nodes(sess):
     held = sess.do_lock(ids)
     assert held is not None
 
-    sess.do_trim(ids, 0)                                  # no retention boundary -> no-op
+    sess.do_trim(ids, 0)  # no retention boundary -> no-op
     sess.check()
     assert _ev(sess)["trim.tombstone"] == 0
 
-    sess.do_trim(ids, n * P)                              # ask for the whole path
+    sess.do_trim(ids, n * P)  # ask for the whole path
     sess.check()
-    assert _ev(sess)["trim.tombstone"] == 2               # only the unlocked internals below it
+    assert _ev(sess)["trim.tombstone"] == 2  # only the unlocked internals below it
     assert _tombstoned(sess) == {tuple(ids[:P]), tuple(ids[: 2 * P])}
     assert not any(g.tomb for g in _groups(sess) if sess.model.trie.is_leaf(g))
 
-    sess.do_trim(ids, n * P)                              # idempotent: the tombstones are skipped
+    sess.do_trim(ids, n * P)  # idempotent: the tombstones are skipped
     sess.check()
     assert _ev(sess)["trim.tombstone"] == 2
 

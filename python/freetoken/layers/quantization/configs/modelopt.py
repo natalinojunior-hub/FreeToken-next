@@ -25,10 +25,19 @@ class ModelOptConfig(QuantConfig):
         "MXFP8": mxfp8_scheme(),
     }
     STORAGE: ClassVar[dict[QuantKind, dict[str, str | Stored]]] = {
-        QuantKind.FP8_TENSOR: {"weight": "weight", "weight_scale": "weight_scale", "input_scale": "input_scale"},
+        QuantKind.FP8_TENSOR: {
+            "weight": "weight",
+            "weight_scale": "weight_scale",
+            "input_scale": "input_scale",
+        },
         QuantKind.FP8_BLOCK: {"weight": "weight", "weight_scale_inv": "weight_scale_inv"},
         QuantKind.MXFP8: {"weight": "weight", "weight_scale_inv": "weight_scale_inv"},
-        QuantKind.NVFP4: {"weight": "weight", "weight_scale": "weight_scale", "weight_global": "weight_scale_2", "input_scale": "input_scale"},
+        QuantKind.NVFP4: {
+            "weight": "weight",
+            "weight_scale": "weight_scale",
+            "weight_global": "weight_scale_2",
+            "input_scale": "input_scale",
+        },
     }
 
     @classmethod
@@ -43,13 +52,27 @@ class ModelOptConfig(QuantConfig):
         self.with_input_scale = q.get("with_input_scale")
         groups = q.get("config_groups")
         # an export with no activation quantizer can still say NVFP4; every config group then has input_activations null (vLLM applies the same rule)
-        if self.with_input_scale is None and self.algo == "NVFP4" and isinstance(groups, dict) and groups and all(isinstance(g, dict) and g.get("input_activations") is None for g in groups.values()):
+        if (
+            self.with_input_scale is None
+            and self.algo == "NVFP4"
+            and isinstance(groups, dict)
+            and groups
+            and all(
+                isinstance(g, dict) and g.get("input_activations") is None for g in groups.values()
+            )
+        ):
             self.algo = "W4A16_NVFP4"
         self.ignore = name_set(tuple(q.get("ignore") or q.get("exclude_modules") or ()))
         layers = q.get("quantized_layers") or {}
-        self.quantized_layers = {k: str((v or {}).get("quant_algo") or "").upper() for k, v in layers.items()} if isinstance(layers, dict) else {}
+        self.quantized_layers = (
+            {k: str((v or {}).get("quant_algo") or "").upper() for k, v in layers.items()}
+            if isinstance(layers, dict)
+            else {}
+        )
         if self.algo == "MIXED_PRECISION" and not self.quantized_layers:
-            raise NotImplementedError("ModelOpt MIXED_PRECISION without quantized_layers in quantization_config")
+            raise NotImplementedError(
+                "ModelOpt MIXED_PRECISION without quantized_layers in quantization_config"
+            )
         if self.algo != "MIXED_PRECISION":
             self._scheme_of(self.algo)
 
@@ -71,7 +94,9 @@ class ModelOptConfig(QuantConfig):
     def _scheme_of(self, algo: str) -> QuantScheme:
         if self.with_input_scale is False:
             if algo == "FP8":
-                return fp8_tensor_scheme("fp32")  # ModelOpt has no algo name for fp8 without an activation scale
+                return fp8_tensor_scheme(
+                    "fp32"
+                )  # ModelOpt has no algo name for fp8 without an activation scale
             if algo == "NVFP4":
                 algo = "W4A16_NVFP4"
         try:

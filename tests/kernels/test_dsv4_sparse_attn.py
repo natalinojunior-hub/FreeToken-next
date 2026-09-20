@@ -58,20 +58,24 @@ def _reference(q, win_pool, cmp_pool, sink, idx, n_window, scale, counts):
     return out
 
 
-def _build(b=2, m=1, n_cmp_cols=N_CMP_COLS, cmp_valid=None, win_valid=N_WINDOW, seed=0, holes=False):
+def _build(
+    b=2, m=1, n_cmp_cols=N_CMP_COLS, cmp_valid=None, win_valid=N_WINDOW, seed=0, holes=False
+):
     g = torch.Generator(device="cuda").manual_seed(seed)
     q = torch.randn(b, m, H, D, device="cuda", dtype=torch.bfloat16, generator=g)
     idx = torch.full((b, m, N_WINDOW + n_cmp_cols), -1, dtype=torch.int32, device="cuda")
     cmp_valid = [n_cmp_cols] * b if cmp_valid is None else cmp_valid
     for i in range(b):
         wv = win_valid if isinstance(win_valid, int) else win_valid[i]
-        idx[i, :, :wv] = torch.randint(0, N_WIN_SLOTS, (m, wv), device="cuda",
-                                       dtype=torch.int32, generator=g)
+        idx[i, :, :wv] = torch.randint(
+            0, N_WIN_SLOTS, (m, wv), device="cuda", dtype=torch.int32, generator=g
+        )
         cv = cmp_valid[i]
-        idx[i, :, N_WINDOW:N_WINDOW + cv] = torch.randint(
-            0, N_CMP, (m, cv), device="cuda", dtype=torch.int32, generator=g)
+        idx[i, :, N_WINDOW : N_WINDOW + cv] = torch.randint(
+            0, N_CMP, (m, cv), device="cuda", dtype=torch.int32, generator=g
+        )
         if holes:  # scattered invalid slots INSIDE the live range
-            idx[i, :, N_WINDOW + 1:N_WINDOW + cv:3] = -1
+            idx[i, :, N_WINDOW + 1 : N_WINDOW + cv : 3] = -1
     counts = torch.tensor(cmp_valid, dtype=torch.int32, device="cuda").view(b, 1).expand(b, m)
     return q, idx, counts.contiguous()
 
@@ -88,7 +92,7 @@ def pools():
 
 def _check(pools, q, idx, counts):
     win, cmp, sink = pools
-    scale = D ** -0.5
+    scale = D**-0.5
     got = sparse_attn_paged(q, win, cmp, sink, idx, N_WINDOW, scale, cmp_counts=counts)
     ref = _reference(q, win, cmp, sink, idx, N_WINDOW, scale, counts)
     torch.testing.assert_close(got.float(), ref, **TOL)
@@ -151,7 +155,7 @@ def test_counts_bound_the_loop(pools, m):
     """counts -- not the -1 padding -- is what stops the walk: leave VALID slots past the live
     width and they must still be ignored. This is the property a captured graph relies on."""
     win, cmp, sink = pools
-    scale = D ** -0.5
+    scale = D**-0.5
     q, idx, counts = _build(b=1, m=m, cmp_valid=[N_CMP_COLS])
     counts = torch.full_like(counts, 24)
     got = sparse_attn_paged(q, win, cmp, sink, idx, N_WINDOW, scale, cmp_counts=counts)
@@ -166,10 +170,9 @@ def test_counts_bound_the_loop(pools, m):
 def test_cuda_graph_follows_counts(pools, m):
     """The captured graph must read its loop bound from device memory, not from capture time."""
     win, cmp, sink = pools
-    scale = D ** -0.5
+    scale = D**-0.5
     q, idx, counts = _build(b=1, m=m, cmp_valid=[N_CMP_COLS])
-    call = lambda: sparse_attn_paged(q, win, cmp, sink, idx, N_WINDOW, scale,
-                                     cmp_counts=counts)
+    call = lambda: sparse_attn_paged(q, win, cmp, sink, idx, N_WINDOW, scale, cmp_counts=counts)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):

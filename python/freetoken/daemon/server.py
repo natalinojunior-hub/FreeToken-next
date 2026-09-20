@@ -46,19 +46,49 @@ def _build_parser(prog: str) -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--host", default="127.0.0.1", help="Control-plane bind host (default loopback)")
-    p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Control port (default {DEFAULT_PORT})")
+    p.add_argument(
+        "--port", type=int, default=DEFAULT_PORT, help=f"Control port (default {DEFAULT_PORT})"
+    )
     p.add_argument("--state-dir", default=_default_state_dir(), help="Lock/pidfile/log directory")
-    p.add_argument("--token", default=os.environ.get("FREETOKEN_DAEMON_TOKEN"), help="Optional X-FT-Token shared secret")
-    p.add_argument("--default-serve-port", type=int, default=DEFAULT_SERVE_PORT, help="Port used when /engine/start omits one")
-    p.add_argument("--serve-python", default=sys.executable, help="Interpreter used to launch ft serve")
-    p.add_argument("--grace", type=float, default=10.0, help="SIGTERM→SIGKILL grace seconds on stop")
-    p.add_argument("--poll-interval", type=float, default=1.0, help="Adopted-serve liveness / OOM reapply interval")
-    p.add_argument("--oom-child-score", type=int, default=500, help="oom_score_adj written to the serve tree")
+    p.add_argument(
+        "--token",
+        default=os.environ.get("FREETOKEN_DAEMON_TOKEN"),
+        help="Optional X-FT-Token shared secret",
+    )
+    p.add_argument(
+        "--default-serve-port",
+        type=int,
+        default=DEFAULT_SERVE_PORT,
+        help="Port used when /engine/start omits one",
+    )
+    p.add_argument(
+        "--serve-python", default=sys.executable, help="Interpreter used to launch ft serve"
+    )
+    p.add_argument(
+        "--grace", type=float, default=10.0, help="SIGTERM→SIGKILL grace seconds on stop"
+    )
+    p.add_argument(
+        "--poll-interval",
+        type=float,
+        default=1.0,
+        help="Adopted-serve liveness / OOM reapply interval",
+    )
+    p.add_argument(
+        "--oom-child-score", type=int, default=500, help="oom_score_adj written to the serve tree"
+    )
     p.add_argument("--no-oom", action="store_true", help="Do not manage oom_score_adj")
-    p.add_argument("--auto-restart", action="store_true", help="Restart the serve on crash (default off)")
-    p.add_argument("--stop-serve-on-exit", action="store_true", help="Stop the serve when the daemon exits (default: detach, engine outlives the daemon)")
+    p.add_argument(
+        "--auto-restart", action="store_true", help="Restart the serve on crash (default off)"
+    )
+    p.add_argument(
+        "--stop-serve-on-exit",
+        action="store_true",
+        help="Stop the serve when the daemon exits (default: detach, engine outlives the daemon)",
+    )
     p.add_argument("--log-capacity", type=int, default=4000, help="Log ring size (lines)")
-    p.add_argument("--setsid", action="store_true", help="Detach into a new session at startup (guarded)")
+    p.add_argument(
+        "--setsid", action="store_true", help="Detach into a new session at startup (guarded)"
+    )
     p.add_argument("--log-level", default="info", help="uvicorn log level")
     return p
 
@@ -220,7 +250,13 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon") -> int:
     )
     app.state.request_shutdown = lambda: setattr(server, "should_exit", True)
 
-    logger.info("ft daemon %s listening on %s:%s (state-dir=%s)", DAEMON_VERSION, args.host, args.port, state_dir)
+    logger.info(
+        "ft daemon %s listening on %s:%s (state-dir=%s)",
+        DAEMON_VERSION,
+        args.host,
+        args.port,
+        state_dir,
+    )
     try:
         server.run()
     finally:

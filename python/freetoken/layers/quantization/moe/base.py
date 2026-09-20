@@ -87,7 +87,7 @@ def fused_piece(pieces: dict[str, torch.Tensor], role: str) -> torch.Tensor:
     """A gate_up-family piece, concatenating separate gate / up pieces along the row axis."""
     if role in pieces:
         return pieces[role]
-    suffix = role[len("gate_up"):]
+    suffix = role[len("gate_up") :]
     return torch.cat([pieces["gate" + suffix], pieces["up" + suffix]], dim=1)
 
 
@@ -103,7 +103,13 @@ def global_rows(piece: torch.Tensor, rows: int) -> torch.Tensor:
 def fused_global(pieces: dict[str, torch.Tensor], half_rows: int) -> torch.Tensor:
     if "gate_up_global" in pieces:
         return global_rows(pieces["gate_up_global"], 2 * half_rows)
-    return torch.cat([global_rows(pieces["gate_global"], half_rows), global_rows(pieces["up_global"], half_rows)], dim=1)
+    return torch.cat(
+        [
+            global_rows(pieces["gate_global"], half_rows),
+            global_rows(pieces["up_global"], half_rows),
+        ],
+        dim=1,
+    )
 
 
 def limit_or_inf(layer: Any) -> float:
@@ -121,7 +127,9 @@ def gated_epilogue_reason(cfg: "MoEConfig") -> str | None:
         return "the epilogue reads uninterleaved [gate; up] halves"
     if cfg.beta != 0.0:
         return f"the epilogue has no beta (got {cfg.beta})"
-    if cfg.activation in ("silu", "gelu", "gelu_tanh") and (cfg.alpha != 1.0 or cfg.limit is not None):
+    if cfg.activation in ("silu", "gelu", "gelu_tanh") and (
+        cfg.alpha != 1.0 or cfg.limit is not None
+    ):
         return f"{cfg.activation} takes no alpha / limit (got alpha={cfg.alpha}, limit={cfg.limit})"
     return None
 
@@ -147,7 +155,9 @@ class MoEKernel(ABC):
         """Most GPU cache slots the kernel can address for ``cfg``; None for no limit."""
         return self.max_slots
 
-    def _common_reject(self, cfg: MoEConfig, *, resident_ok: bool, tp_ok: bool, cpu_ok: bool, plain_silu_only: bool) -> str | None:
+    def _common_reject(
+        self, cfg: MoEConfig, *, resident_ok: bool, tp_ok: bool, cpu_ok: bool, plain_silu_only: bool
+    ) -> str | None:
         if not resident_ok and cfg.strategy == "resident":
             return "not served resident; use --moe-strategy offload or cpu"
         if not tp_ok and cfg.tp_size > 1:
@@ -164,11 +174,22 @@ class MoEKernel(ABC):
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]: ...
 
     @abstractmethod
-    def pack(self, pieces: dict[str, torch.Tensor], cfg: MoEConfig, out: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def pack(
+        self, pieces: dict[str, torch.Tensor], cfg: MoEConfig, out: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
         """Write one batch of expert pieces into ``out`` rows; returns the GPU-resident per-expert values, if any."""
 
     @abstractmethod
-    def apply(self, layer: Any, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor, view: ExpertView, *, is_prefill: bool) -> torch.Tensor: ...
+    def apply(
+        self,
+        layer: Any,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        view: ExpertView,
+        *,
+        is_prefill: bool,
+    ) -> torch.Tensor: ...
 
 
 class MoEMethod(QuantMethod):
@@ -177,13 +198,24 @@ class MoEMethod(QuantMethod):
     def layout(self) -> dict[str, BankSpec]:
         return self.kernel.layout(self.cfg)
 
-    def pack(self, pieces: dict[str, torch.Tensor], out: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def pack(
+        self, pieces: dict[str, torch.Tensor], out: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
         return self.kernel.pack(pieces, self.cfg, out)
 
     def slot_limit(self) -> int | None:
         return self.kernel.slot_limit(self.cfg)
 
-    def apply(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor, view: ExpertView, *, layer: Any, is_prefill: bool) -> torch.Tensor:
+    def apply(
+        self,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        view: ExpertView,
+        *,
+        layer: Any,
+        is_prefill: bool,
+    ) -> torch.Tensor:
         return self.kernel.apply(layer, x, topk_weights, topk_ids, view, is_prefill=is_prefill)
 
     @property

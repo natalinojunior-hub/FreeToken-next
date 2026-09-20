@@ -12,7 +12,10 @@ CHECKPOINT = os.environ.get("FREETOKEN_QWEN3VL_MODEL", "")
 
 pytestmark = [
     pytest.mark.slow,
-    pytest.mark.skipif(not os.path.exists(os.path.join(CHECKPOINT, "config.json")), reason="FREETOKEN_QWEN3VL_MODEL not set"),
+    pytest.mark.skipif(
+        not os.path.exists(os.path.join(CHECKPOINT, "config.json")),
+        reason="FREETOKEN_QWEN3VL_MODEL not set",
+    ),
 ]
 
 # the engine wants a fresh CUDA context, so each run gets its own process
@@ -40,7 +43,10 @@ print("RESULT", repr(text), llm.engine.encoder_cache.stats())
 def test_repeated_image_survives_the_chunk_boundary(storage):
     run = subprocess.run(
         [sys.executable, "-c", _SCRIPT, CHECKPOINT, storage],
-        capture_output=True, text=True, timeout=900, env={**os.environ, "PYTHONPATH": os.environ.get("PYTHONPATH", "")},
+        capture_output=True,
+        text=True,
+        timeout=900,
+        env={**os.environ, "PYTHONPATH": os.environ.get("PYTHONPATH", "")},
     )
     assert run.returncode == 0, run.stderr[-2000:]
     result = [line for line in run.stdout.splitlines() if line.startswith("RESULT")][-1]

@@ -3,6 +3,7 @@
 Each case fakes one model family's template behavior and asserts the derived
 gears match (or improve on) what the deleted ``think_spec`` registry hardcoded.
 """
+
 from __future__ import annotations
 
 from freetoken.server.model_meta import derive_think_gears

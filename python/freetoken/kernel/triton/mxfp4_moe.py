@@ -79,9 +79,9 @@ def mxfp4_splitk_gemv_kernel(
             acc += _fp4_table_lut(hi, lut_ptr) * scale_f * x_hi
 
     if HAS_BIAS and pid_k == 0:
-        acc += tl.load(
-            bias_ptr + expert_id * stride_be + offs_n, mask=mask_n, other=0.0
-        ).to(tl.float32)
+        acc += tl.load(bias_ptr + expert_id * stride_be + offs_n, mask=mask_n, other=0.0).to(
+            tl.float32
+        )
 
     out_row = pid_e * NUM_K_SPLITS + pid_k
     tl.store(out_ptr + out_row * stride_oe + offs_n, acc, mask=mask_n)
@@ -329,4 +329,3 @@ def gpt_oss_routing_kernel(
     out_off = token_id * K + offs_e
     tl.store(topk_weights_ptr + out_off, weights, mask=top_mask)
     tl.store(topk_ids_ptr + out_off, all_ids, mask=top_mask)
-

@@ -48,11 +48,16 @@ class _VisionRotary:
             spatial_dim = self.head_dim // 2
             self._inv_freq = 1.0 / (
                 self.theta
-                ** (torch.arange(0, spatial_dim, 2, dtype=torch.float32, device=device) / spatial_dim)
+                ** (
+                    torch.arange(0, spatial_dim, 2, dtype=torch.float32, device=device)
+                    / spatial_dim
+                )
             )
         return self._inv_freq
 
-    def cos_sin(self, position_ids: torch.Tensor, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+    def cos_sin(
+        self, position_ids: torch.Tensor, dtype: torch.dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         inv = self._inv(position_ids.device)
         all_cos, all_sin = [], []
         for i in range(2):
@@ -109,7 +114,9 @@ class Gemma4VisionAttention(BaseOP):
         k = _apply_multidim_rope(k, cos, sin).transpose(1, 2)
         v = v.transpose(1, 2)
 
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=1.0, enable_gqa=self.num_kv_heads != self.num_heads)
+        o = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, scale=1.0, enable_gqa=self.num_kv_heads != self.num_heads
+        )
         o = o.transpose(1, 2).reshape(B, P, self.num_heads * self.head_dim)
         return self.o_proj.forward(o)
 
@@ -175,7 +182,9 @@ def _avg_pool_by_positions(
     k = int((input_seq_len // length) ** 0.5)
     k_squared = k * k
     if k_squared * length != input_seq_len:
-        raise ValueError(f"Cannot pool {hidden.shape} to {length}: {k}^2 * {length} != {input_seq_len}")
+        raise ValueError(
+            f"Cannot pool {hidden.shape} to {length}: {k}^2 * {length} != {input_seq_len}"
+        )
     clamped = position_ids.clamp(min=0)
     max_x = clamped[..., 0].max(dim=-1, keepdim=True)[0] + 1
     kernel_idxs = torch.div(clamped, k, rounding_mode="floor")
@@ -205,7 +214,9 @@ class Gemma4VisionModel(BaseOP):
     def place_weights(self, mode: str) -> None:
         """gpu: every tensor resident; host: encoder layer tensors in pinned banks streamed two layers at a time (patch embedder and pooling stay resident)."""
         if mode == "host" and self._streamer is None:
-            self._streamer = BlockWeightStreamer(self.encoder.layers.op_list, self.patch_embedder.input_proj.weight.device)
+            self._streamer = BlockWeightStreamer(
+                self.encoder.layers.op_list, self.patch_embedder.input_proj.weight.device
+            )
         elif mode == "gpu" and self._streamer is not None:
             self._streamer.unstream()
             self._streamer = None

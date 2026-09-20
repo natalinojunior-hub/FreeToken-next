@@ -161,7 +161,10 @@ def iter_merged_tensors(
 
 # Quant scales consumed with their ``weight_packed``.
 CT_SCALE_SUFFIXES = (
-    ".weight_scale", ".weight_global_scale", ".input_global_scale", ".input_scale",
+    ".weight_scale",
+    ".weight_global_scale",
+    ".input_global_scale",
+    ".input_scale",
 )
 
 
@@ -175,7 +178,10 @@ class ShardReader:
 
     def __init__(self, model_path: str, device: torch.device):
         folder = download_hf_weight(model_path)
-        self._map = {name: os.path.join(folder, shard) for name, shard in safetensors_weight_map(folder).items()}
+        self._map = {
+            name: os.path.join(folder, shard)
+            for name, shard in safetensors_weight_map(folder).items()
+        }
         self._device = str(device)
         self._handles: dict[str, object] = {}
 
@@ -207,7 +213,9 @@ class ShardReader:
         self._handles.clear()
 
 
-def nvfp4_parts_ct(f, raw_base: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+def nvfp4_parts_ct(
+    f, raw_base: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """compressed-tensors NVFP4 -> ``(packed uint8 [O, IN//2], block scale fp8 [O, IN//16], per-output-row global fp16 [O], dequant-side input_scale fp32 scalar or None)`` for the NVFP4 linear method."""
     w = f.get_tensor(raw_base + ".weight_packed")
     s = f.get_tensor(raw_base + ".weight_scale")
@@ -215,7 +223,7 @@ def nvfp4_parts_ct(f, raw_base: str) -> tuple[torch.Tensor, torch.Tensor, torch.
     g = (1.0 / wg).to(torch.float16).expand(w.shape[0]).contiguous()
     a = None
     if f.has(raw_base + ".input_global_scale"):
-        a = (1.0 / f.get_tensor(raw_base + ".input_global_scale").reshape(()).to(torch.float32))
+        a = 1.0 / f.get_tensor(raw_base + ".input_global_scale").reshape(()).to(torch.float32)
     return w, s, g, a
 
 

@@ -124,9 +124,7 @@ def _checksum(banks: dict) -> dict:
             first = (-offset) % step  # first strided sample that lands inside this part
             if first < p.numel():
                 sample = p[first::step].to(torch.int64)
-                pos = torch.arange(
-                    offset + first, offset + p.numel(), step, dtype=torch.int64
-                )
+                pos = torch.arange(offset + first, offset + p.numel(), step, dtype=torch.int64)
                 h += int((sample * (pos % _HASH_WEIGHT + 1)).sum().item())
             offset += p.numel()
         out[n] = h
@@ -144,8 +142,12 @@ def _model_config(model_path: str):
 
     dev = bind_assigned_gpu()
     torch.zeros(1, device=dev)  # init CUDA context (pinning / nvfp4 backend pick)
-    cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(0, 1),
-                       dtype=torch.bfloat16, moe_strategy="offload")
+    cfg = EngineConfig(
+        model_path=model_path,
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+        moe_strategy="offload",
+    )
     return cfg.model_config
 
 
@@ -166,8 +168,9 @@ def _evict_cache(model_path: str) -> int:
     return n
 
 
-def _bench_load(mode: str, model_path: str, *, parallel: bool, workers: int, chunk: int,
-                drop_cache: bool = True) -> None:
+def _bench_load(
+    mode: str, model_path: str, *, parallel: bool, workers: int, chunk: int, drop_cache: bool = True
+) -> None:
     """Time load_expert_banks end-to-end (alloc + read + pin) and checksum the sources."""
     from freetoken.moe.expert_banks import load_expert_banks
 
@@ -178,38 +181,74 @@ def _bench_load(mode: str, model_path: str, *, parallel: bool, workers: int, chu
     s.start()
     t = time.perf_counter()
     try:
-        banks = load_expert_banks(model_path, mc, device=torch.device("cuda", torch.cuda.current_device()),
-                                  dtype=torch.bfloat16, parallel=parallel,
-                                  workers=workers, chunk=chunk)
+        banks = load_expert_banks(
+            model_path,
+            mc,
+            device=torch.device("cuda", torch.cuda.current_device()),
+            dtype=torch.bfloat16,
+            parallel=parallel,
+            workers=workers,
+            chunk=chunk,
+        )
     except NotImplementedError as e:
         s.stop()
         print("@@RESULT@@" + json.dumps({"mode": mode, "skipped": str(e)}))
         return
     load_s = time.perf_counter() - t
     ck = _checksum(banks.sources)
-    total = sum(bt.numel() * bt.element_size() for v in banks.sources.values() for bt in _bank_tensors(v))
+    total = sum(
+        bt.numel() * bt.element_size() for v in banks.sources.values() for bt in _bank_tensors(v)
+    )
     s.stop()
-    print("@@RESULT@@" + json.dumps({
-        "mode": mode, "load_s": round(load_s, 2), "gib": round(total / GiB, 2),
-        "gibps": round(total / GiB / load_s, 2) if load_s else 0,
-        "peak_rss_gib": round(s.max_rss / GiB, 1), "n_banks": len(banks.sources),
-        "quant_format": banks.quant_format, "checksum": ck}))
+    print(
+        "@@RESULT@@"
+        + json.dumps(
+            {
+                "mode": mode,
+                "load_s": round(load_s, 2),
+                "gib": round(total / GiB, 2),
+                "gibps": round(total / GiB / load_s, 2) if load_s else 0,
+                "peak_rss_gib": round(s.max_rss / GiB, 1),
+                "n_banks": len(banks.sources),
+                "quant_format": banks.quant_format,
+                "checksum": ck,
+            }
+        )
+    )
 
 
 def worker_baseline(ns):
-    _bench_load("baseline", ns.model, parallel=False, workers=ns.workers,
-                chunk=ns.chunk_mib << 20, drop_cache=not ns.no_drop_cache)
+    _bench_load(
+        "baseline",
+        ns.model,
+        parallel=False,
+        workers=ns.workers,
+        chunk=ns.chunk_mib << 20,
+        drop_cache=not ns.no_drop_cache,
+    )
 
 
 def worker_parallel(ns):
-    _bench_load("parallel", ns.model, parallel=True, workers=ns.workers,
-                chunk=ns.chunk_mib << 20, drop_cache=not ns.no_drop_cache)
+    _bench_load(
+        "parallel",
+        ns.model,
+        parallel=True,
+        workers=ns.workers,
+        chunk=ns.chunk_mib << 20,
+        drop_cache=not ns.no_drop_cache,
+    )
 
 
 def worker_ftw(ns):
     # FTW auto-detected by path -> load_expert_banks routes to load_ftw_banks
-    _bench_load("ftw", ns.ftw_dir, parallel=False, workers=ns.workers,
-                chunk=ns.chunk_mib << 20, drop_cache=not ns.no_drop_cache)
+    _bench_load(
+        "ftw",
+        ns.ftw_dir,
+        parallel=False,
+        workers=ns.workers,
+        chunk=ns.chunk_mib << 20,
+        drop_cache=not ns.no_drop_cache,
+    )
 
 
 def worker_build(ns):
@@ -223,23 +262,52 @@ def worker_build(ns):
     s.start()
     t = time.perf_counter()
     dev = f"cuda:{torch.cuda.current_device()}" if ns.gpu else None
-    idx = convert_checkpoint(ns.model, ns.ftw_dir, moe_backend="offload", shard_limit=shard_limit, device=dev)
+    idx = convert_checkpoint(
+        ns.model, ns.ftw_dir, moe_backend="offload", shard_limit=shard_limit, device=dev
+    )
     build_s = time.perf_counter() - t
     s.stop()
-    print("@@RESULT@@" + json.dumps({
-        "mode": "build", "build_s": round(build_s, 2), "gib": round(idx["total_bytes"] / GiB, 2),
-        "shards": len(idx["shards"]), "counts": idx["counts"],
-        "peak_rss_gib": round(s.max_rss / GiB, 1)}))
+    print(
+        "@@RESULT@@"
+        + json.dumps(
+            {
+                "mode": "build",
+                "build_s": round(build_s, 2),
+                "gib": round(idx["total_bytes"] / GiB, 2),
+                "shards": len(idx["shards"]),
+                "counts": idx["counts"],
+                "peak_rss_gib": round(s.max_rss / GiB, 1),
+            }
+        )
+    )
 
 
-_WORKERS = {"baseline": worker_baseline, "parallel": worker_parallel, "ftw": worker_ftw, "build": worker_build}
+_WORKERS = {
+    "baseline": worker_baseline,
+    "parallel": worker_parallel,
+    "ftw": worker_ftw,
+    "build": worker_build,
+}
 
 
 # ---------------- parent orchestration ----------------
 def _spawn(worker: str, ns):
-    cmd = [sys.executable, os.path.abspath(__file__), "--_worker", worker, "--model", ns.model,
-           "--workers", str(ns.workers), "--chunk-mib", str(ns.chunk_mib),
-           "--shard-gib", str(ns.shard_gib), "--ftw-dir", ns.ftw_dir]
+    cmd = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--_worker",
+        worker,
+        "--model",
+        ns.model,
+        "--workers",
+        str(ns.workers),
+        "--chunk-mib",
+        str(ns.chunk_mib),
+        "--shard-gib",
+        str(ns.shard_gib),
+        "--ftw-dir",
+        ns.ftw_dir,
+    ]
     if ns.gpu:
         cmd += ["--gpu", ns.gpu]
     if ns.no_drop_cache:
@@ -249,26 +317,37 @@ def _spawn(worker: str, ns):
     p = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, env=os.environ.copy())
     for line in p.stdout.splitlines():
         if line.startswith("@@RESULT@@"):
-            return json.loads(line[len("@@RESULT@@"):])
+            return json.loads(line[len("@@RESULT@@") :])
     print(f"  [error] worker {worker!r} failed (exit {p.returncode}); see stderr above.")
     return None
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--model", required=True)
-    p.add_argument("--modes", default=",".join(ALL_MODES), help="comma list of: " + ",".join(ALL_MODES))
+    p.add_argument(
+        "--modes", default=",".join(ALL_MODES), help="comma list of: " + ",".join(ALL_MODES)
+    )
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--chunk-mib", type=int, default=8)
     p.add_argument("--shard-gib", type=float, default=8.0, help="FTW shard size cap (ftw build)")
     p.add_argument("--ftw-dir", default="", help="FTW scratch dir (default: /var/tmp/ftw_<model>)")
-    p.add_argument("--no-drop-cache", action="store_true",
-                   help="don't evict page cache before each read (warm comparison)")
+    p.add_argument(
+        "--no-drop-cache",
+        action="store_true",
+        help="don't evict page cache before each read (warm comparison)",
+    )
     p.add_argument("--keep-ftw", action="store_true", help="keep + reuse the FTW dir across runs")
     from freetoken.gpu_select import single_gpu_arg
 
-    p.add_argument("--gpu", type=single_gpu_arg, default=None,
-                   help="GPU UUID or nvidia-smi index (default: the first visible GPU)")
+    p.add_argument(
+        "--gpu",
+        type=single_gpu_arg,
+        default=None,
+        help="GPU UUID or nvidia-smi index (default: the first visible GPU)",
+    )
     p.add_argument("--_worker", default="")
     ns = p.parse_args()
 
@@ -304,8 +383,10 @@ def main():
     if not rp:
         return
     base_ck = rp["checksum"]
-    print(f"[baseline] quant={rp['quant_format']} banks={rp['n_banks']} size={rp['gib']}GiB  "
-          f"load={rp['load_s']}s @ {rp['gibps']} GiB/s  peakRSS={rp['peak_rss_gib']}G")
+    print(
+        f"[baseline] quant={rp['quant_format']} banks={rp['n_banks']} size={rp['gib']}GiB  "
+        f"load={rp['load_s']}s @ {rp['gibps']} GiB/s  peakRSS={rp['peak_rss_gib']}G"
+    )
     rows = [("baseline", rp)]
 
     # build the FTW once (reuse if --keep-ftw and it's already there).
@@ -315,8 +396,10 @@ def main():
         else:
             b = _spawn("build", ns)
             if b:
-                print(f"[FTW ] built {b['gib']}GiB / {b['shards']} shard(s) {b['counts']} "
-                      f"in {b['build_s']}s  (one-time, offline)")
+                print(
+                    f"[FTW ] built {b['gib']}GiB / {b['shards']} shard(s) {b['counts']} "
+                    f"in {b['build_s']}s  (one-time, offline)"
+                )
 
     for m in modes:
         if m not in ("parallel", "ftw"):
@@ -328,7 +411,9 @@ def main():
             print(f"  [skip] {m}: {r['skipped']}")
 
     # ---- table ----
-    hdr = f"{'mode':<10} {'load_s':>8} {'read GiB/s':>11} {'peakRSS':>8} {'speedup':>8} {'bytes':>6}"
+    hdr = (
+        f"{'mode':<10} {'load_s':>8} {'read GiB/s':>11} {'peakRSS':>8} {'speedup':>8} {'bytes':>6}"
+    )
     print("\n" + "=" * len(hdr))
     print(hdr)
     print("-" * len(hdr))
@@ -339,18 +424,24 @@ def main():
             print(f"{name:<10} {'-':>8} {'-':>11} {'-':>8} {'-':>8} {'skip':>6}")
             continue
         if name == "baseline":
-            print(f"{name:<10} {r['load_s']:>8.2f} {r['gibps']:>11.2f} {r['peak_rss_gib']:>7.1f}G "
-                  f"{'1.00x':>8} {'-':>6}")
+            print(
+                f"{name:<10} {r['load_s']:>8.2f} {r['gibps']:>11.2f} {r['peak_rss_gib']:>7.1f}G "
+                f"{'1.00x':>8} {'-':>6}"
+            )
         else:
             ok = r["checksum"] == base_ck
             if not ok:
                 bad.append((name, r["checksum"]))
             spd = f"{base_tot / r['load_s']:.2f}x" if r["load_s"] else "-"
-            print(f"{name:<10} {r['load_s']:>8.2f} {r['gibps']:>11.2f} {r['peak_rss_gib']:>7.1f}G "
-                  f"{spd:>8} {'ok' if ok else 'BAD':>6}")
+            print(
+                f"{name:<10} {r['load_s']:>8.2f} {r['gibps']:>11.2f} {r['peak_rss_gib']:>7.1f}G "
+                f"{spd:>8} {'ok' if ok else 'BAD':>6}"
+            )
     print("=" * len(hdr))
-    print(f"banks={rp['gib']}GiB ({rp['n_banks']} x {rp['quant_format']})  "
-          f"load_s = end-to-end load_expert_banks; speedup vs baseline.")
+    print(
+        f"banks={rp['gib']}GiB ({rp['n_banks']} x {rp['quant_format']})  "
+        f"load_s = end-to-end load_expert_banks; speedup vs baseline."
+    )
 
     if not ns.keep_ftw:
         shutil.rmtree(ns.ftw_dir, ignore_errors=True)

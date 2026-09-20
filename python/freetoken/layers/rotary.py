@@ -138,7 +138,9 @@ def build_section_table(mrope_section: tuple[int, int, int], layout: str) -> tor
         sec[1 : 3 * sh : 3] = 1
         sec[2 : 3 * sw : 3] = 2
         if int((sec == 1).sum()) != sh or int((sec == 2).sum()) != sw:
-            raise ValueError(f"mrope_section {mrope_section} is not representable in the interleaved layout")
+            raise ValueError(
+                f"mrope_section {mrope_section} is not representable in the interleaved layout"
+            )
     elif layout == "interleaved_glm":
         counts = [0, 0, 0]
         for i in range(half):
@@ -155,9 +157,7 @@ def build_section_table(mrope_section: tuple[int, int, int], layout: str) -> tor
 class MRotaryEmbedding(RotaryEmbedding):
     """3-axis (t/h/w) rope over the parent's cos_sin_cache; section_table picks the axis row per frequency slot. Consumes positions [3, n]."""
 
-    def __init__(
-        self, *args, mrope_section: tuple, layout: str = "interleaved", **kwargs
-    ) -> None:
+    def __init__(self, *args, mrope_section: tuple, layout: str = "interleaved", **kwargs) -> None:
         super().__init__(*args, **kwargs)
         assert self.is_neox, "mrope is defined on the NeoX half-rotation layout"
         half = self.rotary_dim // 2
@@ -182,13 +182,21 @@ class MRotaryEmbedding(RotaryEmbedding):
         positions = positions.contiguous()
         if self._kernel is not None:
             self._kernel(
-                positions=positions, query=query, key=key, head_size=self.head_size,
-                cos_sin_cache=self._cos_sin_cache, section_table=self._section_table,
+                positions=positions,
+                query=query,
+                key=key,
+                head_size=self.head_size,
+                cos_sin_cache=self._cos_sin_cache,
+                section_table=self._section_table,
             )
         else:
             _mrope_torch(
-                positions, query, key, self.head_size,
-                self._cos_sin_cache, self._section_table,
+                positions,
+                query,
+                key,
+                self.head_size,
+                self._cos_sin_cache,
+                self._section_table,
             )
         return query, key
 
@@ -292,7 +300,8 @@ def _get_rope(
             def post_process(inv_freq: torch.Tensor) -> torch.Tensor:
                 ramp = torch.clamp(
                     (torch.arange(rotary_dim // 2, dtype=torch.float32) - low) / (high - low),
-                    0, 1,
+                    0,
+                    1,
                 )
                 return (inv_freq / factor) * ramp + inv_freq * (1 - ramp)
 
@@ -334,8 +343,12 @@ def get_rope(
         if mrope_section is not None:
             assert rope_map is None or rope_map.get("rope_type", "default") == "default"
             return MRotaryEmbedding(
-                head_dim, rotary_dim, max_position, base,
-                is_neox=is_neox, mrope_section=tuple(mrope_section),
+                head_dim,
+                rotary_dim,
+                max_position,
+                base,
+                is_neox=is_neox,
+                mrope_section=tuple(mrope_section),
                 layout=mrope_layout,
             )
         return _get_rope(head_dim, rotary_dim, max_position, base, rope_map, is_neox)

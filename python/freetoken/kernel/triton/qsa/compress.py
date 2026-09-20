@@ -43,12 +43,8 @@ def _compress_qsa_groups_kernel(
     end_position = tl.load(logical_positions_ptr + row)
     valid_request = (request >= 0) & (request < num_requests)
     safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
-    query_row_start = tl.load(
-        query_start_loc_ptr + safe_request, mask=valid_request, other=0
-    )
-    query_row_end = tl.load(
-        query_start_loc_ptr + safe_request + 1, mask=valid_request, other=0
-    )
+    query_row_start = tl.load(query_start_loc_ptr + safe_request, mask=valid_request, other=0)
+    query_row_end = tl.load(query_start_loc_ptr + safe_request + 1, mask=valid_request, other=0)
     chunk_start_position = end_position - (row - query_row_start)
     ring_slot = tl.load(ring_slots_ptr + safe_request, mask=valid_request, other=-1)
     valid_ring_slot = (ring_slot >= 0) & (ring_slot < num_ring_slots)
@@ -82,10 +78,7 @@ def _compress_qsa_groups_kernel(
             + tl.maximum(ring_slot, 0).to(tl.int64) * stride_ring_slot
             + (position % RING_CAPACITY) * stride_ring_row
             + dims,
-            mask=valid_row
-            & ~use_raw
-            & valid_ring_slot
-            & (dims < HEAD_DIM),
+            mask=valid_row & ~use_raw & valid_ring_slot & (dims < HEAD_DIM),
             other=0.0,
         ).to(tl.float32)
         accumulator += tl.where(use_raw, raw_values, ring_values)
@@ -139,9 +132,7 @@ def _index_norm_rope_kernel(
     x = tl.load(base + dims[None, :], mask=mask, other=0.0).to(tl.float32)
     x_partner = tl.load(base + partner[None, :], mask=mask, other=0.0).to(tl.float32)
     weight = tl.load(weight_ptr + dims, mask=in_dim, other=0.0).to(tl.float32) + 1.0
-    weight_partner = (
-        tl.load(weight_ptr + partner, mask=in_dim, other=0.0).to(tl.float32) + 1.0
-    )
+    weight_partner = tl.load(weight_ptr + partner, mask=in_dim, other=0.0).to(tl.float32) + 1.0
     rrms = tl.rsqrt(tl.sum(x * x, axis=1) / HEAD_DIM + eps)
     y = x * rrms[:, None] * weight[None, :]
     y_partner = x_partner * rrms[:, None] * weight_partner[None, :]
@@ -193,10 +184,7 @@ def _store_qsa_rows_kernel(
         other=0,
     )
     tl.store(
-        cache_ptr
-        + block.to(tl.int64) * stride_cache_block
-        + token * stride_cache_token
-        + dims,
+        cache_ptr + block.to(tl.int64) * stride_cache_block + token * stride_cache_token + dims,
         values,
         mask=valid & (dims < WIDTH),
     )

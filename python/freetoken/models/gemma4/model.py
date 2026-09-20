@@ -145,4 +145,8 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForCausalLM):
         return self.embed_vision.forward(self.vision_embedder.forward(feature, positions))[0]
 
 
-__all__ = ["Gemma4ForCausalLM", "Gemma4ForConditionalGeneration", "Gemma4UnifiedForConditionalGeneration"]
+__all__ = [
+    "Gemma4ForCausalLM",
+    "Gemma4ForConditionalGeneration",
+    "Gemma4UnifiedForConditionalGeneration",
+]

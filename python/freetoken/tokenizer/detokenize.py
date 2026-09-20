@@ -91,6 +91,15 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        # If the batch contains multiple messages for the same uid (e.g. speculative
+        # decode committing multiple accepted tokens at once), process sequentially
+        # so each token updates the request's decode state before the next reads it.
+        if len(msgs) > len({m.uid for m in msgs}):
+            res: List[str] = []
+            for m in msgs:
+                res.extend(self.detokenize([m]))
+            return res
+
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:

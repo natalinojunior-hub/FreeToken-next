@@ -81,8 +81,12 @@ def expert_bytes(profile: ModelProfile) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gpu", type=single_gpu_arg, default=None,
-                        help="GPU UUID or nvidia-smi index (default: the first visible GPU)")
+    parser.add_argument(
+        "--gpu",
+        type=single_gpu_arg,
+        default=None,
+        help="GPU UUID or nvidia-smi index (default: the first visible GPU)",
+    )
     parser.add_argument("--repeat", type=int, default=25)
     parser.add_argument("--models", type=str, nargs="+", default=list(MODELS), choices=list(MODELS))
     parser.add_argument(

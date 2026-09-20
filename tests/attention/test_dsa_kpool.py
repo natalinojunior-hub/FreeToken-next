@@ -31,21 +31,39 @@ def _args(num_layers=1):
     from freetoken.models.glm5_next.args import Glm5NextArgs
 
     return Glm5NextArgs(
-        hidden_size=32, num_heads=H,
-        q_lora_rank=16, kv_lora_rank=LATENT, qk_nope_head_dim=LATENT,
-        qk_rope_head_dim=0, v_head_dim=LATENT, mla_nope=True, norm_eps=1e-5,
+        hidden_size=32,
+        num_heads=H,
+        q_lora_rank=16,
+        kv_lora_rank=LATENT,
+        qk_nope_head_dim=LATENT,
+        qk_rope_head_dim=0,
+        v_head_dim=LATENT,
+        mla_nope=True,
+        norm_eps=1e-5,
         max_position=4096,
-        index_n_heads=HI, index_head_dim=DI, index_topk=TOPK,
-        indexer_types=("full",) * num_layers, indexer_rope_interleave=True,
-        index_kpool=KPOOL, index_kpool_compress=True,
+        index_n_heads=HI,
+        index_head_dim=DI,
+        index_topk=TOPK,
+        indexer_types=("full",) * num_layers,
+        indexer_rope_interleave=True,
+        index_kpool=KPOOL,
+        index_kpool_compress=True,
         index_kpool_always_select_tail=True,
-        linear_num_heads=0, linear_head_dim=0, linear_conv_kernel_dim=4,
+        linear_num_heads=0,
+        linear_head_dim=0,
+        linear_conv_kernel_dim=4,
         linear_lower_bound=-5.0,
         layer_types=("deepseek_sparse_attention",) * num_layers,
         mlp_layer_types=("dense",) * num_layers,
-        mhc=False, mhc_num_residual_streams=1, hc_eps=1e-6,
-        mhc_sinkhorn_iterations=0, mhc_tau=0.05, mhc_post_mult_value=2.0,
-        mhc_no_norm_weight=False, swiglu_limit=None, rope_theta=10000.0,
+        mhc=False,
+        mhc_num_residual_streams=1,
+        hc_eps=1e-6,
+        mhc_sinkhorn_iterations=0,
+        mhc_tau=0.05,
+        mhc_post_mult_value=2.0,
+        mhc_no_norm_weight=False,
+        swiglu_limit=None,
+        rope_theta=10000.0,
     )
 
 
@@ -55,10 +73,16 @@ def harness(monkeypatch):
     from freetoken.kvcache.dsa_pool import KpoolDSAKVCache
 
     pool = KpoolDSAKVCache(
-        latent_dim=LATENT, num_layers=1, num_pages=8, page_size=64,
-        dtype=torch.bfloat16, device=torch.device(DEV),
-        index_head_dim=DI, num_index_layers=1,
-        index_ratio=KPOOL, num_req_slots=4,
+        latent_dim=LATENT,
+        num_layers=1,
+        num_pages=8,
+        page_size=64,
+        dtype=torch.bfloat16,
+        device=torch.device(DEV),
+        index_head_dim=DI,
+        num_index_layers=1,
+        index_ratio=KPOOL,
+        num_req_slots=4,
     )
     page_table = torch.full((4, 512), -1, dtype=torch.int32, device=DEV)
     page_table[0, :512] = torch.arange(512, dtype=torch.int32, device=DEV)
@@ -66,8 +90,11 @@ def harness(monkeypatch):
     monkeypatch.setattr("freetoken.attention.dsa.get_global_ctx", lambda: ctx)
 
     config = SimpleNamespace(
-        glm5_args=_args(), glm_dsa_args=None, num_qo_heads=H,
-        attn_sm_scale=SM_SCALE, num_layers=1,
+        glm5_args=_args(),
+        glm_dsa_args=None,
+        num_qo_heads=H,
+        attn_sm_scale=SM_SCALE,
+        num_layers=1,
     )
     backend = Glm5NextDSABackend(config)
     torch.manual_seed(0)
@@ -78,14 +105,19 @@ def harness(monkeypatch):
 
 def _req(device_len, cached_len=0):
     return SimpleNamespace(
-        table_idx=0, device_len=device_len, extend_len=device_len - cached_len,
-        cached_len=cached_len, linear_slot_idx=None,
+        table_idx=0,
+        device_len=device_len,
+        extend_len=device_len - cached_len,
+        cached_len=cached_len,
+        linear_slot_idx=None,
     )
 
 
 def _prefill_batch(t0, t1):
     return SimpleNamespace(
-        phase="prefill", padded_reqs=[_req(t1, t0)], reqs=[_req(t1, t0)],
+        phase="prefill",
+        padded_reqs=[_req(t1, t0)],
+        reqs=[_req(t1, t0)],
         positions=torch.arange(t0, t1, device=DEV),
         out_loc=torch.arange(t0, t1, device=DEV),
         active_table_idx=None,
@@ -94,7 +126,9 @@ def _prefill_batch(t0, t1):
 
 def _decode_batch(pos):
     return SimpleNamespace(
-        phase="decode", padded_reqs=[_req(pos + 1, pos)], reqs=[_req(pos + 1, pos)],
+        phase="decode",
+        padded_reqs=[_req(pos + 1, pos)],
+        reqs=[_req(pos + 1, pos)],
         positions=torch.tensor([pos], device=DEV),
         out_loc=torch.tensor([pos], device=DEV),
         active_table_idx=torch.tensor([0], device=DEV),
@@ -105,8 +139,10 @@ def _rand_seq(total, seed=1):
     torch.manual_seed(seed)
     mk = lambda *s: torch.randn(*s, device=DEV, dtype=torch.bfloat16)
     return dict(
-        q_nope=mk(total, H, LATENT), c_kv=mk(total, LATENT),
-        qi=mk(total, HI, DI), ki=mk(total, DI),
+        q_nope=mk(total, H, LATENT),
+        c_kv=mk(total, LATENT),
+        qi=mk(total, HI, DI),
+        ki=mk(total, DI),
         wi=(torch.randn(total, HI, device=DEV).float() * 0.5),
         gate=mk(total, DI),
     )
@@ -118,12 +154,18 @@ def _run(backend, batch, d, sl, ape):
     t = batch.positions.shape[0]
     backend.prepare_metadata(batch)
     return backend.mla_forward(
-        d["q_nope"][sl], d["q_nope"].new_empty(t, H, 0),
-        d["c_kv"][sl], d["c_kv"].new_empty(t, 0),
-        0, batch,
+        d["q_nope"][sl],
+        d["q_nope"].new_empty(t, H, 0),
+        d["c_kv"][sl],
+        d["c_kv"].new_empty(t, 0),
+        0,
+        batch,
         indexer_inputs=DSAIndexerInputs(
-            q=d["qi"][sl], k=d["ki"][sl], w=d["wi"][sl],
-            gate=d["gate"][sl], ape=ape,
+            q=d["qi"][sl],
+            k=d["ki"][sl],
+            w=d["wi"][sl],
+            gate=d["gate"][sl],
+            ape=ape,
         ),
     )
 
@@ -159,9 +201,7 @@ def _ref_selected_positions(d, ape, q_idx_t, w_t, pos):
     expanded to tokens, plus the tail [n_pools*KPOOL, pos]."""
     n_pools = (pos + 1) // KPOOL
     sel_pools = min(TOPK // KPOOL, n_pools)
-    picked = torch.topk(
-        _ref_scores(d, ape, q_idx_t, w_t, n_pools), sel_pools
-    ).indices.tolist()
+    picked = torch.topk(_ref_scores(d, ape, q_idx_t, w_t, n_pools), sel_pools).indices.tolist()
     positions = [p * KPOOL + o for p in picked for o in range(KPOOL)]
     positions += list(range(n_pools * KPOOL, pos + 1))
     return sorted(set(positions))
@@ -235,7 +275,9 @@ def test_sparse_batch_with_sub_pool_request(harness):
         req_b.table_idx = 1
         reqs = [_req(ta), req_b]
         batch = SimpleNamespace(
-            phase="prefill", padded_reqs=reqs, reqs=reqs,
+            phase="prefill",
+            padded_reqs=reqs,
+            reqs=reqs,
             positions=torch.cat([torch.arange(ta), torch.arange(tb)]).to(DEV),
             out_loc=torch.cat([torch.arange(ta), torch.arange(448, 448 + tb)]).to(DEV),
             active_table_idx=None,
@@ -295,12 +337,12 @@ def test_interleaved_decode_requests_do_not_pollute_rings(harness):
         req = _req(t1, t0)
         req.table_idx = table
         return SimpleNamespace(
-            phase=phase, padded_reqs=[req], reqs=[req],
+            phase=phase,
+            padded_reqs=[req],
+            reqs=[req],
             positions=torch.arange(t0, t1, device=DEV),
             out_loc=torch.arange(base + t0, base + t1, device=DEV),
-            active_table_idx=(
-                torch.tensor([table], device=DEV) if phase == "decode" else None
-            ),
+            active_table_idx=(torch.tensor([table], device=DEV) if phase == "decode" else None),
         )
 
     for table in (0, 1):
@@ -311,8 +353,11 @@ def test_interleaved_decode_requests_do_not_pollute_rings(harness):
         for table in (0, 1):  # alternate every step
             d, base = streams[table]
             out = _run(
-                backend, _batch_for(table, "decode", pos, pos + 1), d,
-                slice(pos, pos + 1), ape,
+                backend,
+                _batch_for(table, "decode", pos, pos + 1),
+                d,
+                slice(pos, pos + 1),
+                ape,
             )
             sel = _ref_selected_positions(d, ape, d["qi"][pos], d["wi"][pos], pos)
             ref = _ref_attend(d, d["q_nope"][pos], sel)
@@ -344,12 +389,17 @@ def test_padding_and_empty_batch_leave_shadow_rows_clean():
     gate = torch.randn(2, DI, dtype=torch.bfloat16, device=DEV)
 
     kpool_compress_store(
-        k, gate, ring_k, ring_g, ape,
+        k,
+        gate,
+        ring_k,
+        ring_g,
+        ape,
         ring_slots=torch.tensor([0, 1], dtype=torch.int32, device=DEV),
         token_to_req=torch.tensor([0, -1], dtype=torch.int32, device=DEV),
         cu_seqlens=torch.tensor([0, 1, 1], dtype=torch.int32, device=DEV),
         positions=torch.tensor([0, 0], device=DEV),  # pos 0: no pool can close
-        slab=slab, cmp_rows=torch.tensor([8, 9], dtype=torch.int32, device=DEV),
+        slab=slab,
+        cmp_rows=torch.tensor([8, 9], dtype=torch.int32, device=DEV),
         ratio=KPOOL,
     )
     assert torch.equal(slab[:shadow_n], torch.full_like(slab[:shadow_n], 7.0))
@@ -358,12 +408,17 @@ def test_padding_and_empty_batch_leave_shadow_rows_clean():
 
     before = slab.clone()
     kpool_compress_store(
-        k[:0], gate[:0], ring_k, ring_g, ape,
+        k[:0],
+        gate[:0],
+        ring_k,
+        ring_g,
+        ape,
         ring_slots=torch.tensor([0], dtype=torch.int32, device=DEV),
         token_to_req=torch.empty(0, dtype=torch.int32, device=DEV),
         cu_seqlens=torch.tensor([0, 0], dtype=torch.int32, device=DEV),
         positions=torch.empty(0, dtype=torch.int64, device=DEV),
-        slab=slab, cmp_rows=torch.empty(0, dtype=torch.int32, device=DEV),
+        slab=slab,
+        cmp_rows=torch.empty(0, dtype=torch.int32, device=DEV),
         ratio=KPOOL,
     )
     assert torch.equal(slab, before)

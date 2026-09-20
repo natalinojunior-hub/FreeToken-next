@@ -16,10 +16,18 @@ immediate combine::
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, List
+import os
+import time
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, LinearReplicated, OPList, ParallelLMHead, VocabParallelEmbedding
+from freetoken.layers import (
+    BaseOP,
+    LinearReplicated,
+    OPList,
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from freetoken.layers.quantization import LayerKind, QuantConfig
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
@@ -60,7 +68,12 @@ class Qwen4ExpDecoderLayer(BaseOP):
     """One decoder layer over the hyper-connection streams (see the module docstring for the flow)."""
 
     def __init__(
-        self, config: ModelConfig, layer_id: int, *, prefix: str = "", moe_layer_id: int | None = None
+        self,
+        config: ModelConfig,
+        layer_id: int,
+        *,
+        prefix: str = "",
+        moe_layer_id: int | None = None,
     ) -> None:
         self._layer_id = layer_id
         self._is_linear = config.is_linear_layer(layer_id)
@@ -71,11 +84,15 @@ class Qwen4ExpDecoderLayer(BaseOP):
         # The MTP draft layer shares the target's expert bank (_MTPQuantConfig), so its MoE
         # block must index the offload cache at the TARGET layer's id, not its own KV/attention
         # layer_id (one past the target stack) -- moe_layer_id lets the caller alias the two.
-        self.mlp = Qwen4ExpMoE(config, moe_layer_id if moe_layer_id is not None else layer_id, prefix=f"{prefix}.mlp")
+        self.mlp = Qwen4ExpMoE(
+            config, moe_layer_id if moe_layer_id is not None else layer_id, prefix=f"{prefix}.mlp"
+        )
         self.attn_hyper_connection = GatedResidual(config, prefix=f"{prefix}.attn_hyper_connection")
         self.mlp_hyper_connection = GatedResidual(config, prefix=f"{prefix}.mlp_hyper_connection")
         self.ple = (
-            PLELayer(config, layer_id, prefix=f"{prefix}.ple") if layer_id in config.qwen4_args.ple_layer_ids else None
+            PLELayer(config, layer_id, prefix=f"{prefix}.ple")
+            if layer_id in config.qwen4_args.ple_layer_ids
+            else None
         )
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
@@ -147,7 +164,9 @@ class Qwen4ExpMTP(BaseOP):
         self.layer_id = layer_id
         self._embed_ref = embedding
         self._image_token_id = config.image_token_id
-        self.pre_fc_norm_hidden = GroupedPlusOneRMSNorm(self.hc_count * hidden, config.rms_norm_eps, self.hc_count)
+        self.pre_fc_norm_hidden = GroupedPlusOneRMSNorm(
+            self.hc_count * hidden, config.rms_norm_eps, self.hc_count
+        )
         self.pre_fc_norm_embedding = GroupedPlusOneRMSNorm(hidden, config.rms_norm_eps, 1)
         self.fc_hidden = LinearReplicated(
             hidden, hidden, has_bias=False, quant_config=config.quant, prefix="mtp.fc_hidden"
@@ -155,13 +174,22 @@ class Qwen4ExpMTP(BaseOP):
         self.fc_embedding = LinearReplicated(
             hidden, hidden, has_bias=False, quant_config=config.quant, prefix="mtp.fc_embedding"
         )
-        head_config = replace(config, quant=_MTPQuantConfig(config)) if config.quant is not None else config
-        self.layers = OPList([
-            Qwen4ExpDecoderLayer(
-                head_config, layer_id, prefix="mtp.layers.0", moe_layer_id=config.first_k_dense_replace
-            )
-        ])
-        self.hyper_connection_mixer = GatedResidual(config, use_combine=False, prefix="mtp.hyper_connection_mixer")
+        head_config = (
+            replace(config, quant=_MTPQuantConfig(config)) if config.quant is not None else config
+        )
+        self.layers = OPList(
+            [
+                Qwen4ExpDecoderLayer(
+                    head_config,
+                    layer_id,
+                    prefix="mtp.layers.0",
+                    moe_layer_id=config.first_k_dense_replace,
+                )
+            ]
+        )
+        self.hyper_connection_mixer = GatedResidual(
+            config, use_combine=False, prefix="mtp.hyper_connection_mixer"
+        )
 
     def forward(self, residual: torch.Tensor, next_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
         from freetoken.mm import restore_placeholder
@@ -198,7 +226,9 @@ class Qwen4ExpModel(BaseOP):
                 for layer_id in range(config.num_layers)
             ]
         )
-        self.hyper_connection_mixer = GatedResidual(config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer")
+        self.hyper_connection_mixer = GatedResidual(
+            config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer"
+        )
         # plain tuple (not an OP child), so it never shows up in the state dict
         self._ple = tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)
 
@@ -234,7 +264,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         self.model = Qwen4ExpModel(config)
         self.mtp = (
             Qwen4ExpMTP(config, config.mtp_layer_id, embedding=self.model.embed_tokens)
-            if config.mtp_layer_id is not None else None
+            if config.mtp_layer_id is not None
+            else None
         )
         self.lm_head = ParallelLMHead(
             num_embeddings=config.vocab_size,
@@ -244,6 +275,14 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             quant_config=config.quant,
             prefix="lm_head",
         )
+        from .gguf import convert_qwen4exp_to_gguf, is_gguf_model
+
+        if is_gguf_model(config):
+            assert config.gguf_model_path is not None, (
+                "expert_quant=='gguf' but ModelConfig.gguf_model_path is unset; the "
+                "GGUF loader should have populated it."
+            )
+            convert_qwen4exp_to_gguf(self, config, model_path=config.gguf_model_path)
         super().__init__()
 
     def load_host_tables(self, engine_config) -> int:
@@ -272,12 +311,20 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
             return 0
 
+        from freetoken.models.gguf.reader import is_gguf_path
+
+        is_gguf = is_gguf_path(engine_config.model_path)
+
         if engine_config.ple_backend == "disk":
             from freetoken.utils import download_hf_weight
 
             from .ple_disk import DiskRowTable, resolve_row_source
 
-            folder = download_hf_weight(engine_config.model_path)
+            folder = (
+                engine_config.model_path
+                if is_gguf
+                else download_hf_weight(engine_config.model_path)
+            )
             # one WAIT node per captured graph: the flag protocol supports a single consume
             assert len(ple_layers) == 1, "disk PLE backend expects exactly one PLE layer"
             emb, args = ple_layers[0].ple_embedding, ple_layers[0].args
@@ -289,6 +336,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 "per_head_offsets": emb.ngram_heads_offsets.tolist(),
                 "eos_token_id": args.ngram_boundary_token_id,
                 "image_token_id": args.image_token_id,
+                "ngram_head_dim": args.ngram_head_dim,
             }
             disk_table = DiskRowTable(
                 resolve_row_source(folder),
@@ -301,6 +349,15 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 ple.ple_embedding.attach_table(disk_table)
             # engine enters this around every dispatch; the graph itself never waits on the disk
             self.forward_host_ctx = disk_table.forward_host_ctx
+            return 0
+
+        if is_gguf:
+            from .gguf import load_ple_table_from_gguf
+
+            table = load_ple_table_from_gguf(engine_config.model_path, self._config.qwen4_args)
+            self._ple_table = table
+            for ple in ple_layers:
+                ple.ple_embedding.attach_table(table)
             return 0
 
         from .weight import load_ple_table
@@ -322,8 +379,12 @@ class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__(config)
         if config.is_multimodal:
-            assert not config.vision_config.deepstack_visual_indexes, "Qwen3.8 consumes no DeepStack features"
-            self.visual = Qwen3VLVisionModel(config.vision_config, quant_config=config.quant, prefix="visual")
+            assert not config.vision_config.deepstack_visual_indexes, (
+                "Qwen3.8 consumes no DeepStack features"
+            )
+            self.visual = Qwen3VLVisionModel(
+                config.vision_config, quant_config=config.quant, prefix="visual"
+            )
 
 
 __all__ = [

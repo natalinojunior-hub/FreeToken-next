@@ -38,7 +38,13 @@ def _model_hook(spec, name: str):
 
 
 def iter_expert_pieces(
-    model_path: str, config, kind: QuantKind, *, parallel: bool = False, workers: int = 8, chunk: int = 8 << 20
+    model_path: str,
+    config,
+    kind: QuantKind,
+    *,
+    parallel: bool = False,
+    workers: int = 8,
+    chunk: int = 8 << 20,
 ) -> Iterator[Piece]:
     """The pieces of ``model_path``'s routed experts, stored as ``kind``.
 
@@ -55,7 +61,9 @@ def iter_expert_pieces(
         if pieces is not None:
             return pieces
     if kind is QuantKind.NONE:
-        return _bf16_pieces(model_path, config, spec, parallel=parallel, workers=workers, chunk=chunk)
+        return _bf16_pieces(
+            model_path, config, spec, parallel=parallel, workers=workers, chunk=chunk
+        )
     if kind is QuantKind.NVFP4:
         spec_hook = _model_hook(spec, "nvfp4_expert_spec")
         if spec_hook is None:
@@ -63,7 +71,12 @@ def iter_expert_pieces(
         from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
 
         return iter_nvfp4_expert_pieces(
-            model_path, config, spec_hook(model_path, config), parallel=parallel, workers=workers, chunk=chunk
+            model_path,
+            config,
+            spec_hook(model_path, config),
+            parallel=parallel,
+            workers=workers,
+            chunk=chunk,
         )
     raise NotImplementedError(f"{spec.module} provides no expert reader for {kind!r} experts")
 
@@ -94,7 +107,9 @@ def stacked_expert_pieces(tensors: Iterable[tuple[str, torch.Tensor]], config) -
         if bank_layer is None:
             raise ValueError(f"Unexpected MoE expert layer {layer}; expected a routed-expert layer")
         if tensor.size(0) != num_experts:
-            raise ValueError(f"Unexpected {packed_name} expert count {tensor.size(0)}; expected {num_experts}")
+            raise ValueError(
+                f"Unexpected {packed_name} expert count {tensor.size(0)}; expected {num_experts}"
+            )
         piece = pending.setdefault(bank_layer, {})
         piece["gate_up" if packed_name == "gate_up_proj" else "down"] = tensor
         if len(piece) == 2:
@@ -104,14 +119,21 @@ def stacked_expert_pieces(tensors: Iterable[tuple[str, torch.Tensor]], config) -
         raise ValueError(f"Missing MoE expert source layers: {sorted(pending)}")
 
 
-def _bf16_pieces(model_path: str, config, spec, *, parallel: bool, workers: int, chunk: int) -> Iterator[Piece]:
+def _bf16_pieces(
+    model_path: str, config, spec, *, parallel: bool, workers: int, chunk: int
+) -> Iterator[Piece]:
     device = torch.device("cpu")
     if parallel:
         iter_weights = _model_hook(spec, "iter_weights_parallel")
         if iter_weights is None:
             raise NotImplementedError(f"{spec.module} provides no iter_weights_parallel")
         tensors = iter_weights(
-            model_path, device, include_moe_experts=True, include_non_moe=False, workers=workers, chunk=chunk
+            model_path,
+            device,
+            include_moe_experts=True,
+            include_non_moe=False,
+            workers=workers,
+            chunk=chunk,
         )
     else:
         iter_weights = _load_attr(spec.module, spec.iter_weights)

@@ -54,6 +54,7 @@ def fused_experts_gguf(
     for label, qt in (("gate_up", quant_type), ("down", down_quant_type)):
         if qt not in MOE_VEC_TYPES:
             from freetoken.models.gguf.dequant import GGML_NAME
+
             raise NotImplementedError(
                 f"fused GGUF MoE kernel does not support quant type "
                 f"{GGML_NAME.get(qt, qt)} for the {label} bank "
@@ -95,7 +96,9 @@ def fused_experts_gguf_q4_0(
     All existing callers use this for now; the general function is available for future
     multi-quant pipelines.
     """
-    return fused_experts_gguf(hidden_states, gate_up_q, down_q, topk_weights, topk_ids, activation, int(GGML_Q4_0))
+    return fused_experts_gguf(
+        hidden_states, gate_up_q, down_q, topk_weights, topk_ids, activation, int(GGML_Q4_0)
+    )
 
 
 __all__ = ["fused_experts_gguf", "fused_experts_gguf_q4_0"]

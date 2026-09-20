@@ -26,9 +26,27 @@ class Glm5NextGatedMLP(BaseOP):
         quant_config=None,
         prefix: str = "",
     ):
-        self.gate_proj = LinearReplicated(hidden_size, intermediate_size, has_bias=has_bias, quant_config=quant_config, prefix=f"{prefix}.gate_proj")
-        self.up_proj = LinearReplicated(hidden_size, intermediate_size, has_bias=has_bias, quant_config=quant_config, prefix=f"{prefix}.up_proj")
-        self.down_proj = LinearReplicated(intermediate_size, hidden_size, has_bias=has_bias, quant_config=quant_config, prefix=f"{prefix}.down_proj")
+        self.gate_proj = LinearReplicated(
+            hidden_size,
+            intermediate_size,
+            has_bias=has_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_proj",
+        )
+        self.up_proj = LinearReplicated(
+            hidden_size,
+            intermediate_size,
+            has_bias=has_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.up_proj",
+        )
+        self.down_proj = LinearReplicated(
+            intermediate_size,
+            hidden_size,
+            has_bias=has_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+        )
         self.swiglu_limit = swiglu_limit
 
     @nvtx_annotate("MLP")

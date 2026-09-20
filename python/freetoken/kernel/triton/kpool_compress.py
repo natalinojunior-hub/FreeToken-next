@@ -43,13 +43,11 @@ def _compress_kpool_groups_kernel(
     end_position = tl.load(positions_ptr + row, mask=row < num_rows, other=0).to(tl.int64)
     valid_request = (request >= 0) & (request < num_requests)
     safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
-    query_row_start = tl.load(
-        query_start_loc_ptr + safe_request, mask=valid_request, other=0
-    ).to(tl.int64)
-    chunk_start_position = end_position - (row - query_row_start)
-    ring_slot = tl.load(ring_slots_ptr + safe_request, mask=valid_request, other=0).to(
+    query_row_start = tl.load(query_start_loc_ptr + safe_request, mask=valid_request, other=0).to(
         tl.int64
     )
+    chunk_start_position = end_position - (row - query_row_start)
+    ring_slot = tl.load(ring_slots_ptr + safe_request, mask=valid_request, other=0).to(tl.int64)
     # A row whose group has members before position 0 (end_position < RATIO - 1)
     # can never close; keep its loads masked off entirely -- member positions would
     # be negative and C-style % would produce NEGATIVE ring rows (illegal address).
@@ -84,22 +82,22 @@ def _compress_kpool_groups_kernel(
         raw_row = query_row_start + position - chunk_start_position
         ring_row = ring_slot * RATIO + position % RATIO
         raw_mask = valid_row & use_raw & (raw_row >= 0) & (raw_row < num_rows) & in_dim
-        ring_mask = (
-            valid_row & (~use_raw) & (ring_row >= 0) & (ring_row < num_ring_rows) & in_dim
+        ring_mask = valid_row & (~use_raw) & (ring_row >= 0) & (ring_row < num_ring_rows) & in_dim
+        g_raw = tl.load(raw_g_ptr + raw_row * stride_raw_g_row + dims, mask=raw_mask, other=0.0).to(
+            tl.float32
         )
-        g_raw = tl.load(
-            raw_g_ptr + raw_row * stride_raw_g_row + dims, mask=raw_mask, other=0.0
-        ).to(tl.float32)
         g_ring = tl.load(
             ring_g_ptr + tl.maximum(ring_row, 0) * stride_ring_row + dims,
-            mask=ring_mask, other=0.0,
+            mask=ring_mask,
+            other=0.0,
         ).to(tl.float32)
-        k_raw = tl.load(
-            raw_k_ptr + raw_row * stride_raw_k_row + dims, mask=raw_mask, other=0.0
-        ).to(tl.float32)
+        k_raw = tl.load(raw_k_ptr + raw_row * stride_raw_k_row + dims, mask=raw_mask, other=0.0).to(
+            tl.float32
+        )
         k_ring = tl.load(
             ring_k_ptr + tl.maximum(ring_row, 0) * stride_ring_row + dims,
-            mask=ring_mask, other=0.0,
+            mask=ring_mask,
+            other=0.0,
         ).to(tl.float32)
         ape = tl.load(ape_ptr + off * HEAD_DIM + dims, mask=in_dim, other=0.0)
         e = tl.exp(tl.where(use_raw, g_raw, g_ring) + ape - m)
@@ -134,12 +132,27 @@ def kpool_compress_store(
         return
     assert ape.dtype == torch.float32 and ape.shape == (ratio, d)
     _compress_kpool_groups_kernel[(t,)](
-        k, gate, ring_k, ring_g, ape,
-        ring_slots, token_to_req, cu_seqlens, positions,
-        slab, cmp_rows,
-        k.stride(0), gate.stride(0), ring_k.stride(0), slab.stride(0),
-        t, ring_k.shape[0], ring_slots.numel(),
-        RATIO=ratio, HEAD_DIM=d, BLOCK_D=triton.next_power_of_2(d),
+        k,
+        gate,
+        ring_k,
+        ring_g,
+        ape,
+        ring_slots,
+        token_to_req,
+        cu_seqlens,
+        positions,
+        slab,
+        cmp_rows,
+        k.stride(0),
+        gate.stride(0),
+        ring_k.stride(0),
+        slab.stride(0),
+        t,
+        ring_k.shape[0],
+        ring_slots.numel(),
+        RATIO=ratio,
+        HEAD_DIM=d,
+        BLOCK_D=triton.next_power_of_2(d),
     )
 
 

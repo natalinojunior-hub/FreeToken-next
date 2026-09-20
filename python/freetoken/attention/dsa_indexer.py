@@ -23,8 +23,12 @@ from .dsv4_indexer import IndexerBackendMixin
 
 class DSAIndexerMixin(IndexerBackendMixin):
     def dsa_decode_scores(
-        self, q_idx: torch.Tensor, w: torch.Tensor, slot: int,
-        rows: torch.Tensor, kvlen: torch.Tensor,
+        self,
+        q_idx: torch.Tensor,
+        w: torch.Tensor,
+        slot: int,
+        rows: torch.Tensor,
+        kvlen: torch.Tensor,
     ) -> torch.Tensor:
         """Fused head-reduced logits ``[bs, W]`` fp32 for a decode step: keys gathered
         off the row snapshot inside the kernel, live length read from device memory,
@@ -43,7 +47,8 @@ class DSAIndexerMixin(IndexerBackendMixin):
         from freetoken.kernel.triton.dsv4.indexer import indexer_logits
 
         return indexer_logits(
-            q_idx.unsqueeze(0), k_all.unsqueeze(0),
+            q_idx.unsqueeze(0),
+            k_all.unsqueeze(0),
             (w * self.index_scale).to(torch.float32).unsqueeze(0),
         )[0]
 

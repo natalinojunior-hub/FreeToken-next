@@ -37,7 +37,9 @@ def _hf_indexer(seq: int, topk: int):
     q_resid = torch.randn(1, seq, Q_LORA, device="cuda", dtype=torch.bfloat16)
     pos = torch.arange(seq, device="cuda")
     # cos/sin exactly as the HF rotary: freqs over ROPE_DIM, cat(freqs, freqs)
-    inv = 1.0 / (THETA ** (torch.arange(0, ROPE_DIM, 2, device="cuda", dtype=torch.float) / ROPE_DIM))
+    inv = 1.0 / (
+        THETA ** (torch.arange(0, ROPE_DIM, 2, device="cuda", dtype=torch.float) / ROPE_DIM)
+    )
     freqs = torch.outer(pos.float(), inv)
     emb = torch.cat((freqs, freqs), dim=-1)
     cos, sin = emb.cos()[None].to(torch.bfloat16), emb.sin()[None].to(torch.bfloat16)
@@ -55,6 +57,7 @@ def test_indexer_matches_hf_reference(seq, topk):
     # indexer_rope_interleave=true; transformers >= 5.13 applies interleave in the
     # reference -- <= 5.12 wrongly half-split it, so this test requires >= 5.13)
     import transformers
+
     v = tuple(int(x) for x in transformers.__version__.split(".")[:2])
     # HARD FAIL, not skip: on < 5.13 the reference itself applies the wrong (half-
     # split) convention for GLM, so a skip here would silently disarm the guard.
@@ -63,7 +66,9 @@ def test_indexer_matches_hf_reference(seq, topk):
         f"this env has {transformers.__version__} -- upgrade the test env, do not skip."
     )
     with torch.device("cuda"):
-        rope = get_rope(head_dim=D_IDX, rotary_dim=ROPE_DIM, max_position=4096, base=THETA, is_neox=False)
+        rope = get_rope(
+            head_dim=D_IDX, rotary_dim=ROPE_DIM, max_position=4096, base=THETA, is_neox=False
+        )
     q = (q_resid[0] @ idx_ref.wq_b.weight.T).view(seq, H_IDX * D_IDX)
     k = torch.nn.functional.layer_norm(
         x[0] @ idx_ref.wk.weight.T, (D_IDX,), idx_ref.k_norm.weight, idx_ref.k_norm.bias, 1e-6
@@ -90,7 +95,9 @@ def test_indexer_matches_hf_reference(seq, topk):
         a = set(ref_topk[0, t][: min(k_eff, live)].tolist())
         b = set(ours_topk[t][: min(k_eff, live)].tolist())
         if live <= k_eff:
-            assert a == b == set(range(live)), f"short-context selection must be all live rows @ {t}"
+            assert a == b == set(range(live)), (
+                f"short-context selection must be all live rows @ {t}"
+            )
         else:
             mismatch += len(a ^ b)
     total = sum(min(topk, t + 1) for t in range(seq))
@@ -100,7 +107,9 @@ def test_indexer_matches_hf_reference(seq, topk):
     # shipped for GLM and what this repo used before the fix -- must disagree BADLY
     # (measured at ~53%); if it ever agrees, the reference itself changed.
     with torch.device("cuda"):
-        rope_bad = get_rope(head_dim=D_IDX, rotary_dim=ROPE_DIM, max_position=4095, base=THETA, is_neox=True)
+        rope_bad = get_rope(
+            head_dim=D_IDX, rotary_dim=ROPE_DIM, max_position=4095, base=THETA, is_neox=True
+        )
     q2 = (q_resid[0] @ idx_ref.wq_b.weight.T).view(seq, H_IDX * D_IDX)
     k2 = torch.nn.functional.layer_norm(
         x[0] @ idx_ref.wk.weight.T, (D_IDX,), idx_ref.k_norm.weight, idx_ref.k_norm.bias, 1e-6
@@ -112,9 +121,12 @@ def test_indexer_matches_hf_reference(seq, topk):
     scores2 = scores2.masked_fill(cols[None, :] > pos[:, None], float("-inf"))
     bad_topk = scores2.topk(min(topk, seq), dim=-1).indices
     bad_mismatch = sum(
-        len(set(ref_topk[0, t][: min(min(topk, seq), t + 1)].tolist())
-            ^ set(bad_topk[t][: min(min(topk, seq), t + 1)].tolist()))
-        for t in range(seq) if t + 1 > min(topk, seq)
+        len(
+            set(ref_topk[0, t][: min(min(topk, seq), t + 1)].tolist())
+            ^ set(bad_topk[t][: min(min(topk, seq), t + 1)].tolist())
+        )
+        for t in range(seq)
+        if t + 1 > min(topk, seq)
     )
     live_total = sum(min(topk, t + 1) for t in range(seq) if t + 1 > min(topk, seq))
     if seq > topk:  # the control needs queries PAST the top-k boundary: only (300, 64)
@@ -165,21 +177,33 @@ def test_identity_selection_equals_topk_selection_at_short_kv():
 
     # identity: shared row list broadcast over queries, causal counts
     o_ident = glm_dsa_sparse_attn(
-        q, pool, rows.view(1, 1, kv), scale,
-        counts=(positions + 1).to(torch.int32).view(1, m), d_v=dv,
+        q,
+        pool,
+        rows.view(1, 1, kv),
+        scale,
+        counts=(positions + 1).to(torch.int32).view(1, m),
+        d_v=dv,
     )
 
     # DSA select at kv < topk: causal top-k == all live rows (order may differ)
     mix = DSAIndexerMixin()
     scores = torch.randn(m, kv, device="cuda")  # arbitrary: selection covers all live
     picks = mix.indexer_select_prefill(
-        scores.unsqueeze(0), start_pos=kv - m, seqlen=m, ratio=1,
-        topk=min(topk, kv), offset=0,
+        scores.unsqueeze(0),
+        start_pos=kv - m,
+        seqlen=m,
+        ratio=1,
+        topk=min(topk, kv),
+        offset=0,
     )[0]
     sel = mix.dsa_map_rows(picks, rows.view(1, kv).expand(m, kv))
     o_sel = glm_dsa_sparse_attn(
-        q, pool, sel.view(1, m, -1), scale,
-        counts=(positions + 1).clamp(max=min(topk, kv)).to(torch.int32).view(1, m), d_v=dv,
+        q,
+        pool,
+        sel.view(1, m, -1),
+        scale,
+        counts=(positions + 1).clamp(max=min(topk, kv)).to(torch.int32).view(1, m),
+        d_v=dv,
     )
     assert (o_ident.float() - o_sel.float()).abs().max().item() < 2e-2
 
@@ -238,14 +262,25 @@ def _make_backend(dsa: bool, latent=80, dv=64, idx_dim=32, idx_heads=16, topk=64
     ctx = Context(page_size=1)
     ctx.page_table = torch.zeros(4, pages, dtype=torch.int32, device="cuda")
     if dsa:
-        ctx.kv_cache = DSAKVCache(latent, 2, pages, 1, torch.bfloat16, torch.device("cuda"),
-                                  index_head_dim=idx_dim, num_index_layers=1)
+        ctx.kv_cache = DSAKVCache(
+            latent,
+            2,
+            pages,
+            1,
+            torch.bfloat16,
+            torch.device("cuda"),
+            index_head_dim=idx_dim,
+            num_index_layers=1,
+        )
     else:
         ctx.kv_cache = MLAKVCache(latent, 2, pages, 1, torch.bfloat16, torch.device("cuda"))
     set_global_ctx(ctx)
     args = SimpleNamespace(
-        kv_lora_rank=dv, qk_rope_head_dim=latent - dv, qk_head_dim=latent,
-        index_topk=topk, index_head_dim=idx_dim,
+        kv_lora_rank=dv,
+        qk_rope_head_dim=latent - dv,
+        qk_head_dim=latent,
+        index_topk=topk,
+        index_head_dim=idx_dim,
         indexer_types=("full", "shared"),
     )
     cfg = SimpleNamespace(glm_dsa_args=args, num_qo_heads=8, attn_sm_scale=None, num_layers=2)
@@ -274,8 +309,10 @@ def test_backend_ragged_prefill_identity_and_selection():
     # request A: rows 0..39 (kv 40 <= topk); request B: rows 40..139 (kv 100 > topk)
     ctx.page_table[0, :40] = torch.arange(40, device="cuda")
     ctx.page_table[1, :100] = torch.arange(40, 140, device="cuda")
-    reqs = [SimpleNamespace(extend_len=8, device_len=40, table_idx=0),
-            SimpleNamespace(extend_len=12, device_len=100, table_idx=1)]
+    reqs = [
+        SimpleNamespace(extend_len=8, device_len=40, table_idx=0),
+        SimpleNamespace(extend_len=12, device_len=100, table_idx=1),
+    ]
     positions = torch.cat([torch.arange(32, 40), torch.arange(88, 100)]).cuda()
     out_loc = torch.cat([torch.arange(32, 40), torch.arange(128, 140)]).cuda()
 
@@ -286,11 +323,11 @@ def test_backend_ragged_prefill_identity_and_selection():
     hist_kpe = torch.randn(n_hist, dr, device="cuda", dtype=torch.bfloat16)
     for lid in (0, 1):  # identical content on both layers (leader/follower comparison)
         pool.store_kv(hist_ckv, hist_kpe, hist_loc, lid)
-    pool.store_index_k(torch.randn(n_hist, idx_d, device="cuda", dtype=torch.bfloat16),
-                       hist_loc, 0)
+    pool.store_index_k(torch.randn(n_hist, idx_d, device="cuda", dtype=torch.bfloat16), hist_loc, 0)
 
-    batch = SimpleNamespace(reqs=reqs, positions=positions, out_loc=out_loc,
-                            active_table_idx=None, attn_metadata=None)
+    batch = SimpleNamespace(
+        reqs=reqs, positions=positions, out_loc=out_loc, active_table_idx=None, attn_metadata=None
+    )
     backend.prepare_metadata(batch)
 
     t = 20
@@ -323,8 +360,11 @@ def test_backend_ragged_prefill_identity_and_selection():
         pos = 88 + j
         rows_b = ctx.page_table[1, : pos + 1]
         keys = pool.index_k_cache(0)[rows_b.long()].float()
-        s = (torch.einsum("hd,td->ht", q_idx[row].float(), keys).relu()
-             * (idx_d**-0.5) * (w[row][:, None].float())).sum(0)
+        s = (
+            torch.einsum("hd,td->ht", q_idx[row].float(), keys).relu()
+            * (idx_d**-0.5)
+            * (w[row][:, None].float())
+        ).sum(0)
         sel_rows = rows_b[s.topk(min(topk, pos + 1)).indices]
         ref = _ref_attend(q_cat[row], slab, sel_rows, scale, dv)
         assert (o0[row].float() - ref).abs().max().item() < 3e-2, f"B q{j}"
@@ -339,8 +379,9 @@ def test_backend_ragged_prefill_identity_and_selection():
     ctx_d.page_table.copy_(ctx.page_table)
     for lid in (0, 1):
         ctx_d.kv_cache._kv_buffer.copy_(pool._kv_buffer)
-    batch_d = SimpleNamespace(reqs=reqs, positions=positions, out_loc=out_loc,
-                              active_table_idx=None, attn_metadata=None)
+    batch_d = SimpleNamespace(
+        reqs=reqs, positions=positions, out_loc=out_loc, active_table_idx=None, attn_metadata=None
+    )
     backend_d.prepare_metadata(batch_d)
     od = backend_d.mla_forward(q_nope, q_pe, c_kv, k_rope, 0, batch_d, indexer_inputs=None)
     slab_d = ctx_d.kv_cache.latent_rows(0)

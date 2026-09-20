@@ -17,11 +17,20 @@ import triton.language as tl
 
 @triton.jit
 def _hc_sinkhorn_kernel(
-    mixes_ptr, scale_ptr, base_ptr,
-    pre_ptr, post_ptr, comb_ptr,
+    mixes_ptr,
+    scale_ptr,
+    base_ptr,
+    pre_ptr,
+    post_ptr,
+    comb_ptr,
     n,
-    stride_mn, stride_pn, stride_pon, stride_cn,
-    HC: tl.constexpr, ITERS: tl.constexpr, EPS: tl.constexpr,
+    stride_mn,
+    stride_pn,
+    stride_pon,
+    stride_cn,
+    HC: tl.constexpr,
+    ITERS: tl.constexpr,
+    EPS: tl.constexpr,
 ):
     row = tl.program_id(0)
     if row >= n:
@@ -66,10 +75,21 @@ def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
     post = torch.empty(n, hc_mult, device=dev, dtype=torch.float32)
     comb = torch.empty(n, hc_mult, hc_mult, device=dev, dtype=torch.float32)
     _hc_sinkhorn_kernel[(n,)](
-        mixes, hc_scale.float().contiguous(), hc_base.float().contiguous(),
-        pre, post, comb,
-        n, mixes.stride(0), pre.stride(0), post.stride(0), comb.stride(0),
-        HC=hc_mult, ITERS=sinkhorn_iters, EPS=eps, num_warps=1,
+        mixes,
+        hc_scale.float().contiguous(),
+        hc_base.float().contiguous(),
+        pre,
+        post,
+        comb,
+        n,
+        mixes.stride(0),
+        pre.stride(0),
+        post.stride(0),
+        comb.stride(0),
+        HC=hc_mult,
+        ITERS=sinkhorn_iters,
+        EPS=eps,
+        num_warps=1,
     )
     return pre, post, comb
 

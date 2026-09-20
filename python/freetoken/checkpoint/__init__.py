@@ -14,6 +14,10 @@ from .ftw import (
 from .convert import convert_checkpoint
 
 __all__ = [
-    "FTWReader", "FTWWriter", "is_ftw_checkpoint",
-    "iter_ftw_weights", "load_ftw_banks", "convert_checkpoint",
+    "FTWReader",
+    "FTWWriter",
+    "is_ftw_checkpoint",
+    "iter_ftw_weights",
+    "load_ftw_banks",
+    "convert_checkpoint",
 ]

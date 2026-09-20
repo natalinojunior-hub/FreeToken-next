@@ -292,9 +292,7 @@ def test_duck_typed_config_without_spec_walk_defaults_to_full(monkeypatch):
     from freetoken.engine.engine import _required_attn_types
 
     assert _required_attn_types(SimpleNamespace()) == frozenset({AttnType.FULL})
-    assert _required_attn_types(SimpleNamespace(dsv4_args=object())) == frozenset(
-        {AttnType.DSV4}
-    )
+    assert _required_attn_types(SimpleNamespace(dsv4_args=object())) == frozenset({AttnType.DSV4})
 
 
 def _rotary():
@@ -325,19 +323,35 @@ def _real_hybrid_model_config():
         **kwargs,
         attention_groups=(
             FullAttentionGroupConfig(
-                name="full", layer_ids=(0,), num_kv_heads=2, head_dim=64,
+                name="full",
+                layer_ids=(0,),
+                num_kv_heads=2,
+                head_dim=64,
                 rotary_config=_rotary(),
             ),
             SWAAttentionGroupConfig(
-                name="swa", layer_ids=(1,), num_kv_heads=2, head_dim=64,
-                rotary_config=_rotary(), sliding_window=128,
+                name="swa",
+                layer_ids=(1,),
+                num_kv_heads=2,
+                head_dim=64,
+                rotary_config=_rotary(),
+                sliding_window=128,
             ),
             LinearGatedDeltaGroupConfig(
-                name="linear", layer_ids=(2,), num_key_heads=2, num_value_heads=2,
-                key_head_dim=64, value_head_dim=64, conv_kernel_dim=4, output_gate=False,
+                name="linear",
+                layer_ids=(2,),
+                num_key_heads=2,
+                num_value_heads=2,
+                key_head_dim=64,
+                value_head_dim=64,
+                conv_kernel_dim=4,
+                output_gate=False,
             ),
             DSV4AttentionGroupConfig(
-                name="dsv4", layer_ids=(3,), num_kv_heads=1, head_dim=512,
+                name="dsv4",
+                layer_ids=(3,),
+                num_kv_heads=1,
+                head_dim=512,
                 sliding_window=128,
             ),
         ),
@@ -364,17 +378,37 @@ def test_attn_type_for_layer_and_spec_derivation():
 def test_mla_spec_derivation_from_full_group():
     mc = _real_hybrid_model_config()
     mla_group = FullAttentionGroupConfig(
-        name="full", layer_ids=(0,), num_kv_heads=1, head_dim=576,
-        rotary_config=_rotary(), mla=True,
+        name="full",
+        layer_ids=(0,),
+        num_kv_heads=1,
+        head_dim=576,
+        rotary_config=_rotary(),
+        mla=True,
     )
     mc2 = ModelConfig(
         **{
-            **{f: getattr(mc, f) for f in (
-                "num_layers", "num_qo_heads", "num_kv_heads", "head_dim", "hidden_size",
-                "vocab_size", "intermediate_size", "rms_norm_eps", "rotary_config",
-                "hidden_act", "tie_word_embeddings", "num_experts", "num_experts_per_tok",
-                "moe_intermediate_size", "norm_topk_prob", "model_type", "architectures",
-            )},
+            **{
+                f: getattr(mc, f)
+                for f in (
+                    "num_layers",
+                    "num_qo_heads",
+                    "num_kv_heads",
+                    "head_dim",
+                    "hidden_size",
+                    "vocab_size",
+                    "intermediate_size",
+                    "rms_norm_eps",
+                    "rotary_config",
+                    "hidden_act",
+                    "tie_word_embeddings",
+                    "num_experts",
+                    "num_experts_per_tok",
+                    "moe_intermediate_size",
+                    "norm_topk_prob",
+                    "model_type",
+                    "architectures",
+                )
+            },
         },
         attention_groups=(mla_group,),
     )
@@ -384,8 +418,14 @@ def test_mla_spec_derivation_from_full_group():
 
     # mla + index slab (GLM-5.2 shape) derives DSA, mirroring the DSAKVCache split
     dsa_group = FullAttentionGroupConfig(
-        name="full", layer_ids=(0,), num_kv_heads=1, head_dim=576,
-        rotary_config=_rotary(), mla=True, index_head_dim=128, num_index_layers=1,
+        name="full",
+        layer_ids=(0,),
+        num_kv_heads=1,
+        head_dim=576,
+        rotary_config=_rotary(),
+        mla=True,
+        index_head_dim=128,
+        num_index_layers=1,
     )
     mc3 = dataclasses_replace_groups(mc2, (dsa_group,))
     (spec3,) = mc3.kv_cache_group_specs()

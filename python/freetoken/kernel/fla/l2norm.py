@@ -70,9 +70,7 @@ def l2norm_fwd_kernel(
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
 
 
-def l2norm_fwd(
-    x: torch.Tensor, eps: float = 1e-6, output_dtype: Optional[torch.dtype] = None
-):
+def l2norm_fwd(x: torch.Tensor, eps: float = 1e-6, output_dtype: Optional[torch.dtype] = None):
     x_shape_og = x.shape
     x = x.view(-1, x.shape[-1])
     # allocate output
@@ -120,7 +118,6 @@ def l2norm_fwd(
 
 
 class L2NormFunction(torch.autograd.Function):
-
     @staticmethod
     @input_guard
     def forward(ctx, x, eps=1e-6, output_dtype=None):
@@ -137,7 +134,6 @@ l2_norm = l2norm
 
 
 class L2Norm(nn.Module):
-
     def __init__(self, eps: float = 1e-6, output_dtype: Optional[torch.dtype] = None):
         super().__init__()
         self.eps = eps

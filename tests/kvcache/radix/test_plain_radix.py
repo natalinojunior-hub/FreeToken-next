@@ -10,6 +10,7 @@ and the three ways the class refuses an illegal request.
 Page size is parametrized over {1, 4} wherever it is load-bearing.  Slot ids are globally unique
 and never reused, so ``session.kv.free`` is an exact, public record of what the cache handed back.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -64,19 +65,19 @@ def test_cold_match_is_empty_and_a_commit_round_trips(sess):
     cold, exp = sess.do_match(ids)
     assert (cold.cached_len, cold.indices) == (0, [])
     assert exp.group is None
-    assert cold.node.is_root()               # the lock target of a cold match is the root
+    assert cold.node.is_root()  # the lock target of a cold match is the root
     assert sess.ad.counters() == EMPTY
     assert sess.ad.nodes() == []
 
     slots = sess.kv.take(len(ids))
     got, ins = sess.do_insert(ids, slots=slots)
-    assert got.matched_len == 0              # nothing of this prefix was cached
-    assert ins.adopted == slots              # the tree took every supplied slot
+    assert got.matched_len == 0  # nothing of this prefix was cached
+    assert ins.adopted == slots  # the tree took every supplied slot
 
     warm, _ = sess.do_match(ids)
     assert (warm.cached_len, warm.indices) == (len(ids), slots)
     assert sess.ad.counters() == {"full_evictable": len(ids), "full_protected": 0}
-    assert len(sess.ad.nodes()) == 1         # three pages, one radix node
+    assert len(sess.ad.nodes()) == 1  # three pages, one radix node
     assert ev(sess)["node.add"] == 1 and ev(sess)["node.split"] == 0
     sess.check()
 
@@ -90,7 +91,7 @@ def test_cold_handle_get_matched_indices_raises(sess4):
     assert res.cuda_handle.cached_len == 0
     with pytest.raises(ValueError):
         res.cuda_handle.get_matched_indices()
-    assert sess4.ad.match(ids).indices == []          # every caller needs this cached_len==0 guard
+    assert sess4.ad.match(ids).indices == []  # every caller needs this cached_len==0 guard
 
     slots = sess4.kv.take(len(ids))
     sess4.do_insert(ids, slots=slots)
@@ -101,7 +102,7 @@ def test_cold_handle_get_matched_indices_raises(sess4):
 
 def test_insert_drops_a_trailing_partial_page(sess):
     P = sess.P
-    ids = seq(P, 1, 2) + (9,) * (P - 1)      # a ragged tail at page_size 4, nothing at 1
+    ids = seq(P, 1, 2) + (9,) * (P - 1)  # a ragged tail at page_size 4, nothing at 1
     kept = 2 * P
     slots = sess.kv.take(len(ids))
 
@@ -124,9 +125,9 @@ def test_match_takes_a_ragged_length_and_stops_at_the_page_boundary(sess):
     slots = sess.kv.take(len(ids))
     sess.do_insert(ids, slots=slots)
 
-    m, _ = sess.do_match(ids[: 2 * P - 1])   # one token short of the second page
+    m, _ = sess.do_match(ids[: 2 * P - 1])  # one token short of the second page
     assert (m.cached_len, m.indices) == (P, slots[:P])
-    assert ev(sess)["node.split"] == 1    # the boundary fell inside the node
+    assert ev(sess)["node.split"] == 1  # the boundary fell inside the node
     assert node_end_path(m.node) == ids[:P]
     sess.check()
 
@@ -137,10 +138,10 @@ def test_mid_node_divergence_rounds_down_to_the_page_boundary(sess):
     slots = sess.kv.take(len(ids))
     sess.do_insert(ids, slots=slots)
 
-    alt = ids[:-1] + (999,)                  # identical for 2P-1 tokens, differs in the last
+    alt = ids[:-1] + (999,)  # identical for 2P-1 tokens, differs in the last
     m, _ = sess.do_match(alt)
     assert (m.cached_len, m.indices) == (P, slots[:P])
-    if P > 1:                                # 2P-1 tokens compared equal, only P are reusable
+    if P > 1:  # 2P-1 tokens compared equal, only P are reusable
         assert m.cached_len < len(ids) - 1
     assert ev(sess)["node.split"] == 1
     sess.check()
@@ -150,7 +151,7 @@ def test_pages_sharing_leading_tokens_do_not_share_a_tree_edge():
     """The tree's reuse unit is a whole page: two different pages with a common token prefix must
     get their own edges, or a match would hand back the wrong page's indices."""
     s = Session(P4)
-    one, two = (1, 7, 7, 1), (1, 7, 7, 2)    # equal for 3 of 4 tokens, different pages
+    one, two = (1, 7, 7, 1), (1, 7, 7, 2)  # equal for 3 of 4 tokens, different pages
     s1, s2 = s.kv.take(4), s.kv.take(4)
     s.do_insert(one, slots=s1)
     s.do_insert(two, slots=s2)
@@ -181,14 +182,14 @@ def test_reinserting_a_cached_prefix_adopts_nothing(sess4):
     assert set(second) <= sess4.kv.free
 
     m, _ = sess4.do_match(ids)
-    assert m.indices == first                # the tree kept its own slots
+    assert m.indices == first  # the tree kept its own slots
     assert len(sess4.ad.nodes()) == 1
 
     # The handle insert_prefix returns is the commit's lock target, and it names the TREE's own
     # indices for the whole inserted prefix -- never the supplied ones.
-    fake = list(range(7_000_000, 7_000_000 + len(ids)))     # never registered with the ledger
+    fake = list(range(7_000_000, 7_000_000 + len(ids)))  # never registered with the ledger
     res = sess4.ad.cache.insert_prefix(ids_tensor(ids), slots_tensor(fake))
-    assert res.cached_len == len(ids)        # all of it was already cached ...
+    assert res.cached_len == len(ids)  # all of it was already cached ...
     assert res.handle.cached_len == len(ids)  # ... and the handle still spans all of it
     assert res.handle.get_matched_indices().tolist() == first
     sess4.check()
@@ -200,12 +201,12 @@ def test_request_lifecycle_reuses_the_cached_prefix(sess):
     s_head = sess.kv.take(P)
     sess.do_insert(full[:P], slots=s_head)
 
-    sess.do_request(full, prompt_pages=1)    # match -> lock -> extend+commit -> unlock
-    assert sess.kv.free == set()             # a reused prefix duplicates nothing and leaks nothing
+    sess.do_request(full, prompt_pages=1)  # match -> lock -> extend+commit -> unlock
+    assert sess.kv.free == set()  # a reused prefix duplicates nothing and leaks nothing
 
     m, _ = sess.do_match(full)
     assert m.cached_len == 3 * P
-    assert m.indices[:P] == s_head           # the reused page still owns its original slots
+    assert m.indices[:P] == s_head  # the reused page still owns its original slots
     assert sess.ad.counters() == {"full_evictable": 3 * P, "full_protected": 0}
     assert ev(sess)["node.add"] == 2 and ev(sess)["node.split"] == 0
     sess.check()
@@ -221,7 +222,7 @@ def test_split_turns_the_original_node_into_the_suffix(sess):
     node = whole.node
     assert node.length == 2 * P
 
-    pre, _ = sess.do_match(ids[:P])          # forces split_at(P)
+    pre, _ = sess.do_match(ids[:P])  # forces split_at(P)
     assert ev(sess)["node.split"] == 1
     assert len(sess.ad.nodes()) == 2
     assert pre.node is not node
@@ -235,7 +236,7 @@ def test_split_turns_the_original_node_into_the_suffix(sess):
     assert node.value.tolist() == slots[P:]
     assert node_path_slots(node) == slots
 
-    again, _ = sess.do_match(ids)            # the split is transparent to a full match
+    again, _ = sess.do_match(ids)  # the split is transparent to a full match
     assert (again.cached_len, again.indices) == (2 * P, slots)
     assert again.node is node
     sess.check()
@@ -250,13 +251,13 @@ def test_lock_survives_a_split(sess):
     held = sess.do_lock(ids)
     assert sess.ad.counters() == {"full_evictable": 0, "full_protected": 2 * P}
 
-    sess.do_match(ids[:P])                   # splits the locked node in two
+    sess.do_match(ids[:P])  # splits the locked node in two
     assert ev(sess)["node.split"] == 1
     # split_at copies ref_count into the new prefix half, so the protected total is unchanged
     assert sess.ad.counters() == {"full_evictable": 0, "full_protected": 2 * P}
     sess.check()
 
-    sess.do_unlock(held)                     # the handle points at the suffix; release walks up
+    sess.do_unlock(held)  # the handle points at the suffix; release walks up
     assert sess.ad.counters() == {"full_evictable": 2 * P, "full_protected": 0}
     sess.check()
 
@@ -270,16 +271,16 @@ def test_lock_accounting_walks_to_the_root(sess):
     assert len(sess.ad.nodes()) == 2
     assert sess.ad.counters() == {"full_evictable": 2 * P, "full_protected": 0}
 
-    deep = sess.do_lock(tail)                # protects the leaf AND everything up to the root
+    deep = sess.do_lock(tail)  # protects the leaf AND everything up to the root
     assert sess.ad.counters() == {"full_evictable": 0, "full_protected": 2 * P}
-    again = sess.do_lock(tail)               # ref 2: still exactly one protected region
+    again = sess.do_lock(tail)  # ref 2: still exactly one protected region
     assert sess.ad.counters() == {"full_evictable": 0, "full_protected": 2 * P}
     sess.do_unlock(again)
     assert sess.ad.counters() == {"full_evictable": 0, "full_protected": 2 * P}
     sess.do_unlock(deep)
     assert sess.ad.counters() == {"full_evictable": 2 * P, "full_protected": 0}
 
-    shallow = sess.do_lock(head)             # a lock protects the root path, not the descendants
+    shallow = sess.do_lock(head)  # a lock protects the root path, not the descendants
     assert sess.ad.counters() == {"full_evictable": P, "full_protected": P}
     sess.do_unlock(shallow)
     assert sess.ad.counters() == {"full_evictable": 2 * P, "full_protected": 0}
@@ -293,10 +294,10 @@ def test_eviction_is_lru_ordered_over_leaves(sess):
     sa, sb, sc = sess.kv.take(P), sess.kv.take(P), sess.kv.take(P)
     for ids, slots in ((a, sa), (b, sb), (c, sc)):
         sess.do_insert(ids, slots=slots)
-    sess.do_match(a)                         # a becomes the most recently used
+    sess.do_match(a)  # a becomes the most recently used
 
     sess.do_evict_full(P)
-    assert set(sb) <= sess.kv.free           # b was the oldest
+    assert set(sb) <= sess.kv.free  # b was the oldest
     assert not (set(sa) | set(sc)) & sess.kv.free
 
     sess.do_evict_full(P)
@@ -319,9 +320,9 @@ def test_eviction_takes_the_leaf_before_the_parent(sess):
     sess.do_insert(head, slots=s_head)
     s_tail = sess.kv.take(2 * P)
     sess.do_insert(tail, slots=s_tail)
-    leaf = s_tail[P:]                        # s_tail[:P] were duplicates of the head page
+    leaf = s_tail[P:]  # s_tail[:P] were duplicates of the head page
 
-    sess.do_evict_full(P)                    # only leaves are collectible
+    sess.do_evict_full(P)  # only leaves are collectible
     assert set(leaf) <= sess.kv.free
     assert not set(s_head) & sess.kv.free
     assert len(sess.ad.nodes()) == 1
@@ -329,7 +330,7 @@ def test_eviction_takes_the_leaf_before_the_parent(sess):
     m, _ = sess.do_match(head)
     assert (m.cached_len, m.indices) == (P, s_head)
 
-    sess.do_evict_full(P)                    # now the parent is a leaf itself
+    sess.do_evict_full(P)  # now the parent is a leaf itself
     assert set(s_head) <= sess.kv.free
     assert sess.ad.nodes() == []
     sess.check()
@@ -363,12 +364,12 @@ def test_locked_nodes_are_never_evicted(sess):
     held = sess.do_lock(a)
     assert sess.ad.counters() == {"full_evictable": P, "full_protected": P}
 
-    sess.do_evict_full(10 ** 6)              # clamped to the evictable size
+    sess.do_evict_full(10**6)  # clamped to the evictable size
     assert set(sb) <= sess.kv.free
     assert not set(sa) & sess.kv.free
     m, _ = sess.do_match(a)
     assert (m.cached_len, m.indices) == (P, sa)
-    with pytest.raises(AssertionError):      # a locked node is not evictable capacity
+    with pytest.raises(AssertionError):  # a locked node is not evictable capacity
         sess.ad.cache.evict(1)
 
     sess.do_unlock(held)
@@ -389,14 +390,14 @@ def test_evicting_more_than_evictable_raises_assertion_error(sess4):
     with pytest.raises(AssertionError, match="Cannot evict"):
         sess4.ad.cache.evict(P + 1)
 
-    sess4.check()                            # the guard fires before anything is unlinked
+    sess4.check()  # the guard fires before anything is unlinked
     m, _ = sess4.do_match(ids)
     assert (m.cached_len, m.indices) == (P, slots)
 
 
 def test_evict_zero_is_a_no_op_and_evict_all_keeps_the_root(sess4):
     P = sess4.P
-    assert sess4.ad.cache.evict(0).numel() == 0        # safe on an empty tree
+    assert sess4.ad.cache.evict(0).numel() == 0  # safe on an empty tree
 
     ids = seq(P, 1, 2)
     slots = sess4.kv.take(len(ids))
@@ -408,7 +409,7 @@ def test_evict_zero_is_a_no_op_and_evict_all_keeps_the_root(sess4):
     assert set(slots) <= sess4.kv.free
     root = sess4.ad.root
     assert root.is_root() and root.children == {}
-    assert root.ref_count == 1                         # the root is protected, never a victim
+    assert root.ref_count == 1  # the root is protected, never a victim
     assert sess4.ad.counters() == EMPTY
     cold, _ = sess4.do_match(ids)
     assert cold.cached_len == 0

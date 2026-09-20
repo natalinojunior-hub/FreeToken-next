@@ -36,24 +36,47 @@ def _glm5_like_config(index_kpool=4, index_head_dim=128):
     rotary = RotaryConfig(head_dim=256, rotary_dim=0, max_position=4096, base=1e4, scaling=None)
     groups = (
         LinearGatedDeltaGroupConfig(
-            name="linear", layer_ids=kda_ids,
-            num_key_heads=4, num_value_heads=4, key_head_dim=128, value_head_dim=128,
-            conv_kernel_dim=4, output_gate="sigmoid", variant="kda",
+            name="linear",
+            layer_ids=kda_ids,
+            num_key_heads=4,
+            num_value_heads=4,
+            key_head_dim=128,
+            value_head_dim=128,
+            conv_kernel_dim=4,
+            output_gate="sigmoid",
+            variant="kda",
         ),
         FullAttentionGroupConfig(
-            name="full", layer_ids=dsa_ids, num_kv_heads=1, head_dim=512,
-            rotary_config=rotary, mla=True,
-            index_head_dim=index_head_dim, num_index_layers=len(dsa_ids),
+            name="full",
+            layer_ids=dsa_ids,
+            num_kv_heads=1,
+            head_dim=512,
+            rotary_config=rotary,
+            mla=True,
+            index_head_dim=index_head_dim,
+            num_index_layers=len(dsa_ids),
             index_ratio=index_kpool,
         ),
     )
     return ModelConfig(
-        num_layers=n_layers, num_qo_heads=4, num_kv_heads=1, head_dim=512,
-        hidden_size=256, vocab_size=1000, intermediate_size=512,
-        rms_norm_eps=1e-5, rotary_config=rotary, hidden_act="silu",
-        tie_word_embeddings=False, num_experts=8, num_experts_per_tok=2,
-        moe_intermediate_size=64, norm_topk_prob=True, model_type="glm5_next",
-        architectures=["Glm5NextForCausalLM"], moe_enabled=True,
+        num_layers=n_layers,
+        num_qo_heads=4,
+        num_kv_heads=1,
+        head_dim=512,
+        hidden_size=256,
+        vocab_size=1000,
+        intermediate_size=512,
+        rms_norm_eps=1e-5,
+        rotary_config=rotary,
+        hidden_act="silu",
+        tie_word_embeddings=False,
+        num_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=64,
+        norm_topk_prob=True,
+        model_type="glm5_next",
+        architectures=["Glm5NextForCausalLM"],
+        moe_enabled=True,
         attention_groups=groups,
     )
 
@@ -63,8 +86,12 @@ def test_factory_builds_kpool_pool_with_layer_remap():
     assert resolve_pool_class(cfg) is KpoolDSAKVCache
 
     pool = create_kvcache_pool(
-        model_config=cfg, num_pages=4, page_size=64,
-        dtype=torch.bfloat16, device=torch.device("cpu"), num_req_slots=5,
+        model_config=cfg,
+        num_pages=4,
+        page_size=64,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        num_req_slots=5,
     )
     assert isinstance(pool, KpoolDSAKVCache)
     # Latent slabs back ONLY the 3 DSA layers (34-of-45 economy at real scale).
@@ -86,8 +113,11 @@ def test_factory_kpool1_builds_plain_dsa_pool():
     cfg = _glm5_like_config(index_kpool=1)
     assert resolve_pool_class(cfg) is DSAKVCache
     pool = create_kvcache_pool(
-        model_config=cfg, num_pages=16, page_size=1,
-        dtype=torch.bfloat16, device=torch.device("cpu"),
+        model_config=cfg,
+        num_pages=16,
+        page_size=1,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
     )
     assert type(pool) is DSAKVCache
 
@@ -102,13 +132,9 @@ def test_cost_model_kpool_shadow_slab_quarter_cost():
 
     tp = SimpleNamespace(size=1)
     econf = SimpleNamespace(tp_info=tp, dtype=torch.bfloat16)
-    (spec,) = [
-        s for s in _glm5_like_config().kv_cache_group_specs() if s.num_layers > 0
-    ]
+    (spec,) = [s for s in _glm5_like_config().kv_cache_group_specs() if s.num_layers > 0]
     (spec1,) = [
-        s
-        for s in _glm5_like_config(index_kpool=1).kv_cache_group_specs()
-        if s.num_layers > 0
+        s for s in _glm5_like_config(index_kpool=1).kv_cache_group_specs() if s.num_layers > 0
     ]
     index_full = spec.index_head_dim * spec.num_index_layers * 2
     assert (

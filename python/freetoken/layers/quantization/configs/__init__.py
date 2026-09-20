@@ -27,12 +27,25 @@ def set_quant_config(quant: QuantConfig | None) -> None:
 
 def get_quant_config() -> QuantConfig | None:
     if _QUANT_CONFIG is _UNSET:
-        raise RuntimeError("no QuantConfig installed: EngineConfig.model_config sets it before the weights load")
+        raise RuntimeError(
+            "no QuantConfig installed: EngineConfig.model_config sets it before the weights load"
+        )
     return _QUANT_CONFIG
 
 
 __all__ = [
-    "QuantConfig", "quantization_config_of", "quant_method_for", "set_quant_config", "get_quant_config",
-    "NoQuantConfig", "ModelOptConfig", "CompressedTensorsConfig", "Fp8BlockConfig", "Mxfp4Config",
-    "compressed_tensors", "fp8", "modelopt", "mxfp4",
+    "QuantConfig",
+    "quantization_config_of",
+    "quant_method_for",
+    "set_quant_config",
+    "get_quant_config",
+    "NoQuantConfig",
+    "ModelOptConfig",
+    "CompressedTensorsConfig",
+    "Fp8BlockConfig",
+    "Mxfp4Config",
+    "compressed_tensors",
+    "fp8",
+    "modelopt",
+    "mxfp4",
 ]

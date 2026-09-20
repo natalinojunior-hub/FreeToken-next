@@ -63,14 +63,16 @@ class Glm5NextMMProcessor(MMProcessor):
 
     def dummy_items(self, dtype: torch.dtype, device: torch.device) -> list[MMItem]:
         merge = self.merge
-        return [MMItem(
-            modality="image",
-            hash=0,
-            pad_value=0,
-            offsets=[[0, 1]],
-            feature=torch.zeros(merge * merge, self.patch_dim, dtype=dtype, device=device),
-            model_specific_data={"grid_thw": [1, merge, merge]},
-        )]
+        return [
+            MMItem(
+                modality="image",
+                hash=0,
+                pad_value=0,
+                offsets=[[0, 1]],
+                feature=torch.zeros(merge * merge, self.patch_dim, dtype=dtype, device=device),
+                model_specific_data={"grid_thw": [1, merge, merge]},
+            )
+        ]
 
 
 __all__ = ["Glm5NextMMProcessor"]

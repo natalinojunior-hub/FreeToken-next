@@ -63,6 +63,7 @@ def effective_efforts(profile: EffortProfile) -> frozenset[str]:
         vocab.add(profile.default)
     return frozenset(vocab)
 
+
 #: Protocol-level thinking toggles, broadcast in every spelling the ecosystem's
 #: templates read (``enable_thinking`` bool: qwen/glm/gemma/dsv4;
 #: ``thinking_mode`` string: minimax-m3). Jinja ignores undeclared variables,
@@ -241,7 +242,9 @@ def probe_thinking_profile(
         off = render(dict(THINKING_OFF_KWARGS), None)
         on = render(dict(THINKING_ON_KWARGS), None)
     except Exception:  # noqa: BLE001 -- can't observe the toggle; assume none
-        return ThinkingProfile(efforts=efforts, toggleable=False, has_adaptive=False, default_state="on")
+        return ThinkingProfile(
+            efforts=efforts, toggleable=False, has_adaptive=False, default_state="on"
+        )
     toggleable = _renderings_differ(off, on)
     has_adaptive = False
     adaptive = None

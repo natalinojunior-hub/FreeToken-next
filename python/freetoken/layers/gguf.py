@@ -125,7 +125,9 @@ class GGUFLinear(BaseOP):
         self.in_features = in_features
         self.out_features = out_features
         self._quant_type = quant_type
-        self.qweight = torch.empty(out_features, row_bytes(in_features, quant_type), dtype=torch.uint8)
+        self.qweight = torch.empty(
+            out_features, row_bytes(in_features, quant_type), dtype=torch.uint8
+        )
         self.bias = torch.empty(out_features) if has_bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -285,11 +287,15 @@ class GGUFEmbedding(BaseOP):
             # types (ggml_dequantize rejects type 1), so reinterpret the gathered rows.
             y = rows.view(_UNQUANTIZED_DTYPE[self._quant_type]).to(torch.bfloat16)
         else:
-            y = ggml_dequantize(rows, self._quant_type, flat.shape[0], self.embedding_dim, torch.bfloat16)
+            y = ggml_dequantize(
+                rows, self._quant_type, flat.shape[0], self.embedding_dim, torch.bfloat16
+            )
         y = y.view(*x.shape, self.embedding_dim)
         if self._embed_scale is not None:
             if self._embed_scale_t is None:
-                self._embed_scale_t = torch.tensor(self._embed_scale, dtype=y.dtype, device=y.device)
+                self._embed_scale_t = torch.tensor(
+                    self._embed_scale, dtype=y.dtype, device=y.device
+                )
             y = y * self._embed_scale_t
         return y
 

@@ -39,22 +39,14 @@ def _kv(shim: "GgufConfigShim", key: str, default: Any = None) -> Any:
     """
     val = shim.metadata.get(f"{shim.model_type}.{key}", default)
     if val is None and default is None:
-        raise ValueError(
-            f"GGUF {shim.model_path}: missing required key {shim.model_type}.{key}"
-        )
+        raise ValueError(f"GGUF {shim.model_path}: missing required key {shim.model_type}.{key}")
     return val
 
 
-def _uniform_expert_types(model_path: str, num_layers: int) -> tuple[int, int] | None:
-    """``(gate_up, down)`` ggml types of the routed-expert banks, or None if not uniform.
-
-    The offload slot pool is one allocation per bank shared by every layer, and
-    ``moe_vec.cuh`` addresses it as ``expert * nrows * (ncols / qk)`` with no padding
-    allowance -- so a bank whose type varies by layer cannot be served. We return None
-    rather than raising here because ``parse_gguf_config`` also runs for metadata-only
-    inspection; ``expert_banks._gguf_banks`` is where the load actually fails, with the
-    offending layers named. (llama.cpp's *_M mixes hit this.)
-    """
+def _uniform_expert_types(
+    model_path: str, num_layers: int
+) -> tuple[int, int] | list[tuple[int, int]] | None:
+    """``(gate_up, down)`` ggml types of the routed-expert banks (or per-layer list if mixed)."""
     from .gguf_experts import gguf_expert_types
 
     try:
@@ -62,9 +54,9 @@ def _uniform_expert_types(model_path: str, num_layers: int) -> tuple[int, int] |
     except Exception:
         return None
     gate_up, down = set(types["gate_up"]), set(types["down"])
-    if len(gate_up) != 1 or len(down) != 1:
-        return None
-    return (next(iter(gate_up)), next(iter(down)))
+    if len(gate_up) == 1 and len(down) == 1:
+        return (next(iter(gate_up)), next(iter(down)))
+    return [(types["gate_up"][l], types["down"][l]) for l in range(num_layers)]
 
 
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
@@ -163,9 +155,13 @@ _LAYER_MAP: dict[str, str] = {
 
 # Suffixes that are PARTS of a merged projection: never renamed 1:1, always combined by
 # iter_gguf_weights into the merged buffer the model actually declares.
-_MERGED_PARTS: frozenset[str] = frozenset({
-    "attn_q.weight", "attn_k.weight", "attn_v.weight",
-})
+_MERGED_PARTS: frozenset[str] = frozenset(
+    {
+        "attn_q.weight",
+        "attn_k.weight",
+        "attn_v.weight",
+    }
+)
 
 # Routed-expert stacks: [num_experts, out, in] packed blocks, handled by the offload
 # expert-bank loader rather than yielded as ordinary parameters.
@@ -319,7 +315,8 @@ def iter_gguf_weights(
         # Drop out-of-bounds layers (a draft/MTP block; should not happen in qwen3moe).
         if layer >= config.num_layers:
             warn_dropped_tensors(
-                model_path, "nextn",
+                model_path,
+                "nextn",
                 f"{name} is beyond the served model's {config.num_layers} layers, so it is "
                 f"not loaded; GGUF paths do not do speculative decoding.",
             )
@@ -373,8 +370,9 @@ def iter_gguf_weights(
             ]
             if len(set(types)) == 1:
                 # Uniform quant: fuse via torch.cat along dim 0.
-                yield f"{base}.self_attn.qkv_proj.qweight", torch.cat(
-                    [slots["q"], slots["k"], slots["v"]], dim=0
+                yield (
+                    f"{base}.self_attn.qkv_proj.qweight",
+                    torch.cat([slots["q"], slots["k"], slots["v"]], dim=0),
                 )
             else:
                 # Mixed quant: emit GGUFMergedLinear format.
@@ -476,7 +474,9 @@ def convert_qwen3moe_to_gguf(model, config: ModelConfig, *, model_path: str) -> 
         head = model.lm_head
         out_features, in_features = head.weight.shape
         model.lm_head = GGUFLMHead(
-            in_features, out_features, qt(-1, "output.weight"),
+            in_features,
+            out_features,
+            qt(-1, "output.weight"),
             has_bias=head.bias is not None,
         )
 

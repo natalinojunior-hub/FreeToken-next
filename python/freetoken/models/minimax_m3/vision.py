@@ -32,12 +32,18 @@ class MiniMaxM3VisionEmbeddings(BaseOP):
         return F.conv3d(x, self.patch_embedding.weight, stride=self._shape[1:]).view(x.shape[0], -1)
 
 
-def _rope_table(grid_thw: List[int], merge: int, head_dim: int, theta: float, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+def _rope_table(
+    grid_thw: List[int], merge: int, head_dim: int, theta: float, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-token [cos | sin] rows over the rotated dims: the even part of the head split into three equal t/h/w bands, the remainder passes through."""
     t, h, w = grid_thw
     axis_dim = 2 * (((2 * (head_dim // 2)) // 3) // 2)
-    inv_freq = 1.0 / (theta ** (torch.arange(0, axis_dim, 2, dtype=torch.float32, device=device) / axis_dim))
-    hpos, wpos = torch.meshgrid(torch.arange(h, device=device), torch.arange(w, device=device), indexing="ij")
+    inv_freq = 1.0 / (
+        theta ** (torch.arange(0, axis_dim, 2, dtype=torch.float32, device=device) / axis_dim)
+    )
+    hpos, wpos = torch.meshgrid(
+        torch.arange(h, device=device), torch.arange(w, device=device), indexing="ij"
+    )
     # block-major over the merge blocks, the order the processor flattens patches in
     block = (h // merge, merge, w // merge, merge)
     hpos = hpos.reshape(block).transpose(1, 2).flatten().repeat(t)
@@ -56,7 +62,9 @@ class MiniMaxM3VisionAttention(BaseOP):
         self.qkv = LinearReplicated(vc.hidden_size, 3 * vc.hidden_size, has_bias=True)
         self.out_proj = LinearReplicated(vc.hidden_size, vc.hidden_size, has_bias=True)
 
-    def forward(self, x: torch.Tensor, cache: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, cache: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
         from freetoken.kernel.triton.rope import apply_rope_with_cos_sin_cache_inplace
 
         S, H, D = x.shape[0], self.num_heads, self.head_dim
@@ -84,7 +92,9 @@ class MiniMaxM3VisionEncoderLayer(BaseOP):
         self.mlp = MiniMaxM3VisionMLP(vc)
         self.layer_norm2 = LayerNorm(vc.hidden_size, vc.layer_norm_eps)
 
-    def forward(self, x: torch.Tensor, cache: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, cache: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
         x = x + self.self_attn.forward(self.layer_norm1.forward(x), cache, positions)
         return x + self.mlp.forward(self.layer_norm2.forward(x))
 
@@ -109,7 +119,9 @@ class MiniMaxM3VisionTransformer(BaseOP):
     def place_weights(self, mode: str) -> None:
         """gpu: every tensor resident; host: encoder layer tensors in pinned banks streamed two layers at a time."""
         if mode == "host" and self._streamer is None:
-            self._streamer = BlockWeightStreamer(self.encoder.layers.op_list, self.embeddings.patch_embedding.weight.device)
+            self._streamer = BlockWeightStreamer(
+                self.encoder.layers.op_list, self.embeddings.patch_embedding.weight.device
+            )
         elif mode == "gpu" and self._streamer is not None:
             self._streamer.unstream()
             self._streamer = None
@@ -125,7 +137,9 @@ class MiniMaxM3VisionTransformer(BaseOP):
         vc = self._vc
         device = self.embeddings.patch_embedding.weight.device
         x = self.pre_layrnorm.forward(self.embeddings.forward(pixel_values.to(device)))
-        cache, positions = _rope_table(grid_thw, vc.spatial_merge_size, vc.hidden_size // vc.num_heads, vc.rope_theta, device)
+        cache, positions = _rope_table(
+            grid_thw, vc.spatial_merge_size, vc.hidden_size // vc.num_heads, vc.rope_theta, device
+        )
         for _, layer in self._layers():
             x = layer.forward(x, cache, positions)
         return x
@@ -145,8 +159,14 @@ class MiniMaxM3VisionModel(BaseOP):
 
     def __init__(self, vc: VisionConfig):
         self.vision_model = MiniMaxM3VisionTransformer(vc)
-        self.multi_modal_projector = MiniMaxM3ProjectorMLP(vc.hidden_size, vc.projector_hidden_size, vc.text_hidden_size)
-        self.patch_merge_mlp = MiniMaxM3ProjectorMLP(vc.spatial_merge_size**2 * vc.text_hidden_size, vc.projector_hidden_size, vc.text_hidden_size)
+        self.multi_modal_projector = MiniMaxM3ProjectorMLP(
+            vc.hidden_size, vc.projector_hidden_size, vc.text_hidden_size
+        )
+        self.patch_merge_mlp = MiniMaxM3ProjectorMLP(
+            vc.spatial_merge_size**2 * vc.text_hidden_size,
+            vc.projector_hidden_size,
+            vc.text_hidden_size,
+        )
         self._merge = vc.spatial_merge_size**2
 
     def place_weights(self, mode: str) -> None:

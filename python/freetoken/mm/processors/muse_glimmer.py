@@ -62,18 +62,22 @@ class MuseGlimmerMMProcessor(MMProcessor):
     def prompt_replacement(self, item: MMItem) -> PromptReplacement:
         t, h, w = item.grid_thw
         pads = [self.image_token_id] * ((t * h * w) // (self.merge * self.merge))
-        return PromptReplacement.select_token_id([_IMAGE_START_ID, *pads, _IMAGE_END_ID], self.image_token_id)
+        return PromptReplacement.select_token_id(
+            [_IMAGE_START_ID, *pads, _IMAGE_END_ID], self.image_token_id
+        )
 
     def dummy_items(self, dtype: torch.dtype, device: torch.device) -> list[MMItem]:
         merge = self.merge
-        return [MMItem(
-            modality="image",
-            hash=0,
-            pad_value=0,
-            offsets=[[0, 1]],
-            feature=torch.zeros(merge * merge, self.patch_dim, dtype=dtype, device=device),
-            model_specific_data={"grid_thw": [1, merge, merge]},
-        )]
+        return [
+            MMItem(
+                modality="image",
+                hash=0,
+                pad_value=0,
+                offsets=[[0, 1]],
+                feature=torch.zeros(merge * merge, self.patch_dim, dtype=dtype, device=device),
+                model_specific_data={"grid_thw": [1, merge, merge]},
+            )
+        ]
 
 
 __all__ = ["MuseGlimmerMMProcessor"]

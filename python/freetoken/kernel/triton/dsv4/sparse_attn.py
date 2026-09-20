@@ -121,15 +121,34 @@ MIN_TILES_PER_SPLIT = 4
 
 @triton.jit
 def _sparse_attn_paged_kernel(
-    q_ptr, win_ptr, cmp_ptr, o_ptr, sink_ptr, idx_ptr, cnt_ptr,
+    q_ptr,
+    win_ptr,
+    cmp_ptr,
+    o_ptr,
+    sink_ptr,
+    idx_ptr,
+    cnt_ptr,
     scale,
-    H, TOPK, N_WINDOW,
-    stride_qb, stride_qm, stride_qh, stride_qd,
-    stride_wn, stride_wd,
-    stride_cn, stride_cd,
-    stride_ob, stride_om, stride_oh, stride_od,
-    stride_ib, stride_im, stride_it,
-    stride_nb, stride_nm,
+    H,
+    TOPK,
+    N_WINDOW,
+    stride_qb,
+    stride_qm,
+    stride_qh,
+    stride_qd,
+    stride_wn,
+    stride_wd,
+    stride_cn,
+    stride_cd,
+    stride_ob,
+    stride_om,
+    stride_oh,
+    stride_od,
+    stride_ib,
+    stride_im,
+    stride_it,
+    stride_nb,
+    stride_nm,
     D: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
@@ -143,7 +162,13 @@ def _sparse_attn_paged_kernel(
     h_mask = offs_h < H
     offs_d = tl.arange(0, D)
 
-    q_ptrs = q_ptr + pid_b * stride_qb + pid_m * stride_qm + offs_h[:, None] * stride_qh + offs_d[None, :] * stride_qd
+    q_ptrs = (
+        q_ptr
+        + pid_b * stride_qb
+        + pid_m * stride_qm
+        + offs_h[:, None] * stride_qh
+        + offs_d[None, :] * stride_qd
+    )
     q = tl.load(q_ptrs, mask=h_mask[:, None], other=0.0).to(tl.float32)  # [BLOCK_H, D]
 
     m_i = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
@@ -191,22 +216,51 @@ def _sparse_attn_paged_kernel(
     l_i = l_i + tl.exp(sink - m_i)
     o = acc / l_i[:, None]
 
-    o_ptrs = o_ptr + pid_b * stride_ob + pid_m * stride_om + offs_h[:, None] * stride_oh + offs_d[None, :] * stride_od
+    o_ptrs = (
+        o_ptr
+        + pid_b * stride_ob
+        + pid_m * stride_om
+        + offs_h[:, None] * stride_oh
+        + offs_d[None, :] * stride_od
+    )
     tl.store(o_ptrs, o.to(o_ptr.dtype.element_ty), mask=h_mask[:, None])
 
 
 @triton.jit
 def _sparse_attn_paged_splitk_kernel(
-    q_ptr, win_ptr, cmp_ptr, mid_o_ptr, mid_lse_ptr, idx_ptr, cnt_ptr,
+    q_ptr,
+    win_ptr,
+    cmp_ptr,
+    mid_o_ptr,
+    mid_lse_ptr,
+    idx_ptr,
+    cnt_ptr,
     scale,
-    H, TOPK, N_WINDOW,
-    stride_qb, stride_qm, stride_qh, stride_qd,
-    stride_wn, stride_wd,
-    stride_cn, stride_cd,
-    stride_mb, stride_mm, stride_mh, stride_ms, stride_md,
-    stride_lb, stride_lm, stride_lh, stride_ls,
-    stride_ib, stride_im, stride_it,
-    stride_nb, stride_nm,
+    H,
+    TOPK,
+    N_WINDOW,
+    stride_qb,
+    stride_qm,
+    stride_qh,
+    stride_qd,
+    stride_wn,
+    stride_wd,
+    stride_cn,
+    stride_cd,
+    stride_mb,
+    stride_mm,
+    stride_mh,
+    stride_ms,
+    stride_md,
+    stride_lb,
+    stride_lm,
+    stride_lh,
+    stride_ls,
+    stride_ib,
+    stride_im,
+    stride_it,
+    stride_nb,
+    stride_nm,
     D: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
@@ -241,8 +295,11 @@ def _sparse_attn_paged_splitk_kernel(
 
     if split_end > split_start:
         q_ptrs = (
-            q_ptr + pid_b * stride_qb + pid_m * stride_qm
-            + offs_h[:, None] * stride_qh + offs_d[None, :] * stride_qd
+            q_ptr
+            + pid_b * stride_qb
+            + pid_m * stride_qm
+            + offs_h[:, None] * stride_qh
+            + offs_d[None, :] * stride_qd
         )
         q = tl.load(q_ptrs, mask=h_mask[:, None], other=0.0).to(tl.float32)
         idx_base = idx_ptr + pid_b * stride_ib + pid_m * stride_im
@@ -273,23 +330,43 @@ def _sparse_attn_paged_splitk_kernel(
     lse = tl.where(l_i == 0.0, -float("inf"), m_i + tl.log(l_i))
 
     mid_base = (
-        mid_o_ptr + pid_b * stride_mb + pid_m * stride_mm
-        + offs_h[:, None] * stride_mh + split_id * stride_ms + offs_d[None, :] * stride_md
+        mid_o_ptr
+        + pid_b * stride_mb
+        + pid_m * stride_mm
+        + offs_h[:, None] * stride_mh
+        + split_id * stride_ms
+        + offs_d[None, :] * stride_md
     )
     tl.store(mid_base, out, mask=h_mask[:, None])
     lse_base = (
-        mid_lse_ptr + pid_b * stride_lb + pid_m * stride_lm
-        + offs_h * stride_lh + split_id * stride_ls
+        mid_lse_ptr
+        + pid_b * stride_lb
+        + pid_m * stride_lm
+        + offs_h * stride_lh
+        + split_id * stride_ls
     )
     tl.store(lse_base, lse, mask=h_mask)
 
 
 @triton.jit
 def _sparse_attn_splitk_merge_kernel(
-    mid_o_ptr, mid_lse_ptr, o_ptr, sink_ptr,
-    stride_mb, stride_mm, stride_mh, stride_ms, stride_md,
-    stride_lb, stride_lm, stride_lh, stride_ls,
-    stride_ob, stride_om, stride_oh, stride_od,
+    mid_o_ptr,
+    mid_lse_ptr,
+    o_ptr,
+    sink_ptr,
+    stride_mb,
+    stride_mm,
+    stride_mh,
+    stride_ms,
+    stride_md,
+    stride_lb,
+    stride_lm,
+    stride_lh,
+    stride_ls,
+    stride_ob,
+    stride_om,
+    stride_oh,
+    stride_od,
     D: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
 ):
@@ -309,8 +386,7 @@ def _sparse_attn_splitk_merge_kernel(
     acc = tl.zeros((D,), dtype=tl.float32)
 
     mid_base = (
-        mid_o_ptr + pid_b * stride_mb + pid_m * stride_mm + pid_h * stride_mh
-        + offs_d * stride_md
+        mid_o_ptr + pid_b * stride_mb + pid_m * stride_mm + pid_h * stride_mh + offs_d * stride_md
     )
     lse_base = mid_lse_ptr + pid_b * stride_lb + pid_m * stride_lm + pid_h * stride_lh
 
@@ -325,10 +401,7 @@ def _sparse_attn_splitk_merge_kernel(
         m_i = m_new
 
     o = acc / l_i
-    o_ptrs = (
-        o_ptr + pid_b * stride_ob + pid_m * stride_om + pid_h * stride_oh
-        + offs_d * stride_od
-    )
+    o_ptrs = o_ptr + pid_b * stride_ob + pid_m * stride_om + pid_h * stride_oh + offs_d * stride_od
     tl.store(o_ptrs, o.to(o_ptr.dtype.element_ty))
 
 
@@ -352,12 +425,12 @@ def split_count(b: int, m: int, h: int, topk: int, device) -> int:
 
 
 def sparse_attn_paged(
-    q: torch.Tensor,            # [b, m, h, d]
+    q: torch.Tensor,  # [b, m, h, d]
     window_pool: torch.Tensor,  # [n_win_slots, d]  GLOBAL window-ring pool (this layer)
-    cmp_pool: torch.Tensor,     # [n_cmp, d]        GLOBAL compressed pool (this layer)
-    attn_sink: torch.Tensor,    # [h]
-    topk_idxs: torch.Tensor,    # [b, m, topk] int32, GLOBAL slots, layout [window | compressed]
-    n_window: int,              # # of window entries (the first n_window cols of topk)
+    cmp_pool: torch.Tensor,  # [n_cmp, d]        GLOBAL compressed pool (this layer)
+    attn_sink: torch.Tensor,  # [h]
+    topk_idxs: torch.Tensor,  # [b, m, topk] int32, GLOBAL slots, layout [window | compressed]
+    n_window: int,  # # of window entries (the first n_window cols of topk)
     softmax_scale: float,
     cmp_counts: torch.Tensor | None = None,  # [b, m] int32, live compressed columns per query
 ) -> torch.Tensor:
@@ -374,7 +447,11 @@ def sparse_attn_paged(
     """
     b, m, h, d = q.shape
     topk = topk_idxs.shape[-1]
-    assert window_pool.shape[1] == d and cmp_pool.shape[1] == d, (window_pool.shape, cmp_pool.shape, d)
+    assert window_pool.shape[1] == d and cmp_pool.shape[1] == d, (
+        window_pool.shape,
+        cmp_pool.shape,
+        d,
+    )
     assert 0 <= n_window <= topk, (n_window, topk)
     q = q.contiguous()
     window_pool = window_pool.contiguous()
@@ -396,23 +473,57 @@ def sparse_attn_paged(
     n_splits = split_count(b, m, h, topk, q.device)
     if n_splits:
         return _sparse_attn_paged_splitk(
-            q, window_pool, cmp_pool, sink, idx, cnt, o,
-            b, m, h, d, topk, n_window, softmax_scale, has_counts, stride_nb, stride_nm,
+            q,
+            window_pool,
+            cmp_pool,
+            sink,
+            idx,
+            cnt,
+            o,
+            b,
+            m,
+            h,
+            d,
+            topk,
+            n_window,
+            softmax_scale,
+            has_counts,
+            stride_nb,
+            stride_nm,
             n_splits,
         )
 
     block_h, block_t, n_stages = _tile_plan(q.device.index, d)
     grid = (m, b, triton.cdiv(h, block_h))
     _sparse_attn_paged_kernel[grid](
-        q, window_pool, cmp_pool, o, sink, idx, cnt,
+        q,
+        window_pool,
+        cmp_pool,
+        o,
+        sink,
+        idx,
+        cnt,
         float(softmax_scale),
-        h, topk, int(n_window),
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        window_pool.stride(0), window_pool.stride(1),
-        cmp_pool.stride(0), cmp_pool.stride(1),
-        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-        idx.stride(0), idx.stride(1), idx.stride(2),
-        stride_nb, stride_nm,
+        h,
+        topk,
+        int(n_window),
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        window_pool.stride(0),
+        window_pool.stride(1),
+        cmp_pool.stride(0),
+        cmp_pool.stride(1),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        o.stride(3),
+        idx.stride(0),
+        idx.stride(1),
+        idx.stride(2),
+        stride_nb,
+        stride_nm,
         D=d,
         BLOCK_H=block_h,
         BLOCK_T=block_t,
@@ -424,8 +535,24 @@ def sparse_attn_paged(
 
 
 def _sparse_attn_paged_splitk(
-    q, window_pool, cmp_pool, sink, idx, cnt, o,
-    b, m, h, d, topk, n_window, softmax_scale, has_counts, stride_nb, stride_nm, n_splits,
+    q,
+    window_pool,
+    cmp_pool,
+    sink,
+    idx,
+    cnt,
+    o,
+    b,
+    m,
+    h,
+    d,
+    topk,
+    n_window,
+    softmax_scale,
+    has_counts,
+    stride_nb,
+    stride_nm,
+    n_splits,
 ):
     block_h, block_t, n_stages = _tile_plan(q.device.index, d)
     head_blocks = triton.cdiv(h, block_h)
@@ -433,16 +560,39 @@ def _sparse_attn_paged_splitk(
     mid_lse = torch.empty((b, m, h, n_splits), dtype=torch.float32, device=q.device)
 
     _sparse_attn_paged_splitk_kernel[(m * n_splits, b, head_blocks)](
-        q, window_pool, cmp_pool, mid_o, mid_lse, idx, cnt,
+        q,
+        window_pool,
+        cmp_pool,
+        mid_o,
+        mid_lse,
+        idx,
+        cnt,
         float(softmax_scale),
-        h, topk, int(n_window),
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        window_pool.stride(0), window_pool.stride(1),
-        cmp_pool.stride(0), cmp_pool.stride(1),
-        mid_o.stride(0), mid_o.stride(1), mid_o.stride(2), mid_o.stride(3), mid_o.stride(4),
-        mid_lse.stride(0), mid_lse.stride(1), mid_lse.stride(2), mid_lse.stride(3),
-        idx.stride(0), idx.stride(1), idx.stride(2),
-        stride_nb, stride_nm,
+        h,
+        topk,
+        int(n_window),
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        window_pool.stride(0),
+        window_pool.stride(1),
+        cmp_pool.stride(0),
+        cmp_pool.stride(1),
+        mid_o.stride(0),
+        mid_o.stride(1),
+        mid_o.stride(2),
+        mid_o.stride(3),
+        mid_o.stride(4),
+        mid_lse.stride(0),
+        mid_lse.stride(1),
+        mid_lse.stride(2),
+        mid_lse.stride(3),
+        idx.stride(0),
+        idx.stride(1),
+        idx.stride(2),
+        stride_nb,
+        stride_nm,
         D=d,
         BLOCK_H=block_h,
         BLOCK_T=block_t,
@@ -452,10 +602,23 @@ def _sparse_attn_paged_splitk(
         num_stages=n_stages,
     )
     _sparse_attn_splitk_merge_kernel[(m, b, h)](
-        mid_o, mid_lse, o, sink,
-        mid_o.stride(0), mid_o.stride(1), mid_o.stride(2), mid_o.stride(3), mid_o.stride(4),
-        mid_lse.stride(0), mid_lse.stride(1), mid_lse.stride(2), mid_lse.stride(3),
-        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+        mid_o,
+        mid_lse,
+        o,
+        sink,
+        mid_o.stride(0),
+        mid_o.stride(1),
+        mid_o.stride(2),
+        mid_o.stride(3),
+        mid_o.stride(4),
+        mid_lse.stride(0),
+        mid_lse.stride(1),
+        mid_lse.stride(2),
+        mid_lse.stride(3),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        o.stride(3),
         D=d,
         NUM_SPLITS=n_splits,
         num_warps=4,

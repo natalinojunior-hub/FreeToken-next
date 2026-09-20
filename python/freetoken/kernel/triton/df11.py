@@ -210,9 +210,7 @@ def df11_decompress_ref(c: dict) -> torch.Tensor:
     return u16.view(torch.bfloat16).reshape(out_features, in_features)
 
 
-def df11_compress_rows(
-    weight: torch.Tensor, lmax: int = DF11_LMAX, row_block: int = 8192
-) -> dict:
+def df11_compress_rows(weight: torch.Tensor, lmax: int = DF11_LMAX, row_block: int = 8192) -> dict:
     """Row-contiguous DF11: every ROW is an independently-decodable chunk.
 
     Unlike :func:`df11_compress` (interleaved, tuned for decoding the *whole* matrix at once),

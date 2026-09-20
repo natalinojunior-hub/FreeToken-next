@@ -36,6 +36,7 @@ recurrence), ``fused_recurrent.py`` (pool-indexed decode kernel with in-kernel K
   gate + beta-sigmoid + q/k l2norm computed in-kernel. The per-token state store reads
   ``ssm_state_indices`` as a CONTIGUOUS [N, T] block; materialize, never ``expand()``.
 """
+
 from freetoken.kernel.fla.chunk import chunk_gated_delta_rule
 from freetoken.kernel.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,

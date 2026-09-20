@@ -25,7 +25,9 @@ class _FakeVision:
 
 def _engine(cache: EncoderCache, model=None) -> SimpleNamespace:
     return SimpleNamespace(
-        encoder_cache=cache, device=torch.device("cpu"), dtype=torch.float32,
+        encoder_cache=cache,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
         model=model or _FakeVision(),
     )
 
@@ -33,8 +35,12 @@ def _engine(cache: EncoderCache, model=None) -> SimpleNamespace:
 def _item(h: int, n_tokens: int, precomputed: torch.Tensor | None = None) -> MMItem:
     feature = None if precomputed is not None else torch.zeros(1)
     return MMItem(
-        modality="image", hash=h, pad_value=0, offsets=[[0, n_tokens]],
-        feature=feature, precomputed_embeddings=precomputed,
+        modality="image",
+        hash=h,
+        pad_value=0,
+        offsets=[[0, n_tokens]],
+        feature=feature,
+        precomputed_embeddings=precomputed,
     )
 
 

@@ -14,6 +14,7 @@
 CPU-only, no model: real PrefillManager/PrefillAdder chunking (so the cap is the shipped one)
 in the scheduler's overlap order, then the decode driver.
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -39,7 +40,7 @@ from freetoken.scheduler.utils import PendingReq
 DEVICE = torch.device("cpu")
 MAX_RUNNING = 4
 UID = 7
-TOKEN_BUDGET = 8192   # max_extend_tokens: never the binding cap here, the swa pool is
+TOKEN_BUDGET = 8192  # max_extend_tokens: never the binding cap here, the swa pool is
 GAP = cache_mod._SWA_RETAIN_GAP
 
 if try_get_tp_info() is None:
@@ -49,15 +50,19 @@ if try_get_tp_info() is None:
 def _cfg(window: int, page_size: int = 1, max_running_req: int = 4, **kw):
     """The slice of EngineConfig the floor helpers read."""
     groups = (
-        KVCacheGroupSpec(name="full", layer_ids=(1,), num_kv_heads=1, head_dim=8,
-                         sliding_window=None),
-        KVCacheGroupSpec(name="swa", layer_ids=(0,), num_kv_heads=1, head_dim=8,
-                         sliding_window=window),
+        KVCacheGroupSpec(
+            name="full", layer_ids=(1,), num_kv_heads=1, head_dim=8, sliding_window=None
+        ),
+        KVCacheGroupSpec(
+            name="swa", layer_ids=(0,), num_kv_heads=1, head_dim=8, sliding_window=window
+        ),
     )
     return SimpleNamespace(
-        page_size=page_size, max_running_req=max_running_req,
+        page_size=page_size,
+        max_running_req=max_running_req,
         model_config=SimpleNamespace(kv_cache_group_specs=lambda: groups),
-        swa_num_pages_override=kw.get("override"), swa_full_tokens_ratio=kw.get("ratio", 0.2),
+        swa_num_pages_override=kw.get("override"),
+        swa_full_tokens_ratio=kw.get("ratio", 0.2),
     )
 
 
@@ -70,13 +75,23 @@ def _managers(window: int, num_swa_tokens: int, ps: int = 1, num_pages: int = 40
         set_global_ctx(Context(page_size=ps))
 
     pool = HybridSWAKVCache(
-        groups=_cfg(window, ps).model_config.kv_cache_group_specs(), num_layers=2,
-        num_full_pages=num_pages, page_size=ps, dtype=torch.bfloat16, device=DEVICE,
+        groups=_cfg(window, ps).model_config.kv_cache_group_specs(),
+        num_layers=2,
+        num_full_pages=num_pages,
+        page_size=ps,
+        dtype=torch.bfloat16,
+        device=DEVICE,
         num_swa_tokens=num_swa_tokens,
     )
     pt = torch.zeros((MAX_RUNNING + 1, width), dtype=torch.int32, device=DEVICE)
-    cm = CacheManager(num_pages=num_pages, page_size=ps, page_table=pt, type="swa_radix",
-                      swa_pool=pool, sliding_window_size=window)
+    cm = CacheManager(
+        num_pages=num_pages,
+        page_size=ps,
+        page_table=pt,
+        type="swa_radix",
+        swa_pool=pool,
+        sliding_window_size=window,
+    )
     assert cm.swa_paged and cm.is_swa
     tm = TableManager(max_running_reqs=MAX_RUNNING, page_table=pt)
     return cm, tm, PrefillManager(cm, tm, DecodeManager(page_size=ps))
@@ -86,23 +101,26 @@ def _prefill(cm, pm, prompt_len: int, n_decode: int, base: int = 1):
     """Real chunked prefill (chunk sizes from PrefillAdder) in the scheduler's overlap order:
     schedule+forward chunk N+1 before committing chunk N; only the final chunk commits.
     ``base`` shifts the token ids so concurrent requests share no prefix."""
-    pm.pending_list = [PendingReq(uid=UID,
-                                  input_ids=torch.arange(base, base + prompt_len,
-                                                         dtype=torch.int32),
-                                  sampling_params=SamplingParams(max_tokens=n_decode))]
+    pm.pending_list = [
+        PendingReq(
+            uid=UID,
+            input_ids=torch.arange(base, base + prompt_len, dtype=torch.int32),
+            sampling_params=SamplingParams(max_tokens=n_decode),
+        )
+    ]
     final = last_batch = None
     while pm.runnable or last_batch is not None:
         batch = pm.schedule_next_batch(TOKEN_BUDGET)
         if batch is not None:
             assert batch.reqs[0].extend_len > 0, "prefill stalled at a zero-length chunk"
-            cm.free_swa_out_of_window_extend(batch.reqs)     # _prepare_batch
+            cm.free_swa_out_of_window_extend(batch.reqs)  # _prepare_batch
             cm.allocate_paged(batch.reqs)
             for r in batch.reqs:
                 r.complete_one()
         if last_batch is not None:
             for r in last_batch.reqs:
                 if not isinstance(r, ChunkedReq):
-                    cm.cache_req(r, finished=False)          # scheduler.py:328
+                    cm.cache_req(r, finished=False)  # scheduler.py:328
                     final = r
         last_batch = batch
     return final
@@ -129,8 +147,13 @@ def test_commit_locks_one_window_not_the_whole_extend(ps, monkeypatch):
     boundary must also stay page-aligned for the pool's whole-page free path."""
     monkeypatch.setattr(cache_mod, "_SWA_EVICTION_INTERVAL", 1)
     window, prompt = (8, 200) if ps == 1 else (ps, 24 * ps)
-    cm, _tm, pm = _managers(window, num_swa_tokens=64 * max(ps, 8) + 1, ps=ps,
-                            num_pages=256 if ps > 1 else 4096, width=64 * max(ps, 32))
+    cm, _tm, pm = _managers(
+        window,
+        num_swa_tokens=64 * max(ps, 8) + 1,
+        ps=ps,
+        num_pages=256 if ps > 1 else 4096,
+        width=64 * max(ps, 32),
+    )
     _prefill(cm, pm, prompt, n_decode=1)
 
     retained = -(-(window + GAP) // ps) * ps
@@ -149,14 +172,20 @@ def test_short_final_chunk_locks_no_more_than_a_window(monkeypatch):
     for c_last in (1, 14, 15, 16, 17, 60):
         cm, tm, _pm = _managers(window, num_swa_tokens=4096)
         total = first_chunk + c_last
-        req = Req(input_ids=torch.arange(1, total + 1, dtype=torch.int32), table_idx=0,
-                  cached_len=0, output_len=n_decode, uid=UID,
-                  sampling_params=SamplingParams(), cache_handle=None)
+        req = Req(
+            input_ids=torch.arange(1, total + 1, dtype=torch.int32),
+            table_idx=0,
+            cached_len=0,
+            output_len=n_decode,
+            uid=UID,
+            sampling_params=SamplingParams(),
+            cache_handle=None,
+        )
         req.input_len = total
         h = cm.match_req(req).cuda_handle
         req.cache_handle = h
         cm.lock(h)
-        for end in (first_chunk, total):        # two explicit chunks -> c_last is exact
+        for end in (first_chunk, total):  # two explicit chunks -> c_last is exact
             req.device_len = end
             cm.free_swa_out_of_window_extend([req])
             cm.allocate_paged([req])
@@ -227,7 +256,7 @@ def test_a_per_request_sized_pool_cannot_hold_a_full_batch(monkeypatch):
 def test_floor_terms_and_page_rounding():
     for window in (8, 128, 1024):
         for ps in (1, 8, 64, 128):
-            locked = -(-(window + GAP) // ps) * ps       # what the commit locks
+            locked = -(-(window + GAP) // ps) * ps  # what the commit locks
             tail = window + 2 * ps + cache_mod._SWA_EVICTION_INTERVAL  # uncollected decode tail
             assert _swa_per_req_swa_floor(_cfg(window, ps)) == locked + tail, (window, ps)
 

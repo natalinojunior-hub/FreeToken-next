@@ -16,9 +16,15 @@ from freetoken.models.config import KVCacheGroupSpec
 
 def _spec(name, attn_type, *, mla=False, index_head_dim=0, sliding_window=None):
     return KVCacheGroupSpec(
-        name=name, layer_ids=(0, 1), num_kv_heads=2, head_dim=64,
-        sliding_window=sliding_window, mla=mla, index_head_dim=index_head_dim,
-        num_index_layers=2 if index_head_dim else 0, attn_type=attn_type,
+        name=name,
+        layer_ids=(0, 1),
+        num_kv_heads=2,
+        head_dim=64,
+        sliding_window=sliding_window,
+        mla=mla,
+        index_head_dim=index_head_dim,
+        num_index_layers=2 if index_head_dim else 0,
+        attn_type=attn_type,
     )
 
 
@@ -36,8 +42,10 @@ def test_resolve_pool_class_follows_attn_type():
 
     cases = [
         ((_spec("full", AttnType.FULL),), MHAKVCache),
-        ((_spec("full", AttnType.FULL), _spec("swa", AttnType.SWA, sliding_window=128)),
-         HybridSWAKVCache),
+        (
+            (_spec("full", AttnType.FULL), _spec("swa", AttnType.SWA, sliding_window=128)),
+            HybridSWAKVCache,
+        ),
         ((_spec("full", AttnType.MLA, mla=True),), MLAKVCache),
         ((_spec("full", AttnType.DSA, mla=True, index_head_dim=128),), DSAKVCache),
         ((_spec("dsv4", AttnType.DSV4, sliding_window=128),), DSV4PagedKVCache),
@@ -54,10 +62,16 @@ def _generic_config(num_page_override=None):
     mc = _model_config((_spec("full", AttnType.FULL),))
     mc.linear_attention_group = lambda: None
     return SimpleNamespace(
-        model_config=mc, page_size=16, dtype=SimpleNamespace(itemsize=2),
-        tp_info=SimpleNamespace(size=1), cache_type="radix",
-        swa_full_tokens_ratio=1.0, swa_num_pages_override=None,
-        num_page_override=num_page_override, max_running_req=4, max_seq_len=1024,
+        model_config=mc,
+        page_size=16,
+        dtype=SimpleNamespace(itemsize=2),
+        tp_info=SimpleNamespace(size=1),
+        cache_type="radix",
+        swa_full_tokens_ratio=1.0,
+        swa_num_pages_override=None,
+        num_page_override=num_page_override,
+        max_running_req=4,
+        max_seq_len=1024,
     )
 
 
@@ -99,8 +113,12 @@ def _dsv4_config(num_page_override=None):
     args = DeepseekV4Args()
     return SimpleNamespace(
         model_config=SimpleNamespace(dsv4_args=args),
-        page_size=args.window_size, max_running_req=2, max_seq_len=4096, cache_type="radix",
-        swa_full_tokens_ratio=1.0, swa_num_pages_override=None,
+        page_size=args.window_size,
+        max_running_req=2,
+        max_seq_len=4096,
+        cache_type="radix",
+        swa_full_tokens_ratio=1.0,
+        swa_num_pages_override=None,
         num_page_override=num_page_override,
     )
 
@@ -116,7 +134,10 @@ def test_dsv4_kv_cost_and_floor_parity():
     P = 128
     floor = _dsv4_window_floor_pages(config, P)
     per_page, fixed, min_reserve = dsv4_auto_cost_model(
-        config.model_config.dsv4_args, _dsv4_swa_ratio(config), floor, P=P,
+        config.model_config.dsv4_args,
+        _dsv4_swa_ratio(config),
+        floor,
+        P=P,
         n_scratch=config.max_running_req + 1,
     )
     assert DSV4PagedKVCache.kv_cost(config) == (per_page, fixed, P, min_reserve)
@@ -147,9 +168,14 @@ def test_generic_validate_rebuild_budget_check():
 
     def check(pages, baseline):
         pool.validate_rebuild(
-            config, num_pages=pages, num_swa_pages=None,
-            target_moe=0, per_expert_bytes=0, baseline_free=baseline,
-            weights_bytes=0, current_num_pages=10,
+            config,
+            num_pages=pages,
+            num_swa_pages=None,
+            target_moe=0,
+            per_expert_bytes=0,
+            baseline_free=baseline,
+            weights_bytes=0,
+            current_num_pages=10,
         )
 
     object.__setattr__(config, "memory_ratio", 1.0)
@@ -170,9 +196,14 @@ def test_dsv4_validate_rebuild_floor():
     floor = _dsv4_window_floor_pages(config, config.page_size)
     with pytest.raises(CacheRebuildRejected, match="working-set floor"):
         pool.validate_rebuild(
-            config, num_pages=floor - 1, num_swa_pages=None,
-            target_moe=0, per_expert_bytes=0, baseline_free=0,
-            weights_bytes=0, current_num_pages=100,
+            config,
+            num_pages=floor - 1,
+            num_swa_pages=None,
+            target_moe=0,
+            per_expert_bytes=0,
+            baseline_free=0,
+            weights_bytes=0,
+            current_num_pages=100,
         )
 
 
@@ -223,13 +254,22 @@ def test_create_kv_pool_builds_the_right_family():
         set_tp_info(rank=0, size=1)
 
     mc = SimpleNamespace(
-        has_swa_attention=False, has_linear_attention=False, dsv4_args=None,
-        num_layers=2, num_kv_heads=1, head_dim=8,
+        has_swa_attention=False,
+        has_linear_attention=False,
+        dsv4_args=None,
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=8,
     )
     mc.kv_cache_group_specs = lambda: (_spec("full", AttnType.FULL),)
     config = SimpleNamespace(
-        model_config=mc, page_size=1, cache_type="radix", max_running_req=2,
-        swa_full_tokens_ratio=1.0, swa_num_pages_override=None, max_seq_len=64,
+        model_config=mc,
+        page_size=1,
+        cache_type="radix",
+        max_running_req=2,
+        swa_full_tokens_ratio=1.0,
+        swa_num_pages_override=None,
+        max_seq_len=64,
     )
     pool = create_kv_pool(config, num_pages=8, device=torch.device("cpu"), dtype=torch.bfloat16)
     assert isinstance(pool, MHAKVCache)
@@ -241,12 +281,20 @@ def test_create_kv_pool_builds_the_right_family():
         dataclasses.replace(_spec("swa", AttnType.SWA, sliding_window=4), layer_ids=(1,)),
     )
     mc2 = SimpleNamespace(
-        has_swa_attention=True, has_linear_attention=False, dsv4_args=None, num_layers=2,
+        has_swa_attention=True,
+        has_linear_attention=False,
+        dsv4_args=None,
+        num_layers=2,
     )
     mc2.kv_cache_group_specs = lambda: swa_specs
     config2 = SimpleNamespace(
-        model_config=mc2, page_size=1, cache_type="swa_radix", max_running_req=2,
-        swa_full_tokens_ratio=0.5, swa_num_pages_override=None, max_seq_len=64,
+        model_config=mc2,
+        page_size=1,
+        cache_type="swa_radix",
+        max_running_req=2,
+        swa_full_tokens_ratio=0.5,
+        swa_num_pages_override=None,
+        max_seq_len=64,
         max_extend_tokens=64,
     )
     pool2 = create_kv_pool(config2, num_pages=8, device=torch.device("cpu"), dtype=torch.bfloat16)
@@ -258,13 +306,21 @@ def test_linear_state_pool_prices_itself():
     # The GDN state pool is a sibling pool: the KV family's kv_cost excludes it and the
     # engine adds state_pool_bytes -- the sum must equal the old single-walk total.
     from freetoken.kvcache.linear_state_pool import (
-        _linear_pool_num_slots, linear_state_bytes_per_req, state_pool_bytes,
+        _linear_pool_num_slots,
+        linear_state_bytes_per_req,
+        state_pool_bytes,
     )
     from freetoken.models.config import LinearGatedDeltaGroupConfig
 
     group = LinearGatedDeltaGroupConfig(
-        name="linear", layer_ids=(1, 3), num_key_heads=2, num_value_heads=4,
-        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate="silu",
+        name="linear",
+        layer_ids=(1, 3),
+        num_key_heads=2,
+        num_value_heads=4,
+        key_head_dim=16,
+        value_head_dim=16,
+        conv_kernel_dim=4,
+        output_gate="silu",
     )
     config = _generic_config()
     config.linear_state_cache_ratio = 0.5
@@ -303,9 +359,14 @@ def test_validate_rebuild_targets_flow_by_kv_cost_signature():
         pool = object.__new__(cls)
         per_page, fixed, _, _ = cls.kv_cost(config, **budget_tokens_kwargs)
         pool.validate_rebuild(
-            config, num_pages=10, target_moe=0, per_expert_bytes=0,
-            baseline_free=11 * per_page + fixed, weights_bytes=0,  # 10 usable + dummy page
-            current_num_pages=10, **targets,
+            config,
+            num_pages=10,
+            target_moe=0,
+            per_expert_bytes=0,
+            baseline_free=11 * per_page + fixed,
+            weights_bytes=0,  # 10 usable + dummy page
+            current_num_pages=10,
+            **targets,
         )
 
     # exactly-fitting budget passes with the pin priced in ...
@@ -321,7 +382,13 @@ def test_validate_rebuild_targets_flow_by_kv_cost_signature():
     per_page = MHAKVCache.kv_cost(plain)[0]
     pool = object.__new__(MHAKVCache)
     pool.validate_rebuild(
-        plain, num_pages=10, target_moe=0, per_expert_bytes=0,
-        baseline_free=11 * per_page, weights_bytes=0, current_num_pages=10,  # + dummy page
-        num_swa_pages=None, future_family_key=None,
+        plain,
+        num_pages=10,
+        target_moe=0,
+        per_expert_bytes=0,
+        baseline_free=11 * per_page,
+        weights_bytes=0,
+        current_num_pages=10,  # + dummy page
+        num_swa_pages=None,
+        future_family_key=None,
     )

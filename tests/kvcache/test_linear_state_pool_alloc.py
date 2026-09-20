@@ -1,5 +1,6 @@
 """LinearStatePool unit: the free-list allocator and the declared slot-state siblings.
 CPU-only, fast — pure slot bookkeeping + state copy/zero, no kernels."""
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -17,23 +18,34 @@ from freetoken.models.config import LinearGatedDeltaGroupConfig, SlotStateSpec
 
 def _group():
     return LinearGatedDeltaGroupConfig(
-        name="linear", layer_ids=(0, 1),
-        num_key_heads=2, num_value_heads=4,
-        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate="silu",
+        name="linear",
+        layer_ids=(0, 1),
+        num_key_heads=2,
+        num_value_heads=4,
+        key_head_dim=16,
+        value_head_dim=16,
+        conv_kernel_dim=4,
+        output_gate="silu",
     )
 
 
 def _pool(num_slots=8, device="cpu", slot_states=()):
-    return LinearStatePool(group=_group(), num_slots=num_slots, dtype=torch.bfloat16,
-                           device=torch.device(device), tp_size=1, slot_states=slot_states)
+    return LinearStatePool(
+        group=_group(),
+        num_slots=num_slots,
+        dtype=torch.bfloat16,
+        device=torch.device(device),
+        tp_size=1,
+        slot_states=slot_states,
+    )
 
 
 def test_alloc_free_roundtrip():
     pool = _pool(num_slots=8)
-    assert pool.num_free_slots == 7          # slots 1..7 (slot 0 = padding)
+    assert pool.num_free_slots == 7  # slots 1..7 (slot 0 = padding)
     a = pool.alloc(3)
     assert len(set(a)) == 3 and all(1 <= s <= 7 for s in a)
-    assert pool.padding_slot not in a        # slot 0 never allocated
+    assert pool.padding_slot not in a  # slot 0 never allocated
     assert pool.num_free_slots == 4
     pool.free(a)
     assert pool.num_free_slots == 7
@@ -46,7 +58,7 @@ def test_alloc_free_roundtrip():
 
 
 def test_alloc_exhaustion_raises():
-    pool = _pool(num_slots=4)                # 3 allocatable
+    pool = _pool(num_slots=4)  # 3 allocatable
     pool.alloc(3)
     with pytest.raises(RuntimeError, match="exhausted"):
         pool.alloc(1)
@@ -168,8 +180,12 @@ def test_slot_state_in_the_byte_account():
     mc = SimpleNamespace(slot_states=_SPECS)
     mc.linear_attention_group = lambda: group
     config = SimpleNamespace(
-        model_config=mc, dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1),
-        cache_type="naive", max_running_req=3, linear_state_cache_ratio=0.5,
+        model_config=mc,
+        dtype=torch.bfloat16,
+        tp_info=SimpleNamespace(size=1),
+        cache_type="naive",
+        max_running_req=3,
+        linear_state_cache_ratio=0.5,
     )
     assert state_pool_bytes(config, num_slots=4) == with_state * 4
 
@@ -186,6 +202,7 @@ def test_slot_state_bytes_for_the_real_geometry():
     # qwen4_exp PLE conv history: 4 streams x 2560 channels x 9 taps bf16 = 180 KiB per slot
     spec = SlotStateSpec(name="ple_conv", shape=(4 * 2560, 9), layer_ids=(1,))
     group = _group()
-    delta = linear_state_bytes_per_req(group, 1, torch.bfloat16, (spec,)) - \
-        linear_state_bytes_per_req(group, 1, torch.bfloat16)
+    delta = linear_state_bytes_per_req(
+        group, 1, torch.bfloat16, (spec,)
+    ) - linear_state_bytes_per_req(group, 1, torch.bfloat16)
     assert delta == 4 * 2560 * 9 * 2 == 180 * 1024

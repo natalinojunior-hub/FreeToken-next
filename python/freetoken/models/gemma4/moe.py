@@ -19,7 +19,7 @@ class Gemma4Router(BaseOP):
         self.proj = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
         self.scale = torch.empty(config.hidden_size)
         self.per_expert_scale = torch.empty(config.num_experts)
-        self._scalar_root = config.hidden_size ** -0.5
+        self._scalar_root = config.hidden_size**-0.5
         self._top_k = config.num_experts_per_tok
         from freetoken.kernel.triton.gemma4_fused import gemma4_fused_routing
 
@@ -94,9 +94,7 @@ class Gemma4DenseMLP(BaseOP):
 
     def __init__(self, config: ModelConfig, *, prefix: str = ""):
         self.shared_mlp = GatedMLP(config, quant_config=config.quant, prefix=f"{prefix}.shared_mlp")
-        self.post_feedforward_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_feedforward_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layer_scalar = torch.empty(1)
 
     def forward(self, pre_ff: torch.Tensor, x: torch.Tensor) -> torch.Tensor:

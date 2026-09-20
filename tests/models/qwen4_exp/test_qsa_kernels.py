@@ -45,9 +45,9 @@ def _qsa_relative_topk_reference(logits, row_starts, row_ends, topk):
         length = int((row_ends[row] - row_starts[row]).item())
         width = min(length, topk)
         if width:
-            output[row, :width] = torch.topk(
-                logits[row, start : start + length], width
-            ).indices.to(torch.int32)
+            output[row, :width] = torch.topk(logits[row, start : start + length], width).indices.to(
+                torch.int32
+            )
     return output
 
 
@@ -75,9 +75,7 @@ def _expand_qsa_indices_reference(
     tail_start = visible_tokens // compress_ratio * compress_ratio
     tail = tail_start.unsqueeze(1) + tail_offsets.unsqueeze(0)
     tail_count = (visible_tokens - tail_start).unsqueeze(1)
-    tail_valid = (tail_offsets.unsqueeze(0) < tail_count) & (
-        tail < sequence_lengths.unsqueeze(1)
-    )
+    tail_valid = (tail_offsets.unsqueeze(0) < tail_count) & (tail < sequence_lengths.unsqueeze(1))
     tail = torch.where(tail_valid, tail, torch.full_like(tail, -1))
 
     result = torch.cat((expanded, tail), dim=1)
@@ -102,7 +100,11 @@ def _paged_case(length: int, bs: int, rows_per_req: int, seed: int, index_heads:
         torch.randperm(total_pages, device=device).reshape(bs, pages_per_req).to(torch.int32)
     )
     q = torch.randn(
-        bs * rows_per_req, index_heads, INDEX_DIM, device=device, dtype=torch.bfloat16,
+        bs * rows_per_req,
+        index_heads,
+        INDEX_DIM,
+        device=device,
+        dtype=torch.bfloat16,
         generator=generator,
     )
     token_to_req = torch.repeat_interleave(
@@ -141,15 +143,27 @@ def test_top_blocks_and_expansion_match_vllm_reference(length: int, bs: int, tor
     fixture = Fixture(config, num_pages=4, max_running_req=2)
     case = _paged_case(length, bs, rows_per_req=4, seed=7 * length + bs)
     cache = torch.randn(
-        case.total_pages, CMP_PAGE, 1, INDEX_DIM, device=case.device,
-        dtype=torch.bfloat16, generator=case.generator,
+        case.total_pages,
+        CMP_PAGE,
+        1,
+        INDEX_DIM,
+        device=case.device,
+        dtype=torch.bfloat16,
+        generator=case.generator,
     )
     rows, columns = case.q.shape[0], case.pages_per_req * CMP_PAGE
     logits = torch.empty(rows, columns, dtype=torch.float32, device=case.device)
     visible = torch.empty(rows, dtype=torch.int32, device=case.device)
     qsa_mqa_paged(
-        case.q, cache, case.block_table, case.token_to_req, case.query_positions,
-        case.seq_lens, RATIO, logits, visible,
+        case.q,
+        cache,
+        case.block_table,
+        case.token_to_req,
+        case.query_positions,
+        case.seq_lens,
+        RATIO,
+        logits,
+        visible,
     )
     blocks = torch.empty(rows, BUDGET // RATIO, dtype=torch.int32, device=case.device)
     reference_logits = _qsa_mqa_paged_reference(
@@ -168,8 +182,13 @@ def test_top_blocks_and_expansion_match_vllm_reference(length: int, bs: int, tor
     row_seq_lens = case.seq_lens.index_select(0, case.token_to_req.long())
     indices = torch.empty(rows, BUDGET + RATIO - 1, dtype=torch.int32, device=case.device)
     expand_qsa_block_indices(
-        expected_blocks, case.query_positions, case.seq_lens, case.token_to_req,
-        RATIO, BUDGET, indices,
+        expected_blocks,
+        case.query_positions,
+        case.seq_lens,
+        case.token_to_req,
+        RATIO,
+        BUDGET,
+        indices,
     )
     expected = _expand_qsa_indices_reference(
         expected_blocks, case.query_positions, row_seq_lens, RATIO, BUDGET
@@ -342,9 +361,7 @@ def _policy_topk_blocks(logits, visible, width):
     take = min(width, columns)
     order = masked.argsort(dim=-1, descending=True, stable=True)[:, :take]
     out = torch.full((logits.shape[0], width), -1, dtype=torch.int32, device=logits.device)
-    out[:, :take] = torch.where(
-        masked.gather(1, order) > -float("inf"), order.to(torch.int32), -1
-    )
+    out[:, :take] = torch.where(masked.gather(1, order) > -float("inf"), order.to(torch.int32), -1)
     return out
 
 
@@ -403,9 +420,7 @@ def test_block_topk_split_path_replays_in_a_cuda_graph(preallocated: bool):
     blocks = torch.empty(rows, width, dtype=torch.int32, device=device)
     # The scratch never needs clearing: every split rewrites its own slots on every replay.
     scratch = (
-        torch.empty(rows, scratch_width, dtype=torch.int32, device=device)
-        if preallocated
-        else None
+        torch.empty(rows, scratch_width, dtype=torch.int32, device=device) if preallocated else None
     )
 
     side = torch.cuda.Stream()

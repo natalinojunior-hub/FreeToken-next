@@ -10,7 +10,9 @@ from freetoken.models.weight import ftw_lacks_vision, load_weight
 
 def _write_ftw(out_dir, names):
     writer = FTWWriter(str(out_dir))
-    tensors = {name: torch.full((4, 8), float(i), dtype=torch.bfloat16) for i, name in enumerate(names)}
+    tensors = {
+        name: torch.full((4, 8), float(i), dtype=torch.bfloat16) for i, name in enumerate(names)
+    }
     for name, tensor in tensors.items():
         writer.add_tensor(name, tensor)
     writer.finalize({})
@@ -45,7 +47,9 @@ def test_load_weight_text_only_skips_the_tower(tmp_path):
     names = ["model.a.weight", "visual.b.weight", "vision_tower.c.weight"]
     _write_ftw(tmp_path, names)
     cpu = torch.device("cpu")
-    assert [n for n, _ in load_weight(str(tmp_path), cpu, include_vision=False)] == ["model.a.weight"]
+    assert [n for n, _ in load_weight(str(tmp_path), cpu, include_vision=False)] == [
+        "model.a.weight"
+    ]
     assert [n for n, _ in load_weight(str(tmp_path), cpu)] == names
 
 

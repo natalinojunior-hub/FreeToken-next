@@ -152,15 +152,15 @@ def test_iter_merged_tensors_reports_incomplete_merge_with_model_name():
     }
 
     with pytest.raises(AssertionError, match="test.*Incomplete merge groups"):
-        list(iter_merged_tensors([("x.q_proj.weight", torch.zeros(1, 1))], rules, model_name="test"))
+        list(
+            iter_merged_tensors([("x.q_proj.weight", torch.zeros(1, 1))], rules, model_name="test")
+        )
 
 
 def test_stack_expert_tensors_after_all_experts_arrive():
     from freetoken.models.loader import iter_stacked_experts
 
-    expert_pattern = re.compile(
-        r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$"
-    )
+    expert_pattern = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
     tensors = [
         ("model.layers.0.mlp.experts.1.gate_up_proj.weight", torch.full((1, 2), 11.0)),
         ("model.layers.0.mlp.experts.0.gate_up_proj.weight", torch.full((1, 2), 10.0)),

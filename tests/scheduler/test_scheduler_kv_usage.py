@@ -55,15 +55,18 @@ def _fake_engine(swa=True, moe=True, mamba=True):
             cache_type="swa_radix",
             model_config=SimpleNamespace(dsv4_args=None, has_swa_attention=swa),
         ),
-        kv_cache=SimpleNamespace(
-            swa_num_tokens=513, unit_bytes=lambda: (1 << 20, 1 << 21)
-        ),
+        kv_cache=SimpleNamespace(swa_num_tokens=513, unit_bytes=lambda: (1 << 20, 1 << 21)),
         moe_offload_cache=SimpleNamespace(
-            cache_size=24, num_layers=8, num_experts=16,
+            cache_size=24,
+            num_layers=8,
+            num_experts=16,
             bank_caches={"w": torch.zeros((24, 1024), dtype=torch.float32)},
-        ) if moe else None,
+        )
+        if moe
+        else None,
         linear_state_pool=SimpleNamespace(num_slots=65, bytes_per_slot=lambda: 1 << 24)
-        if mamba else None,
+        if mamba
+        else None,
     )
 
 

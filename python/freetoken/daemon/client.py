@@ -36,14 +36,20 @@ class ClientError(Exception):
 def _effective_timeout(verb: str, configured: float | None) -> float:
     if configured is not None:
         return configured
-    return (
-        DEFAULT_LIFECYCLE_TIMEOUT
-        if verb in {"stop", "switch"}
-        else DEFAULT_TIMEOUT
-    )
+    return DEFAULT_LIFECYCLE_TIMEOUT if verb in {"stop", "switch"} else DEFAULT_TIMEOUT
 
 
-def _request(method: str, url: str, path: str, *, body=None, query=None, token=None, timeout=10.0, accept="application/json"):
+def _request(
+    method: str,
+    url: str,
+    path: str,
+    *,
+    body=None,
+    query=None,
+    token=None,
+    timeout=10.0,
+    accept="application/json",
+):
     full = f"{url.rstrip('/')}{path}"
     if query:
         full = f"{full}?{urllib.parse.urlencode(query)}"
@@ -94,15 +100,22 @@ def _request_json(method, url, path, *, body=None, query=None, token=None, timeo
 def _stream_logs(url, since, token, timeout) -> None:
     # The stream is endless; print each line until interrupted. A long read timeout survives idle
     # heartbeats without hanging forever on a dead socket.
-    with _request("GET", url, "/engine/logs", query={"since": since}, token=token,
-                  timeout=max(timeout, 3600.0), accept="text/event-stream") as resp:
+    with _request(
+        "GET",
+        url,
+        "/engine/logs",
+        query={"since": since},
+        token=token,
+        timeout=max(timeout, 3600.0),
+        accept="text/event-stream",
+    ) as resp:
         try:
             for raw in resp:
                 line = raw.decode("utf-8", "replace").strip()
                 if not line.startswith("data:"):
                     continue
                 try:
-                    rec = json.loads(line[len("data:"):].strip())
+                    rec = json.loads(line[len("data:") :].strip())
                 except json.JSONDecodeError:
                     continue
                 if rec.get("kind") == "gap":
@@ -117,9 +130,14 @@ def _build_parser(prog: str) -> argparse.ArgumentParser:
     # The package dispatcher routes to the client only when a verb is argv[0], so --url/--token/
     # --timeout live on each verb (`ft daemon status --url X`), not before it.
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--url", default=os.environ.get("FREETOKEN_DAEMON_URL", DEFAULT_URL),
-                        help=f"daemon URL (default {DEFAULT_URL})")
-    common.add_argument("--token", default=os.environ.get("FREETOKEN_DAEMON_TOKEN"), help="X-FT-Token shared secret")
+    common.add_argument(
+        "--url",
+        default=os.environ.get("FREETOKEN_DAEMON_URL", DEFAULT_URL),
+        help=f"daemon URL (default {DEFAULT_URL})",
+    )
+    common.add_argument(
+        "--token", default=os.environ.get("FREETOKEN_DAEMON_TOKEN"), help="X-FT-Token shared secret"
+    )
     common.add_argument(
         "--timeout",
         type=float,

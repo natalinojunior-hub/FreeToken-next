@@ -34,7 +34,10 @@ def test_transcribed_constants_are_complete():
     assert sum(tk.SIGNS2) == -12
     assert len(tk.CENTROIDS_3) == 8 and len(tk.MID_3) == 7
     assert len(tk.CENTROIDS_4) == 16 and len(tk.MID_4) == 15
-    for book, cent, mid in (("turbo3", tk.CENTROIDS_3, tk.MID_3), ("turbo4", tk.CENTROIDS_4, tk.MID_4)):
+    for book, cent, mid in (
+        ("turbo3", tk.CENTROIDS_3, tk.MID_3),
+        ("turbo4", tk.CENTROIDS_4, tk.MID_4),
+    ):
         assert sorted(cent) == list(cent), book
         assert sorted(mid) == list(mid), book
         assert all(cent[i] < mid[i] <= cent[i + 1] for i in range(len(mid))), book
@@ -72,7 +75,9 @@ def test_rotate_treats_each_group_of_a_wide_row_independently():
     wide = torch.cat((a, b), dim=-1)
     assert torch.equal(tk.rotate(wide), torch.cat((tk.rotate(a), tk.rotate(b)), dim=-1))
     assert torch.allclose(tk.inv_rotate(tk.rotate(wide)), wide, atol=1e-5)
-    ranks = torch.randn(4, 3, 256, generator=torch.Generator(device=DEVICE).manual_seed(4), device=DEVICE)
+    ranks = torch.randn(
+        4, 3, 256, generator=torch.Generator(device=DEVICE).manual_seed(4), device=DEVICE
+    )
     assert tk.rotate(ranks).shape == ranks.shape == tk.inv_rotate(tk.rotate(ranks)).shape
 
 

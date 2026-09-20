@@ -182,9 +182,11 @@ class GraphRunner:
             # capture on the dummy linear-state slot so GatedDeltaNet gather/scatter
             # touches scratch (real slot indices are written by copy_from on replay). Hybrid-
             # radix decouples the GDN slot from table_idx -> use the GDN padding slot.
-            dummy_slot = (self.dummy_req.linear_slot_idx
-                          if self.dummy_req.linear_slot_idx is not None
-                          else self.dummy_req.table_idx)
+            dummy_slot = (
+                self.dummy_req.linear_slot_idx
+                if self.dummy_req.linear_slot_idx is not None
+                else self.dummy_req.table_idx
+            )
             self.buffer.table_idx[:bs].fill_(dummy_slot)
             with get_global_ctx().forward_batch(batch):
                 self.buffer.logits[:bs] = model.forward()

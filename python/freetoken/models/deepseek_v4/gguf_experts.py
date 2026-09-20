@@ -215,8 +215,7 @@ def load_gguf_expert_sources(
         _load(None)  # CUDA-less: mmap banks stay pageable, never pinned
 
     want = set(range(L))
-    missing_gate, missing_up, missing_down = (
-        want - seen_gate, want - seen_up, want - seen_down)
+    missing_gate, missing_up, missing_down = (want - seen_gate, want - seen_up, want - seen_down)
     if missing_gate or missing_up or missing_down:
         raise ValueError(
             f"deepseek4 GGUF is missing routed experts: gate {sorted(missing_gate)}, "

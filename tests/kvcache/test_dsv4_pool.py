@@ -1,8 +1,8 @@
 """DSV4 paged KV pool (CPU, no model). Sections:
-  * pool construction / tier presence + state-ring layout;
-  * state_loc derivation (scratch routing, page-disjoint ring blocks, boundary straddles);
-  * full-loc -> physical-tier translation (bind/unbind, -1 gather-only sentinel, cmp_rows
-    arithmetic) and the decode full-loc snapshot mirrors (scatter masking, topk masking).
+* pool construction / tier presence + state-ring layout;
+* state_loc derivation (scratch routing, page-disjoint ring blocks, boundary straddles);
+* full-loc -> physical-tier translation (bind/unbind, -1 gather-only sentinel, cmp_rows
+  arithmetic) and the decode full-loc snapshot mirrors (scatter masking, topk masking).
 """
 
 from __future__ import annotations
@@ -404,7 +404,7 @@ def test_decode_cmp_scatter_masking_mirror():
     pool.full_loc_map = torch.full((3, 512), -1, dtype=torch.int64, device=DEVICE)
     pool.full_loc_map[0, :8] = torch.arange(3 * P, 3 * P + 8)  # window/full page 3
     pool.full_loc_map[1, :8] = torch.arange(7 * P, 7 * P + 8)  # window/full page 7
-    pool.full_loc_map[2, :] = 0                                # dummy
+    pool.full_loc_map[2, :] = 0  # dummy
     snap = pool.full_loc_map.clone()  # what the attention backend stages per decode batch
     rows = torch.arange(3)
     pos = torch.tensor([3, 4, 0])  # row0: (3+1)%4==0 completes; row1: no; row2: dummy pos 0
@@ -429,16 +429,16 @@ def test_decode_topk_blocks_beyond_valid_masked_to_minus_one():
     pool.full_loc_map = torch.full((1, 512), -1, dtype=torch.int64, device=DEVICE)
     pool.full_loc_map[0, :16] = torch.arange(5 * P, 5 * P + 16)
     snap = pool.full_loc_map.clone()  # what the attention backend stages per decode batch
-    pos = torch.tensor([7])          # valid blocks = (7+1)//4 = 2
+    pos = torch.tensor([7])  # valid blocks = (7+1)//4 = 2
     n_stage = 4
-    blk = torch.arange(n_stage)      # candidate block indices 0..3
-    valid = (pos + 1) // ratio       # 2
+    blk = torch.arange(n_stage)  # candidate block indices 0..3
+    valid = (pos + 1) // ratio  # 2
     col_valid = blk[None, :] < valid[:, None]
     full_at = snap[torch.zeros(1, dtype=torch.int64)[:, None], (blk * ratio)[None, :]]
     rows = pool.cmp_rows(full_at, ratio)
     picked = torch.where(col_valid, rows, torch.full_like(rows, -1))
-    assert (picked[0, :2] >= 0).all()          # valid blocks -> real rows
-    assert (picked[0, 2:] == -1).all()         # blocks beyond valid -> -1 sentinel
+    assert (picked[0, :2] >= 0).all()  # valid blocks -> real rows
+    assert (picked[0, 2:] == -1).all()  # blocks beyond valid -> -1 sentinel
 
 
 # --------------------------------------------------------------------------- #
@@ -458,17 +458,17 @@ def _expand(bases):
 
 def test_swa_iface_alloc_binds_pages_and_preserves_in_page_offsets():
     pool, sizes = _paged_pool()
-    cap = sizes.n_win_slots - P                       # tail window page reserved for the dummy
+    cap = sizes.n_win_slots - P  # tail window page reserved for the dummy
     assert pool.swa_available_size() == cap
-    assert pool.swa_num_tokens - 1 == cap             # generic sentinel-slot cap convention
+    assert pool.swa_num_tokens - 1 == cap  # generic sentinel-slot cap convention
 
-    pool.alloc_swa(_expand([0, 2 * P]))               # two full pages
+    pool.alloc_swa(_expand([0, 2 * P]))  # two full pages
     assert pool.swa_available_size() == cap - 2 * P
     for fbase in (0, 2 * P):
         ws = pool.translate_loc_from_full_to_swa(torch.arange(fbase, fbase + P))
         assert (ws >= 0).all()
         assert torch.equal(ws - ws[0], torch.arange(P, dtype=torch.int64))  # offsets preserved
-        assert int(ws[0]) % P == 0                                          # page-aligned base
+        assert int(ws[0]) % P == 0  # page-aligned base
 
 
 def test_swa_iface_free_returns_pages_and_is_idempotent():
@@ -478,17 +478,17 @@ def test_swa_iface_free_returns_pages_and_is_idempotent():
     pool.free_swa(_expand([P]))
     assert pool.swa_available_size() == cap - 2 * P
     assert (pool.translate_loc_from_full_to_swa(torch.arange(P, 2 * P)) == -1).all()
-    pool.free_swa(_expand([P]))                       # double free: unbound -> no-op
+    pool.free_swa(_expand([P]))  # double free: unbound -> no-op
     assert pool.swa_available_size() == cap - 2 * P
     pool.free_swa(_expand([0, 3 * P]))
-    assert pool.swa_available_size() == cap           # full conservation
+    assert pool.swa_available_size() == cap  # full conservation
 
 
 def test_swa_iface_rejects_partial_pages_and_survives_int32():
     pool, _ = _paged_pool()
-    pool.alloc_swa(_expand([0]).to(torch.int32))      # int32 page_table values accepted
+    pool.alloc_swa(_expand([0]).to(torch.int32))  # int32 page_table values accepted
     with pytest.raises(AssertionError):
-        pool.free_swa(torch.arange(0, P // 2))        # half a page -> hard error
+        pool.free_swa(torch.arange(0, P // 2))  # half a page -> hard error
     pool.free_swa(_expand([0]).to(torch.int32))
 
 

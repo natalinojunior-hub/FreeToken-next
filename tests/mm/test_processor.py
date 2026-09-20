@@ -42,7 +42,13 @@ class _Family(MMProcessor):
 
     def process(self, images):
         return [
-            MMItem(modality="image", hash=100 + i, pad_value=MM_PAD_SHIFT_VALUE + 100 + i, offsets=[], feature=torch.zeros(1))
+            MMItem(
+                modality="image",
+                hash=100 + i,
+                pad_value=MM_PAD_SHIFT_VALUE + 100 + i,
+                offsets=[],
+                feature=torch.zeros(1),
+            )
             for i, _ in enumerate(images)
         ]
 
@@ -65,7 +71,22 @@ def test_replacement_keeps_wrapper_tokens_and_pads_only_embedding_slots():
     ids = torch.tensor([1, 2, PLACEHOLDER, 3, PLACEHOLDER, 4], dtype=torch.int32)
     r = _Family(n_soft=3).apply(ids, [_png(), _png()])
     a, b = r.mm_items
-    assert r.input_ids.tolist() == [1, 2, BOI, a.pad_value, a.pad_value, a.pad_value, EOI, 3, BOI, b.pad_value, b.pad_value, b.pad_value, EOI, 4]
+    assert r.input_ids.tolist() == [
+        1,
+        2,
+        BOI,
+        a.pad_value,
+        a.pad_value,
+        a.pad_value,
+        EOI,
+        3,
+        BOI,
+        b.pad_value,
+        b.pad_value,
+        b.pad_value,
+        EOI,
+        4,
+    ]
     assert a.offsets == [[3, 6]] and b.offsets == [[9, 12]]
     assert a.num_tokens == 3 and r.mrope_positions is None and r.mrope_delta == 0
 
@@ -108,7 +129,9 @@ def _hf_config(vision=True, mrope=True, arch=ARCH):
         architectures=[arch],
         image_token_id=151655,
         vision_config=(
-            SimpleNamespace(spatial_merge_size=2, patch_size=16, temporal_patch_size=2, in_channels=3)
+            SimpleNamespace(
+                spatial_merge_size=2, patch_size=16, temporal_patch_size=2, in_channels=3
+            )
             if vision
             else None
         ),
@@ -118,8 +141,12 @@ def _hf_config(vision=True, mrope=True, arch=ARCH):
 
 def _grid_item(h, w, offsets):
     return MMItem(
-        modality="image", hash=1, pad_value=1, offsets=offsets,
-        feature=torch.zeros(1), model_specific_data={"grid_thw": [1, h, w]},
+        modality="image",
+        hash=1,
+        pad_value=1,
+        offsets=offsets,
+        feature=torch.zeros(1),
+        model_specific_data={"grid_thw": [1, h, w]},
     )
 
 
@@ -128,7 +155,11 @@ def test_qwen_processor_reads_config():
     assert proc.image_token_id == 151655 and proc.is_mrope and proc.merge == 2
     assert proc.image_grid(_grid_item(8, 6, [[0, 12]])) == (4, 3)
     repl = proc.prompt_replacement(_grid_item(8, 6, []))
-    assert proc.placeholder == [151655] and repl.full == [151655] * 12 and repl.embed_spans() == [[0, 12]]
+    assert (
+        proc.placeholder == [151655]
+        and repl.full == [151655] * 12
+        and repl.embed_spans() == [[0, 12]]
+    )
     (dummy,) = proc.dummy_items(torch.bfloat16, torch.device("cpu"))
     dummy.validate()
     assert dummy.feature.shape == (4, 3 * 2 * 16 * 16) and dummy.num_tokens == 1
@@ -145,15 +176,26 @@ def test_qwen_token_budget_and_kwargs_reach_the_image_processor():
 
         def __call__(self, images, **kwargs):
             calls.append(kwargs)
-            return {"pixel_values": torch.zeros(4, 3 * 2 * 16 * 16), "image_grid_thw": torch.tensor([[1, 2, 2]])}
+            return {
+                "pixel_values": torch.zeros(4, 3 * 2 * 16 * 16),
+                "image_grid_thw": torch.tensor([[1, 2, 2]]),
+            }
 
-    mm = MultimodalConfig(image_min_tokens=100, image_max_tokens=1000, processor_kwargs={"do_convert_rgb": False})
+    mm = MultimodalConfig(
+        image_min_tokens=100, image_max_tokens=1000, processor_kwargs={"do_convert_rgb": False}
+    )
     proc = QwenVLMMProcessor(_hf_config(), "/nonexistent", mm)
     proc._image_processor = lambda: _FakeImageProcessor()
     (item,) = proc.process([object()])
     assert item.grid_thw == [1, 2, 2]
     # one token is a 32x32 patch of the resized image; the budget travels as pixel areas in size, the extra kwarg rides along
-    assert calls == [{"return_tensors": "pt", "size": {"shortest_edge": 100 * 1024, "longest_edge": 1000 * 1024}, "do_convert_rgb": False}]
+    assert calls == [
+        {
+            "return_tensors": "pt",
+            "size": {"shortest_edge": 100 * 1024, "longest_edge": 1000 * 1024},
+            "do_convert_rgb": False,
+        }
+    ]
     proc = QwenVLMMProcessor(_hf_config(), "/nonexistent", MultimodalConfig())
     proc._image_processor = lambda: _FakeImageProcessor()
     proc.process([object()])
@@ -199,7 +241,11 @@ class _FakeGemmaImageProcessor:
         positions = torch.full((1, rows, 2), -1, dtype=torch.int64)
         positions[0, :18, 0] = torch.arange(18) % 6
         positions[0, :18, 1] = torch.arange(18) // 6
-        return {"pixel_values": pixels, "image_position_ids": positions, "num_soft_tokens_per_image": torch.tensor([2])}
+        return {
+            "pixel_values": pixels,
+            "image_position_ids": positions,
+            "num_soft_tokens_per_image": torch.tensor([2]),
+        }
 
 
 def _gemma_processor(mm=None):
@@ -213,7 +259,9 @@ def test_gemma_items_strip_padding_and_wrap_the_soft_tokens_in_boi_eoi():
     proc, _ = _gemma_processor()
     (item,) = proc.process([object()])
     assert item.feature.shape == (18, 768) and item.feature.dtype == torch.float32
-    assert item.feature[0, 0].item() == 0.75  # the [0, 1] pixels of the reference processor; the tower maps them to [-1, 1]
+    assert (
+        item.feature[0, 0].item() == 0.75
+    )  # the [0, 1] pixels of the reference processor; the tower maps them to [-1, 1]
     assert item.position_ids.shape == (18, 2) and item.position_ids[7].tolist() == [1, 1]
     assert item.num_soft_tokens == 2 and item.pad_value >= MM_PAD_SHIFT_VALUE
     repl = proc.prompt_replacement(item)
@@ -223,15 +271,26 @@ def test_gemma_items_strip_padding_and_wrap_the_soft_tokens_in_boi_eoi():
 
 
 def test_gemma_image_max_tokens_picks_an_accepted_soft_token_budget():
-    for budget, tier in ((910, 560), (70, 70), (None, None)):  # the largest accepted budget within the limit
+    for budget, tier in (
+        (910, 560),
+        (70, 70),
+        (None, None),
+    ):  # the largest accepted budget within the limit
         proc, fake = _gemma_processor(MultimodalConfig(image_max_tokens=budget))
         proc.process([object()])
         assert fake.calls == [tier]
-    with pytest.raises(ValueError, match="below the smallest"):  # a maximum no budget honors is refused at start-up instead of rounded up
+    with pytest.raises(
+        ValueError, match="below the smallest"
+    ):  # a maximum no budget honors is refused at start-up instead of rounded up
         _gemma_processor(MultimodalConfig(image_max_tokens=60))
-    proc, _ = _gemma_processor(MultimodalConfig(image_min_tokens=500, processor_kwargs={"max_soft_tokens": 1120}))
+    proc, _ = _gemma_processor(
+        MultimodalConfig(image_min_tokens=500, processor_kwargs={"max_soft_tokens": 1120})
+    )
     # every image is scaled to its budget, so the minimum has no effect; an explicit kwarg wins over the budget
-    assert proc.get_mm_processor_kwargs(proc.mm) == {"return_tensors": "pt", "max_soft_tokens": 1120}
+    assert proc.get_mm_processor_kwargs(proc.mm) == {
+        "return_tensors": "pt",
+        "max_soft_tokens": 1120,
+    }
 
 
 def test_gemma_dummy_item_is_one_pooled_soft_token():
@@ -248,7 +307,9 @@ def _gemma_unified_config():
         image_token_id=258880,
         boi_token_id=255999,
         eoi_token_id=258882,
-        vision_config=SimpleNamespace(patch_size=16, pooling_kernel_size=3, model_patch_size=48, num_soft_tokens=280),
+        vision_config=SimpleNamespace(
+            patch_size=16, pooling_kernel_size=3, model_patch_size=48, num_soft_tokens=280
+        ),
         text_config=SimpleNamespace(vocab_size=262144),
     )
 
@@ -263,26 +324,45 @@ class _FakeGemmaUnifiedImageProcessor:
         positions = torch.full((1, rows, 2), -1, dtype=torch.int64)
         positions[0, :6, 0] = torch.arange(6) % 3
         positions[0, :6, 1] = torch.arange(6) // 3
-        return {"pixel_values": pixels, "image_position_ids": positions, "num_soft_tokens_per_image": torch.tensor([6])}
+        return {
+            "pixel_values": pixels,
+            "image_position_ids": positions,
+            "num_soft_tokens_per_image": torch.tensor([6]),
+        }
 
 
 def test_gemma_unified_items_are_one_row_per_soft_token():
-    proc = Gemma4UnifiedMMProcessor(_gemma_unified_config(), "/nonexistent", MultimodalConfig(image_max_tokens=100))
+    proc = Gemma4UnifiedMMProcessor(
+        _gemma_unified_config(), "/nonexistent", MultimodalConfig(image_max_tokens=100)
+    )
     proc._image_processor = lambda: _FakeGemmaUnifiedImageProcessor()
     (item,) = proc.process([object()])
-    assert item.feature.shape == (6, 6912) and item.num_soft_tokens == 6 and item.position_ids[4].tolist() == [1, 1]
+    assert (
+        item.feature.shape == (6, 6912)
+        and item.num_soft_tokens == 6
+        and item.position_ids[4].tolist() == [1, 1]
+    )
     assert proc.prompt_replacement(item).full == [255999] + [258880] * 6 + [258882]
-    assert proc.get_mm_processor_kwargs(proc.mm) == {"return_tensors": "pt", "max_soft_tokens": 70}  # the same budgets as the tower release
+    assert proc.get_mm_processor_kwargs(proc.mm) == {
+        "return_tensors": "pt",
+        "max_soft_tokens": 70,
+    }  # the same budgets as the tower release
     (dummy,) = proc.dummy_items(torch.bfloat16, torch.device("cpu"))
     dummy.validate()
-    assert dummy.feature.shape == (1, 6912) and dummy.num_tokens == 1 and dummy.position_ids.tolist() == [[0, 0]]
+    assert (
+        dummy.feature.shape == (1, 6912)
+        and dummy.num_tokens == 1
+        and dummy.position_ids.tolist() == [[0, 0]]
+    )
 
 
 def _glm_config():
     return SimpleNamespace(
         architectures=["Glm5NextForConditionalGeneration"],
         image_token_id=154854,
-        vision_config=SimpleNamespace(spatial_merge_size=2, patch_size=14, temporal_patch_size=2, in_channels=3),
+        vision_config=SimpleNamespace(
+            spatial_merge_size=2, patch_size=14, temporal_patch_size=2, in_channels=3
+        ),
         text_config=SimpleNamespace(vocab_size=154880),
     )
 
@@ -293,14 +373,26 @@ def test_glm_token_budget_reaches_the_image_processor_and_rope_stays_one_dimensi
     class _FakeImageProcessor:
         def __call__(self, images, **kwargs):
             calls.append(kwargs)
-            return {"pixel_values": torch.zeros(16, 1176), "image_grid_thw": torch.tensor([[1, 4, 4]])}
+            return {
+                "pixel_values": torch.zeros(16, 1176),
+                "image_grid_thw": torch.tensor([[1, 4, 4]]),
+            }
 
-    mm = MultimodalConfig(image_min_tokens=32, image_max_tokens=1024, processor_kwargs={"do_convert_rgb": False})
+    mm = MultimodalConfig(
+        image_min_tokens=32, image_max_tokens=1024, processor_kwargs={"do_convert_rgb": False}
+    )
     proc = Glm5NextMMProcessor(_glm_config(), "/nonexistent", mm)
     proc._image_processor = lambda: _FakeImageProcessor()
     (item,) = proc.process([object()])
     # the budget is already in tokens; the extra kwarg rides along
-    assert calls == [{"return_tensors": "pt", "min_image_tokens": 32, "max_image_tokens": 1024, "do_convert_rgb": False}]
+    assert calls == [
+        {
+            "return_tensors": "pt",
+            "min_image_tokens": 32,
+            "max_image_tokens": 1024,
+            "do_convert_rgb": False,
+        }
+    ]
     assert item.grid_thw == [1, 4, 4] and item.feature.dtype == torch.bfloat16
     # the template renders the begin/end wrapper tokens itself; only <|image|> expands
     assert proc.placeholder == [154854] and proc.prompt_replacement(item).full == [154854] * 4
@@ -329,9 +421,14 @@ def test_muse_wraps_the_pads_in_image_start_end_and_takes_only_a_token_maximum()
     class _FakeImageProcessor:
         def __call__(self, images, **kwargs):
             calls.append(kwargs)
-            return {"pixel_values": torch.zeros(16, 1176), "image_grid_thw": torch.tensor([[1, 4, 4]])}
+            return {
+                "pixel_values": torch.zeros(16, 1176),
+                "image_grid_thw": torch.tensor([[1, 4, 4]]),
+            }
 
-    mm = MultimodalConfig(image_min_tokens=32, image_max_tokens=1024, processor_kwargs={"do_convert_rgb": False})
+    mm = MultimodalConfig(
+        image_min_tokens=32, image_max_tokens=1024, processor_kwargs={"do_convert_rgb": False}
+    )
     proc = MuseGlimmerMMProcessor(_muse_config(), "/nonexistent", mm)
     proc._image_processor = lambda: _FakeImageProcessor()
     (item,) = proc.process([object()])
@@ -356,7 +453,11 @@ def _minimax_config():
     return SimpleNamespace(
         architectures=["MiniMaxM3SparseForConditionalGeneration"],
         image_token_index=200025,
-        vision_config=SimpleNamespace(patch_size=14, num_channels=3, img_token_compression_config={"spatial_merge_size": 2, "temporal_patch_size": 2}),
+        vision_config=SimpleNamespace(
+            patch_size=14,
+            num_channels=3,
+            img_token_compression_config={"spatial_merge_size": 2, "temporal_patch_size": 2},
+        ),
         text_config=SimpleNamespace(vocab_size=200064),
     )
 
@@ -369,17 +470,32 @@ def test_minimax_token_budget_becomes_pixel_bounds_and_the_span_gets_start_end_t
 
         def __call__(self, images, **kwargs):
             calls.append(kwargs)
-            return {"pixel_values": torch.zeros(16, 1176), "image_grid_thw": torch.tensor([[1, 4, 4]])}
+            return {
+                "pixel_values": torch.zeros(16, 1176),
+                "image_grid_thw": torch.tensor([[1, 4, 4]]),
+            }
 
-    mm = MultimodalConfig(image_min_tokens=8, image_max_tokens=256, processor_kwargs={"do_convert_rgb": False})
+    mm = MultimodalConfig(
+        image_min_tokens=8, image_max_tokens=256, processor_kwargs={"do_convert_rgb": False}
+    )
     proc = MiniMaxM3MMProcessor(_minimax_config(), "/nonexistent", mm)
     proc._image_processor = lambda: _FakeImageProcessor()
     (item,) = proc.process([object()])
     # 784 pixels per token: patch 14 x merge 2, squared
-    assert calls == [{"return_tensors": "pt", "size": {"shortest_edge": 8 * 784, "longest_edge": 256 * 784}, "do_convert_rgb": False}]
+    assert calls == [
+        {
+            "return_tensors": "pt",
+            "size": {"shortest_edge": 8 * 784, "longest_edge": 256 * 784},
+            "do_convert_rgb": False,
+        }
+    ]
     assert item.grid_thw == [1, 4, 4] and item.feature.dtype == torch.bfloat16
     repl = proc.prompt_replacement(item)
-    assert proc.placeholder == [200025] and repl.full == [IMAGE_START_ID] + [200025] * 4 + [IMAGE_END_ID] and repl.embed_spans() == [[1, 5]]
+    assert (
+        proc.placeholder == [200025]
+        and repl.full == [IMAGE_START_ID] + [200025] * 4 + [IMAGE_END_ID]
+        and repl.embed_spans() == [[1, 5]]
+    )
     assert proc.positions(10, [item]) is None
     proc = MiniMaxM3MMProcessor(_minimax_config(), "/nonexistent", MultimodalConfig())
     proc._image_processor = lambda: _FakeImageProcessor()
@@ -406,7 +522,9 @@ def test_registry_resolves_by_architecture(monkeypatch):
     }
     monkeypatch.setattr(freetoken.utils, "cached_load_hf_config", lambda p: configs[p])
     assert isinstance(get_mm_processor("/qwen"), QwenVLMMProcessor)
-    assert get_mm_processor("/qwen", MultimodalConfig(disabled_encoders=frozenset({"vision"}))) is None  # --mm-disable vision
+    assert (
+        get_mm_processor("/qwen", MultimodalConfig(disabled_encoders=frozenset({"vision"}))) is None
+    )  # --mm-disable vision
     assert isinstance(get_mm_processor("/gemma"), Gemma4MMProcessor)
     assert isinstance(get_mm_processor("/gemma-unified"), Gemma4UnifiedMMProcessor)
     assert isinstance(get_mm_processor("/glm"), Glm5NextMMProcessor)

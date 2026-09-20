@@ -42,41 +42,53 @@ def mock_kernel_module(monkeypatch):
 
     def make_mmvq_kernel(call_log):
         """Mock ggml_mul_mat_vec_a8: GEMV kernel for small batch."""
+
         def kernel(qweight, x, qweight_type, out_features):
-            call_log["ggml_mul_mat_vec_a8"].append({
-                "qweight_shape": qweight.shape,
-                "x_shape": x.shape,
-                "qweight_type": qweight_type,
-                "out_features": out_features,
-            })
+            call_log["ggml_mul_mat_vec_a8"].append(
+                {
+                    "qweight_shape": qweight.shape,
+                    "x_shape": x.shape,
+                    "qweight_type": qweight_type,
+                    "out_features": out_features,
+                }
+            )
             batch_size = x.shape[0]
             return torch.randn(batch_size, out_features, dtype=x.dtype)
+
         return kernel
 
     def make_mmq_kernel(call_log):
         """Mock ggml_mul_mat_a8: MMQ kernel for large batch."""
+
         def kernel(qweight, x, qweight_type, out_features):
-            call_log["ggml_mul_mat_a8"].append({
-                "qweight_shape": qweight.shape,
-                "x_shape": x.shape,
-                "qweight_type": qweight_type,
-                "out_features": out_features,
-            })
+            call_log["ggml_mul_mat_a8"].append(
+                {
+                    "qweight_shape": qweight.shape,
+                    "x_shape": x.shape,
+                    "qweight_type": qweight_type,
+                    "out_features": out_features,
+                }
+            )
             batch_size = x.shape[0]
             return torch.randn(batch_size, out_features, dtype=x.dtype)
+
         return kernel
 
     def make_dequant_kernel(call_log):
         """Mock ggml_dequantize: materializes weight into BF16."""
+
         def kernel(qweight, qweight_type, out_features, in_features, out_dtype):
-            call_log["ggml_dequantize"].append({
-                "qweight_shape": qweight.shape,
-                "qweight_type": qweight_type,
-                "out_features": out_features,
-                "in_features": in_features,
-                "out_dtype": out_dtype,
-            })
+            call_log["ggml_dequantize"].append(
+                {
+                    "qweight_shape": qweight.shape,
+                    "qweight_type": qweight_type,
+                    "out_features": out_features,
+                    "in_features": in_features,
+                    "out_dtype": out_dtype,
+                }
+            )
             return torch.randn(out_features, in_features, dtype=out_dtype)
+
         return kernel
 
     mock_module = ModuleType("freetoken.kernel.gguf")
@@ -273,7 +285,9 @@ class TestQwenNameMapping:
         num_layers = 40
 
         # Global tensors
-        assert gguf_name_to_freetoken("token_embd.weight", num_layers) == "model.embed_tokens.weight"
+        assert (
+            gguf_name_to_freetoken("token_embd.weight", num_layers) == "model.embed_tokens.weight"
+        )
         assert gguf_name_to_freetoken("output_norm.weight", num_layers) == "model.norm.weight"
         assert gguf_name_to_freetoken("output.weight", num_layers) == "lm_head.weight"
 
@@ -282,21 +296,47 @@ class TestQwenNameMapping:
         # the mapper reports None -- iter_gguf_weights owns their fusion because only it
         # knows the concat order and the per-part quant types. Asserting a q_proj name here
         # would lock in a parameter the module does not have.
-        assert gguf_name_to_freetoken("blk.3.attn_output.weight", num_layers) == "model.layers.3.self_attn.o_proj.weight"
+        assert (
+            gguf_name_to_freetoken("blk.3.attn_output.weight", num_layers)
+            == "model.layers.3.self_attn.o_proj.weight"
+        )
         for part in ("attn_q.weight", "attn_k.weight", "attn_v.weight"):
             assert gguf_name_to_freetoken(f"blk.3.{part}", num_layers) is None, part
 
         # Layer 0 (GDN): linear attention with conv1d and SSM
-        assert gguf_name_to_freetoken("blk.0.ssm_conv1d.weight", num_layers) == "model.layers.0.linear_attn.conv1d.weight"
-        assert gguf_name_to_freetoken("blk.0.ssm_norm.weight", num_layers) == "model.layers.0.linear_attn.norm.weight"
-        assert gguf_name_to_freetoken("blk.0.ssm_out.weight", num_layers) == "model.layers.0.linear_attn.out_proj.weight"
-        assert gguf_name_to_freetoken("blk.0.ssm_a", num_layers) == "model.layers.0.linear_attn.A_log"
-        assert gguf_name_to_freetoken("blk.0.ssm_dt.bias", num_layers) == "model.layers.0.linear_attn.dt_bias"
+        assert (
+            gguf_name_to_freetoken("blk.0.ssm_conv1d.weight", num_layers)
+            == "model.layers.0.linear_attn.conv1d.weight"
+        )
+        assert (
+            gguf_name_to_freetoken("blk.0.ssm_norm.weight", num_layers)
+            == "model.layers.0.linear_attn.norm.weight"
+        )
+        assert (
+            gguf_name_to_freetoken("blk.0.ssm_out.weight", num_layers)
+            == "model.layers.0.linear_attn.out_proj.weight"
+        )
+        assert (
+            gguf_name_to_freetoken("blk.0.ssm_a", num_layers) == "model.layers.0.linear_attn.A_log"
+        )
+        assert (
+            gguf_name_to_freetoken("blk.0.ssm_dt.bias", num_layers)
+            == "model.layers.0.linear_attn.dt_bias"
+        )
 
         # MoE tensors: shared expert and router
-        assert gguf_name_to_freetoken("blk.5.ffn_gate_inp.weight", num_layers) == "model.layers.5.mlp.gate.weight"
-        assert gguf_name_to_freetoken("blk.5.ffn_gate_inp_shexp.weight", num_layers) == "model.layers.5.mlp.shared_expert_gate.weight"
-        assert gguf_name_to_freetoken("blk.5.ffn_down_shexp.weight", num_layers) == "model.layers.5.mlp.shared_expert.down_proj.weight"
+        assert (
+            gguf_name_to_freetoken("blk.5.ffn_gate_inp.weight", num_layers)
+            == "model.layers.5.mlp.gate.weight"
+        )
+        assert (
+            gguf_name_to_freetoken("blk.5.ffn_gate_inp_shexp.weight", num_layers)
+            == "model.layers.5.mlp.shared_expert_gate.weight"
+        )
+        assert (
+            gguf_name_to_freetoken("blk.5.ffn_down_shexp.weight", num_layers)
+            == "model.layers.5.mlp.shared_expert.down_proj.weight"
+        )
         # gate/up shexp are parts of _SharedExpert's merged gate_up_proj -- same reasoning
         # as attn_q/k/v above.
         for part in ("ffn_gate_shexp.weight", "ffn_up_shexp.weight"):
@@ -310,6 +350,7 @@ class TestQwenNameMapping:
         assert gguf_name_to_freetoken("blk.0.ffn_gate_exps.weight", num_layers) is None
         assert gguf_name_to_freetoken("blk.15.ffn_up_exps.weight", num_layers) is None
         assert gguf_name_to_freetoken("blk.39.ffn_down_exps.weight", num_layers) is None
+
 
 __all__ = [
     "test_merged_linear_concatenates_outputs",

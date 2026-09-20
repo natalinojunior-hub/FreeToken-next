@@ -43,12 +43,18 @@ class MuseGlimmerAttention(BaseOP):
 
         self._qkvg_split = [self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim, self.qo_attn_dim]
         self.qkvg_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkvg_split, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.qkvg_proj",
+            config.hidden_size,
+            self._qkvg_split,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.qkvg_proj",
         )
         self.o_proj = LinearReplicated(
-            self.qo_attn_dim, config.hidden_size, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.o_proj",
+            self.qo_attn_dim,
+            config.hidden_size,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.o_proj",
         )
         # Weightless: the checkpoint carries no q/k norm weights; the runtime ones vector
         # is intentionally not part of state_dict.

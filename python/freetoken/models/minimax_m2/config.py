@@ -33,11 +33,15 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # Partial RoPE: MiniMax-M2 rotates only the first ``rotary_dim`` dims of each head.
     rotary_dim = getattr(hf_config, "rotary_dim", None)
     if rotary_dim is None:
-        partial = rope.get("partial_rotary_factor", getattr(hf_config, "partial_rotary_factor", 1.0))
+        partial = rope.get(
+            "partial_rotary_factor", getattr(hf_config, "partial_rotary_factor", 1.0)
+        )
         rotary_dim = int(head_dim * partial)
 
     # Experts use the dense ``intermediate_size`` (there is no separate moe size key).
-    moe_intermediate_size = getattr(hf_config, "moe_intermediate_size", 0) or hf_config.intermediate_size
+    moe_intermediate_size = (
+        getattr(hf_config, "moe_intermediate_size", 0) or hf_config.intermediate_size
+    )
 
     return ModelConfig(
         num_layers=hf_config.num_hidden_layers,

@@ -132,7 +132,6 @@ def _args_from_gguf(shim: "GgufConfigShim") -> DeepseekV4Args:
     )
 
 
-
 def _check_schedule(model_path: str, args: DeepseekV4Args, served: int) -> None:
     """Cross-check the compress_ratios schedule against the tensor table.
 
@@ -145,19 +144,20 @@ def _check_schedule(model_path: str, args: DeepseekV4Args, served: int) -> None:
     names = gguf_tensor_names(model_path)
     want_compressor = sum(1 for r in args.compress_ratios[:served] if r != 0)
     want_indexer = sum(1 for r in args.compress_ratios[:served] if r == 4)
-    got_compressor = sum(
-        1 for i in range(served) if f"blk.{i}.attn_compressor_kv.weight" in names)
-    got_indexer = sum(
-        1 for i in range(served) if f"blk.{i}.indexer.attn_q_b.weight" in names)
+    got_compressor = sum(1 for i in range(served) if f"blk.{i}.attn_compressor_kv.weight" in names)
+    got_indexer = sum(1 for i in range(served) if f"blk.{i}.indexer.attn_q_b.weight" in names)
 
-    for label, want, got in (("compressor", want_compressor, got_compressor),
-                             ("indexer", want_indexer, got_indexer)):
+    for label, want, got in (
+        ("compressor", want_compressor, got_compressor),
+        ("indexer", want_indexer, got_indexer),
+    ):
         if want != got:
             raise ValueError(
                 f"deepseek4 GGUF: compress_ratios predicts {want} layers with a {label} "
                 f"but the file has {got}; the per-layer schedule does not match this "
                 f"checkpoint (a wrong served-layer count is the usual cause)"
             )
+
 
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     """ModelConfig for a deepseek4 GGUF, mirroring deepseek_v4/config.py::parse_config.
@@ -254,7 +254,6 @@ def is_gguf_model(config: ModelConfig) -> bool:
     return getattr(config, "gguf_model_path", None) is not None
 
 
-
 class GGUFLinearNN(torch.nn.Module):
     """A GGUF-quantized Linear that DSV4's loader can actually fill.
 
@@ -270,8 +269,7 @@ class GGUFLinearNN(torch.nn.Module):
     ``.to(p.dtype)`` cast is then a no-op on uint8, and the tensor arrives byte-for-byte.
     """
 
-    def __init__(self, in_features: int, out_features: int, quant_type: int,
-                 bias: bool = False):
+    def __init__(self, in_features: int, out_features: int, quant_type: int, bias: bool = False):
         super().__init__()
         from freetoken.models.gguf.dequant import row_bytes
 
@@ -279,8 +277,7 @@ class GGUFLinearNN(torch.nn.Module):
         self.out_features = out_features
         self._quant_type = int(quant_type)
         self.weight = torch.nn.Parameter(
-            torch.empty(out_features, row_bytes(in_features, self._quant_type),
-                        dtype=torch.uint8),
+            torch.empty(out_features, row_bytes(in_features, self._quant_type), dtype=torch.uint8),
             requires_grad=False,
         )
         if bias:
@@ -319,8 +316,9 @@ class GGUFEmbeddingNN(torch.nn.Module):
         self.embedding_dim = embedding_dim
         self._quant_type = int(quant_type)
         self.weight = torch.nn.Parameter(
-            torch.empty(num_embeddings, row_bytes(embedding_dim, self._quant_type),
-                        dtype=torch.uint8),
+            torch.empty(
+                num_embeddings, row_bytes(embedding_dim, self._quant_type), dtype=torch.uint8
+            ),
             requires_grad=False,
         )
 
@@ -339,8 +337,9 @@ class GGUFEmbeddingNN(torch.nn.Module):
         else:
             from freetoken.kernel.gguf import ggml_dequantize
 
-            y = ggml_dequantize(rows, self._quant_type, flat.shape[0], self.embedding_dim,
-                                torch.bfloat16)
+            y = ggml_dequantize(
+                rows, self._quant_type, flat.shape[0], self.embedding_dim, torch.bfloat16
+            )
         return y.view(*x.shape, self.embedding_dim)
 
 
@@ -364,16 +363,14 @@ def _dense(t, dtype: torch.dtype) -> torch.Tensor:
     gt = int(t.ggml_type)
     raw = t.packed()
     if gt in GGML_UNQUANTIZED:
-        view = {GGML_F32: torch.float32, GGML_F16: torch.float16,
-                GGML_BF16: torch.bfloat16}[gt]
+        view = {GGML_F32: torch.float32, GGML_F16: torch.float16, GGML_BF16: torch.bfloat16}[gt]
         return raw.reshape(-1).view(view).reshape(t.shape).to(dtype)
 
     from freetoken.kernel.gguf import ggml_dequantize
 
     block, type_size = BLOCK_SHAPE[gt]
     in_features = t.row_bytes // type_size * block
-    out = ggml_dequantize(raw.cuda().contiguous(), gt, t.rows, in_features,
-                          torch.bfloat16)
+    out = ggml_dequantize(raw.cuda().contiguous(), gt, t.rows, in_features, torch.bfloat16)
     return out.reshape(t.shape).to(dtype)
 
 
@@ -399,57 +396,56 @@ def _to_i64(t) -> torch.Tensor:
 # per tensor rather than derived from the name, because three of them do not follow the
 # pattern the names imply (see the module docstring).
 _LAYER_MAP: dict[str, tuple[str, str]] = {
-    "attn_norm.weight":            ("attn_norm.weight", "f32"),
-    "ffn_norm.weight":             ("ffn_norm.weight", "f32"),
-    "attn_q_a.weight":             ("attn.wq_a.weight", "packed"),
-    "attn_q_a_norm.weight":        ("attn.q_norm.weight", "f32"),
-    "attn_q_b.weight":             ("attn.wq_b.weight", "packed"),
-    "attn_kv.weight":              ("attn.wkv.weight", "packed"),
-    "attn_kv_a_norm.weight":       ("attn.kv_norm.weight", "f32"),
+    "attn_norm.weight": ("attn_norm.weight", "f32"),
+    "ffn_norm.weight": ("ffn_norm.weight", "f32"),
+    "attn_q_a.weight": ("attn.wq_a.weight", "packed"),
+    "attn_q_a_norm.weight": ("attn.q_norm.weight", "f32"),
+    "attn_q_b.weight": ("attn.wq_b.weight", "packed"),
+    "attn_kv.weight": ("attn.wkv.weight", "packed"),
+    "attn_kv_a_norm.weight": ("attn.kv_norm.weight", "f32"),
     # wo_a is a bare nn.Parameter in bf16, NOT a Linear: no .weight, never packed.
-    "attn_output_a.weight":        ("attn.wo_a", "bf16"),
-    "attn_output_b.weight":        ("attn.wo_b.weight", "packed"),
-    "attn_sinks.weight":           ("attn.attn_sink", "f32"),
+    "attn_output_a.weight": ("attn.wo_a", "bf16"),
+    "attn_output_b.weight": ("attn.wo_b.weight", "packed"),
+    "attn_sinks.weight": ("attn.attn_sink", "f32"),
     # compressor / indexer projections are F16 in the file. F16 is in GGML_UNQUANTIZED, so
     # GGUFLinear cannot hold them -- they must land dense on a normal .weight.
-    "attn_compressor_kv.weight":   ("attn.compressor.wkv.weight", "bf16"),
+    "attn_compressor_kv.weight": ("attn.compressor.wkv.weight", "bf16"),
     "attn_compressor_gate.weight": ("attn.compressor.wgate.weight", "bf16"),
     "attn_compressor_norm.weight": ("attn.compressor.norm.weight", "f32"),
-    "attn_compressor_ape.weight":  ("attn.compressor.ape", "f32"),
-    "indexer.attn_q_b.weight":     ("attn.indexer.wq_b.weight", "bf16"),
-    "indexer.proj.weight":         ("attn.indexer.weights_proj.weight", "bf16"),
-    "indexer_compressor_kv.weight":   ("attn.indexer.compressor.wkv.weight", "bf16"),
+    "attn_compressor_ape.weight": ("attn.compressor.ape", "f32"),
+    "indexer.attn_q_b.weight": ("attn.indexer.wq_b.weight", "bf16"),
+    "indexer.proj.weight": ("attn.indexer.weights_proj.weight", "bf16"),
+    "indexer_compressor_kv.weight": ("attn.indexer.compressor.wkv.weight", "bf16"),
     "indexer_compressor_gate.weight": ("attn.indexer.compressor.wgate.weight", "bf16"),
     "indexer_compressor_norm.weight": ("attn.indexer.compressor.norm.weight", "f32"),
-    "indexer_compressor_ape.weight":  ("attn.indexer.compressor.ape", "f32"),
-    "hc_attn_base.weight":         ("hc_attn_base", "f32"),
-    "hc_attn_fn.weight":           ("hc_attn_fn", "f32"),
-    "hc_attn_scale.weight":        ("hc_attn_scale", "f32"),
-    "hc_ffn_base.weight":          ("hc_ffn_base", "f32"),
-    "hc_ffn_fn.weight":            ("hc_ffn_fn", "f32"),
-    "hc_ffn_scale.weight":         ("hc_ffn_scale", "f32"),
-    "ffn_gate_inp.weight":         ("ffn.gate.weight", "bf16"),
-    "exp_probs_b.bias":            ("ffn.gate.bias", "f32"),
+    "indexer_compressor_ape.weight": ("attn.indexer.compressor.ape", "f32"),
+    "hc_attn_base.weight": ("hc_attn_base", "f32"),
+    "hc_attn_fn.weight": ("hc_attn_fn", "f32"),
+    "hc_attn_scale.weight": ("hc_attn_scale", "f32"),
+    "hc_ffn_base.weight": ("hc_ffn_base", "f32"),
+    "hc_ffn_fn.weight": ("hc_ffn_fn", "f32"),
+    "hc_ffn_scale.weight": ("hc_ffn_scale", "f32"),
+    "ffn_gate_inp.weight": ("ffn.gate.weight", "bf16"),
+    "exp_probs_b.bias": ("ffn.gate.bias", "f32"),
     # DeepSeek names the shared expert gate/up/down; Expert calls them w1/w3/w2.
-    "ffn_gate_shexp.weight":       ("ffn.shared_experts.w1.weight", "packed"),
-    "ffn_up_shexp.weight":         ("ffn.shared_experts.w3.weight", "packed"),
-    "ffn_down_shexp.weight":       ("ffn.shared_experts.w2.weight", "packed"),
+    "ffn_gate_shexp.weight": ("ffn.shared_experts.w1.weight", "packed"),
+    "ffn_up_shexp.weight": ("ffn.shared_experts.w3.weight", "packed"),
+    "ffn_down_shexp.weight": ("ffn.shared_experts.w2.weight", "packed"),
 }
 
 _GLOBAL_MAP: dict[str, tuple[str, str]] = {
-    "output_norm.weight":    ("norm.weight", "f32"),
+    "output_norm.weight": ("norm.weight", "f32"),
     # output.weight is Q8_0 but `head` is a bare bf16 nn.Parameter consumed by F.linear,
     # so it is dequantized rather than swapped. deepseek_v4/model.py already slices to the
     # last prefill position itself, so it needs no GGUFLMHead.
-    "output.weight":         ("head", "bf16"),
+    "output.weight": ("head", "bf16"),
     "output_hc_base.weight": ("hc_head_base", "f32"),
-    "output_hc_fn.weight":   ("hc_head_fn", "f32"),
+    "output_hc_fn.weight": ("hc_head_fn", "f32"),
     "output_hc_scale.weight": ("hc_head_scale", "f32"),
 }
 
 # Routed experts are streamed from the offload cache, never yielded here.
-_EXPERT_SUFFIXES = frozenset(
-    {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"})
+_EXPERT_SUFFIXES = frozenset({"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"})
 
 
 def iter_gguf_weights(
@@ -560,9 +556,14 @@ def convert_deepseek4_to_gguf(model, config: ModelConfig, *, model_path: str) ->
     def swap_linear(owner, attr: str, quant_type: int) -> None:
         lin = getattr(owner, attr)
         setattr(
-            owner, attr,
-            GGUFLinearNN(lin.in_features, lin.out_features, quant_type,
-                         bias=getattr(lin, "bias", None) is not None),
+            owner,
+            attr,
+            GGUFLinearNN(
+                lin.in_features,
+                lin.out_features,
+                quant_type,
+                bias=getattr(lin, "bias", None) is not None,
+            ),
         )
 
     # DeepseekV4ForCausalLM is an engine wrapper; the parameters live on the inner
@@ -588,8 +589,12 @@ def convert_deepseek4_to_gguf(model, config: ModelConfig, *, model_path: str) ->
             # F16 in the file, fp8 in the module: rebuild as bf16 so there is no orphan
             # .scale and F.linear is used instead of the block-fp8 GEMM.
             old = idx.wq_b
-            idx.wq_b = Linear(old.in_features, old.out_features,
-                              bias=getattr(old, "bias", None) is not None, kind="bf16")
+            idx.wq_b = Linear(
+                old.in_features,
+                old.out_features,
+                bias=getattr(old, "bias", None) is not None,
+                kind="bf16",
+            )
 
         shexp = layer.ffn.shared_experts
         swap_linear(shexp, "w1", qt(layer_idx, "ffn_gate_shexp.weight"))

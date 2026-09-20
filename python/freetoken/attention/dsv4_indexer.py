@@ -29,8 +29,11 @@ class IndexerBackendMixin:
         """
         block_starts = torch.arange(0, n_blocks * ratio, ratio, device=self.device)
         rows = self.compress_rows_of(ti, block_starts, ratio)
-        return self.compress_pool(layer_id, "idx").index_select(0, rows).unsqueeze(0).expand(
-            bsz, -1, -1
+        return (
+            self.compress_pool(layer_id, "idx")
+            .index_select(0, rows)
+            .unsqueeze(0)
+            .expand(bsz, -1, -1)
         )
 
     def indexer_prefill_logits(
@@ -42,8 +45,13 @@ class IndexerBackendMixin:
         return indexer_logits(q, keys, weights)
 
     def indexer_decode_scores(
-        self, q: torch.Tensor, weights: torch.Tensor, valid: torch.Tensor, n_stage: int,
-        ratio: int, layer_id: int,
+        self,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        valid: torch.Tensor,
+        n_stage: int,
+        ratio: int,
+        layer_id: int,
     ) -> torch.Tensor:
         """Head-reduced scores ``[B, n_stage]`` for a decode step, gathering each block's key off
         the decode SNAPSHOT and bounding the work by the live block count read from device
@@ -51,12 +59,23 @@ class IndexerBackendMixin:
         from freetoken.kernel.triton.dsv4.indexer import indexer_decode_logits
 
         return indexer_decode_logits(
-            q, weights, self.compress_pool(layer_id, "idx"), self.snapshot(),
-            valid, n_stage, ratio,
+            q,
+            weights,
+            self.compress_pool(layer_id, "idx"),
+            self.snapshot(),
+            valid,
+            n_stage,
+            ratio,
         )
 
     def indexer_select_prefill(
-        self, scores: torch.Tensor, *, start_pos: int, seqlen: int, ratio: int, topk: int,
+        self,
+        scores: torch.Tensor,
+        *,
+        start_pos: int,
+        seqlen: int,
+        ratio: int,
+        topk: int,
         offset: int,
     ) -> torch.Tensor:
         """Causal top-k over compressed blocks for a prefill/extend range.

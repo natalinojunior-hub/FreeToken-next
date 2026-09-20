@@ -117,16 +117,11 @@ def _layer_types(text: Any) -> list[str]:
     layer_types = getattr(text, "layer_types", None)
     if layer_types is not None:
         # HF Qwen4ExpTextConfig rewrites full_attention to qwen_sparse_attention in __post_init__.
-        return [
-            "full_attention" if t == "qwen_sparse_attention" else t for t in layer_types
-        ]
+        return ["full_attention" if t == "qwen_sparse_attention" else t for t in layer_types]
     # Fall back to full_attention_interval: every Nth layer (1-indexed) is full.
     interval = int(getattr(text, "full_attention_interval", 4))
     n = int(text.num_hidden_layers)
-    return [
-        "full_attention" if (i + 1) % interval == 0 else "linear_attention"
-        for i in range(n)
-    ]
+    return ["full_attention" if (i + 1) % interval == 0 else "linear_attention" for i in range(n)]
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
@@ -150,17 +145,16 @@ def _parse_mtp(text: Any) -> Qwen4ExpMTPConfig:
         num_hidden_layers=count,
         layer_types=layer_types,
         use_hidden_state_from_layer=(None if hidden_layer is None else int(hidden_layer)),
-        rope_theta=(None if _field(raw, "rope_theta", None) is None else float(_field(raw, "rope_theta"))),
+        rope_theta=(
+            None if _field(raw, "rope_theta", None) is None else float(_field(raw, "rope_theta"))
+        ),
     )
 
 
 def parse_config(hf_config: Any) -> ModelConfig:
     text = getattr(hf_config, "text_config", hf_config)
 
-    head_dim = (
-        getattr(text, "head_dim", None)
-        or text.hidden_size // text.num_attention_heads
-    )
+    head_dim = getattr(text, "head_dim", None) or text.hidden_size // text.num_attention_heads
     num_kv_heads = getattr(text, "num_key_value_heads", text.num_attention_heads)
 
     rope_params = getattr(text, "rope_parameters", None) or {}
@@ -188,7 +182,9 @@ def parse_config(hf_config: Any) -> ModelConfig:
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
 
     # the engine reads this flag for its MoE strategy decisions; every module takes its own scheme from the QuantConfig when it is built
-    expert_scheme = QuantConfig.from_hf(hf_config).scheme_for_name("model.language_model.layers.0.mlp.experts.0.gate_proj")
+    expert_scheme = QuantConfig.from_hf(hf_config).scheme_for_name(
+        "model.language_model.layers.0.mlp.experts.0.gate_proj"
+    )
     expert_quant = "none" if expert_scheme is None else str(expert_scheme.kind)
 
     # HF stores ple_layer_ids one-indexed (validated upstream as [1, num_layers]).

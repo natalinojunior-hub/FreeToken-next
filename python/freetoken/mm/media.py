@@ -71,8 +71,7 @@ def _load_local_media(url: str, config: ServerArgs) -> bytes:
     resolved = filepath.resolve()
     if Path(root).resolve() not in resolved.parents:
         raise ValueError(
-            f"the file path {filepath} must be a subpath of "
-            f"--allowed-local-media-path {root}"
+            f"the file path {filepath} must be a subpath of --allowed-local-media-path {root}"
         )
     return resolved.read_bytes()
 
@@ -101,9 +100,7 @@ async def fetch_image_bytes(refs: list[dict[str, Any]], config: ServerArgs) -> l
             elif data.startswith("file://"):
                 out.append(_load_local_media(data, config))
             else:
-                raise ValueError(
-                    "unsupported image source (expect http(s)/file url or base64)"
-                )
+                raise ValueError("unsupported image source (expect http(s)/file url or base64)")
         except Exception as exc:  # noqa: BLE001 -- input-driven, client-classifiable
             raise ValueError(f"could not load image: {exc}") from exc
     return out

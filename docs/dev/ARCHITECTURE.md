@@ -120,7 +120,7 @@ Spec Loop (per decode step):
 | `DECISIONS.md` | D-001 a D-023 rationale |
 | `PERFORMANCE.md` | Métricas medidas |
 | `EXPERIMENTS.md` | EXP-000 a EXP-045 setup/result/verdict |
-| `old/docs/freetoken-next/audits/A1-A9.md` | Auditorias fonte detalhadas |
+| *(Auditorias A1-A9 movidas para ARCHITECTURE.md §1-§9)* | Auditorias fonte integradas |
 | `LESSONS.md` | Sintoma→causa→fix patterns |
 
 ---

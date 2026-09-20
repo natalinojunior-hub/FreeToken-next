@@ -92,7 +92,9 @@ def gguf_shards(path: str) -> list[str]:
     shard_map = {}  # index -> path
     for shard_path in found_shards:
         shard_basename = os.path.basename(shard_path)
-        shard_match = re.match(rf"{re.escape(base)}-(\d{{5}})-of-{total_shards_str}\.gguf$", shard_basename)
+        shard_match = re.match(
+            rf"{re.escape(base)}-(\d{{5}})-of-{total_shards_str}\.gguf$", shard_basename
+        )
         if shard_match:
             idx = int(shard_match.group(1))
             shard_indices.add(idx)

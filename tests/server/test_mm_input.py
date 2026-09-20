@@ -19,8 +19,12 @@ PNG = base64.b64encode(b"fakepng").decode()
 
 def _config(**overrides):
     fields = dict(
-        model_path="/nonexistent", allowed_media_domains="", allowed_local_media_path="",
-        served_model_name="unit-model", max_seq_len=8192, model_config=SimpleNamespace(),
+        model_path="/nonexistent",
+        allowed_media_domains="",
+        allowed_local_media_path="",
+        served_model_name="unit-model",
+        max_seq_len=8192,
+        model_config=SimpleNamespace(),
     )
     text_model_only = overrides.pop("text_model_only", False)
     serves_images = overrides.pop("vision_enabled", False)
@@ -28,15 +32,24 @@ def _config(**overrides):
         text_model_only=text_model_only,
         disabled_encoders=frozenset({"vision", "audio"}) if text_model_only else frozenset(),
     )
-    return SimpleNamespace(mm=mm, served_modalities=frozenset({"image"}) if serves_images else frozenset(), **{**fields, **overrides})
+    return SimpleNamespace(
+        mm=mm,
+        served_modalities=frozenset({"image"}) if serves_images else frozenset(),
+        **{**fields, **overrides},
+    )
 
 
 def test_image_url_part_becomes_template_image_part():
     msgs = render_messages(
-        [{"role": "user", "content": [
-            {"type": "text", "text": "hi"},
-            {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
-        ]}]
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
+                ],
+            }
+        ]
     )
     content = msgs[0]["content"]
     assert isinstance(content, list)
@@ -52,10 +65,13 @@ def test_collect_refs_preserves_prompt_order():
     msgs = render_messages(
         [
             {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "u1"}}]},
-            {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": "u2"}},
-                {"type": "image_url", "image_url": {"url": "u3"}},
-            ]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "u2"}},
+                    {"type": "image_url", "image_url": {"url": "u3"}},
+                ],
+            },
         ]
     )
     assert [r["data"] for r in collect_image_refs(msgs)] == ["u1", "u2", "u3"]
@@ -101,9 +117,7 @@ def test_media_domain_allowlist():
     _check_media_domain("https://evil.com/a.png", _config())
 
     with pytest.raises(ValueError, match="allowed domains"):
-        asyncio.run(
-            fetch_image_bytes([{"kind": "url", "data": "https://evil.com/a.png"}], config)
-        )
+        asyncio.run(fetch_image_bytes([{"kind": "url", "data": "https://evil.com/a.png"}], config))
 
 
 def test_local_media_requires_allowlisted_root(tmp_path):
@@ -129,14 +143,36 @@ def test_image_token_budget_flags_land_in_the_multimodal_config():
 
     from freetoken.server.args import parse_args
 
-    hf = SimpleNamespace(to_dict=lambda: {"architectures": ["Qwen3VLForConditionalGeneration"], "torch_dtype": "bfloat16"})
+    hf = SimpleNamespace(
+        to_dict=lambda: {
+            "architectures": ["Qwen3VLForConditionalGeneration"],
+            "torch_dtype": "bfloat16",
+        }
+    )
     with patch("freetoken.utils.cached_load_hf_config", lambda _path: hf):
-        args, _ = parse_args([
-            "--model", "/models/anon", "--image-min-tokens", "64", "--image-max-tokens", "1024",
-            "--mm-processor-kwargs", '{"size": {"longest_edge": 4096}}',
-        ])
+        args, _ = parse_args(
+            [
+                "--model",
+                "/models/anon",
+                "--image-min-tokens",
+                "64",
+                "--image-max-tokens",
+                "1024",
+                "--mm-processor-kwargs",
+                '{"size": {"longest_edge": 4096}}',
+            ]
+        )
         assert (args.mm.image_min_tokens, args.mm.image_max_tokens) == (64, 1024)
         assert args.mm.processor_kwargs == {"size": {"longest_edge": 4096}}
         assert parse_args(["--model", "/models/anon"])[0].mm.processor_kwargs == {}
         with pytest.raises(SystemExit):  # argparse reports the bad pair and exits
-            parse_args(["--model", "/models/anon", "--image-min-tokens", "2048", "--image-max-tokens", "1024"])
+            parse_args(
+                [
+                    "--model",
+                    "/models/anon",
+                    "--image-min-tokens",
+                    "2048",
+                    "--image-max-tokens",
+                    "1024",
+                ]
+            )

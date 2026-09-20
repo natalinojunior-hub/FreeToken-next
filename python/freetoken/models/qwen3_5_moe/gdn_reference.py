@@ -20,10 +20,10 @@ def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 def recurrent_gated_delta_rule(
     query: torch.Tensor,  # [B, T, Hv, Dk]
-    key: torch.Tensor,    # [B, T, Hv, Dk]
+    key: torch.Tensor,  # [B, T, Hv, Dk]
     value: torch.Tensor,  # [B, T, Hv, Dv]
-    g: torch.Tensor,      # [B, T, Hv]   (log-decay; per-step decay = exp(g))
-    beta: torch.Tensor,   # [B, T, Hv]
+    g: torch.Tensor,  # [B, T, Hv]   (log-decay; per-step decay = exp(g))
+    beta: torch.Tensor,  # [B, T, Hv]
     *,
     initial_state: torch.Tensor | None = None,
     use_qk_l2norm: bool = True,
@@ -34,12 +34,11 @@ def recurrent_gated_delta_rule(
         query = _l2norm(query, eps=1e-6)
         key = _l2norm(key, eps=1e-6)
     query, key, value, beta, g = [
-        t.transpose(1, 2).contiguous().to(torch.float32)
-        for t in (query, key, value, beta, g)
+        t.transpose(1, 2).contiguous().to(torch.float32) for t in (query, key, value, beta, g)
     ]
     b, h, t_len, dk = key.shape
     dv = value.shape[-1]
-    scale = 1.0 / (dk ** 0.5)
+    scale = 1.0 / (dk**0.5)
     query = query * scale
 
     out = torch.zeros(b, h, t_len, dv, dtype=value.dtype, device=value.device)
@@ -115,8 +114,12 @@ class Qwen3_5GatedDeltaNetReference(nn.Module):
         self.in_proj_b = nn.Linear(hidden_size, num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(hidden_size, num_v_heads, bias=False)
         self.conv1d = nn.Conv1d(
-            self.conv_dim, self.conv_dim, kernel_size=conv_kernel_size,
-            groups=self.conv_dim, padding=conv_kernel_size - 1, bias=False,
+            self.conv_dim,
+            self.conv_dim,
+            kernel_size=conv_kernel_size,
+            groups=self.conv_dim,
+            padding=conv_kernel_size - 1,
+            bias=False,
         )
         self.dt_bias = nn.Parameter(torch.zeros(num_v_heads))
         self.A_log = nn.Parameter(torch.zeros(num_v_heads))

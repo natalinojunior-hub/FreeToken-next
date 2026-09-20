@@ -84,8 +84,10 @@ def _gdn_parts(layer: int) -> list[str]:
 
 
 def _hc_parts(layer: int, hc: str) -> list[str]:
-    return [f"{LM}.layers.{layer}.{hc}.input_mix_weight_down.weight",
-            f"{LM}.layers.{layer}.{hc}.block_inject_weight.weight"]
+    return [
+        f"{LM}.layers.{layer}.{hc}.input_mix_weight_down.weight",
+        f"{LM}.layers.{layer}.{hc}.block_inject_weight.weight",
+    ]
 
 
 def _qkv_parts(layer: int) -> list[str]:
@@ -99,56 +101,138 @@ SAMPLES: tuple[tuple[str, list[str], str], ...] = (
     ("lm_head.weight", ["lm_head.weight"], "same"),
     ("model.layers.0.linear_attn.in_proj.weight", _gdn_parts(0), "cat"),
     ("model.layers.46.linear_attn.in_proj.weight", _gdn_parts(46), "cat"),
-    ("model.layers.0.linear_attn.conv1d.weight", [f"{LM}.layers.0.linear_attn.conv1d.weight"], "same"),
+    (
+        "model.layers.0.linear_attn.conv1d.weight",
+        [f"{LM}.layers.0.linear_attn.conv1d.weight"],
+        "same",
+    ),
     ("model.layers.0.linear_attn.A_log", [f"{LM}.layers.0.linear_attn.A_log"], "same"),
     ("model.layers.0.linear_attn.dt_bias", [f"{LM}.layers.0.linear_attn.dt_bias"], "same"),
     ("model.layers.0.linear_attn.norm.weight", [f"{LM}.layers.0.linear_attn.norm.weight"], "same"),
-    ("model.layers.0.linear_attn.out_proj.weight", [f"{LM}.layers.0.linear_attn.out_proj.weight"], "same"),
+    (
+        "model.layers.0.linear_attn.out_proj.weight",
+        [f"{LM}.layers.0.linear_attn.out_proj.weight"],
+        "same",
+    ),
     ("model.layers.3.self_attn.qkv_proj.weight", _qkv_parts(3), "cat"),
     ("model.layers.47.self_attn.qkv_proj.weight", _qkv_parts(47), "cat"),
     ("model.layers.3.self_attn.o_proj.weight", [f"{LM}.layers.3.self_attn.o_proj.weight"], "same"),
     ("model.layers.3.self_attn.q_norm.weight", [f"{LM}.layers.3.self_attn.q_norm.weight"], "same"),
     ("model.layers.3.self_attn.k_norm.weight", [f"{LM}.layers.3.self_attn.k_norm.weight"], "same"),
-    ("model.layers.3.self_attn.indexer.index_qk_proj.weight",
-     [f"{LM}.layers.3.self_attn.indexer.index_qk_proj.weight"], "same"),
-    ("model.layers.3.self_attn.indexer.q_layernorm.weight",
-     [f"{LM}.layers.3.self_attn.indexer.q_layernorm.weight"], "same"),
-    ("model.layers.47.self_attn.indexer.k_layernorm.weight",
-     [f"{LM}.layers.47.self_attn.indexer.k_layernorm.weight"], "same"),
-    ("model.layers.7.attn_hyper_connection.hc_norm.weight",
-     [f"{LM}.layers.7.attn_hyper_connection.hc_norm.weight"], "same"),
-    ("model.layers.7.attn_hyper_connection.input_mix_weight_down_block_inject.weight",
-     _hc_parts(7, "attn_hyper_connection"), "cat16"),
-    ("model.layers.7.attn_hyper_connection.input_mix_weight_up.weight",
-     [f"{LM}.layers.7.attn_hyper_connection.input_mix_weight_up.weight"], "same"),
-    ("model.layers.47.mlp_hyper_connection.input_mix_weight_down_block_inject.weight",
-     _hc_parts(47, "mlp_hyper_connection"), "cat16"),
-    ("model.hyper_connection_mixer.hc_norm.weight",
-     [f"{LM}.hyper_connection_mixer.hc_norm.weight"], "same"),
-    ("model.hyper_connection_mixer.input_mix_weight_down.weight",
-     [f"{LM}.hyper_connection_mixer.input_mix_weight_down.weight"], "same"),
-    ("model.hyper_connection_mixer.input_mix_weight_up.weight",
-     [f"{LM}.hyper_connection_mixer.input_mix_weight_up.weight"], "same"),
-    (f"model.layers.{PLE_LAYER}.ple.key_proj.weight", [f"{LM}.layers.{PLE_LAYER}.ple.key_proj.weight"], "same"),
-    (f"model.layers.{PLE_LAYER}.ple.value_proj.weight", [f"{LM}.layers.{PLE_LAYER}.ple.value_proj.weight"], "same"),
-    (f"model.layers.{PLE_LAYER}.ple.norm_key.weight", [f"{LM}.layers.{PLE_LAYER}.ple.norm_key.weight"], "same"),
-    (f"model.layers.{PLE_LAYER}.ple.norm_query.weight", [f"{LM}.layers.{PLE_LAYER}.ple.norm_query.weight"], "same"),
-    (f"model.layers.{PLE_LAYER}.ple.norm_conv.weight", [f"{LM}.layers.{PLE_LAYER}.ple.norm_conv.weight"], "same"),
-    (f"model.layers.{PLE_LAYER}.ple.conv1d.weight", [f"{LM}.layers.{PLE_LAYER}.ple.conv1d.weight"], "same"),
-    (f"model.layers.{PLE_LAYER}.ple.ple_embedding.layer_multipliers",
-     [f"{LM}.layers.{PLE_LAYER}.ple.ple_embedding.layer_multipliers"], "same"),
-    (f"model.layers.{PLE_LAYER}.ple.ple_embedding.ngram_heads_offsets",
-     [f"{LM}.layers.{PLE_LAYER}.ple.ple_embedding.ngram_heads_offsets"], "same"),
-    (f"model.layers.{PLE_LAYER}.ple.ple_embedding.ngram_heads_vocab_sizes",
-     [f"{LM}.layers.{PLE_LAYER}.ple.ple_embedding.ngram_heads_vocab_sizes"], "same"),
+    (
+        "model.layers.3.self_attn.indexer.index_qk_proj.weight",
+        [f"{LM}.layers.3.self_attn.indexer.index_qk_proj.weight"],
+        "same",
+    ),
+    (
+        "model.layers.3.self_attn.indexer.q_layernorm.weight",
+        [f"{LM}.layers.3.self_attn.indexer.q_layernorm.weight"],
+        "same",
+    ),
+    (
+        "model.layers.47.self_attn.indexer.k_layernorm.weight",
+        [f"{LM}.layers.47.self_attn.indexer.k_layernorm.weight"],
+        "same",
+    ),
+    (
+        "model.layers.7.attn_hyper_connection.hc_norm.weight",
+        [f"{LM}.layers.7.attn_hyper_connection.hc_norm.weight"],
+        "same",
+    ),
+    (
+        "model.layers.7.attn_hyper_connection.input_mix_weight_down_block_inject.weight",
+        _hc_parts(7, "attn_hyper_connection"),
+        "cat16",
+    ),
+    (
+        "model.layers.7.attn_hyper_connection.input_mix_weight_up.weight",
+        [f"{LM}.layers.7.attn_hyper_connection.input_mix_weight_up.weight"],
+        "same",
+    ),
+    (
+        "model.layers.47.mlp_hyper_connection.input_mix_weight_down_block_inject.weight",
+        _hc_parts(47, "mlp_hyper_connection"),
+        "cat16",
+    ),
+    (
+        "model.hyper_connection_mixer.hc_norm.weight",
+        [f"{LM}.hyper_connection_mixer.hc_norm.weight"],
+        "same",
+    ),
+    (
+        "model.hyper_connection_mixer.input_mix_weight_down.weight",
+        [f"{LM}.hyper_connection_mixer.input_mix_weight_down.weight"],
+        "same",
+    ),
+    (
+        "model.hyper_connection_mixer.input_mix_weight_up.weight",
+        [f"{LM}.hyper_connection_mixer.input_mix_weight_up.weight"],
+        "same",
+    ),
+    (
+        f"model.layers.{PLE_LAYER}.ple.key_proj.weight",
+        [f"{LM}.layers.{PLE_LAYER}.ple.key_proj.weight"],
+        "same",
+    ),
+    (
+        f"model.layers.{PLE_LAYER}.ple.value_proj.weight",
+        [f"{LM}.layers.{PLE_LAYER}.ple.value_proj.weight"],
+        "same",
+    ),
+    (
+        f"model.layers.{PLE_LAYER}.ple.norm_key.weight",
+        [f"{LM}.layers.{PLE_LAYER}.ple.norm_key.weight"],
+        "same",
+    ),
+    (
+        f"model.layers.{PLE_LAYER}.ple.norm_query.weight",
+        [f"{LM}.layers.{PLE_LAYER}.ple.norm_query.weight"],
+        "same",
+    ),
+    (
+        f"model.layers.{PLE_LAYER}.ple.norm_conv.weight",
+        [f"{LM}.layers.{PLE_LAYER}.ple.norm_conv.weight"],
+        "same",
+    ),
+    (
+        f"model.layers.{PLE_LAYER}.ple.conv1d.weight",
+        [f"{LM}.layers.{PLE_LAYER}.ple.conv1d.weight"],
+        "same",
+    ),
+    (
+        f"model.layers.{PLE_LAYER}.ple.ple_embedding.layer_multipliers",
+        [f"{LM}.layers.{PLE_LAYER}.ple.ple_embedding.layer_multipliers"],
+        "same",
+    ),
+    (
+        f"model.layers.{PLE_LAYER}.ple.ple_embedding.ngram_heads_offsets",
+        [f"{LM}.layers.{PLE_LAYER}.ple.ple_embedding.ngram_heads_offsets"],
+        "same",
+    ),
+    (
+        f"model.layers.{PLE_LAYER}.ple.ple_embedding.ngram_heads_vocab_sizes",
+        [f"{LM}.layers.{PLE_LAYER}.ple.ple_embedding.ngram_heads_vocab_sizes"],
+        "same",
+    ),
     ("model.layers.5.mlp.gate.weight", [f"{LM}.layers.5.mlp.gate.weight"], "same"),
-    ("model.layers.5.mlp.shared_expert.gate_up_proj.weight",
-     [f"{LM}.layers.5.mlp.shared_expert.gate_proj.weight",
-      f"{LM}.layers.5.mlp.shared_expert.up_proj.weight"], "cat"),
-    ("model.layers.5.mlp.shared_expert.down_proj.weight",
-     [f"{LM}.layers.5.mlp.shared_expert.down_proj.weight"], "same"),
-    ("model.layers.5.mlp.shared_expert_gate.weight",
-     [f"{LM}.layers.5.mlp.shared_expert_gate.weight"], "same"),
+    (
+        "model.layers.5.mlp.shared_expert.gate_up_proj.weight",
+        [
+            f"{LM}.layers.5.mlp.shared_expert.gate_proj.weight",
+            f"{LM}.layers.5.mlp.shared_expert.up_proj.weight",
+        ],
+        "cat",
+    ),
+    (
+        "model.layers.5.mlp.shared_expert.down_proj.weight",
+        [f"{LM}.layers.5.mlp.shared_expert.down_proj.weight"],
+        "same",
+    ),
+    (
+        "model.layers.5.mlp.shared_expert_gate.weight",
+        [f"{LM}.layers.5.mlp.shared_expert_gate.weight"],
+        "same",
+    ),
 )
 
 
@@ -183,11 +267,16 @@ def test_emitted_names_are_unique_and_complete(dense_pass):
     assert len(names) == len(set(names))
     assert len([n for n in names if n.endswith(".linear_attn.in_proj.weight")]) == 36
     assert len([n for n in names if n.endswith(".self_attn.qkv_proj.weight")]) == 12
-    assert len([n for n in names
-                if n.endswith(".input_mix_weight_down_block_inject.weight")]) == 2 * NUM_LAYERS
+    assert (
+        len([n for n in names if n.endswith(".input_mix_weight_down_block_inject.weight")])
+        == 2 * NUM_LAYERS
+    )
     assert len([n for n in names if ".ple." in n]) == 9
-    assert {"model.embed_tokens.weight", "lm_head.weight",
-            "model.hyper_connection_mixer.input_mix_weight_down.weight"} <= set(names)
+    assert {
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "model.hyper_connection_mixer.input_mix_weight_down.weight",
+    } <= set(names)
 
 
 @pytest.fixture(scope="module")
@@ -249,8 +338,9 @@ def test_ple_table_loads_pinned_and_matches_the_checkpoint(reader):
     assert table.tensor.dtype is torch.float8_e4m3fn
 
     prefix = f"{LM}.layers.{PLE_LAYER}.ple.ple_embedding.ngram_embedding"
-    assert torch.equal(table.weight_scale.reshape(1),
-                       reader.get(f"{prefix}.weight_scale").reshape(1))
+    assert torch.equal(
+        table.weight_scale.reshape(1), reader.get(f"{prefix}.weight_scale").reshape(1)
+    )
     rows = random.Random(0).sample(range(PLE_SHARDS * PLE_ROWS_PER_SHARD), 1000)
     by_shard: dict[int, list[int]] = {}
     for row in rows:
@@ -274,8 +364,9 @@ def layer0_expert_banks():
     spec = dataclasses.replace(
         _NVFP4_SOURCE_SPEC, layer_to_bank=lambda layer, config: 0 if layer == 0 else None
     )
-    config = SimpleNamespace(num_experts=E, hidden_size=H, moe_intermediate_size=I,
-                             num_moe_layers=1)
+    config = SimpleNamespace(
+        num_experts=E, hidden_size=H, moe_intermediate_size=I, num_moe_layers=1
+    )
     layer = _triton_layer()
     pieces = iter_nvfp4_expert_pieces(
         MODEL_PATH, config, spec, drop_page_cache=lambda path: None, primary=False
@@ -291,7 +382,15 @@ def _triton_layer():
     if try_get_tp_info() is None:
         set_tp_info(0, 1)
     set_quant_backend(QuantBackend.parse("moe.nvfp4=triton"))
-    quant = QuantConfig.from_hf({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["lm_head"]}})
+    quant = QuantConfig.from_hf(
+        {
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "NVFP4",
+                "ignore": ["lm_head"],
+            }
+        }
+    )
     return OffloadMoELayer(0, E, 10, H, I, quant_config=quant, prefix="model.layers.0.mlp.experts")
 
 
@@ -300,18 +399,19 @@ def test_sampled_experts_match_the_checkpoint(layer0_expert_banks, reader):
     banks = layer0_expert_banks
     for expert in random.Random(1).sample(range(E), 8):
         base = f"{LM}.layers.0.mlp.experts.{expert}"
-        assert torch.equal(banks["gate_up"][0][expert, :I],
-                           reader.get(f"{base}.gate_proj.weight"))
-        assert torch.equal(banks["gate_up"][0][expert, I:],
-                           reader.get(f"{base}.up_proj.weight"))
-        assert torch.equal(banks["down"][0][expert],
-                           reader.get(f"{base}.down_proj.weight"))
-        for proj, bank, rows in (("gate_proj", "gate_up_scale", slice(0, I)),
-                                 ("up_proj", "gate_up_scale", slice(I, 2 * I)),
-                                 ("down_proj", "down_scale", slice(None))):
+        assert torch.equal(banks["gate_up"][0][expert, :I], reader.get(f"{base}.gate_proj.weight"))
+        assert torch.equal(banks["gate_up"][0][expert, I:], reader.get(f"{base}.up_proj.weight"))
+        assert torch.equal(banks["down"][0][expert], reader.get(f"{base}.down_proj.weight"))
+        for proj, bank, rows in (
+            ("gate_proj", "gate_up_scale", slice(0, I)),
+            ("up_proj", "gate_up_scale", slice(I, 2 * I)),
+            ("down_proj", "down_scale", slice(None)),
+        ):
             scale = reader.get(f"{base}.{proj}.weight_scale")
-            assert torch.equal(banks[bank][0][expert][rows].reshape(-1).view(torch.uint8),
-                               scale.reshape(-1).view(torch.uint8))
+            assert torch.equal(
+                banks[bank][0][expert][rows].reshape(-1).view(torch.uint8),
+                scale.reshape(-1).view(torch.uint8),
+            )
         gate_g = reader.get(f"{base}.gate_proj.weight_scale_2").to(torch.float16)
         assert torch.equal(banks["gate_up_global"][0][expert, :I], gate_g.reshape(1).expand(I))
 
@@ -325,7 +425,9 @@ def test_expert_bank_bytes_match_the_aot_row_table(layer0_expert_banks):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="dummy banks are pinned")
 def test_dummy_expert_banks_have_the_real_bank_shapes(layer0_expert_banks):
     layer = _triton_layer()
-    dummy = build_expert_banks(layer.quant_method, 1, None, device=torch.device("cuda"), dummy=True).sources
+    dummy = build_expert_banks(
+        layer.quant_method, 1, None, device=torch.device("cuda"), dummy=True
+    ).sources
     assert set(dummy) == set(layer0_expert_banks)
     for name, banks in dummy.items():
         assert banks[0].shape == layer0_expert_banks[name][0].shape

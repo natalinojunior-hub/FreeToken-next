@@ -82,7 +82,12 @@ def test_two_groups_per_row_pack_and_read_back():
 def test_unwritten_rows_stay_zero_and_a_bf16_reader_is_refused():
     pool = _pool()
     loc = torch.tensor([2, 3], device=DEVICE)
-    pool.store_kv(torch.ones(2, HEADS, HEAD_DIM, device=DEVICE), torch.ones(2, HEADS, HEAD_DIM, device=DEVICE), loc, 0)
+    pool.store_kv(
+        torch.ones(2, HEADS, HEAD_DIM, device=DEVICE),
+        torch.ones(2, HEADS, HEAD_DIM, device=DEVICE),
+        loc,
+        0,
+    )
     assert pool._k_codes[0][0].eq(0).all() and pool._k_norm[0][0].eq(0).all()
     with pytest.raises(NotImplementedError, match="k_slab"):
         pool.k_cache(0)
@@ -138,13 +143,25 @@ def test_kv_cost_prices_the_same_bytes_the_pool_allocates():
     from freetoken.models.config import KVCacheGroupSpec
 
     full = KVCacheGroupSpec(
-        name="full", layer_ids=(0, 1, 2, 3), num_kv_heads=HEADS, head_dim=HEAD_DIM,
-        sliding_window=None, mla=False, index_head_dim=0, num_index_layers=0,
+        name="full",
+        layer_ids=(0, 1, 2, 3),
+        num_kv_heads=HEADS,
+        head_dim=HEAD_DIM,
+        sliding_window=None,
+        mla=False,
+        index_head_dim=0,
+        num_index_layers=0,
         attn_type=AttnType.FULL,
     )
     swa = KVCacheGroupSpec(
-        name="swa", layer_ids=(0, 1), num_kv_heads=2, head_dim=64,
-        sliding_window=128, mla=False, index_head_dim=0, num_index_layers=0,
+        name="swa",
+        layer_ids=(0, 1),
+        num_kv_heads=2,
+        head_dim=64,
+        sliding_window=128,
+        mla=False,
+        index_head_dim=0,
+        num_index_layers=0,
         attn_type=AttnType.SWA,
     )
     config = SimpleNamespace(

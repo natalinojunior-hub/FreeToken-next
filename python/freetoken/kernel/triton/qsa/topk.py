@@ -171,9 +171,7 @@ def _qsa_block_topk_kernel(
                             BINS,
                             mask=(key != 0) & ((key & keep) == prefix),
                         )
-                    prefix, keep, k_rem, settled = _narrow(
-                        hist, prefix, keep, k_rem, shift, BINS
-                    )
+                    prefix, keep, k_rem, settled = _narrow(hist, prefix, keep, k_rem, shift, BINS)
             ties = tl.where(settled, k_eff, k_rem)
 
         above_base = 0
@@ -307,18 +305,42 @@ def _qsa_topk_merge_kernel(
         # short row takes a narrower tile.
         elif candidates <= BLOCK_SMALL:
             emitted = _merge_tile(
-                key_row, col_row, out_row, candidates, k_eff,
-                TOP_K, BLOCK_SMALL, BINS, RADIX, PASSES,
+                key_row,
+                col_row,
+                out_row,
+                candidates,
+                k_eff,
+                TOP_K,
+                BLOCK_SMALL,
+                BINS,
+                RADIX,
+                PASSES,
             )
         elif candidates <= BLOCK_MID:
             emitted = _merge_tile(
-                key_row, col_row, out_row, candidates, k_eff,
-                TOP_K, BLOCK_MID, BINS, RADIX, PASSES,
+                key_row,
+                col_row,
+                out_row,
+                candidates,
+                k_eff,
+                TOP_K,
+                BLOCK_MID,
+                BINS,
+                RADIX,
+                PASSES,
             )
         else:
             emitted = _merge_tile(
-                key_row, col_row, out_row, candidates, k_eff,
-                TOP_K, BLOCK_FULL, BINS, RADIX, PASSES,
+                key_row,
+                col_row,
+                out_row,
+                candidates,
+                k_eff,
+                TOP_K,
+                BLOCK_FULL,
+                BINS,
+                RADIX,
+                PASSES,
             )
 
     pad = tl.arange(0, PAD_K)

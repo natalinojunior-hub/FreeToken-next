@@ -388,9 +388,7 @@ class ServeManager:
                 if not child.reaped.wait(timeout=grace):
                     self._signal(child.pid, signal.SIGKILL)
                     if not child.reaped.wait(timeout=self._reap_wait_s):
-                        raise RuntimeError(
-                            f"serve pid={child.pid} did not exit after SIGKILL"
-                        )
+                        raise RuntimeError(f"serve pid={child.pid} did not exit after SIGKILL")
         except Exception:
             # The receipt is durable, but the process may still be alive.  Keep it visible so a
             # retry can take another (possibly newer, for legacy engines) snapshot and signal it.
@@ -432,8 +430,8 @@ class ServeManager:
             return
         identity = self._child_identity(child)
         try:
-            instance_id, model_id, prompt_total, completion_total, uptime_s = (
-                self._snapshot_values(snapshot, model=model, require_instance=False)
+            instance_id, model_id, prompt_total, completion_total, uptime_s = self._snapshot_values(
+                snapshot, model=model, require_instance=False
             )
         except AccountingPrepareError:
             return
@@ -548,9 +546,7 @@ class ServeManager:
             self._last_accounting.pop(identity, None)
             return persisted
 
-    def _sealed_receipt(
-        self, prepared: dict[str, Any], *, model: str | None
-    ) -> dict[str, Any]:
+    def _sealed_receipt(self, prepared: dict[str, Any], *, model: str | None) -> dict[str, Any]:
         if not isinstance(prepared, dict):
             raise AccountingPrepareError("prepare-stop returned a non-object response")
 
@@ -590,8 +586,8 @@ class ServeManager:
             if self._read_stats is None or port is None:
                 raise AccountingPrepareError("stats fallback is unavailable")
             snapshot = self._read_stats(port)
-            instance_id, model_id, prompt_total, completion_total, uptime_s = (
-                self._snapshot_values(snapshot, model=model, require_instance=False)
+            instance_id, model_id, prompt_total, completion_total, uptime_s = self._snapshot_values(
+                snapshot, model=model, require_instance=False
             )
             receipt = {
                 "receiptId": stable_receipt_id(
@@ -646,9 +642,7 @@ class ServeManager:
             requests = {}
         prompt_total = snapshot.get("prompt_tokens_total", snapshot.get("promptTokensTotal"))
         if prompt_total is None:
-            prompt_total = requests.get(
-                "prompt_tokens_total", requests.get("promptTokensTotal")
-            )
+            prompt_total = requests.get("prompt_tokens_total", requests.get("promptTokensTotal"))
         completion_total = snapshot.get(
             "completion_tokens_total", snapshot.get("completionTokensTotal")
         )
@@ -740,7 +734,9 @@ class ServeManager:
             self._stopping = False
         self._maybe_apply_oom(child.pid)
         self._begin_watch(child)
-        self._emit(f"re-adopted running serve (pid={child.pid} model={state.model} port={state.port})")
+        self._emit(
+            f"re-adopted running serve (pid={child.pid} model={state.model} port={state.port})"
+        )
         return True
 
     # ---- monitor / reap (single reaper) ----

@@ -136,7 +136,9 @@ def test_parser_accepts_common_tagged_tool_call_shapes(text):
 def test_gemma4_parser_accepts_compact_tool_call_shape():
     parser = FunctionCallParser(TOOLS, tool_call_parser="gemma4")
 
-    result = parser.parse_non_stream('<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>')
+    result = parser.parse_non_stream(
+        '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>'
+    )
 
     assert len(result.calls) == 1
     assert result.calls[0].name == "get_weather"
@@ -155,9 +157,7 @@ def test_gemma4_parser_accepts_namespaced_tool_name():
     ]
     parser = FunctionCallParser(tools, tool_call_parser="gemma4")
 
-    result = parser.parse_non_stream(
-        "<|tool_call>call:superpowers:using_superpowers{}<tool_call|>"
-    )
+    result = parser.parse_non_stream("<|tool_call>call:superpowers:using_superpowers{}<tool_call|>")
 
     assert result.normal_text == ""
     assert len(result.calls) == 1
@@ -168,9 +168,7 @@ def test_gemma4_parser_accepts_namespaced_tool_name():
 def test_gemma4_parser_forwards_namespaced_skill_without_declared_tool():
     parser = FunctionCallParser(TOOLS, tool_call_parser="gemma4")
 
-    result = parser.parse_non_stream(
-        "<|tool_call>call:superpowers:using_superpowers{}<tool_call|>"
-    )
+    result = parser.parse_non_stream("<|tool_call>call:superpowers:using_superpowers{}<tool_call|>")
 
     assert result.normal_text == ""
     assert len(result.calls) == 1
@@ -218,7 +216,7 @@ def test_gpt_oss_parser_accepts_namespaced_tool_name():
         ),
         (
             "minimax",
-            "<minimax:tool_call><invoke name=\"read\"><parameter name=\"filePath\">"
+            '<minimax:tool_call><invoke name="read"><parameter name="filePath">'
             "/tmp/test_calc.py</parameter></invoke></minimax:tool_call>",
             "read",
             {"filePath": "/tmp/test_calc.py"},
@@ -227,22 +225,22 @@ def test_gpt_oss_parser_accepts_namespaced_tool_name():
             "gpt_oss",
             "<|channel|>analysis<|message|>Need files.<|end|><|start|>assistant"
             "<|channel|>commentary to=functions.glob <|constrain|>json<|message|>"
-            "{\"pattern\":\"**/*.py\",\"path\":\"/tmp/ws\"}",
+            '{"pattern":"**/*.py","path":"/tmp/ws"}',
             "glob",
             {"pattern": "**/*.py", "path": "/tmp/ws"},
         ),
         (
             "deepseekv32",
-            "<｜DSML｜function_calls><｜DSML｜invoke name=\"read\">"
-            "<｜DSML｜parameter name=\"filePath\" string=\"true\">/tmp/test_calc.py</｜DSML｜parameter>"
+            '<｜DSML｜function_calls><｜DSML｜invoke name="read">'
+            '<｜DSML｜parameter name="filePath" string="true">/tmp/test_calc.py</｜DSML｜parameter>'
             "</｜DSML｜invoke></｜DSML｜function_calls>",
             "read",
             {"filePath": "/tmp/test_calc.py"},
         ),
         (
             "deepseekv32",
-            "<｜DSML｜tool_calls><｜DSML｜invoke name=\"read\">"
-            "<｜DSML｜parameter name=\"filePath\">/tmp/test_calc.py</｜DSML｜parameter>"
+            '<｜DSML｜tool_calls><｜DSML｜invoke name="read">'
+            '<｜DSML｜parameter name="filePath">/tmp/test_calc.py</｜DSML｜parameter>'
             "</｜DSML｜invoke></｜DSML｜tool_calls>",
             "read",
             {"filePath": "/tmp/test_calc.py"},
@@ -275,7 +273,9 @@ def _feed(parser, chunks):
     return texts, calls
 
 
-@pytest.mark.parametrize("parser_name", ["qwen25", "glm47", "gemma4", "minimax", "deepseekv32", "qwen3_coder"])
+@pytest.mark.parametrize(
+    "parser_name", ["qwen25", "glm47", "gemma4", "minimax", "deepseekv32", "qwen3_coder"]
+)
 def test_streaming_plain_text_releases_per_chunk(parser_name):
     # A pure-text response must stream out chunk by chunk, not buffer to the end.
     parser = FunctionCallParser(TOOLS, tool_call_parser=parser_name)

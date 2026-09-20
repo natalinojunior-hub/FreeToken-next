@@ -244,6 +244,7 @@ def dsv4_solve_num_pages(
     anchor SHRINKS to fit, instead of every tier inflating past the budget. Raises ``ValueError``
     when even the minimal pool does not fit.
     """
+
     def _sizes(num: int) -> DSV4PoolSizes:
         win = max(floor_win_pages, (round(swa_ratio * num * P) + P - 1) // P)
         return dsv4_pool_sizes(num, args, swa_ratio, P=P, n_win_pages=win)
@@ -267,7 +268,9 @@ def dsv4_solve_num_pages(
     return _sizes(lo)
 
 
-_AUTO_KV_SLACK_BYTES = 2 << 30  # absorbs plan-vs-measured drift (observed ~265MiB) and leaves a usable pool
+_AUTO_KV_SLACK_BYTES = (
+    2 << 30
+)  # absorbs plan-vs-measured drift (observed ~265MiB) and leaves a usable pool
 
 
 def dsv4_auto_cost_model(args, swa_ratio, floor_win_pages, P=128, n_scratch=1):
@@ -342,15 +345,14 @@ def _dsv4_pool_sizes(config, num_pages: int, num_swa_pages: int | None = None):
     if override:
         num_pages = max(2, int(override))  # in 128-pages; keep >=2 so the dummy page + 1 fit
         return dsv4_pool_sizes(
-            num_pages=num_pages, args=config.model_config.dsv4_args,
-            swa_ratio=swa_ratio, P=P,
+            num_pages=num_pages,
+            args=config.model_config.dsv4_args,
+            swa_ratio=swa_ratio,
+            P=P,
         )
 
     floor_pages = _dsv4_window_floor_pages(config, P)
-    target = (
-        num_swa_pages if num_swa_pages is not None
-        else config.swa_num_pages_override
-    )
+    target = num_swa_pages if num_swa_pages is not None else config.swa_num_pages_override
     if target is not None:
         # Absolute window: `target` usable pages + 1 dummy, floored and capped at the full anchor.
         win = min(num_pages, max(floor_pages, int(target) + 1))

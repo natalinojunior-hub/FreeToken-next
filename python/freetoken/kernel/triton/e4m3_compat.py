@@ -33,6 +33,7 @@ from triton import jit
 from triton.language import target_info
 from triton.runtime.jit import constexpr_function
 
+
 def _env_force() -> bool:
     return os.environ.get("FREETOKEN_FORCE_E4M3_EMU", "").lower() in ("1", "true", "yes", "on")
 
@@ -40,8 +41,7 @@ def _env_force() -> bool:
 FORCE_EMU = _env_force()
 
 if FORCE_EMU and "TRITON_CACHE_DIR" not in os.environ:
-    os.environ["TRITON_CACHE_DIR"] = os.path.join(
-        os.path.expanduser("~/.triton"), "cache-e4m3emu")
+    os.environ["TRITON_CACHE_DIR"] = os.path.join(os.path.expanduser("~/.triton"), "cache-e4m3emu")
 
 _native: bool | None = None
 

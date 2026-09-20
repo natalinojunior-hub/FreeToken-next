@@ -39,7 +39,9 @@ def register_method(kind: QuantKind, layer_kind: LayerKind):
     def deco(cls: type) -> type:
         key = (kind, layer_kind)
         if key in _METHODS:
-            raise ValueError(f"quant method for {layer_kind}.{kind} already registered: {_METHODS[key].__name__}")
+            raise ValueError(
+                f"quant method for {layer_kind}.{kind} already registered: {_METHODS[key].__name__}"
+            )
         cls.kind = kind
         cls.layer_kind = layer_kind
         _METHODS[key] = cls

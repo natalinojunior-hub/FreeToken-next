@@ -149,8 +149,8 @@ def _causal_conv1d_fwd_tiled_kernel(
 
     # Tile is [BLOCK_M tokens (rows), BLOCK_N feats (cols)].  For each of the WIDTH taps,
     # add w_j * x[token - state_len + j].  Overlapping tap loads are served from L2.
-    rows = tl.arange(0, BLOCK_M)                        # [BLOCK_M] token index within chunk
-    local_out = token_offset + rows                     # [BLOCK_M] abs local token
+    rows = tl.arange(0, BLOCK_M)  # [BLOCK_M] token index within chunk
+    local_out = token_offset + rows  # [BLOCK_M] abs local token
     acc = acc_bias[None, :] + tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     mfc = (idx_feats < dim)[None, :]
 
@@ -165,23 +165,16 @@ def _causal_conv1d_fwd_tiled_kernel(
             w_j = w_col2
         else:
             w_j = w_col3
-        src_local = local_out - state_len + j            # [BLOCK_M]
+        src_local = local_out - state_len + j  # [BLOCK_M]
         gx = sequence_start_index + src_local
-        x_ptrs = (
-            x_ptr
-            + (gx * stride_x_token)[:, None]
-            + feat_x[None, :]
-        )
+        x_ptrs = x_ptr + (gx * stride_x_token)[:, None] + feat_x[None, :]
         mask_x = (src_local >= 0)[:, None] & (src_local < seqlen)[:, None] & mfc
         xj = tl.load(x_ptrs, mask_x, 0.0)
         acc += w_j[None, :] * xj
         if HAS_INITIAL_STATES:
             if load_init_state:
-                st_idx = state_len + src_local        # 0..state_len-1 where src_local<0
-                s_ptrs = (
-                    conv_states_base[None, :]
-                    + (st_idx * stride_conv_state_tok)[:, None]
-                )
+                st_idx = state_len + src_local  # 0..state_len-1 where src_local<0
+                s_ptrs = conv_states_base[None, :] + (st_idx * stride_conv_state_tok)[:, None]
                 mask_s = (src_local < 0)[:, None] & mfc
                 sj = tl.load(s_ptrs, mask_s, 0.0)
                 acc += w_j[None, :] * sj
@@ -192,9 +185,7 @@ def _causal_conv1d_fwd_tiled_kernel(
         acc = acc / (1.0 + tl.exp2(-acc * 1.4426950408889634))
 
     o_ptrs = (
-        o_ptr
-        + ((sequence_start_index + local_out) * stride_o_token)[:, None]
-        + feat_o[None, :]
+        o_ptr + ((sequence_start_index + local_out) * stride_o_token)[:, None] + feat_o[None, :]
     )
     mask_o = (local_out < seqlen)[:, None] & mfc
     tl.store(o_ptrs, acc, mask_o)
@@ -339,9 +330,7 @@ def _causal_conv1d_update_kernel(
     tl.debug_barrier()
     new_conv_state = tl.where(mask, conv_state, loaded_x)
 
-    conv_state_ptrs_target = (
-        conv_states_base + (idx_tokens * stride_conv_state_tok)[:, None]
-    )
+    conv_state_ptrs_target = conv_states_base + (idx_tokens * stride_conv_state_tok)[:, None]
     mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
     tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
@@ -420,11 +409,11 @@ def _causal_conv1d_update_kernel(
 # Tuned entrypoints (mirror the vendored op's varlen / decode split)
 # ---------------------------------------------------------------------------
 def causal_conv1d_varlen(
-    x: torch.Tensor,            # [conv_dim, total_tokens]
-    weight: torch.Tensor,       # [conv_dim, kernel]
+    x: torch.Tensor,  # [conv_dim, total_tokens]
+    weight: torch.Tensor,  # [conv_dim, kernel]
     conv_states: torch.Tensor,  # [num_slots, conv_dim, kernel-1] (in place)
-    cu_seqlens: torch.Tensor,   # [batch+1] int32
-    cache_indices: torch.Tensor,      # [batch] int32
+    cu_seqlens: torch.Tensor,  # [batch+1] int32
+    cache_indices: torch.Tensor,  # [batch] int32
     has_initial_state: torch.Tensor,  # [batch] bool
     activation: Optional[str] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
@@ -518,9 +507,9 @@ def causal_conv1d_varlen(
 
 
 def causal_conv1d_decode(
-    x: torch.Tensor,                # [batch, conv_dim]
-    conv_state: torch.Tensor,       # [num_slots, conv_dim, state_len>=kernel-1] (in place)
-    weight: torch.Tensor,           # [conv_dim, kernel]
+    x: torch.Tensor,  # [batch, conv_dim]
+    conv_state: torch.Tensor,  # [num_slots, conv_dim, state_len>=kernel-1] (in place)
+    weight: torch.Tensor,  # [conv_dim, kernel]
     conv_state_indices: torch.Tensor,  # [batch] int32
     activation: Optional[str] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,

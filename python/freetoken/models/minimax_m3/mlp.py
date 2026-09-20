@@ -35,12 +35,18 @@ class MiniMaxM3MLP(BaseOP):
         prefix: str = "",
     ):
         self.gate_up_proj = LinearReplicated(
-            hidden_size, 2 * intermediate_size, has_bias=False,
-            quant_config=quant_config, prefix=f"{prefix}.gate_up_proj",
+            hidden_size,
+            2 * intermediate_size,
+            has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = LinearReplicated(
-            intermediate_size, hidden_size, has_bias=False,
-            quant_config=quant_config, prefix=f"{prefix}.down_proj",
+            intermediate_size,
+            hidden_size,
+            has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
         )
         self._alpha = alpha
         self._limit = limit

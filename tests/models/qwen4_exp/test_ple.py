@@ -44,6 +44,7 @@ requires_hf_ref = pytest.mark.skipif(
 # fixtures
 # --------------------------------------------------------------------------------------
 
+
 def _config() -> ModelConfig:
     return parse_config(toy_hf_config())
 
@@ -98,12 +99,21 @@ def _meta(sequences, contexts, *, device="cpu", slots=None, fresh=None, decode=F
 
 
 def _run_hf_reference(tmp_path, data: dict, layer_idx=2, ple_layer_index=0) -> dict:
-    spec = {"config": vars(toy_hf_config().text_config), "layer_idx": layer_idx, "ple_layer_index": ple_layer_index}
+    spec = {
+        "config": vars(toy_hf_config().text_config),
+        "layer_idx": layer_idx,
+        "ple_layer_index": ple_layer_index,
+    }
     (tmp_path / "spec.json").write_text(json.dumps(spec), encoding="utf-8")
     np.savez(tmp_path / "in.npz", **data)
     subprocess.run(
-        [_HF_REF_PYTHON, str(_HF_REF_SCRIPT), str(tmp_path / "spec.json"),
-         str(tmp_path / "in.npz"), str(tmp_path / "out.npz")],
+        [
+            _HF_REF_PYTHON,
+            str(_HF_REF_SCRIPT),
+            str(tmp_path / "spec.json"),
+            str(tmp_path / "in.npz"),
+            str(tmp_path / "out.npz"),
+        ],
         check=True,
         capture_output=True,
     )
@@ -149,7 +159,10 @@ def test_hash_constants_match_hf(tmp_path):
     layer = _make_layer(config)
     ref = _run_hf_reference(
         tmp_path,
-        {"hash_tokens": np.array([[EOS, EOS, 3, 4]], dtype=np.int64), **_layer_ref_inputs(config, layer)},
+        {
+            "hash_tokens": np.array([[EOS, EOS, 3, 4]], dtype=np.int64),
+            **_layer_ref_inputs(config, layer),
+        },
     )
     multipliers, sizes, offsets = hash_constants(config.qwen4_args)
     assert torch.equal(multipliers, torch.as_tensor(ref["layer_multipliers"]))
@@ -316,14 +329,19 @@ def test_fresh_slots_read_a_zero_state():
     assert torch.equal(got, want)
 
 
-@pytest.mark.parametrize("cuts", [[1], [2, 3, 4], [9]], ids=["first-token", "uneven-mix", "penultimate"])
+@pytest.mark.parametrize(
+    "cuts", [[1], [2, 3, 4], [9]], ids=["first-token", "uneven-mix", "penultimate"]
+)
 def test_chunked_prefill_matches_one_shot(cuts):
     """Chunked prefill at arbitrary cut points (including chunks shorter than the conv state) matches one shot."""
     torch.manual_seed(14)
     config = _config()
     args = config.qwen4_args
     layer = _make_layer(config)
-    sequences = [[3, 4, EOS, 5, 6, 8, 9, 2, 4, 5, 6, 7], [2, EOS, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]]
+    sequences = [
+        [3, 4, EOS, 5, 6, 8, 9, 2, 4, 5, 6, 7],
+        [2, EOS, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+    ]
     length = len(sequences[0])
     contexts = [[EOS, EOS], [21, 22]]
     x = torch.randn(len(sequences) * length, args.ple_state_width)
@@ -351,9 +369,7 @@ def test_chunked_prefill_matches_one_shot(cuts):
         start = end
 
     for i, seq in enumerate(sequences):
-        rebuilt = torch.cat(
-            [p.chunk(len(sequences))[i] for p in pieces]
-        )
+        rebuilt = torch.cat([p.chunk(len(sequences))[i] for p in pieces])
         assert torch.allclose(rebuilt, full[i * length : (i + 1) * length], rtol=1e-4, atol=1e-5)
     assert torch.allclose(chunk_states, full_states, rtol=1e-4, atol=1e-5)
 
@@ -362,8 +378,12 @@ def _state_pool(config, num_slots=8):
     from freetoken.kvcache.linear_state_pool import LinearStatePool
 
     return LinearStatePool(
-        config.linear_attention_group(), num_slots, torch.float32,
-        torch.device("cpu"), tp_size=1, slot_states=config.slot_states,
+        config.linear_attention_group(),
+        num_slots,
+        torch.float32,
+        torch.device("cpu"),
+        tp_size=1,
+        slot_states=config.slot_states,
     )
 
 
@@ -417,7 +437,9 @@ def test_track_snapshot_equals_a_prefill_stopped_at_the_boundary():
     got = pool.slot_state("ple_conv", args.ple_layer_ids[0])[dst].clone()
 
     stopped = torch.zeros_like(slab)
-    _forward(layer, R[:CHUNK_SIZE], _meta([tokens[:CHUNK_SIZE]], [[EOS, EOS]], slots=[live]), stopped)
+    _forward(
+        layer, R[:CHUNK_SIZE], _meta([tokens[:CHUNK_SIZE]], [[EOS, EOS]], slots=[live]), stopped
+    )
     assert torch.equal(got, stopped[live])
 
 
@@ -435,13 +457,21 @@ def test_prefix_hit_matches_the_uncached_run():
     R = torch.randn(len(tokens), args.ple_state_width)
 
     uncached = _forward(
-        layer, R, _meta([tokens], context, slots=[1]), torch.zeros_like(pool.slot_state("ple_conv", args.ple_layer_ids[0]))
+        layer,
+        R,
+        _meta([tokens], context, slots=[1]),
+        torch.zeros_like(pool.slot_state("ple_conv", args.ple_layer_ids[0])),
     )
 
     live, dst = 1, 5
     req = _tracked_req(0, 0, tokens, live=live, ping_pong=(dst, 6))
     batch = _track_batch(req, tokens, pool)
-    layer.forward(R, batch, meta=_meta([tokens], context, slots=[live]), conv_states=pool.slot_state("ple_conv", args.ple_layer_ids[0]))
+    layer.forward(
+        R,
+        batch,
+        meta=_meta([tokens], context, slots=[live]),
+        conv_states=pool.slot_state("ple_conv", args.ple_layer_ids[0]),
+    )
 
     resumed_slot = 3
     pool.copy_from(dst, resumed_slot)
@@ -461,8 +491,11 @@ def test_prefill_matches_stepwise_decode():
     config = _config()
     args = config.qwen4_args
     layer = _make_layer(config)
-    sequences = [[3, 4, EOS, 5, 6, 8, 9, 2, 4, 5, 6, 12], [2, EOS, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
-                 [9, 10, 11, 12, 13, 14, EOS, 16, 17, 18, 19, 20]]
+    sequences = [
+        [3, 4, EOS, 5, 6, 8, 9, 2, 4, 5, 6, 12],
+        [2, EOS, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+        [9, 10, 11, 12, 13, 14, EOS, 16, 17, 18, 19, 20],
+    ]
     length = len(sequences[0])
     contexts = [[EOS, EOS], [21, 22], [EOS, 31]]
     x = torch.randn(len(sequences) * length, args.ple_state_width)
@@ -540,10 +573,14 @@ def test_layer_matches_hf(tmp_path):
         getattr(gpu, name).weight.copy_(getattr(layer, name).weight)
     gpu.conv1d.weight.copy_(layer.conv1d.weight)
     gpu.ple_embedding.attach_table(
-        GpuResidentTable(layer.ple_embedding.table.weight.to("cuda", torch.bfloat16), dtype=torch.bfloat16)
+        GpuResidentTable(
+            layer.ple_embedding.table.weight.to("cuda", torch.bfloat16), dtype=torch.bfloat16
+        )
     )
     R = torch.as_tensor(hidden)[0].to("cuda", torch.bfloat16)
-    states = torch.zeros(1, args.ple_state_width, args.ple_conv_state_len, device="cuda", dtype=torch.bfloat16)
+    states = torch.zeros(
+        1, args.ple_state_width, args.ple_conv_state_len, device="cuda", dtype=torch.bfloat16
+    )
     got = _forward(gpu, R, _meta([tokens], [[EOS, EOS]], device="cuda"), states)
     assert torch.allclose(got.float().cpu(), want, rtol=2e-2, atol=2e-2)
 
@@ -560,7 +597,9 @@ def _fake_batch(reqs, *, decode, input_ids, positions=None, table_idx=None, devi
         is_decode=decode,
         is_prefill=not decode,
         input_ids=torch.tensor(input_ids, dtype=torch.int64, device=device),
-        positions=None if positions is None else torch.tensor(positions, dtype=torch.int32, device=device),
+        positions=None
+        if positions is None
+        else torch.tensor(positions, dtype=torch.int32, device=device),
         linear_table_idx=(
             None if table_idx is None else torch.tensor(table_idx, dtype=torch.int32, device=device)
         ),
@@ -585,7 +624,9 @@ def test_commit_writes_the_track_slot_at_the_boundary():
     eos = args.ngram_boundary_token_id
     ctxp = torch.full((8, 2), eos, dtype=torch.int32)
     tokens = _no_eos_tokens(CHUNK_SIZE + 6)
-    batch = _fake_batch([_req(1, 0, tokens, extend_len=len(tokens))], decode=False, input_ids=tokens)
+    batch = _fake_batch(
+        [_req(1, 0, tokens, extend_len=len(tokens))], decode=False, input_ids=tokens
+    )
     meta = build_ple_metadata(batch, args, torch.device("cpu"), context_pool=ctxp)
     fla = SimpleNamespace(
         track_boundary_row=torch.tensor([CHUNK_SIZE]), track_dst=torch.tensor([5])
@@ -599,14 +640,17 @@ def test_context_matches_the_token_history_across_chunks_and_decode():
     """Rolling the slot state chunk by chunk reproduces the last-2-tokens oracle exactly."""
     args = _config().qwen4_args
     eos = args.ngram_boundary_token_id
-    ctxp = torch.full((3, 2), 99, dtype=torch.int32)  # stale tenant garbage; fresh rows must mask to eos
+    ctxp = torch.full(
+        (3, 2), 99, dtype=torch.int32
+    )  # stale tenant garbage; fresh rows must mask to eos
     history = _no_eos_tokens(11, start=3)
     cached = 0
     for chunk in (3, 1, 2, 5):
         ids = history[cached : cached + chunk]
         batch = _fake_batch(
             [_req(1, cached, history[: cached + chunk], extend_len=chunk)],
-            decode=False, input_ids=ids,
+            decode=False,
+            input_ids=ids,
         )
         meta = build_ple_metadata(batch, args, torch.device("cpu"), context_pool=ctxp)
         assert meta.ngram_context.tolist() == [([eos, eos] + history[:cached])[-2:]]
@@ -616,7 +660,10 @@ def test_context_matches_the_token_history_across_chunks_and_decode():
         tok = 200 + step
         batch = _fake_batch(
             [_req(1, cached, history + [tok], extend_len=1)],
-            decode=True, input_ids=[tok], positions=[cached], table_idx=[1],
+            decode=True,
+            input_ids=[tok],
+            positions=[cached],
+            table_idx=[1],
         )
         meta = build_ple_metadata(batch, args, torch.device("cpu"), context_pool=ctxp)
         assert meta.ngram_context.tolist() == [history[-2:]]
@@ -646,13 +693,24 @@ def test_decode_graph_replay_matches_eager():
     positions = torch.full((bs,), 8, dtype=torch.int32, device="cuda")
     slots = torch.arange(1, bs + 1, dtype=torch.int32, device="cuda")
     batch = SimpleNamespace(
-        padded_reqs=[None] * bs, is_decode=True, is_prefill=False,
+        padded_reqs=[None] * bs,
+        is_decode=True,
+        is_prefill=False,
         input_ids=torch.randint(0, VOCAB, (bs,), device="cuda", dtype=torch.int32),
-        positions=positions, linear_table_idx=slots,
+        positions=positions,
+        linear_table_idx=slots,
     )
     R = torch.randn(bs, args.ple_state_width, device="cuda", dtype=torch.bfloat16)
-    states0 = torch.randn(bs + 1, args.ple_state_width, args.ple_conv_state_len,
-                          device="cuda", dtype=torch.bfloat16) * 0.1
+    states0 = (
+        torch.randn(
+            bs + 1,
+            args.ple_state_width,
+            args.ple_conv_state_len,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        * 0.1
+    )
     states = states0.clone()
 
     def step():

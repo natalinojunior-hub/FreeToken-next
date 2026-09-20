@@ -45,8 +45,14 @@ def test_dsfp4_gpu_prequant_bit_parity():
 
     def run(cpu_roundtrip: bool) -> torch.Tensor:
         ex = CpuMoeExecutor(
-            cache, top_k=TOPK, activation="silu", apply_router_weight_on_input=False,
-            num_threads=4, max_tokens=2, device=dev, swiglu_limit=10.0,
+            cache,
+            top_k=TOPK,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            num_threads=4,
+            max_tokens=2,
+            device=dev,
+            swiglu_limit=10.0,
         )
         assert ex._gpu_prequant, "ds_fp4 on CUDA should enable GPU prequant"
         if cpu_roundtrip:  # control: the original CPU-side scalar round-trip

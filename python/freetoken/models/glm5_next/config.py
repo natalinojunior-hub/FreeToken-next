@@ -60,7 +60,9 @@ def parse_vision_config(hf_config: Any) -> VisionConfig | None:
     if vc is None:
         return None
     if vc.hidden_act != "silu":
-        raise NotImplementedError(f"glm5_next vision tower activation {vc.hidden_act!r}; only silu is implemented")
+        raise NotImplementedError(
+            f"glm5_next vision tower activation {vc.hidden_act!r}; only silu is implemented"
+        )
     return VisionConfig(
         hidden_size=vc.hidden_size,
         depth=vc.depth,
@@ -146,11 +148,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # Each DSA layer owns its indexer ("full" in indexer_types); count only the
     # layers that actually exist under a dev layer cap.
     num_index_layers = (
-        sum(
-            1
-            for i in dsa_ids
-            if i < len(args.indexer_types) and args.indexer_types[i] == "full"
-        )
+        sum(1 for i in dsa_ids if i < len(args.indexer_types) and args.indexer_types[i] == "full")
         if dsa_on
         else 0
     )
@@ -190,9 +188,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # The MLP layout is a dense prefix + sparse tail; ModelConfig models exactly that
     # via first_k_dense_replace, so assert the checkpoint matches before collapsing.
     mlp_types = args.mlp_layer_types[:num_layers]
-    first_dense = next(
-        (i for i, t in enumerate(mlp_types) if t == "sparse"), len(mlp_types)
-    )
+    first_dense = next((i for i, t in enumerate(mlp_types) if t == "sparse"), len(mlp_types))
     assert all(t == "dense" for t in mlp_types[:first_dense]) and all(
         t == "sparse" for t in mlp_types[first_dense:]
     ), f"mlp_layer_types is not a dense-prefix layout: {mlp_types}"
@@ -213,27 +209,19 @@ def parse_config(hf_config: Any) -> ModelConfig:
         # experts and dense MLPs both run clamped SwiGLU when swiglu_limit is set,
         # even though the HF config still says "silu". Passing "silu" through would
         # let auto-selection repack experts into the marlin/b12x silu-only epilogue.
-        hidden_act=(
-            "swiglu_clamp" if args.swiglu_limit is not None else text.hidden_act
-        ),
+        hidden_act=("swiglu_clamp" if args.swiglu_limit is not None else text.hidden_act),
         rms_norm_eps=args.norm_eps,
         tie_word_embeddings=bool(getattr(text, "tie_word_embeddings", False)),
         rotary_config=rotary_config,
         attention_groups=groups,
-        num_experts=(
-            getattr(text, "n_routed_experts", None) or getattr(text, "num_experts", 0)
-        ),
+        num_experts=(getattr(text, "n_routed_experts", None) or getattr(text, "num_experts", 0)),
         num_experts_per_tok=(
-            getattr(text, "num_experts_per_tok", None)
-            or getattr(text, "num_experts_per_token", 0)
+            getattr(text, "num_experts_per_tok", None) or getattr(text, "num_experts_per_token", 0)
         ),
-        moe_intermediate_size=getattr(text, "moe_intermediate_size", 0)
-        or text.intermediate_size,
+        moe_intermediate_size=getattr(text, "moe_intermediate_size", 0) or text.intermediate_size,
         norm_topk_prob=bool(getattr(text, "norm_topk_prob", True)),
         model_type=getattr(hf_config, "model_type", "glm5_next"),
-        architectures=getattr(
-            hf_config, "architectures", ["Glm5NextForConditionalGeneration"]
-        ),
+        architectures=getattr(hf_config, "architectures", ["Glm5NextForConditionalGeneration"]),
         moe_enabled=True,
         expert_quant=expert_quant,
         weight_block_size=weight_block_size,

@@ -35,9 +35,7 @@ def _gemma_dual_rmsnorm_residual_kernel(
     x2 = tl.load(X2_ptr + row * stride_x2 + cols, mask=mask, other=0.0).to(tl.float32)
     w2 = tl.load(W2_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     w3 = tl.load(W3_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    residual = tl.load(
-        Residual_ptr + row * stride_r + cols, mask=mask, other=0.0
-    ).to(tl.float32)
+    residual = tl.load(Residual_ptr + row * stride_r + cols, mask=mask, other=0.0).to(tl.float32)
 
     rrms1 = tl.rsqrt(tl.sum(x1 * x1, axis=0) / N + eps1)
     norm1 = x1 * rrms1 * w1
@@ -170,9 +168,7 @@ def gemma4_fused_routing(
 
     logits = logits.contiguous()
     per_expert_scale = per_expert_scale.contiguous()
-    topk_weights = torch.empty(
-        (tokens, topk), dtype=torch.float32, device=logits.device
-    )
+    topk_weights = torch.empty((tokens, topk), dtype=torch.float32, device=logits.device)
     topk_ids = torch.empty((tokens, topk), dtype=torch.int32, device=logits.device)
     if tokens == 0:
         return topk_weights, topk_ids

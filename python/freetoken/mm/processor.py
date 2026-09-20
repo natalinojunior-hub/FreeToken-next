@@ -197,7 +197,11 @@ def get_mm_processor(model_path: str, mm: MultimodalConfig | None = None) -> MMP
     except Exception:  # noqa: BLE001 -- missing/foreign config or unknown architecture: no multimodal input
         return None
     mm = mm or MultimodalConfig()
-    served = [e for e in spec.encoders if getattr(config, e.config_key, None) is not None and e.kind not in mm.disabled_encoders]
+    served = [
+        e
+        for e in spec.encoders
+        if getattr(config, e.config_key, None) is not None and e.kind not in mm.disabled_encoders
+    ]
     if spec.mm_processor is None or not served:
         return None
     check_mm_pad_shift(config.text_config.vocab_size)

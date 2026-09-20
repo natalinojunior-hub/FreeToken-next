@@ -57,6 +57,7 @@ _DEFAULT_CHUNK = 8 << 20
 # Hold the mmaps for the process lifetime; the offload cache reads from these banks forever.
 _LIVE_BUFFERS: list[mmap.mmap] = []
 
+
 def _env_born_pinned() -> bool | None:
     """``FREETOKEN_BANK_CUDA_ALLOC`` tri-state: unset -> ``None`` (default applies), else the parsed boolean."""
     v = os.environ.get("FREETOKEN_BANK_CUDA_ALLOC", "").strip().lower()
@@ -85,8 +86,7 @@ class HostBank:
 
     __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked")
 
-    def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
-                 *, backing: str | None = None):
+    def __init__(self, shape: tuple[int, ...], dtype: torch.dtype, *, backing: str | None = None):
         if backing is None:
             plan = _requested_residency
             # a plan with non-pinned labels vetoes born-pinned: cudaHostAlloc spends the pin quota the plan exists to save
@@ -104,7 +104,7 @@ class HostBank:
             raw = alloc_pinned_tensor(asize + _BLK, dtype=torch.uint8)  # cudaMallocHost
             raw.zero_()  # keep the anonymous-mmap guarantee: unwritten regions stay zero
             off = (-raw.data_ptr()) % _BLK
-            self._buf = raw.numpy()[off:off + asize]
+            self._buf = raw.numpy()[off : off + asize]
             self.addr = raw.data_ptr() + off
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
@@ -115,7 +115,9 @@ class HostBank:
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False
-        self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
+        self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(
+            *shape
+        )
         self._locked = False
 
     @property
@@ -135,14 +137,21 @@ class HostBank:
         ``FREETOKEN_SKIP_BANK_PIN=1`` makes this a no-op for CPU-only tooling (the FTW converter); never set it when serving, the GPU paths need registered banks."""
         if self._pinned:
             return
-        if os.environ.get("FREETOKEN_SKIP_BANK_PIN", "").strip().lower() in ("1", "true", "yes", "on"):
+        if os.environ.get("FREETOKEN_SKIP_BANK_PIN", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
             return
         from freetoken.kernel.pinned import host_register
 
         try:
             host_register(self.addr, len(self._buf))
         except RuntimeError as exc:
-            raise PinFailed(f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB") from exc
+            raise PinFailed(
+                f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB"
+            ) from exc
         self._pinned = True
 
     def release(self) -> None:
@@ -207,15 +216,23 @@ def alloc_banks(specs: dict[str, tuple[tuple[int, ...], torch.dtype]]) -> dict[s
 
 
 def alloc_layer_banks(
-    specs: dict[str, tuple[tuple[int, ...], torch.dtype]], num_layers: int
+    specs: dict[
+        str, tuple[tuple[int, ...], torch.dtype] | list[tuple[tuple[int, ...], torch.dtype]]
+    ],
+    num_layers: int,
 ) -> dict[str, list[HostBank]]:
     """Allocate per-layer host banks: ``{name: ([num_experts, ...] row shape, dtype)}``
+    or ``{name: [([num_experts, ...] row shape, dtype) per layer]}``
     -> one independently allocated (page-aligned, independently pin/lock-able)
     ``HostBank`` per layer per name."""
-    return {
-        name: [HostBank(shape, dtype) for _ in range(num_layers)]
-        for name, (shape, dtype) in specs.items()
-    }
+    out: dict[str, list[HostBank]] = {}
+    for name, spec in specs.items():
+        if isinstance(spec, list):
+            out[name] = [HostBank(shape, dtype) for shape, dtype in spec]
+        else:
+            shape, dtype = spec
+            out[name] = [HostBank(shape, dtype) for _ in range(num_layers)]
+    return out
 
 
 class _ResidencyPlan:
@@ -275,8 +292,7 @@ def pin_banks(banks: dict[str, HostBank | list[HostBank]]) -> None:
         if isinstance(bank, list):
             for layer_id, layer_bank in enumerate(bank):
                 residency = (
-                    HostResidency.PINNED.value if plan is None
-                    else plan.residency_for(layer_id)
+                    HostResidency.PINNED.value if plan is None else plan.residency_for(layer_id)
                 )
                 _settle(layer_bank, residency)
                 if plan is not None and residency == HostResidency.LOCKED.value:
@@ -318,16 +334,19 @@ class PinPipeline:
             except BaseException as exc:  # surfaced by wait()/__exit__
                 self._exc = exc
 
-    def submit(self, bank: HostBank, residency: str = HostResidency.PINNED.value,
-               plan=None, layer_id: int | None = None) -> None:
+    def submit(
+        self,
+        bank: HostBank,
+        residency: str = HostResidency.PINNED.value,
+        plan=None,
+        layer_id: int | None = None,
+    ) -> None:
         self._q.put((bank, residency, plan, layer_id))
 
     def __call__(self, layer_id: int, banks: dict[str, HostBank]) -> None:
         """Layer-completion sink: queue every bank of the completed layer at its ambient :func:`requested_residency` label."""
         plan = _requested_residency
-        residency = (
-            HostResidency.PINNED.value if plan is None else plan.residency_for(layer_id)
-        )
+        residency = HostResidency.PINNED.value if plan is None else plan.residency_for(layer_id)
         for bank in banks.values():
             self.submit(bank, residency, plan, layer_id)
 
@@ -381,8 +400,14 @@ class LayerCompletionTracker:
             self._on_layer(layer_id, {name: per[layer_id] for name, per in self._banks.items()})
 
 
-def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
-                   chunk: int = _DEFAULT_CHUNK, drop_cache: bool = True) -> int:
+def read_file_into(
+    buf: memoryview | mmap.mmap,
+    path: str,
+    *,
+    workers: int = 8,
+    chunk: int = _DEFAULT_CHUNK,
+    drop_cache: bool = True,
+) -> int:
     """Chunked multi-threaded O_DIRECT read of the whole file ``path`` into ``buf``
     (page-aligned). Returns the file size. The buffer must be >= the rounded-up file size."""
     size = os.path.getsize(path)
@@ -400,7 +425,7 @@ def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
     def rd(o):
         want = min(chunk, len(mv) - o)
         want = min(want, ((size - o + _BLK - 1) // _BLK) * _BLK)
-        os.preadv(fd, [mv[o:o + want]], o)
+        os.preadv(fd, [mv[o : o + want]], o)
 
     try:
         if len(offs) <= 1:
@@ -426,9 +451,17 @@ def _preadv_all(fd: int, dst: memoryview, offset: int, need: int) -> None:
         done += got
 
 
-def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int, nbytes: int,
-                    dest_offset: int = 0, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
-                    drop_cache: bool = True) -> int:
+def read_range_into(
+    buf: memoryview | mmap.mmap,
+    path: str,
+    *,
+    file_offset: int,
+    nbytes: int,
+    dest_offset: int = 0,
+    workers: int = 8,
+    chunk: int = _DEFAULT_CHUNK,
+    drop_cache: bool = True,
+) -> int:
     """Chunked multi-threaded O_DIRECT read of ``path[file_offset : file_offset + nbytes]`` into ``buf`` at ``dest_offset``. Returns ``nbytes``.
 
     Byte-range counterpart of :func:`read_file_into`, for one tensor inside a shard. O_DIRECT needs the file offset AND the destination address block-aligned at the same time, which only holds when the two share their offset mod 4096 -- a safetensors data offset practically never lines up with the tensor's slot in the bank. Chunks that do line up DMA straight into ``buf``; the rest DMA into a page-aligned bounce (source window rounded out to whole blocks) and are copied into place, which also covers the unaligned head and tail.
@@ -451,7 +484,7 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
         n = min(chunk, nbytes - i)
         src, dst = file_offset + i, dest_offset + i
         if src % _BLK == 0 and (base + dst) % _BLK == 0 and n % _BLK == 0:
-            _preadv_all(fd, mv[dst:dst + n], src, n)
+            _preadv_all(fd, mv[dst : dst + n], src, n)
             return
         head = src % _BLK
         span = ((head + n + _BLK - 1) // _BLK) * _BLK
@@ -460,7 +493,7 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
             bounce = scratch.buf = mmap.mmap(-1, span)  # anonymous mmaps are page-aligned
         bmv = memoryview(bounce)
         _preadv_all(fd, bmv[:span], src - head, head + n)
-        mv[dst:dst + n] = bmv[head:head + n]
+        mv[dst : dst + n] = bmv[head : head + n]
 
     try:
         offs = list(range(0, nbytes, chunk))

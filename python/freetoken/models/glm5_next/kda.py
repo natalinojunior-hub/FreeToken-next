@@ -64,19 +64,32 @@ class Glm5NextKDA(BaseOP):
         # one fused input GEMM over q|k|v|b|f_a|g_a
         self._in_proj_split = [p, p, p, h, d, d]
         self.in_proj = LinearColParallelMerged(
-            args.hidden_size, self._in_proj_split, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.in_proj",
+            args.hidden_size,
+            self._in_proj_split,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.in_proj",
         )
         # Low-rank gate up-projections (128 -> 8192): forget gate and output gate.
-        self.f_b_proj = LinearReplicated(d, p, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.f_b_proj")
-        self.g_b_proj = LinearReplicated(d, p, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.g_b_proj")
+        self.f_b_proj = LinearReplicated(
+            d, p, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.f_b_proj"
+        )
+        self.g_b_proj = LinearReplicated(
+            d, p, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.g_b_proj"
+        )
         self.conv1d = _DepthwiseConv1d(self.conv_dim, self.conv_kernel_size)
         # Gate params stay fp32 (exp/sigmoid precision; the kernels read fp32).
         # models/weight.py exempts *.A_log / *.dt_bias from the model-dtype downcast.
         self.A_log = torch.empty(h, dtype=torch.float32)
         self.dt_bias = torch.empty(p, dtype=torch.float32)
         self.o_norm = GatedRMSNorm(d, eps=args.norm_eps, activation="sigmoid")
-        self.o_proj = LinearReplicated(p, args.hidden_size, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.o_proj")
+        self.o_proj = LinearReplicated(
+            p,
+            args.hidden_size,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.o_proj",
+        )
 
     def _conv_weight(self) -> torch.Tensor:
         return self.conv1d.weight.squeeze(1)  # [conv_dim, kernel]
@@ -109,9 +122,7 @@ class Glm5NextKDA(BaseOP):
             batch.fla_metadata = fla
 
         proj = self.in_proj.forward(hidden_states)
-        conv_in, b, f_a, g_a = torch.split(
-            proj, [self.conv_dim, h, d, d], dim=-1
-        )
+        conv_in, b, f_a, g_a = torch.split(proj, [self.conv_dim, h, d, d], dim=-1)
         g1 = self.f_b_proj.forward(f_a)  # raw forget-gate logits [T, H*D]
         g2 = self.g_b_proj.forward(g_a)  # output-gate logits [T, H*D]
         li = pool.local_index(self.layer_id)
@@ -122,11 +133,12 @@ class Glm5NextKDA(BaseOP):
             )
             bsz = mixed.shape[0]
             q, k, v = (
-                t.reshape(1, bsz, h, d).to(dtype)
-                for t in torch.split(mixed, [p, p, p], dim=-1)
+                t.reshape(1, bsz, h, d).to(dtype) for t in torch.split(mixed, [p, p, p], dim=-1)
             )
             core_out, _ = _fused_recurrent(
-                q, k, v,
+                q,
+                k,
+                v,
                 g=g1.view(1, bsz, h, d),
                 beta=b.view(1, bsz, h),
                 state_pool=pool.recurrent_states[li],
@@ -140,12 +152,15 @@ class Glm5NextKDA(BaseOP):
         else:
             x = conv_in.transpose(0, 1).contiguous()  # [conv_dim, total]
             mixed = causal_conv1d_varlen(
-                x, self._conv_weight(), pool.conv_states[li],
-                fla.cu_seqlens, fla.cache_indices, fla.has_initial_state,
+                x,
+                self._conv_weight(),
+                pool.conv_states[li],
+                fla.cu_seqlens,
+                fla.cache_indices,
+                fla.has_initial_state,
             ).transpose(0, 1)
             q, k, v = (
-                t.reshape(1, total, h, d).to(dtype)
-                for t in torch.split(mixed, [p, p, p], dim=-1)
+                t.reshape(1, total, h, d).to(dtype) for t in torch.split(mixed, [p, p, p], dim=-1)
             )
             # Fresh sequences start from a zeroed slot; then gather every request's
             # initial state (the chunk kernel takes it dense, [N, H, D, D]).
@@ -159,7 +174,9 @@ class Glm5NextKDA(BaseOP):
 
             track = fla.track_dst is not None
             result = chunk_kda_with_fused_gate(
-                q=q, k=k, v=v,  # NOTE: v (ephemeral conv output) is clobbered
+                q=q,
+                k=k,
+                v=v,  # NOTE: v (ephemeral conv output) is clobbered
                 raw_g=g1.view(1, total, h, d),
                 beta=b.float().sigmoid().view(1, total, h),
                 A_log=self.A_log,
@@ -186,15 +203,29 @@ class Glm5NextKDA(BaseOP):
 
 
 def _fused_recurrent(
-    q, k, v, g, beta, state_pool, indices, cu_seqlens,
-    a_log, dt_bias, lower_bound, scale,
+    q,
+    k,
+    v,
+    g,
+    beta,
+    state_pool,
+    indices,
+    cu_seqlens,
+    a_log,
+    dt_bias,
+    lower_bound,
+    scale,
 ):
     """Decode via the vendored recurrent kernel: gate + beta-sigmoid + q/k l2norm
     in-kernel, state read/written in place at ``indices`` (int32, 1 token/req)."""
     from freetoken.kernel.fla import fused_recurrent_kda
 
     return fused_recurrent_kda(
-        q=q, k=k, v=v, g=g, beta=beta,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
         scale=scale,
         initial_state=state_pool,
         use_qk_l2norm_in_kernel=True,

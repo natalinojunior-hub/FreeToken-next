@@ -111,14 +111,20 @@ def gguf_expert_specs(
     out = {}
     for name, elems in (("gate_up", H), ("down", I)):
         distinct = sorted(set(types[name]))
-        if len(distinct) != 1:
-            raise ValueError(
-                f"expert bank {name!r} mixes ggml types across layers ({distinct}); a bank "
-                f"must be uniform because its slot pool is one allocation with one stride"
-            )
-        rb = row_bytes(elems, distinct[0])
-        shape = (E, 2 * I, rb) if name == "gate_up" else (E, H, rb)
-        out[name] = (shape, torch.uint8)
+        if len(distinct) == 1:
+            rb = row_bytes(elems, distinct[0])
+            shape = (E, 2 * I, rb) if name == "gate_up" else (E, H, rb)
+            out[name] = (shape, torch.uint8)
+        else:
+            out[name] = [
+                (
+                    (E, 2 * I, row_bytes(elems, t))
+                    if name == "gate_up"
+                    else (E, H, row_bytes(elems, t)),
+                    torch.uint8,
+                )
+                for t in types[name]
+            ]
     return out
 
 
@@ -194,7 +200,7 @@ def load_gguf_expert_sources(
                 # expert-major order. Reshaping to [E, H, row_bytes(I)] is therefore a
                 # plain view, no data movement. (The row_bytes is over I, the fastest
                 # dim, not over E.)
-                down_row_bytes = specs["down"][0][2]
+                down_row_bytes = row_bytes(I, types["down"][layer])
                 banks["down"][layer].copy_(t.packed().reshape(E, H, down_row_bytes))
                 seen_down.add(layer)
                 if tracker is not None:
@@ -205,7 +211,7 @@ def load_gguf_expert_sources(
 
             # Emit gate_up bank once both gate and up are present.
             if layer in gate_buf and layer in up_buf:
-                rb = specs["gate_up"][0][2]
+                rb = row_bytes(H, types["gate_up"][layer])
                 # gate and up each arrive as [rows, row_bytes] = [E*I, row_bytes(H)], and
                 # ggml's fastest-first dims [H, I, E] make E the slowest axis, so those rows
                 # are EXPERT-MAJOR: expert e owns rows [e*I, (e+1)*I).

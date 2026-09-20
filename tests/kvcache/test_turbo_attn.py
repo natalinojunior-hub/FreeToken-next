@@ -19,17 +19,54 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a C
 
 @triton.jit
 def _probe_tiles(
-    codes_ptr, norm_ptr, cent_ptr, k_out_ptr, v_out_ptr,
-    stride_ct, stride_ch, stride_nt, stride_nh,
-    D: tl.constexpr, N: tl.constexpr, CB: tl.constexpr, BOOK3: tl.constexpr, NREAL: tl.constexpr,
+    codes_ptr,
+    norm_ptr,
+    cent_ptr,
+    k_out_ptr,
+    v_out_ptr,
+    stride_ct,
+    stride_ch,
+    stride_nt,
+    stride_nh,
+    D: tl.constexpr,
+    N: tl.constexpr,
+    CB: tl.constexpr,
+    BOOK3: tl.constexpr,
+    NREAL: tl.constexpr,
 ):
     offs_d = tl.arange(0, D)
     slots = tl.arange(0, N)
     mask = slots < NREAL
-    kt = turbo_k_tile(codes_ptr, norm_ptr, cent_ptr, slots, 0, stride_ct, stride_ch,
-                      stride_nt, stride_nh, offs_d, mask, BOOK3, tl.float32)
-    vt = turbo_v_tile(codes_ptr, norm_ptr, cent_ptr, slots, 0, stride_ct, stride_ch,
-                      stride_nt, stride_nh, offs_d, mask, BOOK3, tl.float32)
+    kt = turbo_k_tile(
+        codes_ptr,
+        norm_ptr,
+        cent_ptr,
+        slots,
+        0,
+        stride_ct,
+        stride_ch,
+        stride_nt,
+        stride_nh,
+        offs_d,
+        mask,
+        BOOK3,
+        tl.float32,
+    )
+    vt = turbo_v_tile(
+        codes_ptr,
+        norm_ptr,
+        cent_ptr,
+        slots,
+        0,
+        stride_ct,
+        stride_ch,
+        stride_nt,
+        stride_nh,
+        offs_d,
+        mask,
+        BOOK3,
+        tl.float32,
+    )
     tl.store(k_out_ptr + offs_d[:, None] * N + slots[None, :], kt)
     tl.store(v_out_ptr + slots[:, None] * D + offs_d[None, :], vt)
 
@@ -55,10 +92,20 @@ def test_tile_readers_reconstruct_exactly_what_the_codec_stored(book, head_dim):
     k_out = torch.empty(head_dim, tokens, device=device, dtype=torch.float32)
     v_out = torch.empty(tokens, head_dim, device=device, dtype=torch.float32)
     _probe_tiles[(1,)](
-        codes4, norm2, cent_t, k_out, v_out,
-        stride_ct=groups * tk.CODE_BYTES[book], stride_ch=groups * tk.CODE_BYTES[book],
-        stride_nt=groups, stride_nh=groups,
-        D=head_dim, N=tokens, CB=tk.CODE_BYTES[book], BOOK3=book == "turbo3", NREAL=tokens,
+        codes4,
+        norm2,
+        cent_t,
+        k_out,
+        v_out,
+        stride_ct=groups * tk.CODE_BYTES[book],
+        stride_ch=groups * tk.CODE_BYTES[book],
+        stride_nt=groups,
+        stride_nh=groups,
+        D=head_dim,
+        N=tokens,
+        CB=tk.CODE_BYTES[book],
+        BOOK3=book == "turbo3",
+        NREAL=tokens,
     )
     want = tk.decode_rotated(codes, norm, book)  # [tokens, head_dim]
     assert torch.equal(k_out.T.contiguous(), want), "K tile must equal the stored rotated values"
@@ -80,10 +127,20 @@ def test_masked_lanes_read_zero(book):
     k_out = torch.zeros(tk.QK_TURBO, tokens, device=device, dtype=torch.float32)
     v_out = torch.zeros(tokens, tk.QK_TURBO, device=device, dtype=torch.float32)
     _probe_tiles[(1,)](
-        codes4, norm2, cent_t, k_out, v_out,
-        stride_ct=tk.CODE_BYTES[book], stride_ch=tk.CODE_BYTES[book],
-        stride_nt=1, stride_nh=1,
-        D=tk.QK_TURBO, N=tokens, CB=tk.CODE_BYTES[book], BOOK3=book == "turbo3", NREAL=real,
+        codes4,
+        norm2,
+        cent_t,
+        k_out,
+        v_out,
+        stride_ct=tk.CODE_BYTES[book],
+        stride_ch=tk.CODE_BYTES[book],
+        stride_nt=1,
+        stride_nh=1,
+        D=tk.QK_TURBO,
+        N=tokens,
+        CB=tk.CODE_BYTES[book],
+        BOOK3=book == "turbo3",
+        NREAL=real,
     )
     want = tk.decode_rotated(codes, norm, book)
     assert torch.equal(k_out[:, :real], want[:real].T.contiguous())

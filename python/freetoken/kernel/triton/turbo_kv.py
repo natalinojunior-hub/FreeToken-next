@@ -26,39 +26,312 @@ FWHT_SCALE = 0.08838834764831845  # 1/sqrt(128), folded inside the butterfly
 # tests/kvcache/test_turbo_kv.py: a hand-typed sign array is where a codec goes silently wrong,
 # and the first transcription here was 127 long.
 SIGNS1 = (
-    -1, 1, 1, -1, -1, 1, -1, 1, -1, -1, 1, 1, 1, 1, 1, 1,
-    1, -1, 1, -1, 1, -1, -1, 1, 1, 1, -1, 1, 1, -1, -1, -1,
-    -1, 1, 1, -1, 1, 1, -1, 1, -1, 1, 1, -1, -1, 1, -1, 1,
-    1, 1, 1, -1, -1, -1, -1, -1, 1, -1, 1, 1, 1, 1, -1, 1,
-    -1, -1, 1, -1, -1, -1, 1, -1, -1, -1, 1, -1, -1, -1, 1, 1,
-    1, -1, -1, 1, 1, 1, -1, -1, 1, 1, -1, 1, 1, -1, 1, -1,
-    -1, 1, 1, -1, 1, -1, 1, -1, 1, 1, 1, 1, -1, 1, -1, 1,
-    1, -1, 1, 1, -1, -1, -1, -1, -1, 1, 1, -1, 1, 1, -1, 1,
+    -1,
+    1,
+    1,
+    -1,
+    -1,
+    1,
+    -1,
+    1,
+    -1,
+    -1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    -1,
+    1,
+    -1,
+    1,
+    -1,
+    -1,
+    1,
+    1,
+    1,
+    -1,
+    1,
+    1,
+    -1,
+    -1,
+    -1,
+    -1,
+    1,
+    1,
+    -1,
+    1,
+    1,
+    -1,
+    1,
+    -1,
+    1,
+    1,
+    -1,
+    -1,
+    1,
+    -1,
+    1,
+    1,
+    1,
+    1,
+    -1,
+    -1,
+    -1,
+    -1,
+    -1,
+    1,
+    -1,
+    1,
+    1,
+    1,
+    1,
+    -1,
+    1,
+    -1,
+    -1,
+    1,
+    -1,
+    -1,
+    -1,
+    1,
+    -1,
+    -1,
+    -1,
+    1,
+    -1,
+    -1,
+    -1,
+    1,
+    1,
+    1,
+    -1,
+    -1,
+    1,
+    1,
+    1,
+    -1,
+    -1,
+    1,
+    1,
+    -1,
+    1,
+    1,
+    -1,
+    1,
+    -1,
+    -1,
+    1,
+    1,
+    -1,
+    1,
+    -1,
+    1,
+    -1,
+    1,
+    1,
+    1,
+    1,
+    -1,
+    1,
+    -1,
+    1,
+    1,
+    -1,
+    1,
+    1,
+    -1,
+    -1,
+    -1,
+    -1,
+    -1,
+    1,
+    1,
+    -1,
+    1,
+    1,
+    -1,
+    1,
 )
 SIGNS2 = (
-    1, 1, 1, 1, -1, 1, 1, -1, 1, -1, -1, -1, 1, -1, -1, -1,
-    1, 1, -1, -1, 1, -1, 1, -1, 1, -1, -1, 1, -1, 1, 1, 1,
-    1, 1, -1, -1, -1, 1, -1, -1, -1, -1, -1, -1, 1, 1, 1, -1,
-    1, -1, 1, 1, 1, -1, -1, 1, -1, -1, -1, -1, -1, -1, 1, 1,
-    1, -1, 1, -1, -1, -1, -1, 1, -1, 1, -1, 1, -1, -1, 1, 1,
-    -1, 1, -1, 1, 1, -1, 1, -1, -1, -1, -1, 1, -1, -1, 1, -1,
-    1, -1, 1, 1, 1, -1, -1, 1, -1, 1, -1, 1, 1, -1, -1, 1,
-    -1, 1, -1, 1, 1, -1, 1, -1, 1, -1, -1, -1, -1, -1, 1, -1,
+    1,
+    1,
+    1,
+    1,
+    -1,
+    1,
+    1,
+    -1,
+    1,
+    -1,
+    -1,
+    -1,
+    1,
+    -1,
+    -1,
+    -1,
+    1,
+    1,
+    -1,
+    -1,
+    1,
+    -1,
+    1,
+    -1,
+    1,
+    -1,
+    -1,
+    1,
+    -1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    -1,
+    -1,
+    -1,
+    1,
+    -1,
+    -1,
+    -1,
+    -1,
+    -1,
+    -1,
+    1,
+    1,
+    1,
+    -1,
+    1,
+    -1,
+    1,
+    1,
+    1,
+    -1,
+    -1,
+    1,
+    -1,
+    -1,
+    -1,
+    -1,
+    -1,
+    -1,
+    1,
+    1,
+    1,
+    -1,
+    1,
+    -1,
+    -1,
+    -1,
+    -1,
+    1,
+    -1,
+    1,
+    -1,
+    1,
+    -1,
+    -1,
+    1,
+    1,
+    -1,
+    1,
+    -1,
+    1,
+    1,
+    -1,
+    1,
+    -1,
+    -1,
+    -1,
+    -1,
+    1,
+    -1,
+    -1,
+    1,
+    -1,
+    1,
+    -1,
+    1,
+    1,
+    1,
+    -1,
+    -1,
+    1,
+    -1,
+    1,
+    -1,
+    1,
+    1,
+    -1,
+    -1,
+    1,
+    -1,
+    1,
+    -1,
+    1,
+    1,
+    -1,
+    1,
+    -1,
+    1,
+    -1,
+    -1,
+    -1,
+    -1,
+    -1,
+    1,
+    -1,
 )
 
 # Lloyd-Max books for N(0, 1/128) coordinates after normalize+rotate (stock default, SKEW=0).
 CENTROIDS_3 = (
-    -0.190685, -0.117832, -0.065717, -0.021460,
-    0.021460, 0.065717, 0.117832, 0.190685,
+    -0.190685,
+    -0.117832,
+    -0.065717,
+    -0.021460,
+    0.021460,
+    0.065717,
+    0.117832,
+    0.190685,
 )
 MID_3 = (-0.154259, -0.091775, -0.043589, 0.0, 0.043589, 0.091775, 0.154259)
 CENTROIDS_4 = (
-    -0.241556, -0.182907, -0.143047, -0.111065, -0.083317, -0.058069, -0.034311, -0.011353,
-    0.011353, 0.034311, 0.058069, 0.083317, 0.111065, 0.143047, 0.182907, 0.241556,
+    -0.241556,
+    -0.182907,
+    -0.143047,
+    -0.111065,
+    -0.083317,
+    -0.058069,
+    -0.034311,
+    -0.011353,
+    0.011353,
+    0.034311,
+    0.058069,
+    0.083317,
+    0.111065,
+    0.143047,
+    0.182907,
+    0.241556,
 )
 MID_4 = (
-    -0.212232, -0.162977, -0.127056, -0.097191, -0.070693, -0.046190, -0.022832, 0.0,
-    0.022832, 0.046190, 0.070693, 0.097191, 0.127056, 0.162977, 0.212232,
+    -0.212232,
+    -0.162977,
+    -0.127056,
+    -0.097191,
+    -0.070693,
+    -0.046190,
+    -0.022832,
+    0.0,
+    0.022832,
+    0.046190,
+    0.070693,
+    0.097191,
+    0.127056,
+    0.162977,
+    0.212232,
 )
 
 # Packed payload bytes per 128-element group, excluding the fp16 norm.
@@ -179,7 +452,9 @@ def _normalize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-group L2 normalize; a group whose norm is <= 1e-10 encodes as all-zero scaled."""
     groups = x.reshape(-1, QK_TURBO).float()
     grp_norm = groups.norm(dim=-1)
-    inv = torch.where(grp_norm > 1e-10, 1.0 / torch.clamp(grp_norm, min=1e-10), torch.zeros_like(grp_norm))
+    inv = torch.where(
+        grp_norm > 1e-10, 1.0 / torch.clamp(grp_norm, min=1e-10), torch.zeros_like(grp_norm)
+    )
     return groups * inv.unsqueeze(-1), grp_norm
 
 
@@ -205,7 +480,9 @@ def pack(idx: torch.Tensor, book: str) -> torch.Tensor:
         q = idx.reshape(rows, groups, QK_TURBO // 2, 2)
         return (q[:, :, :, 0] | (q[:, :, :, 1] << 4)).reshape(rows, -1).contiguous()
     two = (idx & 0x3).reshape(rows, groups, QK_TURBO // 4, 4)
-    words = two[:, :, :, 0] | (two[:, :, :, 1] << 2) | (two[:, :, :, 2] << 4) | (two[:, :, :, 3] << 6)
+    words = (
+        two[:, :, :, 0] | (two[:, :, :, 1] << 2) | (two[:, :, :, 2] << 4) | (two[:, :, :, 3] << 6)
+    )
     third = ((idx >> 2) & 1).reshape(rows, groups, QK_TURBO // 8, 8)
     shifts = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=idx.device, dtype=torch.int32)
     bits = (third * shifts).sum(-1).to(torch.uint8)
@@ -220,12 +497,16 @@ def unpack(codes: torch.Tensor, book: str) -> torch.Tensor:
         q = codes.reshape(-1, groups, QK_TURBO // 2, 1)
         even = q & 0xF
         odd = q >> 4
-        return torch.cat((even, odd), dim=-1).reshape(codes.shape[0], groups * QK_TURBO).to(torch.int64)
+        return (
+            torch.cat((even, odd), dim=-1)
+            .reshape(codes.shape[0], groups * QK_TURBO)
+            .to(torch.int64)
+        )
     rows = codes.shape[0]
     # group-major: each group writes its 32 word bytes then its 16 third-bit bytes, so the slice
     # has to be per group. Slicing "all words, then all bits" is only right when groups == 1.
     grouped = codes.reshape(rows, groups, CODE_BYTES[book])
-    words = grouped[:, :, : 32].reshape(rows, groups, QK_TURBO // 4, 1)
+    words = grouped[:, :, :32].reshape(rows, groups, QK_TURBO // 4, 1)
     bits = grouped[:, :, 32:].reshape(rows, groups, QK_TURBO // 8, 1)
     sh4 = torch.tensor([0, 2, 4, 6], device=codes.device, dtype=torch.uint8)
     low = (words >> sh4) & 0x3
@@ -255,7 +536,9 @@ def quantize(x: torch.Tensor, book: str) -> tuple[torch.Tensor, torch.Tensor]:
     recon = cent[idx.long()].pow(2).sum(-1).sqrt()
     scale = torch.where(recon > 1e-10, grp_norm / recon, torch.zeros_like(recon))
     groups = x.shape[-1] // QK_TURBO
-    return pack(idx.reshape(x.shape[0], -1), book), scale.reshape(x.shape[0], groups).to(torch.float16)
+    return pack(idx.reshape(x.shape[0], -1), book), scale.reshape(x.shape[0], groups).to(
+        torch.float16
+    )
 
 
 def decode_rotated(codes: torch.Tensor, norm: torch.Tensor, book: str) -> torch.Tensor:
@@ -263,12 +546,7 @@ def decode_rotated(codes: torch.Tensor, norm: torch.Tensor, book: str) -> torch.
     cent, _ = _book(codes.device, book)
     idx = unpack(codes, book)  # [rows, groups * 128]
     groups = idx.shape[1] // QK_TURBO
-    scale = (
-        norm.reshape(-1, groups, 1)
-        .expand(-1, -1, QK_TURBO)
-        .reshape(idx.shape[0], -1)
-        .float()
-    )
+    scale = norm.reshape(-1, groups, 1).expand(-1, -1, QK_TURBO).reshape(idx.shape[0], -1).float()
     return cent[idx] * scale
 
 

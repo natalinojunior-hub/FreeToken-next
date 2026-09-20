@@ -126,6 +126,7 @@ where = ["python"]
 "*" = ["csrc/**/*", "moe/configs/**/*.json"]
 
 [tool.pytest.ini_options]
+pythonpath = [".", "python"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "--timeout=60"

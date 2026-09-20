@@ -56,9 +56,7 @@ _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
 
 # The n-gram table itself: too big for the dense state dict, loaded by load_ple_table.
 _PLE_TABLE_INFIX = ".ple.ple_embedding.ngram_embedding."
-_PLE_SHARD_RE = re.compile(
-    r"\.ple\.ple_embedding\.ngram_embedding\.shard_(?P<shard>\d+)\.weight$"
-)
+_PLE_SHARD_RE = re.compile(r"\.ple\.ple_embedding\.ngram_embedding\.shard_(?P<shard>\d+)\.weight$")
 _PLE_SCALE_SUFFIX = ".ple.ple_embedding.ngram_embedding.weight_scale"
 _PLE_FILE_BYTES = 4 << 30  # ple-table-*.safetensors written by ftw_side_files
 
@@ -115,7 +113,9 @@ class _DenseFuser:
 
     def __init__(self, quant, packed: tuple[tuple[str, tuple[str, ...]], ...]) -> None:
         self.quant = quant
-        self.groups = {fused: parts for fused, parts in packed if fused != "experts"}  # experts: bank reader
+        self.groups = {
+            fused: parts for fused, parts in packed if fused != "experts"
+        }  # experts: bank reader
         self.by_part: dict[str, list[tuple[str, int]]] = {}
         for fused, parts in self.groups.items():
             for idx, part in enumerate(parts):
@@ -135,7 +135,9 @@ class _DenseFuser:
             keep = {"in_proj_qkvz", "in_proj_ba"} if split else {"in_proj"}
             candidates = [c for c in candidates if c[0] in keep]
             if not candidates:
-                raise ValueError(f"{parent}.{leaf}: no merged projection for the {'split' if split else 'fused'} GDN layout")
+                raise ValueError(
+                    f"{parent}.{leaf}: no merged projection for the {'split' if split else 'fused'} GDN layout"
+                )
         fused, idx = candidates[0]
         if fused in _PAD_TO and not parent.endswith(_HC_WITH_INJECT):
             return None
@@ -146,19 +148,27 @@ class _DenseFuser:
         scheme = self.scheme(module)
         if name.endswith(".weight_scale_inv"):
             if scheme is None or not scheme.has("weight_scale_inv"):
-                raise ValueError(f"{name}: {module} has no block scale in the checkpoint's quant config ({scheme})")
+                raise ValueError(
+                    f"{name}: {module} has no block scale in the checkpoint's quant config ({scheme})"
+                )
             return
         is_fp8 = tensor.dtype in _FP8_DTYPES
         if scheme is None:
             if is_fp8:
-                raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} unquantized")
+                raise ValueError(
+                    f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} unquantized"
+                )
             return
         expected = _ELEM_DTYPES.get(scheme.weight.elem)
         if expected is not None and tensor.dtype is not expected:
-            raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} {scheme}")
-        rows, cols = (scheme.weight.group or (1, 1))
+            raise ValueError(
+                f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} {scheme}"
+            )
+        rows, cols = scheme.weight.group or (1, 1)
         if rows > 1 and tensor.shape[0] % rows or cols > 1 and tensor.shape[1] % cols:
-            raise ValueError(f"{name}: {tuple(tensor.shape)} is not a multiple of the {rows}x{cols} scale block of {module}")
+            raise ValueError(
+                f"{name}: {tuple(tensor.shape)} is not a multiple of the {rows}x{cols} scale block of {module}"
+            )
 
     def check_unfused(self, name: str, tensor: torch.Tensor) -> None:
         module, kind = _split_kind(name)
@@ -186,7 +196,9 @@ class _DenseFuser:
         pad_to = _PAD_TO.get(fused.rpartition(".")[2], 0) if kind == ".weight" else 0
         pad = (-sum(t.shape[0] for t in rows)) % pad_to if pad_to else 0
         if pad:
-            rows.append(torch.zeros(pad, *rows[0].shape[1:], dtype=rows[0].dtype, device=rows[0].device))
+            rows.append(
+                torch.zeros(pad, *rows[0].shape[1:], dtype=rows[0].dtype, device=rows[0].device)
+            )
         return [(fused + kind, torch.cat(rows, dim=0))]
 
 
@@ -254,6 +266,13 @@ def iter_mtp_weights(
     """
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen4_exp MTP loading supports TP=1 only")
+    from freetoken.models.gguf.reader import is_gguf_path
+
+    if is_gguf_path(model_path):
+        from .gguf import iter_gguf_mtp_weights
+
+        yield from iter_gguf_mtp_weights(model_path, device)
+        return
     hf_config = cached_load_hf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
     fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping)
@@ -271,10 +290,14 @@ def iter_mtp_weights(
                     yield raw_name, tensor
                 else:
                     yield from fused
-    assert not fuser.buf, f"Incomplete MTP projection fusions: {sorted(k[0] + k[1] for k in fuser.buf)}"
+    assert not fuser.buf, (
+        f"Incomplete MTP projection fusions: {sorted(k[0] + k[1] for k in fuser.buf)}"
+    )
 
 
-def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+def iter_vision_weights(
+    model_path: str, device: torch.device
+) -> Iterator[tuple[str, torch.Tensor]]:
     """The vision tower alone, named as iter_weights names it."""
     for file in iter_weight_files(model_path):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
@@ -361,8 +384,9 @@ def ftw_side_files(model_path: str, out_dir: str) -> list[str]:
     return written
 
 
-def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
-                   workers: int = 8, chunk: int = 8 << 20) -> PleTable:
+def load_ple_table(
+    model_path: str, qwen4_args, *, pin: bool = True, workers: int = 8, chunk: int = 8 << 20
+) -> PleTable:
     """Concatenate the checkpoint's ``ngram_embedding.shard_<i>`` tensors into one pinned host bank.
 
     The checkpoint splits the table into ``split_ngram_parts`` equal row blocks named by shard
@@ -413,8 +437,15 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
         for shard in range(expected):
             path, offset, nbytes = parts[shard]
             assert nbytes == shard_bytes, f"PLE shard {shard} is {nbytes} B, expected {shard_bytes}"
-            read_range_into(buf, path, file_offset=offset, nbytes=nbytes,
-                            dest_offset=shard * shard_bytes, workers=workers, chunk=chunk)
+            read_range_into(
+                buf,
+                path,
+                file_offset=offset,
+                nbytes=nbytes,
+                dest_offset=shard * shard_bytes,
+                workers=workers,
+                chunk=chunk,
+            )
             bar.update(nbytes)
     finally:
         bar.close()

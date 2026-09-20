@@ -35,8 +35,10 @@ logger = init_logger(__name__)
 
 def _context(ids: torch.Tensor, position: int, eos: int) -> list[int]:
     """The two token ids before ``position``; eos pads past the start."""
-    return [int(ids[position - 2]) if position >= 2 else eos,
-            int(ids[position - 1]) if position >= 1 else eos]
+    return [
+        int(ids[position - 2]) if position >= 2 else eos,
+        int(ids[position - 1]) if position >= 1 else eos,
+    ]
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,8 @@ class PleRowSource:
     row_bytes: int
     row_stride: int
     scale: float
+    quant_type: int | None = None
+    embed_dim: int | None = None
 
     @property
     def total_rows(self) -> int:
@@ -76,7 +80,9 @@ def source_from_safetensors(folder: str) -> PleRowSource:
             if match is None:
                 continue
             if meta["dtype"] != _PLE_ST_DTYPE:
-                raise ValueError(f"PLE shard {key} has dtype {meta['dtype']}, expected {_PLE_ST_DTYPE}")
+                raise ValueError(
+                    f"PLE shard {key} has dtype {meta['dtype']}, expected {_PLE_ST_DTYPE}"
+                )
             if rows and tuple(meta["shape"]) != (rows, cols):
                 raise ValueError(f"PLE shard {key} is {meta['shape']}, expected {[rows, cols]}")
             rows, cols = meta["shape"]
@@ -92,11 +98,46 @@ def source_from_safetensors(folder: str) -> PleRowSource:
     if scale is None:
         raise ValueError("PLE table has no weight_scale")
     order = [shards[i] for i in range(len(shards))]
-    return PleRowSource(paths, [f for f, _ in order], [b for _, b in order], rows, cols, cols, float(scale))
+    return PleRowSource(
+        paths, [f for f, _ in order], [b for _, b in order], rows, cols, cols, float(scale)
+    )
+
+
+def source_from_gguf(path: str) -> PleRowSource:
+    """Map the checkpoint's GGUF ``per_layer_token_embd.weight`` tensor in place."""
+    from freetoken.models.gguf.dequant import row_bytes as calc_row_bytes
+    from freetoken.models.gguf.reader import _reader, gguf_shards
+
+    shards = gguf_shards(path)
+    for shard_path in shards:
+        reader = _reader(shard_path)
+        for t in reader.tensors:
+            if t.name == "per_layer_token_embd.weight":
+                ne = [int(s) for s in t.shape]
+                embed_dim = ne[0]
+                rows = int(ne[1]) if len(ne) > 1 else 1
+                qtype = int(t.tensor_type)
+                r_bytes = calc_row_bytes(embed_dim, qtype)
+                return PleRowSource(
+                    paths=[shard_path],
+                    extent_file=[0],
+                    extent_base=[int(t.data_offset)],
+                    rows_per_extent=rows,
+                    row_bytes=r_bytes,
+                    row_stride=r_bytes,
+                    scale=1.0,
+                    quant_type=qtype,
+                    embed_dim=embed_dim,
+                )
+    raise ValueError(f"No 'per_layer_token_embd.weight' found in GGUF shards for {path}")
 
 
 def resolve_row_source(folder: str) -> PleRowSource:
     """Pick the row source for a checkpoint; the seam where a repacked format would plug in."""
+    from freetoken.models.gguf.reader import is_gguf_path
+
+    if is_gguf_path(folder):
+        return source_from_gguf(folder)
     return source_from_safetensors(folder)
 
 
@@ -115,7 +156,11 @@ class DiskRowTable:
         from freetoken.kernel import _ple_store
 
         self.num_rows = source.total_rows
-        self.head_dim = source.row_bytes  # fp8: one byte per element
+        self.head_dim = source.row_bytes  # packed row bytes
+        self.quant_type = getattr(source, "quant_type", None)
+        self.embed_dim = getattr(source, "embed_dim", None) or hash_constants.get(
+            "ngram_head_dim", 160
+        )
         self.dtype = dtype
         self.heads = int(hash_constants["num_ngram_heads"])
         self.scale = source.scale
@@ -144,7 +189,9 @@ class DiskRowTable:
         self._device = torch.device("cuda", torch.cuda.current_device())
         self._token_bytes = self.heads * self.head_dim
         # allocated up front: pinned alloc inside stream capture is illegal; one replay consumes it at a time
-        self._graph_pinned = alloc_pinned_tensor(max_graph_rows * self._token_bytes, dtype=torch.uint8)
+        self._graph_pinned = alloc_pinned_tensor(
+            max_graph_rows * self._token_bytes, dtype=torch.uint8
+        )
         self._graph_pinned.zero_()  # padded decode lanes read whatever sits here
         # outlives any one graph: a cache rebuild recaptures against the same pointer
         self._graph_dev = torch.empty(
@@ -190,7 +237,9 @@ class DiskRowTable:
         pinned = self._graph_pinned if graph else self._eager_pinned
         offset = 0
         for run in runs:
-            self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
+            self._store.stage(
+                run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes
+            )
             offset += run.numel() - 2
         self._store.flush(self._flag.data_ptr() if graph and self._wait_sync else 0)
 
@@ -202,7 +251,10 @@ class DiskRowTable:
     def _ple_context(self, ids: torch.Tensor, position: int) -> list[int]:
         if self.image_token_id is None:
             return _context(ids, position, self.eos_token_id)
-        return [self.image_token_id if t >= MM_PAD_SHIFT_VALUE else t for t in _context(ids, position, self.eos_token_id)]
+        return [
+            self.image_token_id if t >= MM_PAD_SHIFT_VALUE else t
+            for t in _context(ids, position, self.eos_token_id)
+        ]
 
     def host_fill_batch(self, batch: Batch, use_graph: bool):
         """Stage this batch's rows; returns the post-dispatch fill callable under flag-sync, else None."""
@@ -218,8 +270,13 @@ class DiskRowTable:
                     try:
                         self._readback_event.synchronize()
                         tokens = self._token_readback[:bs].to(torch.int64).tolist()
-                        runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), t], dtype=torch.int64)
-                                for r, t in zip(reqs, tokens)]
+                        runs = [
+                            torch.tensor(
+                                [*self._ple_context(r.input_ids, r.device_len - 1), t],
+                                dtype=torch.int64,
+                            )
+                            for r, t in zip(reqs, tokens)
+                        ]
                         self.fill(runs, graph=True)
                     except BaseException:
                         from freetoken.kernel import _ple_store
@@ -231,15 +288,23 @@ class DiskRowTable:
                 return _complete
             # launch-gating: this D2H is the step's readback and orders the fill after sampling
             tokens = batch.input_ids.to("cpu").to(torch.int64).tolist()
-            runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), t], dtype=torch.int64)
-                    for r, t in zip(reqs, tokens)]
+            runs = [
+                torch.tensor(
+                    [*self._ple_context(r.input_ids, r.device_len - 1), t], dtype=torch.int64
+                )
+                for r, t in zip(reqs, tokens)
+            ]
             self.fill(runs, graph=use_graph)
             return None
         runs = [
-            torch.cat((
-                torch.tensor(self._ple_context(req.input_ids, req.cached_len), dtype=torch.int64),
-                self._ple_ids(req.input_ids[req.cached_len : req.device_len]).to(torch.int64),
-            ))
+            torch.cat(
+                (
+                    torch.tensor(
+                        self._ple_context(req.input_ids, req.cached_len), dtype=torch.int64
+                    ),
+                    self._ple_ids(req.input_ids[req.cached_len : req.device_len]).to(torch.int64),
+                )
+            )
             for req in batch.padded_reqs
         ]
         self.fill(runs, graph=False)
@@ -266,13 +331,24 @@ class DiskRowTable:
                 torch.cuda.current_stream(self._device).cuda_stream, self._flag.data_ptr()
             )
         pinned, dev = (
-            (self._graph_pinned, self._graph_dev) if capturing else (self._eager_pinned, self._eager_dev)
+            (self._graph_pinned, self._graph_dev)
+            if capturing
+            else (self._eager_pinned, self._eager_dev)
         )
         nbytes = rows * self._token_bytes
         dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
-        values = dev[:nbytes].view(torch.float8_e4m3fn).to(self.dtype)
-        if self.scale != 1.0:
-            values = values * self.scale
+        if self.quant_type is not None:
+            from freetoken.kernel.gguf import ggml_dequantize
+
+            total_items = rows * self.heads
+            packed = dev[:nbytes].view(total_items, self.head_dim)
+            values = ggml_dequantize(
+                packed, self.quant_type, total_items, self.embed_dim, self.dtype
+            )
+        else:
+            values = dev[:nbytes].view(torch.float8_e4m3fn).to(self.dtype)
+            if self.scale != 1.0:
+                values = values * self.scale
         values = values.view(*row_ids.shape[:-1], -1)
         if out is None:
             return values

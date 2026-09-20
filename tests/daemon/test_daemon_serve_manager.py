@@ -477,9 +477,7 @@ def test_crash_during_failed_prepare_still_persists_receipt_and_never_restarts(t
         sp.children[0].die(1, "exited")
         raise AccountingPrepareError("connection lost")
 
-    mgr, _, _ = make_manager(
-        tmp_path, sp, prepare_stop=prepare, auto_restart=True
-    )
+    mgr, _, _ = make_manager(tmp_path, sp, prepare_stop=prepare, auto_restart=True)
     mgr.start("m", 1919, [])
     with pytest.raises(AccountingPrepareError, match="connection lost"):
         mgr.stop()
@@ -498,9 +496,7 @@ def test_prepare_failure_keeps_stop_latch_for_a_later_crash(tmp_path):
     def prepare(_port):
         raise AccountingPrepareError("outbox unavailable")
 
-    mgr, _, _ = make_manager(
-        tmp_path, sp, prepare_stop=prepare, auto_restart=True
-    )
+    mgr, _, _ = make_manager(tmp_path, sp, prepare_stop=prepare, auto_restart=True)
     started = mgr.start("m", 1919, [])
     with pytest.raises(AccountingPrepareError, match="outbox unavailable"):
         mgr.stop()
@@ -547,7 +543,9 @@ def test_stop_during_inflight_start_stops_the_new_serve(tmp_path):
     a.join(3)
     b.join(3)
     assert results["stop"]["stopped"] is True
-    assert wait_until(lambda: mgr.status()["running"] is False)  # new serve was stopped, not left up
+    assert wait_until(
+        lambda: mgr.status()["running"] is False
+    )  # new serve was stopped, not left up
 
 
 def test_auto_restart_does_not_resurrect_after_user_stop(tmp_path):
@@ -715,8 +713,13 @@ def test_readopt_attaches_running_serve(tmp_path):
 
     ring = LogRing()
     mgr = ServeManager(
-        ring, store, spawn_fn=sp, adopt_fn=lambda state: adopted, tailer_factory=None,
-        signal_fn=lambda p, s: None, apply_oom=False,
+        ring,
+        store,
+        spawn_fn=sp,
+        adopt_fn=lambda state: adopted,
+        tailer_factory=None,
+        signal_fn=lambda p, s: None,
+        apply_oom=False,
     )
     assert mgr.readopt() is True
     st = mgr.status()
@@ -728,8 +731,13 @@ def test_readopt_clears_stale_state(tmp_path):
     store.save(ServeState(model="m", port=1919, pid=999999, args=[], starttime=1))
     ring = LogRing()
     mgr = ServeManager(
-        ring, store, spawn_fn=Spawner(), adopt_fn=lambda state: None, tailer_factory=None,
-        signal_fn=lambda p, s: None, apply_oom=False,
+        ring,
+        store,
+        spawn_fn=Spawner(),
+        adopt_fn=lambda state: None,
+        tailer_factory=None,
+        signal_fn=lambda p, s: None,
+        apply_oom=False,
     )
     assert mgr.readopt() is False
     assert store.load() is None  # a serve that is no longer alive is cleared, not adopted
@@ -738,8 +746,14 @@ def test_readopt_clears_stale_state(tmp_path):
 def test_readopt_no_state_is_noop(tmp_path):
     store = ServeStateStore(str(tmp_path / "serve.json"))
     ring = LogRing()
-    mgr = ServeManager(ring, store, spawn_fn=Spawner(), tailer_factory=None,
-                       signal_fn=lambda p, s: None, apply_oom=False)
+    mgr = ServeManager(
+        ring,
+        store,
+        spawn_fn=Spawner(),
+        tailer_factory=None,
+        signal_fn=lambda p, s: None,
+        apply_oom=False,
+    )
     assert mgr.readopt() is False
 
 

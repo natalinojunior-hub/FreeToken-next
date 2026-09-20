@@ -21,9 +21,15 @@ import triton.language as tl
 
 @triton.jit
 def _bf16_gemv_fp32_kernel(
-    x_ptr, w_ptr, out_ptr, N, K,
-    stride_wn, stride_wk,
-    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    N,
+    K,
+    stride_wn,
+    stride_wk,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -33,8 +39,9 @@ def _bf16_gemv_fp32_kernel(
     for k0 in range(0, K, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
         k_mask = offs_k < K
-        w = tl.load(w_row + offs_k[None, :] * stride_wk,
-                    mask=n_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
+        w = tl.load(
+            w_row + offs_k[None, :] * stride_wk, mask=n_mask[:, None] & k_mask[None, :], other=0.0
+        ).to(tl.float32)
         xk = tl.load(x_ptr + offs_k, mask=k_mask, other=0.0).to(tl.float32)
         acc += tl.sum(w * xk[None, :], axis=1)
     tl.store(out_ptr + offs_n, acc, mask=n_mask)
@@ -60,9 +67,16 @@ def bf16_linear_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     BLOCK_N = 2
     BLOCK_K = min(triton.next_power_of_2(K), 4096)
     _bf16_gemv_fp32_kernel[(triton.cdiv(N, BLOCK_N),)](
-        x1, weight, out, N, K,
-        weight.stride(0), weight.stride(1),
-        BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=4,
+        x1,
+        weight,
+        out,
+        N,
+        K,
+        weight.stride(0),
+        weight.stride(1),
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
     )
     return out.reshape(*lead, N)
 

@@ -283,14 +283,16 @@ def iter_gguf_weights(
             else:
                 v = None
             if v is not None:
-                yield f"{base}.self_attn.qkv_proj.qweight", torch.cat(
-                    [slots["q"], slots["k"], v], dim=0
+                yield (
+                    f"{base}.self_attn.qkv_proj.qweight",
+                    torch.cat([slots["q"], slots["k"], v], dim=0),
                 )
                 del qkv_buf[layer]
         gu = gate_up_buf.get(layer)
         if gu is not None and "gate" in gu and "up" in gu:
-            yield f"{base}.feed_forward.shared_mlp.gate_up_proj.qweight", torch.cat(
-                [gu["gate"], gu["up"]], dim=0
+            yield (
+                f"{base}.feed_forward.shared_mlp.gate_up_proj.qweight",
+                torch.cat([gu["gate"], gu["up"]], dim=0),
             )
             del gate_up_buf[layer]
 
@@ -379,6 +381,7 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
 # Routed-expert host banks (native Q4_0) for the offload cache.
 # --------------------------------------------------------------------------------------
 
+
 def _q4_0_expert_specs(config: ModelConfig) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     E = config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
@@ -418,7 +421,9 @@ def load_q4_0_expert_sources(
     seen_gu, seen_dn = set(), set()
 
     def _load(sink) -> None:
-        tracker = LayerCompletionTracker(2, hb, sink) if sink is not None else None  # gate_up + down
+        tracker = (
+            LayerCompletionTracker(2, hb, sink) if sink is not None else None
+        )  # gate_up + down
         for t in iter_gguf_tensors(model_path):
             if not t.name.startswith("blk."):
                 continue

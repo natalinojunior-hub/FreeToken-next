@@ -131,7 +131,9 @@ class ParallelLMHead(VocabParallelEmbedding):
             # each request's last row (get_last_indices' usual prefill contract).
             spec_indices = getattr(batch, "spec_logits_indices", None)
             indices = (
-                spec_indices if spec_indices is not None else batch.attn_metadata.get_last_indices(bs)
+                spec_indices
+                if spec_indices is not None
+                else batch.attn_metadata.get_last_indices(bs)
             )
             x = x[indices].contiguous()
             del indices

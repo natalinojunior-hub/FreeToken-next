@@ -84,6 +84,7 @@ from .request_logger import log_request
 # frame, so long queue/prefill or decode gaps must be bridged with real events.
 KEEPALIVE_INTERVAL_S = 15.0
 
+
 class ResponsesRequest(BaseModel):
     """The subset of the Responses request FreeToken honors (extra fields allowed)."""
 
@@ -119,7 +120,9 @@ def register_responses_routes(
         state = get_state()
         mstate = getattr(state, "maintenance_state", "serving")
         if mstate != "serving":
-            detail = "model is still loading" if mstate == "loading" else "cache rebuild in progress"
+            detail = (
+                "model is still loading" if mstate == "loading" else "cache rebuild in progress"
+            )
             return _error_response(503, detail)
         if req.background:
             return _error_response(400, "background mode is not supported")
@@ -153,7 +156,9 @@ async def handle_responses(
     default_max = getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
     try:
         spec = convert_responses_to_genspec(
-            req, model_sampling, default_max_tokens=default_max,
+            req,
+            model_sampling,
+            default_max_tokens=default_max,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
         )
         uid = await submit_generation(spec, state)
@@ -165,7 +170,10 @@ async def handle_responses(
     cache_report = getattr(state.config, "enable_cache_report", False)
     if req.stream:
         events = responses_stream_generator(
-            generate_events(uid, spec, state, source="/v1/responses"), req, response_id, created,
+            generate_events(uid, spec, state, source="/v1/responses"),
+            req,
+            response_id,
+            created,
             cache_report=cache_report,
         )
         if request is not None:
@@ -176,7 +184,9 @@ async def handle_responses(
         result = await generate_full(uid, spec, state, source="/v1/responses")
     except GenerationError as exc:
         return _error_response(400, str(exc), exc.code)
-    response = build_responses_response(result, req, response_id, created, cache_report=cache_report)
+    response = build_responses_response(
+        result, req, response_id, created, cache_report=cache_report
+    )
     return JSONResponse(content=response.model_dump(mode="json"))
 
 
@@ -269,7 +279,9 @@ def _convert_input_item(item: dict[str, Any]) -> list[dict[str, Any]]:
                 "role": "assistant",
                 "tool_calls": [
                     {
-                        "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:8]}",
+                        "id": item.get("call_id")
+                        or item.get("id")
+                        or f"call_{uuid.uuid4().hex[:8]}",
                         "type": "function",
                         "function": {
                             "name": item.get("name", ""),
@@ -431,7 +443,9 @@ def build_responses_response(
                 role="assistant",
                 status=item_status,
                 type="message",
-                content=[ResponseOutputText(type="output_text", text=result.content, annotations=[])],
+                content=[
+                    ResponseOutputText(type="output_text", text=result.content, annotations=[])
+                ],
             )
         )
     for call in result.tool_calls:
@@ -447,10 +461,14 @@ def build_responses_response(
         )
 
     return _response_obj(
-        response_id, created, req.model, output,
+        response_id,
+        created,
+        req.model,
+        output,
         status="incomplete" if truncated else "completed",
         usage=_usage(
-            result.prompt_tokens, result.completion_tokens,
+            result.prompt_tokens,
+            result.completion_tokens,
             result.cached_tokens if cache_report else 0,
         ),
         incomplete_reason="max_output_tokens" if truncated else None,
@@ -458,8 +476,14 @@ def build_responses_response(
 
 
 def _response_obj(
-    response_id: str, created: int, model: str, output: list[Any],
-    *, status: str, usage: ResponseUsage | None, error: ResponseError | None = None,
+    response_id: str,
+    created: int,
+    model: str,
+    output: list[Any],
+    *,
+    status: str,
+    usage: ResponseUsage | None,
+    error: ResponseError | None = None,
     incomplete_reason: str | None = None,
 ) -> Response:
     return Response(
@@ -471,7 +495,9 @@ def _response_obj(
         status=status,
         usage=usage,
         error=error,
-        incomplete_details=IncompleteDetails(reason=incomplete_reason) if incomplete_reason else None,
+        incomplete_details=IncompleteDetails(reason=incomplete_reason)
+        if incomplete_reason
+        else None,
         parallel_tool_calls=True,
         tool_choice="auto",
         tools=[],
@@ -504,16 +530,29 @@ async def responses_stream_generator(
 
     def snapshot(status, output, usage=None, incomplete_reason=None):
         return _response_obj(
-            response_id, created, req.model, output,
-            status=status, usage=usage, incomplete_reason=incomplete_reason,
+            response_id,
+            created,
+            req.model,
+            output,
+            status=status,
+            usage=usage,
+            incomplete_reason=incomplete_reason,
         )
 
-    yield _sse(ResponseCreatedEvent(
-        type="response.created", sequence_number=seq.next(), response=snapshot("in_progress", []),
-    ))
-    yield _sse(ResponseInProgressEvent(
-        type="response.in_progress", sequence_number=seq.next(), response=snapshot("in_progress", []),
-    ))
+    yield _sse(
+        ResponseCreatedEvent(
+            type="response.created",
+            sequence_number=seq.next(),
+            response=snapshot("in_progress", []),
+        )
+    )
+    yield _sse(
+        ResponseInProgressEvent(
+            type="response.in_progress",
+            sequence_number=seq.next(),
+            response=snapshot("in_progress", []),
+        )
+    )
 
     output_items: list[Any] = []
     output_index = 0
@@ -530,48 +569,93 @@ async def responses_stream_generator(
             return frames
         if current["kind"] == "reasoning":
             item_id, text = current["id"], current["text"]
-            frames.append(_sse(ResponseReasoningTextDoneEvent(
-                type="response.reasoning_text.done", sequence_number=seq.next(),
-                item_id=item_id, output_index=output_index, content_index=0, text=text,
-            )))
+            frames.append(
+                _sse(
+                    ResponseReasoningTextDoneEvent(
+                        type="response.reasoning_text.done",
+                        sequence_number=seq.next(),
+                        item_id=item_id,
+                        output_index=output_index,
+                        content_index=0,
+                        text=text,
+                    )
+                )
+            )
             done_item = ResponseReasoningItem(
-                id=item_id, type="reasoning", summary=[],
+                id=item_id,
+                type="reasoning",
+                summary=[],
                 content=[ReasoningTextContent(type="reasoning_text", text=text)],
                 status="completed",
             )
         elif current["kind"] == "message":
             item_id, text = current["id"], current["text"]
-            frames.append(_sse(ResponseTextDoneEvent(
-                type="response.output_text.done", sequence_number=seq.next(),
-                item_id=item_id, output_index=output_index, content_index=0, text=text, logprobs=[],
-            )))
-            frames.append(_sse(ResponseContentPartDoneEvent(
-                type="response.content_part.done", sequence_number=seq.next(),
-                item_id=item_id, output_index=output_index, content_index=0,
-                part=ResponseOutputText(type="output_text", text=text, annotations=[]),
-            )))
+            frames.append(
+                _sse(
+                    ResponseTextDoneEvent(
+                        type="response.output_text.done",
+                        sequence_number=seq.next(),
+                        item_id=item_id,
+                        output_index=output_index,
+                        content_index=0,
+                        text=text,
+                        logprobs=[],
+                    )
+                )
+            )
+            frames.append(
+                _sse(
+                    ResponseContentPartDoneEvent(
+                        type="response.content_part.done",
+                        sequence_number=seq.next(),
+                        item_id=item_id,
+                        output_index=output_index,
+                        content_index=0,
+                        part=ResponseOutputText(type="output_text", text=text, annotations=[]),
+                    )
+                )
+            )
             # finish_reason is only non-"stop" once GenDone has arrived, so only the final
             # (truncated) message item is marked incomplete; items closed mid-stream stay completed.
             done_item = ResponseOutputMessage(
-                id=item_id, role="assistant",
+                id=item_id,
+                role="assistant",
                 status="incomplete" if finish_reason == "length" else "completed",
                 type="message",
                 content=[ResponseOutputText(type="output_text", text=text, annotations=[])],
             )
         else:  # function_call
             item_id, args = current["id"], current["args"]
-            frames.append(_sse(ResponseFunctionCallArgumentsDoneEvent(
-                type="response.function_call_arguments.done", sequence_number=seq.next(),
-                item_id=item_id, output_index=output_index, name=current["name"], arguments=args,
-            )))
-            done_item = ResponseFunctionToolCall(
-                type="function_call", id=item_id, call_id=current["call_id"],
-                name=current["name"], arguments=args, status="completed",
+            frames.append(
+                _sse(
+                    ResponseFunctionCallArgumentsDoneEvent(
+                        type="response.function_call_arguments.done",
+                        sequence_number=seq.next(),
+                        item_id=item_id,
+                        output_index=output_index,
+                        name=current["name"],
+                        arguments=args,
+                    )
+                )
             )
-        frames.append(_sse(ResponseOutputItemDoneEvent(
-            type="response.output_item.done", sequence_number=seq.next(),
-            output_index=output_index, item=done_item,
-        )))
+            done_item = ResponseFunctionToolCall(
+                type="function_call",
+                id=item_id,
+                call_id=current["call_id"],
+                name=current["name"],
+                arguments=args,
+                status="completed",
+            )
+        frames.append(
+            _sse(
+                ResponseOutputItemDoneEvent(
+                    type="response.output_item.done",
+                    sequence_number=seq.next(),
+                    output_index=output_index,
+                    item=done_item,
+                )
+            )
+        )
         output_items.append(done_item)
         output_index += 1
         current = None
@@ -583,24 +667,42 @@ async def responses_stream_generator(
         item_id = f"fc_{uuid.uuid4().hex}"
         call_id = f"call_{uuid.uuid4().hex[:24]}"
         current = {
-            "kind": "function_call", "id": item_id,
-            "call_id": call_id, "name": name, "args": "", "ordinal": ordinal,
+            "kind": "function_call",
+            "id": item_id,
+            "call_id": call_id,
+            "name": name,
+            "args": "",
+            "ordinal": ordinal,
         }
-        frames.append(_sse(ResponseOutputItemAddedEvent(
-            type="response.output_item.added", sequence_number=seq.next(),
-            output_index=output_index,
-            item=ResponseFunctionToolCall(
-                type="function_call", id=item_id, call_id=call_id,
-                name=name, arguments="", status="in_progress",
-            ),
-        )))
+        frames.append(
+            _sse(
+                ResponseOutputItemAddedEvent(
+                    type="response.output_item.added",
+                    sequence_number=seq.next(),
+                    output_index=output_index,
+                    item=ResponseFunctionToolCall(
+                        type="function_call",
+                        id=item_id,
+                        call_id=call_id,
+                        name=name,
+                        arguments="",
+                        status="in_progress",
+                    ),
+                )
+            )
+        )
         return frames
 
     def args_delta_frame(fragment: str) -> str:
-        return _sse(ResponseFunctionCallArgumentsDeltaEvent(
-            type="response.function_call_arguments.delta", sequence_number=seq.next(),
-            item_id=current["id"], output_index=output_index, delta=fragment,
-        ))
+        return _sse(
+            ResponseFunctionCallArgumentsDeltaEvent(
+                type="response.function_call_arguments.delta",
+                sequence_number=seq.next(),
+                item_id=current["id"],
+                output_index=output_index,
+                delta=fragment,
+            )
+        )
 
     events = with_keepalive(events, KEEPALIVE_INTERVAL_S)
     try:
@@ -608,10 +710,13 @@ async def responses_stream_generator(
             if ev is KEEPALIVE:
                 # Data-bearing frame codex ignores but whose arrival resets its
                 # stream-idle countdown (SSE comments would not).
-                yield _sse(ResponseInProgressEvent(
-                    type="response.in_progress", sequence_number=seq.next(),
-                    response=snapshot("in_progress", output_items),
-                ))
+                yield _sse(
+                    ResponseInProgressEvent(
+                        type="response.in_progress",
+                        sequence_number=seq.next(),
+                        response=snapshot("in_progress", output_items),
+                    )
+                )
 
             elif isinstance(ev, ReasoningDelta):
                 # Streamed as a first-class reasoning item (codex renders
@@ -623,19 +728,30 @@ async def responses_stream_generator(
                         yield f
                     item_id = f"rs_{uuid.uuid4().hex}"
                     current = {"kind": "reasoning", "id": item_id, "text": ""}
-                    yield _sse(ResponseOutputItemAddedEvent(
-                        type="response.output_item.added", sequence_number=seq.next(),
-                        output_index=output_index,
-                        item=ResponseReasoningItem(
-                            id=item_id, type="reasoning", summary=[], status="in_progress",
-                        ),
-                    ))
+                    yield _sse(
+                        ResponseOutputItemAddedEvent(
+                            type="response.output_item.added",
+                            sequence_number=seq.next(),
+                            output_index=output_index,
+                            item=ResponseReasoningItem(
+                                id=item_id,
+                                type="reasoning",
+                                summary=[],
+                                status="in_progress",
+                            ),
+                        )
+                    )
                 current["text"] += ev.text
-                yield _sse(ResponseReasoningTextDeltaEvent(
-                    type="response.reasoning_text.delta", sequence_number=seq.next(),
-                    item_id=current["id"], output_index=output_index, content_index=0,
-                    delta=ev.text,
-                ))
+                yield _sse(
+                    ResponseReasoningTextDeltaEvent(
+                        type="response.reasoning_text.delta",
+                        sequence_number=seq.next(),
+                        item_id=current["id"],
+                        output_index=output_index,
+                        content_index=0,
+                        delta=ev.text,
+                    )
+                )
 
             elif isinstance(ev, ContentDelta):
                 if ev.text == "":
@@ -645,24 +761,42 @@ async def responses_stream_generator(
                         yield f
                     item_id = f"msg_{uuid.uuid4().hex}"
                     current = {"kind": "message", "id": item_id, "text": ""}
-                    yield _sse(ResponseOutputItemAddedEvent(
-                        type="response.output_item.added", sequence_number=seq.next(),
-                        output_index=output_index,
-                        item=ResponseOutputMessage(
-                            id=item_id, role="assistant", status="in_progress", type="message", content=[],
-                        ),
-                    ))
-                    yield _sse(ResponseContentPartAddedEvent(
-                        type="response.content_part.added", sequence_number=seq.next(),
-                        item_id=item_id, output_index=output_index, content_index=0,
-                        part=ResponseOutputText(type="output_text", text="", annotations=[]),
-                    ))
+                    yield _sse(
+                        ResponseOutputItemAddedEvent(
+                            type="response.output_item.added",
+                            sequence_number=seq.next(),
+                            output_index=output_index,
+                            item=ResponseOutputMessage(
+                                id=item_id,
+                                role="assistant",
+                                status="in_progress",
+                                type="message",
+                                content=[],
+                            ),
+                        )
+                    )
+                    yield _sse(
+                        ResponseContentPartAddedEvent(
+                            type="response.content_part.added",
+                            sequence_number=seq.next(),
+                            item_id=item_id,
+                            output_index=output_index,
+                            content_index=0,
+                            part=ResponseOutputText(type="output_text", text="", annotations=[]),
+                        )
+                    )
                 current["text"] += ev.text
-                yield _sse(ResponseTextDeltaEvent(
-                    type="response.output_text.delta", sequence_number=seq.next(),
-                    item_id=current["id"], output_index=output_index, content_index=0,
-                    delta=ev.text, logprobs=[],
-                ))
+                yield _sse(
+                    ResponseTextDeltaEvent(
+                        type="response.output_text.delta",
+                        sequence_number=seq.next(),
+                        item_id=current["id"],
+                        output_index=output_index,
+                        content_index=0,
+                        delta=ev.text,
+                        logprobs=[],
+                    )
+                )
 
             elif isinstance(ev, ToolCallStart):
                 for f in open_function_call(ev.name or "", ev.tool_index):
@@ -685,7 +819,7 @@ async def responses_stream_generator(
                         # are authoritative — top up whatever wasn't streamed yet.
                         final = call.parameters or ""
                         if final.startswith(current["args"]):
-                            remainder = final[len(current["args"]):]
+                            remainder = final[len(current["args"]) :]
                             if remainder:
                                 yield args_delta_frame(remainder)
                         current["args"] = final
@@ -710,51 +844,73 @@ async def responses_stream_generator(
                 for f in close_current():
                     yield f
                 if finish_reason == "length":
-                    yield _sse(ResponseIncompleteEvent(
-                        type="response.incomplete", sequence_number=seq.next(),
-                        response=snapshot(
-                            "incomplete", output_items,
-                            usage=_usage(usage_pt, usage_ct, usage_cached),
-                            incomplete_reason="max_output_tokens",
-                        ),
-                    ))
+                    yield _sse(
+                        ResponseIncompleteEvent(
+                            type="response.incomplete",
+                            sequence_number=seq.next(),
+                            response=snapshot(
+                                "incomplete",
+                                output_items,
+                                usage=_usage(usage_pt, usage_ct, usage_cached),
+                                incomplete_reason="max_output_tokens",
+                            ),
+                        )
+                    )
                 else:
-                    yield _sse(ResponseCompletedEvent(
-                        type="response.completed", sequence_number=seq.next(),
-                        response=snapshot(
-                            "completed", output_items,
-                            usage=_usage(usage_pt, usage_ct, usage_cached),
-                        ),
-                    ))
+                    yield _sse(
+                        ResponseCompletedEvent(
+                            type="response.completed",
+                            sequence_number=seq.next(),
+                            response=snapshot(
+                                "completed",
+                                output_items,
+                                usage=_usage(usage_pt, usage_ct, usage_cached),
+                            ),
+                        )
+                    )
     except GenerationError as exc:
         # Request failed before/instead of producing output (template render error, over-length
         # prompt). Emit the protocol's terminal failure event so codex sees a clean error rather
         # than a stalled stream that trips its 300s idle timeout into "Reconnecting".
         for f in close_current():
             yield f
-        yield _sse(ResponseFailedEvent(
-            type="response.failed", sequence_number=seq.next(),
-            response=_response_obj(
-                response_id, created, req.model, output_items, status="failed",
-                usage=_usage(usage_pt, usage_ct, usage_cached),
-                # codex reads this code to tell a blown context window from a generic failure.
-                # model_construct because ResponseError.code is a closed Literal in the SDK.
-                error=ResponseError.model_construct(
-                    code=exc.code or "server_error", message=str(exc)
+        yield _sse(
+            ResponseFailedEvent(
+                type="response.failed",
+                sequence_number=seq.next(),
+                response=_response_obj(
+                    response_id,
+                    created,
+                    req.model,
+                    output_items,
+                    status="failed",
+                    usage=_usage(usage_pt, usage_ct, usage_cached),
+                    # codex reads this code to tell a blown context window from a generic failure.
+                    # model_construct because ResponseError.code is a closed Literal in the SDK.
+                    error=ResponseError.model_construct(
+                        code=exc.code or "server_error", message=str(exc)
+                    ),
                 ),
-            ),
-        ))
+            )
+        )
     except Exception as exc:  # noqa: BLE001 — never leave the client without a terminal event
         for f in close_current():
             yield f
-        yield _sse(ResponseFailedEvent(
-            type="response.failed", sequence_number=seq.next(),
-            response=_response_obj(
-                response_id, created, req.model, output_items, status="failed",
-                usage=_usage(usage_pt, usage_ct, usage_cached),
-                error=ResponseError(code="server_error", message=str(exc)),
-            ),
-        ))
+        yield _sse(
+            ResponseFailedEvent(
+                type="response.failed",
+                sequence_number=seq.next(),
+                response=_response_obj(
+                    response_id,
+                    created,
+                    req.model,
+                    output_items,
+                    status="failed",
+                    usage=_usage(usage_pt, usage_ct, usage_cached),
+                    error=ResponseError(code="server_error", message=str(exc)),
+                ),
+            )
+        )
 
 
 # --------------------------------------------------------------------------- #

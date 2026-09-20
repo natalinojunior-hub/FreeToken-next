@@ -223,15 +223,18 @@ def iter_weights(
                     if not is_expert and not include_non_moe:
                         continue
                     raw = f.get_tensor(raw_name)
-                    yield raw_name, shard_gpt_oss_tensor(
+                    yield (
                         raw_name,
-                        raw,
-                        rank=tp_info.rank,
-                        world_size=tp_info.size,
-                        num_q_heads=config.num_qo_heads,
-                        num_kv_heads=config.num_kv_heads,
-                        head_dim=config.head_dim,
-                        intermediate_size=config.moe_intermediate_size,
+                        shard_gpt_oss_tensor(
+                            raw_name,
+                            raw,
+                            rank=tp_info.rank,
+                            world_size=tp_info.size,
+                            num_q_heads=config.num_qo_heads,
+                            num_kv_heads=config.num_kv_heads,
+                            head_dim=config.head_dim,
+                            intermediate_size=config.moe_intermediate_size,
+                        ),
                     )
 
     yield from iter_merged_tensors(
@@ -265,8 +268,12 @@ def _read_safetensor_slice(
 
 
 _EXPERT_SOURCES = (
-    "gate_up_proj_blocks", "gate_up_proj_scales", "gate_up_proj_bias",
-    "down_proj_blocks", "down_proj_scales", "down_proj_bias",
+    "gate_up_proj_blocks",
+    "gate_up_proj_scales",
+    "gate_up_proj_bias",
+    "down_proj_blocks",
+    "down_proj_scales",
+    "down_proj_bias",
 )
 
 
@@ -288,7 +295,15 @@ def _source_slices(config, tp_info) -> dict[str, tuple[str, tuple[slice, ...]]]:
     }
 
 
-def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bool = False, workers: int = 8, chunk: int = 8 << 20):
+def iter_expert_pieces(
+    model_path: str,
+    config,
+    kind: QuantKind,
+    *,
+    parallel: bool = False,
+    workers: int = 8,
+    chunk: int = 8 << 20,
+):
     """gpt-oss experts as HF ships them, one piece per layer: stacked ``[E, ...]`` mxfp4
     ``_blocks`` / ``_scales`` / ``_bias`` tensors sliced to this rank's intermediate range."""
     if kind is not QuantKind.MXFP4:
@@ -307,7 +322,9 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
         if parallel:
             from freetoken.models.weight import iter_expert_tensors_parallel
 
-            for name, whole in iter_expert_tensors_parallel(model_path, _is_expert, workers=workers, chunk=chunk):
+            for name, whole in iter_expert_tensors_parallel(
+                model_path, _is_expert, workers=workers, chunk=chunk
+            ):
                 _, source = _expert_layer_and_name(name)
                 yield name, whole[slices[source][1]]
             return

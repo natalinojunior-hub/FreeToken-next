@@ -23,8 +23,10 @@ class GlmMoeDsaDecoderLayer(BaseOP):
             self.mlp: BaseOP = GlmMoeDsaSparseBlock(config, layer_id, prefix=f"{prefix}.mlp")
         else:
             self.mlp = GlmDsaGatedMLP(
-                config.hidden_size, config.intermediate_size,
-                quant_config=config.quant, prefix=f"{prefix}.mlp",
+                config.hidden_size,
+                config.intermediate_size,
+                quant_config=config.quant,
+                prefix=f"{prefix}.mlp",
             )
         self.input_layernorm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNormFused(

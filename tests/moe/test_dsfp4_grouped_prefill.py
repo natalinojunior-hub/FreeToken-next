@@ -74,8 +74,12 @@ def test_grouped_gemms_within_one_ulp_of_gemv(block_m):
     T = 1024 if block_m == 64 else 256
     x, slots, w = _routing(T, device)
     cfg = dict(
-        BLOCK_SIZE_M=block_m, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64, GROUP_SIZE_M=8,
-        num_warps=8, num_stages=1,
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=64,
+        BLOCK_SIZE_K=64,
+        GROUP_SIZE_M=8,
+        num_warps=8,
+        num_stages=1,
     )
     si, ei, ntpp = moe_align_block_size(slots, block_m, E)
     tw = w.reshape(-1)

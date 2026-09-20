@@ -21,9 +21,14 @@ def test_moe_priority_fills_experts_up_to_total():
     # budget large enough to cache every expert; KV gets the remainder.
     # per_expert=100, cache_per_page=10, total=8 experts (L*E), E=4.
     size, pages, overlap = plan_cache_budget(
-        budget_bytes=2000, per_expert_bytes=100, cache_per_page=10,
-        num_experts=4, total_experts=8, prefill_overlap=True,
-        kv_reserve_pages=5, max_slots=8,
+        budget_bytes=2000,
+        per_expert_bytes=100,
+        cache_per_page=10,
+        num_experts=4,
+        total_experts=8,
+        prefill_overlap=True,
+        kv_reserve_pages=5,
+        max_slots=8,
     )
     assert size == 8  # capped at full residency
     assert pages == (2000 - 8 * 100) // 10 - 1  # == 119 usable; one page buys the dummy row
@@ -36,9 +41,14 @@ def test_offload_case_experts_take_most_kv_gets_reserve_floor():
     # and 1000 B cannot buy that -- the old arithmetic claimed it could and the CUDA
     # allocation then disagreed.
     size, pages, overlap = plan_cache_budget(
-        budget_bytes=1010, per_expert_bytes=100, cache_per_page=10,
-        num_experts=2, total_experts=50, prefill_overlap=True,
-        kv_reserve_pages=10, max_slots=50,
+        budget_bytes=1010,
+        per_expert_bytes=100,
+        cache_per_page=10,
+        num_experts=2,
+        total_experts=50,
+        prefill_overlap=True,
+        kv_reserve_pages=10,
+        max_slots=50,
     )
     # raw = (1010 - 10*10) // 100 = 9 ; clamped to [4, 50] -> 9
     assert size == 9
@@ -49,9 +59,14 @@ def test_offload_case_experts_take_most_kv_gets_reserve_floor():
 def test_marlin_cap_clamps_count_and_rolls_bytes_to_kv():
     # budget would fund 1500 experts, but marlin caps at 992; freed bytes become KV pages.
     size, pages, overlap = plan_cache_budget(
-        budget_bytes=200_000, per_expert_bytes=100, cache_per_page=10,
-        num_experts=128, total_experts=4000, prefill_overlap=True,
-        kv_reserve_pages=0, max_slots=992,
+        budget_bytes=200_000,
+        per_expert_bytes=100,
+        cache_per_page=10,
+        num_experts=128,
+        total_experts=4000,
+        prefill_overlap=True,
+        kv_reserve_pages=0,
+        max_slots=992,
     )
     assert size == 992
     assert pages == (200_000 - 992 * 100) // 10 - 1
@@ -60,9 +75,14 @@ def test_marlin_cap_clamps_count_and_rolls_bytes_to_kv():
 def test_small_cache_disables_prefill_overlap():
     # cap below 2*num_experts -> overlap impossible, falls back to num_experts floor.
     size, pages, overlap = plan_cache_budget(
-        budget_bytes=10_000, per_expert_bytes=100, cache_per_page=10,
-        num_experts=8, total_experts=12, prefill_overlap=True,
-        kv_reserve_pages=0, max_slots=12,
+        budget_bytes=10_000,
+        per_expert_bytes=100,
+        cache_per_page=10,
+        num_experts=8,
+        total_experts=12,
+        prefill_overlap=True,
+        kv_reserve_pages=0,
+        max_slots=12,
     )
     assert overlap is False
     # raw = 10000//100 = 100, clamped to hi = min(12, 12) = 12.
@@ -72,9 +92,14 @@ def test_small_cache_disables_prefill_overlap():
 def test_insufficient_kv_memory_raises():
     with pytest.raises(AssertionError, match="not enough memory"):
         plan_cache_budget(
-            budget_bytes=410, per_expert_bytes=100, cache_per_page=10,
-            num_experts=4, total_experts=4, prefill_overlap=False,
-            kv_reserve_pages=0, max_slots=4,
+            budget_bytes=410,
+            per_expert_bytes=100,
+            cache_per_page=10,
+            num_experts=4,
+            total_experts=4,
+            prefill_overlap=False,
+            kv_reserve_pages=0,
+            max_slots=4,
         )  # experts eat 400, KV gets 1 page -> not > 1
 
 
@@ -83,18 +108,28 @@ def test_budget_too_small_for_min_moe_plus_reserve_raises():
     # would exceed budget_bytes. Reject in arithmetic rather than OOM in a later CUDA alloc.
     with pytest.raises(AssertionError, match="budget too small"):
         plan_cache_budget(
-            budget_bytes=300, per_expert_bytes=100, cache_per_page=10,
-            num_experts=4, total_experts=4, prefill_overlap=False,
-            kv_reserve_pages=10, max_slots=4,
+            budget_bytes=300,
+            per_expert_bytes=100,
+            cache_per_page=10,
+            num_experts=4,
+            total_experts=4,
+            prefill_overlap=False,
+            kv_reserve_pages=10,
+            max_slots=4,
         )  # min moe = 4 slots (400 B) + reserve (10 pages = 100 B) = 500 B > 300 B budget
 
 
 def test_prefill_overlap_false_is_honored():
     # Even when the cache could fit 2*num_experts, an explicit False stays False.
     size, pages, overlap = plan_cache_budget(
-        budget_bytes=2000, per_expert_bytes=100, cache_per_page=10,
-        num_experts=4, total_experts=8, prefill_overlap=False,
-        kv_reserve_pages=0, max_slots=8,
+        budget_bytes=2000,
+        per_expert_bytes=100,
+        cache_per_page=10,
+        num_experts=4,
+        total_experts=8,
+        prefill_overlap=False,
+        kv_reserve_pages=0,
+        max_slots=8,
     )
     assert size == 8
     assert overlap is False
@@ -106,9 +141,14 @@ def test_plan_prices_the_page_the_pool_allocates():
     # the usable pages over-commits the budget it was solved against: the geometry it
     # returns must fit, and one page more must not.
     size, pages, _ = plan_cache_budget(
-        budget_bytes=2000, per_expert_bytes=100, cache_per_page=10,
-        num_experts=4, total_experts=8, prefill_overlap=True,
-        kv_reserve_pages=5, max_slots=8,
+        budget_bytes=2000,
+        per_expert_bytes=100,
+        cache_per_page=10,
+        num_experts=4,
+        total_experts=8,
+        prefill_overlap=True,
+        kv_reserve_pages=5,
+        max_slots=8,
     )
     assert pool_pages(pages) == pages + 1
     assert required_bytes(size, pages, 100, 10) <= 2000
@@ -122,9 +162,14 @@ def test_plan_gives_expert_slots_back_when_the_kv_page_floor_binds():
     per_expert, cache_per_page = 2 * (1 << 20), 4 * (1 << 20)
     budget = 20 * per_expert + (5 + 1) * cache_per_page + 1  # one byte past a clean fit
     size, pages, _ = plan_cache_budget(
-        budget_bytes=budget, per_expert_bytes=per_expert, cache_per_page=cache_per_page,
-        num_experts=8, total_experts=2560, prefill_overlap=False,
-        kv_reserve_pages=5, max_slots=64,
+        budget_bytes=budget,
+        per_expert_bytes=per_expert,
+        cache_per_page=cache_per_page,
+        num_experts=8,
+        total_experts=2560,
+        prefill_overlap=False,
+        kv_reserve_pages=5,
+        max_slots=64,
     )
     assert pages >= 5 and required_bytes(size, pages, per_expert, cache_per_page) <= budget
 
@@ -132,16 +177,21 @@ def test_plan_gives_expert_slots_back_when_the_kv_page_floor_binds():
 def test_plan_still_rejects_a_budget_below_its_own_minimum():
     with pytest.raises(AssertionError, match="cache budget too small"):
         plan_cache_budget(
-            budget_bytes=8 * 100, per_expert_bytes=100, cache_per_page=10,
-            num_experts=4, total_experts=8, prefill_overlap=False,
-            kv_reserve_pages=64, max_slots=8,
+            budget_bytes=8 * 100,
+            per_expert_bytes=100,
+            cache_per_page=10,
+            num_experts=4,
+            total_experts=8,
+            prefill_overlap=False,
+            kv_reserve_pages=64,
+            max_slots=8,
         )
 
 
 def test_expert_bytes_per_slot_sums_row_bytes_over_banks():
     sources = {
         "gate_up": [torch.zeros(4, 32, 8, dtype=torch.float16)],  # row = 32*8*2 = 512
-        "down": [torch.zeros(4, 8, 16, dtype=torch.float16)],     # row = 8*16*2 = 256
+        "down": [torch.zeros(4, 8, 16, dtype=torch.float16)],  # row = 8*16*2 = 256
     }
     assert expert_bytes_per_slot(sources) == 512 + 256
 
@@ -149,10 +199,17 @@ def test_expert_bytes_per_slot_sums_row_bytes_over_banks():
 def test_resolve_auto_applies_ratio_once():
     # baseline 1000, weights 100, ratio 0.9 -> budget = 900 - 100 - 0(fixed) = 800
     size, pages, overlap = resolve_moe_cache_auto(
-        baseline_free=1000, weights_bytes=100, memory_ratio=0.9,
-        cache_per_page=10, fixed_cache_size=0, per_expert_bytes=50,
-        num_experts=4, total_experts=8, prefill_overlap=True,
-        kv_reserve_tokens=0, page_size=1,
+        baseline_free=1000,
+        weights_bytes=100,
+        memory_ratio=0.9,
+        cache_per_page=10,
+        fixed_cache_size=0,
+        per_expert_bytes=50,
+        num_experts=4,
+        total_experts=8,
+        prefill_overlap=True,
+        kv_reserve_tokens=0,
+        page_size=1,
     )
     # budget 800: experts cap at 8 -> 400 bytes; KV = 400//10 - 1 = 39 usable pages
     assert size == 8 and pages == 39 and overlap is True
@@ -160,10 +217,18 @@ def test_resolve_auto_applies_ratio_once():
 
 def test_resolve_auto_caps_slots_at_the_kernel_limit():
     size, _, _ = resolve_moe_cache_auto(
-        baseline_free=10_000_000, weights_bytes=0, memory_ratio=1.0,
-        cache_per_page=10, fixed_cache_size=0, per_expert_bytes=100,
-        num_experts=128, total_experts=4000, prefill_overlap=False,
-        kv_reserve_tokens=0, page_size=1, max_slots=992,
+        baseline_free=10_000_000,
+        weights_bytes=0,
+        memory_ratio=1.0,
+        cache_per_page=10,
+        fixed_cache_size=0,
+        per_expert_bytes=100,
+        num_experts=128,
+        total_experts=4000,
+        prefill_overlap=False,
+        kv_reserve_tokens=0,
+        page_size=1,
+        max_slots=992,
     )
     assert size == 992
 
@@ -174,8 +239,12 @@ def _dsv4_adjust_cfg(**over):
     from types import SimpleNamespace
 
     model_config = SimpleNamespace(
-        single_stream_only=False, dsv4_args=SimpleNamespace(window_size=128), is_moe=True,
-        expert_quant="ds_fp4", has_swa_attention=False, has_linear_attention=False,
+        single_stream_only=False,
+        dsv4_args=SimpleNamespace(window_size=128),
+        is_moe=True,
+        expert_quant="ds_fp4",
+        has_swa_attention=False,
+        has_linear_attention=False,
     )
 
     class Cfg:
@@ -249,8 +318,11 @@ def test_adjust_config_resolves_num_tokens_generic():
     from freetoken.engine.engine import _adjust_config
 
     model_config = SimpleNamespace(
-        single_stream_only=False, is_moe=False, expert_quant="none",
-        has_swa_attention=False, has_linear_attention=False,
+        single_stream_only=False,
+        is_moe=False,
+        expert_quant="none",
+        has_swa_attention=False,
+        has_linear_attention=False,
     )
 
     class Cfg:
@@ -287,10 +359,15 @@ def test_mha_kv_cost_simple_full_attention():
         has_swa_attention = False
 
         def kv_cache_group_specs(self):
-            return [KVCacheGroupSpec(
-                name="full", layer_ids=tuple(range(3)),
-                num_kv_heads=8, head_dim=64, sliding_window=None,
-            )]
+            return [
+                KVCacheGroupSpec(
+                    name="full",
+                    layer_ids=tuple(range(3)),
+                    num_kv_heads=8,
+                    head_dim=64,
+                    sliding_window=None,
+                )
+            ]
 
         def linear_attention_group(self):
             return None
@@ -324,9 +401,15 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         num_moe_layers = 2  # total_experts = 8
 
         def kv_cache_group_specs(self):
-            return [KVCacheGroupSpec(
-                name="full", layer_ids=(0, 1, 2), num_kv_heads=8, head_dim=64, sliding_window=None,
-            )]
+            return [
+                KVCacheGroupSpec(
+                    name="full",
+                    layer_ids=(0, 1, 2),
+                    num_kv_heads=8,
+                    head_dim=64,
+                    sliding_window=None,
+                )
+            ]
 
         def linear_attention_group(self):
             return None
@@ -354,7 +437,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         # 2 layers (num_moe_layers above) x 4 experts each -- per-layer host bank contract.
         sources = {
             "gate_up": [torch.zeros(4, 32, 8, dtype=torch.float16)] * 2,  # row = 32*8*2 = 512
-            "down": [torch.zeros(4, 8, 16, dtype=torch.float16)] * 2,     # row = 8*16*2 = 256
+            "down": [torch.zeros(4, 8, 16, dtype=torch.float16)] * 2,  # row = 8*16*2 = 256
         }
 
     from freetoken.kvcache.mha_pool import MHAKVCache
@@ -367,7 +450,9 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
     from freetoken.engine.vram_ledger import Kind, VramLedger
 
     engine.vram_ledger = VramLedger(
-        device_total_bytes=12_000_000, baseline_free=10_000_000, memory_ratio=0.9,
+        device_total_bytes=12_000_000,
+        baseline_free=10_000_000,
+        memory_ratio=0.9,
     )
     engine.vram_ledger.charge("weights:model", 1_000_000, Kind.IMMUTABLE)
 
@@ -381,11 +466,17 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
 
     cache_per_page, fixed, _, _ = MHAKVCache.kv_cost(StubConfig())
     expected = resolve_moe_cache_auto(
-        baseline_free=10_000_000, weights_bytes=1_000_000, memory_ratio=0.9,
-        cache_per_page=cache_per_page, fixed_cache_size=fixed,
+        baseline_free=10_000_000,
+        weights_bytes=1_000_000,
+        memory_ratio=0.9,
+        cache_per_page=cache_per_page,
+        fixed_cache_size=fixed,
         per_expert_bytes=expert_bytes_per_slot(StubBanks.sources),
-        num_experts=4, total_experts=8, prefill_overlap=True,
-        kv_reserve_tokens=0, page_size=16,
+        num_experts=4,
+        total_experts=8,
+        prefill_overlap=True,
+        kv_reserve_tokens=0,
+        page_size=16,
     )
     assert (size, pages, overlap) == expected
     assert engine.memory_plan.pool_budget_bytes == engine.vram_ledger.pool_budget_bytes(fixed)
@@ -412,9 +503,15 @@ def test_engine_resolve_auto_moe_cache_size_refuses_undersized_num_tokens_overri
         num_moe_layers = 2
 
         def kv_cache_group_specs(self):
-            return [KVCacheGroupSpec(
-                name="full", layer_ids=(0, 1, 2), num_kv_heads=8, head_dim=64, sliding_window=None,
-            )]
+            return [
+                KVCacheGroupSpec(
+                    name="full",
+                    layer_ids=(0, 1, 2),
+                    num_kv_heads=8,
+                    head_dim=64,
+                    sliding_window=None,
+                )
+            ]
 
         def linear_attention_group(self):
             return None
@@ -454,7 +551,9 @@ def test_engine_resolve_auto_moe_cache_size_refuses_undersized_num_tokens_overri
     from freetoken.engine.vram_ledger import Kind, VramLedger
 
     engine.vram_ledger = VramLedger(
-        device_total_bytes=12_000_000, baseline_free=10_000_000, memory_ratio=0.9,
+        device_total_bytes=12_000_000,
+        baseline_free=10_000_000,
+        memory_ratio=0.9,
     )
     engine.vram_ledger.charge("weights:model", 1_000_000, Kind.IMMUTABLE)
 
@@ -492,10 +591,15 @@ def test_kv_reserve_context_funds_the_context_before_experts():
 
             @staticmethod
             def kv_cache_group_specs():
-                return [KVCacheGroupSpec(
-                    name="full", layer_ids=(0, 1, 2), num_kv_heads=8, head_dim=64,
-                    sliding_window=None,
-                )]
+                return [
+                    KVCacheGroupSpec(
+                        name="full",
+                        layer_ids=(0, 1, 2),
+                        num_kv_heads=8,
+                        head_dim=64,
+                        sliding_window=None,
+                    )
+                ]
 
             @staticmethod
             def linear_attention_group():
@@ -516,7 +620,9 @@ def test_kv_reserve_context_funds_the_context_before_experts():
         engine._weights_bytes = 1_000_000
         engine._pool_cls = MHAKVCache
         engine.vram_ledger = VramLedger(
-            device_total_bytes=70_000_000, baseline_free=64_000_000, memory_ratio=1.0,
+            device_total_bytes=70_000_000,
+            baseline_free=64_000_000,
+            memory_ratio=1.0,
         )
         engine.vram_ledger.charge("weights:model", 1_000_000, Kind.IMMUTABLE)
         return engine
@@ -613,9 +719,9 @@ def test_page_table_width_covers_whole_trailing_pages():
     # page's end, not just the next multiple of 32 (DSV4's P=128 exposed the gap).
     from freetoken.engine.engine import _page_table_width
 
-    assert _page_table_width(4001, 128) == 4096   # align32 alone gave 4032 -> OOB
-    assert _page_table_width(4096, 128) == 4096   # page-aligned length unchanged
-    assert _page_table_width(100, 1) == 128       # page_size 1 degenerates to align32
+    assert _page_table_width(4001, 128) == 4096  # align32 alone gave 4032 -> OOB
+    assert _page_table_width(4096, 128) == 4096  # page-aligned length unchanged
+    assert _page_table_width(100, 1) == 128  # page_size 1 degenerates to align32
     assert _page_table_width(33, 128) == 128
     for max_seq_len in (1, 31, 33, 4001, 4095, 4096):
         for page_size in (1, 32, 64, 128):
@@ -628,8 +734,11 @@ def _generic_rotary_cfg(max_position, override):
     from types import SimpleNamespace
 
     model_config = SimpleNamespace(
-        single_stream_only=False, is_moe=False, expert_quant="none",
-        has_swa_attention=False, has_linear_attention=False,
+        single_stream_only=False,
+        is_moe=False,
+        expert_quant="none",
+        has_swa_attention=False,
+        has_linear_attention=False,
         rotary_config=SimpleNamespace(max_position=max_position),
     )
 

@@ -12,6 +12,7 @@ _TYPE_KEY = "__type__"
 # reading it as a serialized class -- without this, a request could crash the tokenizer worker.
 _RAW_DICT_KEY = "__raw_dict__"
 
+
 def _serialize_any(value: Any) -> Any:
     if isinstance(value, dict):
         encoded = {k: _serialize_any(v) for k, v in value.items()}

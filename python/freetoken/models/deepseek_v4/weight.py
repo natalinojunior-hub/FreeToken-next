@@ -1,10 +1,10 @@
 """Weight loading for DeepSeek-V4-Flash (engine path).
 
-  - :func:`iter_weights` streams resident (non-expert) tensors keyed by the model's
-    attribute paths (``model.`` + the checkpoint name). ``wo_a`` dequantized to bf16 to match
-    the reference bf16 einsum.
-  - :func:`iter_expert_pieces` streams the routed MXFP4 experts (e2m1 pairs + e8m0 per-32
-    scales, no global) as per-expert pieces for the expert quant method's banks.
+- :func:`iter_weights` streams resident (non-expert) tensors keyed by the model's
+  attribute paths (``model.`` + the checkpoint name). ``wo_a`` dequantized to bf16 to match
+  the reference bf16 einsum.
+- :func:`iter_expert_pieces` streams the routed MXFP4 experts (e2m1 pairs + e8m0 per-32
+  scales, no global) as per-expert pieces for the expert quant method's banks.
 """
 
 from __future__ import annotations
@@ -121,9 +121,7 @@ def iter_weights(
             yield from linear(f"{a}.wkv", f"{m}.wkv")
             yield f"{m}.kv_norm.weight", get(f"{a}.kv_norm.weight")
             # wo_a: FP8 in the checkpoint, dequantized to bf16 (reference bf16 einsum).
-            yield f"{m}.wo_a", _dequant_fp8_block(
-                get(f"{a}.wo_a.weight"), get(f"{a}.wo_a.scale")
-            )
+            yield f"{m}.wo_a", _dequant_fp8_block(get(f"{a}.wo_a.weight"), get(f"{a}.wo_a.scale"))
             yield from linear(f"{a}.wo_b", f"{m}.wo_b")
             yield f"{m}.attn_sink", get(f"{a}.attn_sink")
 
@@ -154,8 +152,12 @@ def iter_weights(
                 yield from linear(src, f"model.{src}")
 
             for nm in (
-                "hc_attn_fn", "hc_ffn_fn", "hc_attn_base",
-                "hc_ffn_base", "hc_attn_scale", "hc_ffn_scale",
+                "hc_attn_fn",
+                "hc_ffn_fn",
+                "hc_attn_base",
+                "hc_ffn_base",
+                "hc_attn_scale",
+                "hc_ffn_scale",
             ):
                 yield f"model.layers.{L}.{nm}", get(f"layers.{L}.{nm}")
     finally:
@@ -173,7 +175,15 @@ _PROJ_ROLE = {"w1": "gate", "w3": "up", "w2": "down"}
 _KIND_SUFFIX = {"weight": "", "scale": "_scale"}
 
 
-def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
+def iter_expert_pieces(
+    model_path: str,
+    config,
+    kind: QuantKind,
+    *,
+    parallel: bool | None = False,
+    workers: int = 8,
+    chunk: int = 8 << 20,
+):
     """Routed experts, one piece per expert: ``{gate, up, down}`` e2m1 pairs and their e8m0
     ``_scale`` companions (``w1`` / ``w3`` / ``w2``). The MTP layer's experts are skipped."""
     if kind is not QuantKind.MXFP4:
@@ -193,13 +203,19 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
         return int(m["layer"]), int(m["expert"]), _PROJ_ROLE[m["proj"]] + _KIND_SUFFIX[m["kind"]]
 
     if parallel:
-        tensors = iter_expert_tensors_parallel(model_path, lambda n: locate(n) is not None, workers=workers, chunk=chunk)
+        tensors = iter_expert_tensors_parallel(
+            model_path, lambda n: locate(n) is not None, workers=workers, chunk=chunk
+        )
         return per_expert_pieces(tensors, locate, tensors_per_expert=6)
 
     def _serial():
         reader = _ShardReader(model_path, _weight_map(model_path), torch.device("cpu"))
         try:
-            for li in tqdm(range(L), desc="Loading DSV4 experts (serial)", disable=not get_tp_info().is_primary()):
+            for li in tqdm(
+                range(L),
+                desc="Loading DSV4 experts (serial)",
+                disable=not get_tp_info().is_primary(),
+            ):
                 for e in range(E):
                     base = f"layers.{li}.ffn.experts.{e}"
                     for proj in ("w1", "w3", "w2"):

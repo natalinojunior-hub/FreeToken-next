@@ -71,18 +71,27 @@ class QuantConfig(ABC):
         names = self.name_map.to_checkpoint(prefix)
         schemes = {None if self.unquantized(n) else self.scheme_for_name(n) for n in names}
         if len(schemes) != 1:
-            raise ValueError(f"fused module {prefix!r} mixes quantization schemes across {names}: {schemes}")
+            raise ValueError(
+                f"fused module {prefix!r} mixes quantization schemes across {names}: {schemes}"
+            )
         scheme = schemes.pop()
         self._schemes[prefix] = scheme
         return scheme
 
     def stored_tensors(self, kind: QuantKind) -> dict[str, Stored]:
         """role -> checkpoint tensor for every role the dialect stores for ``kind``."""
-        return {role: entry if isinstance(entry, Stored) else Stored(entry) for role, entry in self.STORAGE[kind].items()}
+        return {
+            role: entry if isinstance(entry, Stored) else Stored(entry)
+            for role, entry in self.STORAGE[kind].items()
+        }
 
     def storage(self, scheme: QuantScheme) -> dict[str, Stored]:
         """role -> checkpoint tensor for one scheme's tensors."""
-        return {role: entry for role, entry in self.stored_tensors(scheme.kind).items() if scheme.has(role)}
+        return {
+            role: entry
+            for role, entry in self.stored_tensors(scheme.kind).items()
+            if scheme.has(role)
+        }
 
     def get_quant_method(self, layer: Any, prefix: str):
         scheme = self.scheme_for(prefix)

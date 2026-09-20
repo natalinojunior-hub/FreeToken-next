@@ -59,7 +59,9 @@ def embed_input_ids(embed_tokens, input_ids: torch.Tensor, batch: Batch) -> torc
 
 
 class GatedMLP(BaseOP):
-    def __init__(self, config: ModelConfig, *, quant_config: QuantConfig | None = None, prefix: str = ""):
+    def __init__(
+        self, config: ModelConfig, *, quant_config: QuantConfig | None = None, prefix: str = ""
+    ):
         self.gate_up_proj = LinearColParallelMerged(
             config.hidden_size,
             [config.intermediate_size, config.intermediate_size],

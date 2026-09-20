@@ -25,8 +25,22 @@ import triton
 import triton.language as tl
 
 _E2M1_VALUES = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
 ]
 
 
@@ -39,22 +53,31 @@ def _e2m1_lut(device_index: int) -> torch.Tensor:
 
 @triton.jit
 def _decode_dsfp4_moe_kernel(
-    a_ptr,             # [M, K] activations (compute dtype)
-    packed_ptr,        # [S, N, K // 2] uint8
-    scale_ptr,         # [S, N, K // 32] uint8 (e8m0 codes)
-    c_ptr,             # [M, TOP_K, N] output (compute dtype)
+    a_ptr,  # [M, K] activations (compute dtype)
+    packed_ptr,  # [S, N, K // 2] uint8
+    scale_ptr,  # [S, N, K // 32] uint8 (e8m0 codes)
+    c_ptr,  # [M, TOP_K, N] output (compute dtype)
     topk_weights_ptr,  # [M, TOP_K] fp32
-    topk_ids_ptr,      # [M, TOP_K] int32 -> cache slot
-    lut_ptr,           # [16] fp32
+    topk_ids_ptr,  # [M, TOP_K] int32 -> cache slot
+    lut_ptr,  # [16] fp32
     total_routes,
     N,
     K,
-    stride_am, stride_ak,
-    stride_pe, stride_pn, stride_pkb,
-    stride_se, stride_sn, stride_sblk,
-    stride_cm, stride_ck, stride_cn,
-    stride_tw_m, stride_tw_k,
-    stride_tid_m, stride_tid_k,
+    stride_am,
+    stride_ak,
+    stride_pe,
+    stride_pn,
+    stride_pkb,
+    stride_se,
+    stride_sn,
+    stride_sblk,
+    stride_cm,
+    stride_ck,
+    stride_cn,
+    stride_tw_m,
+    stride_tw_k,
+    stride_tid_m,
+    stride_tid_k,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_KB: tl.constexpr,  # bytes processed per K-iter (covers 2*KB k-values)
     TOP_K: tl.constexpr,
@@ -74,7 +97,7 @@ def _decode_dsfp4_moe_kernel(
     a_row = route_id if A_ROW_IS_ROUTE else token_id
     a_base = a_ptr + a_row * stride_am
 
-    NB: tl.constexpr = BLOCK_SIZE_KB // 16   # 16 bytes (==32 fp4 values) per e8m0 scale block
+    NB: tl.constexpr = BLOCK_SIZE_KB // 16  # 16 bytes (==32 fp4 values) per e8m0 scale block
     offs_kb = tl.arange(0, BLOCK_SIZE_KB)
     offs_nb = tl.arange(0, NB)
     K_BYTES = K // 2
@@ -96,9 +119,12 @@ def _decode_dsfp4_moe_kernel(
         # One exp2 per (n, 16-byte scale block) instead of per element (the scale is
         # constant over each 16-byte run): ~16x fewer SFU ops -> ~1.6x throughput.
         sblk = kb_start * NB + offs_nb
-        codes = tl.load(scale_slot + offs_n[:, None] * stride_sn + sblk[None, :] * stride_sblk,
-                        mask=n_mask[:, None], other=0).to(tl.float32)
-        sc = tl.exp2(codes - 127.0)                                          # [BLOCK_N, NB]
+        codes = tl.load(
+            scale_slot + offs_n[:, None] * stride_sn + sblk[None, :] * stride_sblk,
+            mask=n_mask[:, None],
+            other=0,
+        ).to(tl.float32)
+        sc = tl.exp2(codes - 127.0)  # [BLOCK_N, NB]
         b_lo = tl.reshape(b_lo, (BLOCK_SIZE_N, NB, 16)) * sc[:, :, None]
         b_hi = tl.reshape(b_hi, (BLOCK_SIZE_N, NB, 16)) * sc[:, :, None]
         b_lo = tl.reshape(b_lo, (BLOCK_SIZE_N, BLOCK_SIZE_KB))
@@ -119,11 +145,18 @@ def _decode_dsfp4_moe_kernel(
 
 @triton.jit
 def _swiglu_kernel(
-    gu_ptr,            # [R, 2I] gate_up (compute dtype)
-    out_ptr,           # [R, I] activated (compute dtype)
-    R, I, limit,
-    stride_gr, stride_gi, stride_or, stride_oi,
-    BLOCK: tl.constexpr, HAS_LIMIT: tl.constexpr, compute_type: tl.constexpr,
+    gu_ptr,  # [R, 2I] gate_up (compute dtype)
+    out_ptr,  # [R, I] activated (compute dtype)
+    R,
+    I,
+    limit,
+    stride_gr,
+    stride_gi,
+    stride_or,
+    stride_oi,
+    BLOCK: tl.constexpr,
+    HAS_LIMIT: tl.constexpr,
+    compute_type: tl.constexpr,
 ):
     """Fused SwiGLU: ``out = silu(min(gate, limit)) * clamp(up, -limit, limit)``.
 
@@ -134,7 +167,9 @@ def _swiglu_kernel(
     offs = cb * BLOCK + tl.arange(0, BLOCK)
     mask = offs < I
     g = tl.load(gu_ptr + row * stride_gr + offs * stride_gi, mask=mask, other=0.0).to(tl.float32)
-    u = tl.load(gu_ptr + row * stride_gr + (I + offs) * stride_gi, mask=mask, other=0.0).to(tl.float32)
+    u = tl.load(gu_ptr + row * stride_gr + (I + offs) * stride_gi, mask=mask, other=0.0).to(
+        tl.float32
+    )
     if HAS_LIMIT:
         g = tl.minimum(g, limit)
         u = tl.minimum(tl.maximum(u, -limit), limit)
@@ -167,22 +202,28 @@ def _fp4_bf16_bits(nib, shift):
 
 @triton.jit
 def _prefill_dsfp4_moe_kernel(
-    a_ptr,             # [M, K] activations (compute dtype, FP8 round-tripped)
-    packed_ptr,        # [S, N, K // 2] uint8
-    scale_ptr,         # [S, N, K // 32] uint8 (e8m0 codes)
-    c_ptr,             # [M, TOP_K, N] output, indexed flat over M*TOP_K routes
+    a_ptr,  # [M, K] activations (compute dtype, FP8 round-tripped)
+    packed_ptr,  # [S, N, K // 2] uint8
+    scale_ptr,  # [S, N, K // 32] uint8 (e8m0 codes)
+    c_ptr,  # [M, TOP_K, N] output, indexed flat over M*TOP_K routes
     topk_weights_ptr,  # [M * TOP_K] fp32
     sorted_token_ids_ptr,
-    expert_ids_ptr,    # bank row per M-block
+    expert_ids_ptr,  # bank row per M-block
     num_tokens_post_padded_ptr,
     N: tl.constexpr,
     K: tl.constexpr,
     EM,
     num_valid_tokens,
-    stride_am, stride_ak,
-    stride_pe, stride_pn, stride_pkb,
-    stride_se, stride_sn, stride_sblk,
-    stride_cm, stride_cn,
+    stride_am,
+    stride_ak,
+    stride_pe,
+    stride_pn,
+    stride_pkb,
+    stride_se,
+    stride_sn,
+    stride_sblk,
+    stride_cm,
+    stride_cn,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -257,7 +298,11 @@ def _prefill_dsfp4_moe_kernel(
         bits = tl.interleave(
             _fp4_bf16_bits(packed & 0x0F, shift), _fp4_bf16_bits((packed >> 4) & 0x0F, shift)
         )
-        b = tl.reshape(bits, (BLOCK_SIZE_N, BLOCK_SIZE_K)).to(tl.uint16).to(compute_type, bitcast=True)
+        b = (
+            tl.reshape(bits, (BLOCK_SIZE_N, BLOCK_SIZE_K))
+            .to(tl.uint16)
+            .to(compute_type, bitcast=True)
+        )
         accumulator += tl.dot(a, tl.trans(b))
         a_ptrs += BLOCK_SIZE_K * stride_ak
 
@@ -271,7 +316,9 @@ def _prefill_dsfp4_moe_kernel(
 
 
 def _compute_type(dtype: torch.dtype):
-    return {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}[dtype]
+    return {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}[
+        dtype
+    ]
 
 
 def fused_swiglu(gate_up: torch.Tensor, limit: float) -> torch.Tensor:
@@ -284,10 +331,19 @@ def fused_swiglu(gate_up: torch.Tensor, limit: float) -> torch.Tensor:
     BLOCK = 1024
     grid = (R, triton.cdiv(I, BLOCK))
     _swiglu_kernel[grid](
-        gu, out, R, I, float(limit),
-        gu.stride(0), gu.stride(1), out.stride(0), out.stride(1),
-        BLOCK=BLOCK, HAS_LIMIT=limit > 0,
-        compute_type=_compute_type(gate_up.dtype), num_warps=4,
+        gu,
+        out,
+        R,
+        I,
+        float(limit),
+        gu.stride(0),
+        gu.stride(1),
+        out.stride(0),
+        out.stride(1),
+        BLOCK=BLOCK,
+        HAS_LIMIT=limit > 0,
+        compute_type=_compute_type(gate_up.dtype),
+        num_warps=4,
     )
     return out.reshape(*lead, I)
 

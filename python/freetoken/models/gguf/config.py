@@ -20,6 +20,8 @@ from .reader import gguf_architecture, load_gguf_metadata, gguf_tensor_names
 GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     "gemma4": "Gemma4GGUFForCausalLM",
     "qwen35moe": "Qwen35MoeGGUFForCausalLM",
+    # Qwen3.8-Flash-Next (qwen4exp): hybrid GDN + QSA + PLE + MTP
+    "qwen4exp": "Qwen4ExpGGUFForCausalLM",
     # Dense sibling (Qwen3.8-27B): same hybrid GDN/full-attention decoder, a plain SwiGLU
     # MLP instead of routed experts. Same model classes and the same GGUF adapter; the
     # config's expert_count is absent so moe_enabled comes out False.
@@ -71,8 +73,7 @@ def build_gguf_shim(model_path: str) -> GgufConfigShim:
     registry_key = GGUF_ARCH_TO_REGISTRY.get(arch)
     if registry_key is None:
         raise ValueError(
-            f"GGUF architecture {arch!r} is not supported "
-            f"(known: {sorted(GGUF_ARCH_TO_REGISTRY)})"
+            f"GGUF architecture {arch!r} is not supported (known: {sorted(GGUF_ARCH_TO_REGISTRY)})"
         )
     names = gguf_tensor_names(model_path)
     metadata = load_gguf_metadata(model_path)

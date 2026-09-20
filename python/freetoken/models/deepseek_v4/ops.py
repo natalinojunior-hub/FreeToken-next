@@ -17,8 +17,13 @@ import torch
 
 
 def precompute_freqs_cis(
-    dim: int, seqlen: int, original_seq_len: int, base: float,
-    factor: float, beta_fast: int, beta_slow: int,
+    dim: int,
+    seqlen: int,
+    original_seq_len: int,
+    base: float,
+    factor: float,
+    beta_fast: int,
+    beta_slow: int,
 ) -> torch.Tensor:
     """YaRN rotary frequencies (verbatim from the reference)."""
 
@@ -48,8 +53,14 @@ def precompute_freqs_cis(
 
 @lru_cache(2)  # exactly the model's two rope regimes; a stale 1M entry pins ~256 MB of VRAM
 def get_freqs_cis(
-    dim: int, seqlen: int, original_seq_len: int, base: float,
-    factor: float, beta_fast: int, beta_slow: int, device: torch.device,
+    dim: int,
+    seqlen: int,
+    original_seq_len: int,
+    base: float,
+    factor: float,
+    beta_fast: int,
+    beta_slow: int,
+    device: torch.device,
 ) -> torch.Tensor:
     """Device-resident ``freqs_cis``, shared across layers (the DSV4 analogue of
     ``layers.rotary.get_rope``'s instance cache).
@@ -62,7 +73,9 @@ def get_freqs_cis(
     ).to(device)
 
 
-def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
+def apply_rotary_emb(
+    x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
+) -> torch.Tensor:
     """In-place interleaved rotary embedding (verbatim from the reference)."""
     y = x
     xc = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
@@ -96,9 +109,9 @@ def apply_rotary_emb_decode(
 
 
 def hc_split_sinkhorn(
-    mixes: torch.Tensor,      # [n, (2+hc)*hc] fp32
-    hc_scale: torch.Tensor,   # [3]
-    hc_base: torch.Tensor,    # [(2+hc)*hc]
+    mixes: torch.Tensor,  # [n, (2+hc)*hc] fp32
+    hc_scale: torch.Tensor,  # [3]
+    hc_base: torch.Tensor,  # [(2+hc)*hc]
     hc_mult: int,
     sinkhorn_iters: int,
     eps: float,
@@ -113,8 +126,8 @@ def hc_split_sinkhorn(
     sc = hc_scale.float()
     base = hc_base.float()
     pre = torch.sigmoid(mixes[:, :hc] * sc[0] + base[:hc]) + eps
-    post = 2 * torch.sigmoid(mixes[:, hc:2 * hc] * sc[1] + base[hc:2 * hc])
-    comb = mixes[:, 2 * hc:] * sc[2] + base[2 * hc:]
+    post = 2 * torch.sigmoid(mixes[:, hc : 2 * hc] * sc[1] + base[hc : 2 * hc])
+    comb = mixes[:, 2 * hc :] * sc[2] + base[2 * hc :]
     comb = comb.view(-1, hc, hc)
     comb = comb.softmax(dim=-1) + eps
     comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)

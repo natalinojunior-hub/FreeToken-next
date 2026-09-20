@@ -53,15 +53,17 @@ def _prompt_admitted_reply(msg: PromptAdmittedMsg) -> UserReply:
 
 def _error_reply(msg: ErrorReplyMsg) -> UserReply:
     return UserReply(
-        uid=msg.uid, incremental_output="", finished=True, error=msg.error, error_code=msg.code,
+        uid=msg.uid,
+        incremental_output="",
+        finished=True,
+        error=msg.error,
+        error_code=msg.code,
     )
 
 
 def _put_user_replies(send_frontend: Any, replies: List[UserReply]) -> None:
     if replies:
-        send_frontend.put(
-            replies[0] if len(replies) == 1 else BatchFrontendMsg(data=replies)
-        )
+        send_frontend.put(replies[0] if len(replies) == 1 else BatchFrontendMsg(data=replies))
 
 
 def _send_generation_replies(
@@ -150,9 +152,7 @@ def tokenize_worker(
     from .tokenize import TokenizeManager
 
     tokenize_manager = TokenizeManager(tokenizer, get_mm_processor(tokenizer_path, mm))
-    detokenize_manager = DetokenizeManager(
-        tokenizer, load_eos_token_ids(tokenizer_path, tokenizer)
-    )
+    detokenize_manager = DetokenizeManager(tokenizer, load_eos_token_ids(tokenizer_path, tokenizer))
 
     if ack_queue is not None:
         ack_queue.put(f"Tokenize server {tokenizer_id} is ready")
@@ -203,9 +203,8 @@ def tokenize_worker(
                 )
                 for m in pending_msg
             )
-            assert (
-                len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) + n_control
-                == len(pending_msg)
+            assert len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) + n_control == len(
+                pending_msg
             )
             sampled_replies: List[UserReply] = []
             if len(detokenize_msg) > 0:
@@ -253,7 +252,9 @@ def tokenize_worker(
                         errors[0] if len(errors) == 1 else BatchFrontendMsg(data=errors)
                     )
                 if backend:
-                    send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
+                    send_backend.put(
+                        backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend)
+                    )
             if len(abort_msg) > 0:
                 batch_output = BatchBackendMsg(
                     data=[AbortBackendMsg(uid=msg.uid) for msg in abort_msg]

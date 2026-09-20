@@ -24,6 +24,7 @@ def _single_rank_tp():
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
 
+
 HIDDEN, H, D, KERNEL = 256, 4, 128, 4
 P = H * D
 LOWER_BOUND = -5.0
@@ -34,19 +35,39 @@ def _make_args():
 
     n_layers = 2
     return Glm5NextArgs(
-        hidden_size=HIDDEN, num_heads=8,
-        q_lora_rank=64, kv_lora_rank=32, qk_nope_head_dim=32, qk_rope_head_dim=0,
-        v_head_dim=32, mla_nope=True, norm_eps=1e-5, max_position=4096,
-        index_n_heads=0, index_head_dim=0, index_topk=0, indexer_types=(),
-        indexer_rope_interleave=True, index_kpool=1, index_kpool_compress=False,
+        hidden_size=HIDDEN,
+        num_heads=8,
+        q_lora_rank=64,
+        kv_lora_rank=32,
+        qk_nope_head_dim=32,
+        qk_rope_head_dim=0,
+        v_head_dim=32,
+        mla_nope=True,
+        norm_eps=1e-5,
+        max_position=4096,
+        index_n_heads=0,
+        index_head_dim=0,
+        index_topk=0,
+        indexer_types=(),
+        indexer_rope_interleave=True,
+        index_kpool=1,
+        index_kpool_compress=False,
         index_kpool_always_select_tail=False,
-        linear_num_heads=H, linear_head_dim=D, linear_conv_kernel_dim=KERNEL,
+        linear_num_heads=H,
+        linear_head_dim=D,
+        linear_conv_kernel_dim=KERNEL,
         linear_lower_bound=LOWER_BOUND,
         layer_types=("linear_attention",) * n_layers,
         mlp_layer_types=("dense",) * n_layers,
-        mhc=False, mhc_num_residual_streams=1, hc_eps=1e-6,
-        mhc_sinkhorn_iterations=0, mhc_tau=0.05, mhc_post_mult_value=2.0,
-        mhc_no_norm_weight=False, swiglu_limit=None, rope_theta=10000.0,
+        mhc=False,
+        mhc_num_residual_streams=1,
+        hc_eps=1e-6,
+        mhc_sinkhorn_iterations=0,
+        mhc_tau=0.05,
+        mhc_post_mult_value=2.0,
+        mhc_no_norm_weight=False,
+        swiglu_limit=None,
+        rope_theta=10000.0,
     )
 
 
@@ -73,21 +94,28 @@ def _make_pool(num_slots=4):
     from freetoken.models.config import LinearGatedDeltaGroupConfig
 
     group = LinearGatedDeltaGroupConfig(
-        name="linear", layer_ids=(0,),
-        num_key_heads=H, num_value_heads=H, key_head_dim=D, value_head_dim=D,
-        conv_kernel_dim=KERNEL, output_gate=True, variant="kda",
+        name="linear",
+        layer_ids=(0,),
+        num_key_heads=H,
+        num_value_heads=H,
+        key_head_dim=D,
+        value_head_dim=D,
+        conv_kernel_dim=KERNEL,
+        output_gate=True,
+        variant="kda",
     )
     return LinearStatePool(
-        group, num_slots, dtype=torch.bfloat16,
-        device=torch.device("cuda"), tp_size=1,
+        group,
+        num_slots,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+        tp_size=1,
     )
 
 
 def _patch_ctx(monkeypatch, pool, batch):
     ctx = SimpleNamespace(batch=batch, linear_state_pool=pool)
-    monkeypatch.setattr(
-        "freetoken.models.glm5_next.kda.get_global_ctx", lambda: ctx
-    )
+    monkeypatch.setattr("freetoken.models.glm5_next.kda.get_global_ctx", lambda: ctx)
 
 
 def _l2norm(x):
@@ -113,15 +141,17 @@ def _reference_forward(op, x_seq, conv_ctx=None, h0=None):
         else torch.zeros(3 * P, KERNEL - 1, device=x_seq.device)
     )
     padded = torch.cat([left, stream], dim=1)  # [3P, KERNEL-1+T]
-    conv = torch.stack(
-        [(padded[:, t : t + KERNEL] * w).sum(-1) for t in range(T)], dim=1
-    )
+    conv = torch.stack([(padded[:, t : t + KERNEL] * w).sum(-1) for t in range(T)], dim=1)
     mixed = torch.nn.functional.silu(conv).T  # [T, 3P]
-    conv_tail = padded[:, -(KERNEL - 1):]
+    conv_tail = padded[:, -(KERNEL - 1) :]
 
     q, k, v = (t.reshape(T, H, D) for t in torch.split(mixed, [P, P, P], dim=-1))
     # bf16 round-trip like the op (kernel inputs are bf16)
-    q, k, v = q.to(torch.bfloat16).float(), k.to(torch.bfloat16).float(), v.to(torch.bfloat16).float()
+    q, k, v = (
+        q.to(torch.bfloat16).float(),
+        k.to(torch.bfloat16).float(),
+        v.to(torch.bfloat16).float(),
+    )
 
     h = h0.clone() if h0 is not None else torch.zeros(H, D, D, device=x_seq.device)
     amp = op.A_log.exp().view(H, 1)
@@ -131,9 +161,9 @@ def _reference_forward(op, x_seq, conv_ctx=None, h0=None):
         gk = LOWER_BOUND * torch.sigmoid(amp * (g1[t].view(H, D) + bias))
         h = h * gk.exp().unsqueeze(1)
         kt = _l2norm(k[t])
-        v_err = (v[t] - torch.einsum("hvk,hk->hv", h, kt)) * torch.sigmoid(
-            b[t].float()
-        ).unsqueeze(-1)
+        v_err = (v[t] - torch.einsum("hvk,hk->hv", h, kt)) * torch.sigmoid(b[t].float()).unsqueeze(
+            -1
+        )
         h = h + torch.einsum("hv,hk->hvk", v_err, kt)
         core.append(torch.einsum("hvk,hk->hv", h, _l2norm(q[t]) * D**-0.5))
     core = torch.stack(core)  # [T, H, D]
@@ -149,8 +179,10 @@ def _fla(cu, indices, has_init=None, fresh=None):
     from freetoken.attention.linear import FLAMetadata
 
     return FLAMetadata(
-        cu_seqlens=cu, cache_indices=indices,
-        has_initial_state=has_init, fresh_state_indices=fresh,
+        cu_seqlens=cu,
+        cache_indices=indices,
+        has_initial_state=has_init,
+        fresh_state_indices=fresh,
     )
 
 
@@ -200,7 +232,8 @@ def test_prefill_then_decode_continuity(monkeypatch):
     batch = SimpleNamespace(
         is_decode=False,
         fla_metadata=_fla(
-            cu, indices,
+            cu,
+            indices,
             torch.tensor([False], device="cuda"),
             torch.tensor([1], dtype=torch.int64, device="cuda"),
         ),
@@ -212,9 +245,7 @@ def test_prefill_then_decode_continuity(monkeypatch):
     for t in range(T0, T0 + T1):
         batch = SimpleNamespace(
             is_decode=True,
-            fla_metadata=_fla(
-                torch.tensor([0, 1], dtype=torch.int32, device="cuda"), indices
-            ),
+            fla_metadata=_fla(torch.tensor([0, 1], dtype=torch.int32, device="cuda"), indices),
         )
         _patch_ctx(monkeypatch, pool, batch)
         out_t = op.forward(x[t : t + 1])
@@ -235,7 +266,8 @@ def test_chunked_prefill_continuation(monkeypatch):
     batch = SimpleNamespace(
         is_decode=False,
         fla_metadata=_fla(
-            torch.tensor([0, T0], dtype=torch.int32, device="cuda"), indices,
+            torch.tensor([0, T0], dtype=torch.int32, device="cuda"),
+            indices,
             torch.tensor([False], device="cuda"),
             torch.tensor([1], dtype=torch.int64, device="cuda"),
         ),
@@ -247,8 +279,10 @@ def test_chunked_prefill_continuation(monkeypatch):
     batch = SimpleNamespace(
         is_decode=False,
         fla_metadata=_fla(
-            torch.tensor([0, T1], dtype=torch.int32, device="cuda"), indices,
-            torch.tensor([True], device="cuda"), None,
+            torch.tensor([0, T1], dtype=torch.int32, device="cuda"),
+            indices,
+            torch.tensor([True], device="cuda"),
+            None,
         ),
     )
     _patch_ctx(monkeypatch, pool, batch)

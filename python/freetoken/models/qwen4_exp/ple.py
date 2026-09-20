@@ -78,8 +78,10 @@ class GpuResidentTable:
         self.weight = weight
         self.scale = float(scale)
         self.num_rows, self.head_dim = weight.shape
-        self.dtype = dtype if dtype is not None else (
-            torch.bfloat16 if weight.dtype.itemsize < 2 else weight.dtype
+        self.dtype = (
+            dtype
+            if dtype is not None
+            else (torch.bfloat16 if weight.dtype.itemsize < 2 else weight.dtype)
         )
 
     def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
@@ -112,6 +114,56 @@ class ZeroTable:
             dtype=self.dtype,
             device=row_ids.device,
         )
+
+    def prefetch(self, row_ids: torch.Tensor) -> None:
+        return None
+
+
+class GgufUVATable:
+    """GGUF PLE table mapped via mmap in slices, dequantizing on GPU per lookup."""
+
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        quant_type: int,
+        *,
+        embed_dim: int = 160,
+        scale: float = 1.0,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        self.weight = weight
+        self.quant_type = quant_type
+        self.scale = float(scale)
+        self.num_rows = weight.shape[0]
+        self.head_dim = embed_dim
+        self.row_bytes = weight.shape[1]
+        self.dtype = dtype
+
+    def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        from freetoken.kernel.gguf import ggml_dequantize
+
+        flat_ids = row_ids.reshape(-1)
+        # ponytail: direct CPU index_select is fast for small decode batches (<= 1024 rows, <100KB);
+        # add batched asynchronous UVA gather when prefill exceeds 32k tokens.
+        cpu_ids = flat_ids.to("cpu")
+        valid = (cpu_ids >= 0) & (cpu_ids < self.num_rows)
+        safe_ids = torch.where(valid, cpu_ids, torch.zeros_like(cpu_ids))
+        packed_cpu = self.weight.index_select(0, safe_ids)
+        packed_dev = packed_cpu.to(device=row_ids.device, non_blocking=True)
+        values = ggml_dequantize(
+            packed_dev, self.quant_type, flat_ids.numel(), self.head_dim, self.dtype
+        )
+        if not valid.all():
+            values = torch.where(
+                valid.to(values.device).unsqueeze(-1), values, torch.zeros_like(values)
+            )
+        if self.scale != 1.0:
+            values = values * self.scale
+        values = values.view(*row_ids.shape[:-1], -1)
+        if out is None:
+            return values
+        out.copy_(values)
+        return out
 
     def prefetch(self, row_ids: torch.Tensor) -> None:
         return None
@@ -359,9 +411,17 @@ def build_ple_metadata(
         fresh = ~fla.has_initial_state
     else:  # direct-op callers (tests) with no scheduler metadata
         pin = {"device": "cpu", "pin_memory": torch.cuda.is_available()}
-        cu = torch.tensor([0, *lens], dtype=torch.int64, **pin).cumsum_(0).to(device, non_blocking=True)
-        slots = torch.tensor([_state_slot(r) for r in reqs], dtype=torch.int64, **pin).to(device, non_blocking=True)
-        fresh = torch.tensor([r.cached_len == 0 for r in reqs], dtype=torch.bool, **pin).to(device, non_blocking=True)
+        cu = (
+            torch.tensor([0, *lens], dtype=torch.int64, **pin)
+            .cumsum_(0)
+            .to(device, non_blocking=True)
+        )
+        slots = torch.tensor([_state_slot(r) for r in reqs], dtype=torch.int64, **pin).to(
+            device, non_blocking=True
+        )
+        fresh = torch.tensor([r.cached_len == 0 for r in reqs], dtype=torch.bool, **pin).to(
+            device, non_blocking=True
+        )
     context = context_pool.index_select(0, slots).long()
     context = torch.where(fresh.unsqueeze(1), context.new_full((), eos), context)
     return PLEMetadata(
@@ -477,7 +537,9 @@ class NGramEmbedding(BaseOP):
             end = start + self.heads_per_ngram
             mixed = tokens[0] * self.layer_multipliers[0]
             for position in range(1, ngram):
-                mixed = torch.bitwise_xor(mixed, tokens[position] * self.layer_multipliers[position])
+                mixed = torch.bitwise_xor(
+                    mixed, tokens[position] * self.layer_multipliers[position]
+                )
             head_ids = torch.remainder(mixed.unsqueeze(-1), self.ngram_heads_vocab_sizes[start:end])
             blocks.append(head_ids + self.ngram_heads_offsets[start:end])
         return torch.cat(blocks, dim=-1)
@@ -547,7 +609,12 @@ class PLELayer(BaseOP):
     """
 
     def __init__(
-        self, config: ModelConfig, layer_id: int, table: PLETableBackend | None = None, *, prefix: str = ""
+        self,
+        config: ModelConfig,
+        layer_id: int,
+        table: PLETableBackend | None = None,
+        *,
+        prefix: str = "",
     ) -> None:
         args = config.qwen4_args
         self.args = args
@@ -560,10 +627,18 @@ class PLELayer(BaseOP):
         width = args.ple_state_width
         self.ple_embedding = NGramEmbedding(args, table)
         self.key_proj = LinearReplicated(
-            args.ple_embed_dim, width, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.key_proj"
+            args.ple_embed_dim,
+            width,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.key_proj",
         )
         self.value_proj = LinearReplicated(
-            args.ple_embed_dim, args.hidden_size, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.value_proj"
+            args.ple_embed_dim,
+            args.hidden_size,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.value_proj",
         )
         self.norm_key = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
         self.norm_query = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
@@ -609,7 +684,9 @@ class PLELayer(BaseOP):
         value = self.value_proj.forward(embeddings)
         query = self.norm_query.forward(R)
         shape = (-1, self.hc_count, self.hidden_size)
-        gate = (key.view(shape) * query.view(shape)).sum(-1, keepdim=True) / math.sqrt(self.hidden_size)
+        gate = (key.view(shape) * query.view(shape)).sum(-1, keepdim=True) / math.sqrt(
+            self.hidden_size
+        )
         gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
         gated = (gate * value.unsqueeze(-2)).flatten(-2)
         states = conv_states if conv_states is not None else self._conv_state_slab(R)
@@ -645,9 +722,7 @@ class PLELayer(BaseOP):
             state = torch.where(meta.fresh_slots.view(-1, 1, 1), torch.zeros_like(state), state)
         return state
 
-    def _short_conv(
-        self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor
-    ) -> torch.Tensor:
+    def _short_conv(self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor) -> torch.Tensor:
         """silu of the dilated depthwise conv over [state | x], and roll the per-request state."""
         if meta.is_decode:
             return self._decode_conv(x, meta, states)

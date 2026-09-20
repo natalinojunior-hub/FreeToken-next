@@ -72,7 +72,11 @@ def _bench_profile_path(gpu_uuid: str | None) -> str | None:
 def _serve_gpu_uuid(args: list[str]) -> str | None:
     """The full UUID a serve's `--gpu` pins, or None when there is none or it cannot be resolved."""
     for i, a in enumerate(args):
-        val = a[len("--gpu="):] if a.startswith("--gpu=") else (args[i + 1] if a == "--gpu" and i + 1 < len(args) else None)
+        val = (
+            a[len("--gpu=") :]
+            if a.startswith("--gpu=")
+            else (args[i + 1] if a == "--gpu" and i + 1 < len(args) else None)
+        )
         if not val:
             continue
         from freetoken.gpu_select import resolve_gpu_uuids
@@ -84,7 +88,7 @@ def _serve_gpu_uuid(args: list[str]) -> str | None:
         if resolved:
             return resolved[0]
         # no NVML: a UUID value still keys the profile file (canonical prefix), an index cannot
-        return "GPU-" + val[len("GPU-"):] if val.upper().startswith("GPU-") else None
+        return "GPU-" + val[len("GPU-") :] if val.upper().startswith("GPU-") else None
     return None
 
 
@@ -355,7 +359,9 @@ def build_app(
             except Exception as exc:  # noqa: BLE001
                 yield _bench_sse("error", {"message": f"failed to spawn bench: {exc}"})
                 return
-            tail: collections.deque = collections.deque(maxlen=8)  # last non-progress lines (errors)
+            tail: collections.deque = collections.deque(
+                maxlen=8
+            )  # last non-progress lines (errors)
             out_path: str | None = None
             assert proc.stdout is not None
             async for raw in proc.stdout:
@@ -364,7 +370,7 @@ def build_app(
                 if prog is not None:
                     yield _bench_sse("progress", prog)
                 elif line.startswith("FTBENCH_OUT "):
-                    out_path = line[len("FTBENCH_OUT "):]
+                    out_path = line[len("FTBENCH_OUT ") :]
                 elif line:
                     tail.append(line)
             rc = await proc.wait()
@@ -424,14 +430,14 @@ def _sse_gap(dropped: int, from_seq: Any, to_seq: Any) -> str:
 
 def _log_stream(request: Request, ring, since: int) -> StreamingResponse:
     """SSE log stream with replay + live tail. Correctness points:
-      * subscribe BEFORE snapshotting the backlog, then dedupe live records by seq → no gap and
-        no duplicate across the replay→live boundary;
-      * per-subscriber bounded queue, drop-oldest on overflow via ``call_soon_threadsafe`` (the
-        mutation runs on the loop thread, so the reader never blocks) and a client-visible gap
-        sentinel so a slow client knows it lost lines;
-      * ``id:<seq>`` on every frame + ``Last-Event-ID`` honoured for native EventSource resume;
-      * a 15 s heartbeat + ``is_disconnected`` check so an idle client's disconnect is detected
-        and the subscriber is always removed in ``finally`` (no leak)."""
+    * subscribe BEFORE snapshotting the backlog, then dedupe live records by seq → no gap and
+      no duplicate across the replay→live boundary;
+    * per-subscriber bounded queue, drop-oldest on overflow via ``call_soon_threadsafe`` (the
+      mutation runs on the loop thread, so the reader never blocks) and a client-visible gap
+      sentinel so a slow client knows it lost lines;
+    * ``id:<seq>`` on every frame + ``Last-Event-ID`` honoured for native EventSource resume;
+    * a 15 s heartbeat + ``is_disconnected`` check so an idle client's disconnect is detected
+      and the subscriber is always removed in ``finally`` (no leak)."""
     loop = asyncio.get_running_loop()
     lei = request.headers.get("last-event-id")
     if lei and lei.isdigit():

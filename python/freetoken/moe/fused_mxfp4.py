@@ -76,12 +76,12 @@ def run_mxfp4_prefill_experts_t(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    gate_up_blocks_t: torch.Tensor,   # [E, H//2, 2*I]
-    gate_up_scales_t: torch.Tensor,   # [E, H//32, 2*I]
-    gate_up_bias: torch.Tensor,       # [E, 2*I]
-    down_blocks_t: torch.Tensor,      # [E, I//2, H]
-    down_scales_t: torch.Tensor,      # [E, I//32, H]
-    down_bias: torch.Tensor,          # [E, H]
+    gate_up_blocks_t: torch.Tensor,  # [E, H//2, 2*I]
+    gate_up_scales_t: torch.Tensor,  # [E, H//32, 2*I]
+    gate_up_bias: torch.Tensor,  # [E, 2*I]
+    down_blocks_t: torch.Tensor,  # [E, I//2, H]
+    down_scales_t: torch.Tensor,  # [E, I//32, H]
+    down_bias: torch.Tensor,  # [E, H]
     *,
     top_k: int,
     hidden_act_alpha: float,
@@ -251,13 +251,21 @@ def run_mxfp4_splitk_decode_experts(
 
     gu_splits = _decode_split_count(routes, H // 32, target_programs=180)
     gate_up_out = mxfp4_splitk_gemv_triton(
-        routed_x, gate_up_blocks_t, gate_up_scales_t, gate_up_bias,
-        route_experts, N=two_I, K=H, stride_xe=gu_stride_xe, num_splits=gu_splits,
+        routed_x,
+        gate_up_blocks_t,
+        gate_up_scales_t,
+        gate_up_bias,
+        route_experts,
+        N=two_I,
+        K=H,
+        stride_xe=gu_stride_xe,
+        num_splits=gu_splits,
     )
 
     hidden_out = torch.empty((routes, local_intermediate_size), device=device, dtype=compute_type)
     gpt_oss_swiglu_triton(
-        gate_up_out, hidden_out,
+        gate_up_out,
+        hidden_out,
         alpha=hidden_act_alpha,
         limit=swiglu_limit if swiglu_limit is not None else float("inf"),
         compute_type=compute_type,
@@ -265,9 +273,16 @@ def run_mxfp4_splitk_decode_experts(
 
     dp_splits = _decode_split_count(routes, local_intermediate_size // 32, target_programs=72)
     down_out = mxfp4_splitk_gemv_triton(
-        hidden_out, down_blocks_t, down_scales_t, down_bias,
-        route_experts, N=H, K=local_intermediate_size,
-        stride_xe=hidden_out.stride(0), num_splits=dp_splits, expert_wts=route_weights,
+        hidden_out,
+        down_blocks_t,
+        down_scales_t,
+        down_bias,
+        route_experts,
+        N=H,
+        K=local_intermediate_size,
+        stride_xe=hidden_out.stride(0),
+        num_splits=dp_splits,
+        expert_wts=route_weights,
     )
 
     return down_out.view(M, top_k, H).sum(dim=1).to(compute_type)

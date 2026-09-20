@@ -55,7 +55,6 @@ def _thinking_type(req: Any) -> str | None:
     return None
 
 
-
 def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
@@ -137,14 +136,18 @@ def register_openai_routes(
         model_id = _served_model_name(state)
         ctx = _model_context_length(state)
         efforts, default_effort = await _effort_fields(state)
-        return ModelList(data=[ModelCard(
-            id=model_id,
-            root=state.config.model_path,
-            max_model_len=ctx,
-            context_length=ctx,
-            supported_reasoning_efforts=efforts,
-            default_reasoning_effort=default_effort,
-        )])
+        return ModelList(
+            data=[
+                ModelCard(
+                    id=model_id,
+                    root=state.config.model_path,
+                    max_model_len=ctx,
+                    context_length=ctx,
+                    supported_reasoning_efforts=efforts,
+                    default_reasoning_effort=default_effort,
+                )
+            ]
+        )
 
 
 async def handle_chat_completion(
@@ -154,7 +157,9 @@ async def handle_chat_completion(
     model_sampling: dict[str, Any],
 ):
     if req.function_call is not None:
-        return create_error_response("function_call is not supported; use tools/tool_choice instead")
+        return create_error_response(
+            "function_call is not supported; use tools/tool_choice instead"
+        )
     if req.logit_bias is not None:
         return create_error_response("logit_bias is not supported")
     if _response_format_unsupported(req.response_format):
@@ -297,16 +302,24 @@ async def stream_chat_completion_chunks(
             }
             yield _sse(
                 _chat_chunk(
-                    req, uid,
-                    [{
-                        "delta": {"tool_calls": [{
-                            "index": open_tool["index"],
-                            "id": _tool_call_id(ev.name, open_tool["index"]),
-                            "type": "function",
-                            "function": {"name": ev.name, "arguments": ""},
-                        }]},
-                        "index": 0, "finish_reason": None,
-                    }],
+                    req,
+                    uid,
+                    [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": open_tool["index"],
+                                        "id": _tool_call_id(ev.name, open_tool["index"]),
+                                        "type": "function",
+                                        "function": {"name": ev.name, "arguments": ""},
+                                    }
+                                ]
+                            },
+                            "index": 0,
+                            "finish_reason": None,
+                        }
+                    ],
                 )
             )
         elif isinstance(ev, ToolCallArgsDelta):
@@ -316,14 +329,22 @@ async def stream_chat_completion_chunks(
                 open_tool["sent"] += ev.fragment
                 yield _sse(
                     _chat_chunk(
-                        req, uid,
-                        [{
-                            "delta": {"tool_calls": [{
-                                "index": open_tool["index"],
-                                "function": {"arguments": ev.fragment},
-                            }]},
-                            "index": 0, "finish_reason": None,
-                        }],
+                        req,
+                        uid,
+                        [
+                            {
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": open_tool["index"],
+                                            "function": {"arguments": ev.fragment},
+                                        }
+                                    ]
+                                },
+                                "index": 0,
+                                "finish_reason": None,
+                            }
+                        ],
                     )
                 )
         elif isinstance(ev, ToolCallsDelta):
@@ -333,21 +354,31 @@ async def stream_chat_completion_chunks(
                     # final (authoritative) arguments wasn't streamed yet.
                     final = call.parameters or ""
                     remainder = (
-                        final[len(open_tool["sent"]):]
+                        final[len(open_tool["sent"]) :]
                         if final.startswith(open_tool["sent"])
-                        else final if not open_tool["sent"] else ""
+                        else final
+                        if not open_tool["sent"]
+                        else ""
                     )
                     if remainder:
                         yield _sse(
                             _chat_chunk(
-                                req, uid,
-                                [{
-                                    "delta": {"tool_calls": [{
-                                        "index": open_tool["index"],
-                                        "function": {"arguments": remainder},
-                                    }]},
-                                    "index": 0, "finish_reason": None,
-                                }],
+                                req,
+                                uid,
+                                [
+                                    {
+                                        "delta": {
+                                            "tool_calls": [
+                                                {
+                                                    "index": open_tool["index"],
+                                                    "function": {"arguments": remainder},
+                                                }
+                                            ]
+                                        },
+                                        "index": 0,
+                                        "finish_reason": None,
+                                    }
+                                ],
                             )
                         )
                     open_tool = None
@@ -357,7 +388,8 @@ async def stream_chat_completion_chunks(
                 for delta in _tool_call_deltas([call], start_index=tool_calls_sent):
                     yield _sse(
                         _chat_chunk(
-                            req, uid,
+                            req,
+                            uid,
                             [{"delta": {"tool_calls": [delta]}, "index": 0, "finish_reason": None}],
                         )
                     )
@@ -366,7 +398,11 @@ async def stream_chat_completion_chunks(
             prompt_tokens = ev.prompt_tokens
             completion_tokens = ev.completion_tokens
             cached_tokens = ev.cached_tokens
-            yield _sse(_chat_chunk(req, uid, [{"delta": {}, "index": 0, "finish_reason": ev.finish_reason}]))
+            yield _sse(
+                _chat_chunk(
+                    req, uid, [{"delta": {}, "index": 0, "finish_reason": ev.finish_reason}]
+                )
+            )
 
     if req.stream_options and req.stream_options.include_usage:
         yield _sse(
@@ -409,9 +445,13 @@ async def handle_completion(
             return create_error_response("Streaming completions only support a single text prompt")
         uid = state.new_user()
         await state.send_one(
-            TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(
-                req, model_sampling, default_max_tokens=default_max_tokens
-            ))
+            TokenizeMsg(
+                uid=uid,
+                text=prompts[0],
+                sampling_params=_resolve_sampling(
+                    req, model_sampling, default_max_tokens=default_max_tokens
+                ),
+            )
         )
         chunks = stream_completion_chunks(uid, req, state)
         if request is not None:
@@ -445,7 +485,9 @@ async def handle_completion(
             if ack.finished:
                 finish_reason = getattr(ack, "finish_reason", None) or "stop"
                 break
-        choices.append({"index": index, "text": text, "finish_reason": finish_reason, "logprobs": None})
+        choices.append(
+            {"index": index, "text": text, "finish_reason": finish_reason, "logprobs": None}
+        )
 
     return {
         "id": f"cmpl-{uuid.uuid4().hex}",
@@ -457,14 +499,18 @@ async def handle_completion(
     }
 
 
-async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any) -> AsyncIterator[bytes]:
+async def stream_completion_chunks(
+    uid: int, req: CompletionRequest, state: Any
+) -> AsyncIterator[bytes]:
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
     finish_reason = "stop"
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
-            yield _sse({"error": {"message": ack.error, "type": "invalid_request_error", "code": None}})
+            yield _sse(
+                {"error": {"message": ack.error, "type": "invalid_request_error", "code": None}}
+            )
             yield b"data: [DONE]\n\n"
             return
         prompt_tokens += ack.prompt_tokens_delta
@@ -611,7 +657,9 @@ def _tool_call_id(name: str | None, index: int) -> str:
     return f"call_{prefix}_{index}_{uuid.uuid4().hex[:8]}"
 
 
-def _chat_chunk(req: ChatCompletionRequest, uid: int, choices: list[dict[str, Any]]) -> dict[str, Any]:
+def _chat_chunk(
+    req: ChatCompletionRequest, uid: int, choices: list[dict[str, Any]]
+) -> dict[str, Any]:
     return {
         "id": f"chatcmpl-{uid}",
         "object": "chat.completion.chunk",
@@ -670,7 +718,10 @@ def _is_token_prompt(prompt: Any) -> bool:
         and bool(prompt)
         and (
             all(isinstance(item, int) for item in prompt)
-            or all(isinstance(item, list) and all(isinstance(token, int) for token in item) for item in prompt)
+            or all(
+                isinstance(item, list) and all(isinstance(token, int) for token in item)
+                for item in prompt
+            )
         )
     )
 

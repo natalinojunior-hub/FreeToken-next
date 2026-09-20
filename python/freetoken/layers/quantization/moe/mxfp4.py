@@ -6,7 +6,16 @@ import torch
 
 from ..registry import LayerKind, register_method
 from ..scheme import MX_GROUP as GROUP, QuantKind
-from .base import BankSpec, ExpertView, fused_piece, is_resident, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
+from .base import (
+    BankSpec,
+    ExpertView,
+    fused_piece,
+    is_resident,
+    limit_or_inf,
+    MoEConfig,
+    MoEKernel,
+    MoEMethod,
+)
 
 E8M0 = torch.float8_e8m0fnu
 
@@ -22,7 +31,9 @@ class TritonMxfp4MoEKernel(MoEKernel):
             return "standard MXFP4 kernel reads the concatenated gate|up row order"
         if (cfg.alpha, cfg.beta) != (1.0, 0.0):
             return "standard MXFP4 kernel has no alpha / beta in its swiglu"
-        return self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        return self._common_reject(
+            cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False
+        )
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         i, h = cfg.intermediate, cfg.hidden
@@ -90,16 +101,29 @@ class TritonGptossMxfp4MoEKernel(MoEKernel):
         return {}
 
     def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
-        from freetoken.moe.fused_mxfp4 import MXFP4_DECODE_MAX_TOKENS, run_mxfp4_prefill_experts_t, run_mxfp4_splitk_decode_experts
+        from freetoken.moe.fused_mxfp4 import (
+            MXFP4_DECODE_MAX_TOKENS,
+            run_mxfp4_prefill_experts_t,
+            run_mxfp4_splitk_decode_experts,
+        )
 
         t = view.tensors
         # the resident layer picks the split-K decode kernel by token count, not by phase
         decode = x.shape[0] <= MXFP4_DECODE_MAX_TOKENS if is_resident(layer) else not is_prefill
         run = run_mxfp4_splitk_decode_experts if decode else run_mxfp4_prefill_experts_t
         return run(
-            x, topk_weights, topk_ids,
-            t["gate_up"], t["gate_up_scale"], t["gate_up_bias"], t["down"], t["down_scale"], t["down_bias"],
-            top_k=layer.top_k, hidden_act_alpha=float(layer.alpha), swiglu_limit=layer.limit,
+            x,
+            topk_weights,
+            topk_ids,
+            t["gate_up"],
+            t["gate_up_scale"],
+            t["gate_up_bias"],
+            t["down"],
+            t["down_scale"],
+            t["down_bias"],
+            top_k=layer.top_k,
+            hidden_act_alpha=float(layer.alpha),
+            swiglu_limit=layer.limit,
         )
 
 
@@ -109,7 +133,9 @@ class Mxfp4MoEMethod(MoEMethod):
 
     def create_weights(self, layer) -> None:
         if not self.cfg.has_bias:
-            raise NotImplementedError("standard MXFP4 experts are served from the offload cache, not resident")
+            raise NotImplementedError(
+                "standard MXFP4 experts are served from the offload cache, not resident"
+            )
         g = self.cfg
         e, i, h = g.num_experts, g.local_intermediate, g.hidden
         if h % GROUP:
@@ -127,8 +153,12 @@ class Mxfp4MoEMethod(MoEMethod):
         from freetoken.moe.fused_mxfp4 import _transpose_mxfp4_for_decode
 
         # one transposed copy serves prefill and decode; the HF blocks are freed so 120B fits
-        layer._gu_blocks_t, layer._gu_scales_t = _transpose_mxfp4_for_decode(layer.gate_up_proj_blocks, layer.gate_up_proj_scales)
-        layer._dn_blocks_t, layer._dn_scales_t = _transpose_mxfp4_for_decode(layer.down_proj_blocks, layer.down_proj_scales)
+        layer._gu_blocks_t, layer._gu_scales_t = _transpose_mxfp4_for_decode(
+            layer.gate_up_proj_blocks, layer.gate_up_proj_scales
+        )
+        layer._dn_blocks_t, layer._dn_scales_t = _transpose_mxfp4_for_decode(
+            layer.down_proj_blocks, layer.down_proj_scales
+        )
         layer.gate_up_proj_blocks = None
         layer.gate_up_proj_scales = None
         layer.down_proj_blocks = None
@@ -136,7 +166,13 @@ class Mxfp4MoEMethod(MoEMethod):
         torch.cuda.empty_cache()
 
     def resident_view(self, layer) -> ExpertView:
-        return ExpertView({
-            "gate_up": layer._gu_blocks_t, "gate_up_scale": layer._gu_scales_t, "gate_up_bias": layer.gate_up_proj_bias,
-            "down": layer._dn_blocks_t, "down_scale": layer._dn_scales_t, "down_bias": layer.down_proj_bias,
-        })
+        return ExpertView(
+            {
+                "gate_up": layer._gu_blocks_t,
+                "gate_up_scale": layer._gu_scales_t,
+                "gate_up_bias": layer.gate_up_proj_bias,
+                "down": layer._dn_blocks_t,
+                "down_scale": layer._dn_scales_t,
+                "down_bias": layer.down_proj_bias,
+            }
+        )

@@ -27,7 +27,6 @@ from freetoken.models.config import (
 from .args import load_args
 
 
-
 def _dsa_on(args, num_layers: int) -> bool:
     """DSA serving switch, resolved ONCE here into the attention-group spec (the pool
     factory, the KV cost model, and the backend all read the spec, never the env)."""
@@ -95,8 +94,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
             ),
         ),
         num_experts=(
-            getattr(hf_config, "n_routed_experts", None)
-            or getattr(hf_config, "num_experts", 0)
+            getattr(hf_config, "n_routed_experts", None) or getattr(hf_config, "num_experts", 0)
         ),
         num_experts_per_tok=hf_config.num_experts_per_tok,
         moe_intermediate_size=getattr(hf_config, "moe_intermediate_size", 0)

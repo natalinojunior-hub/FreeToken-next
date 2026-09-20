@@ -14,6 +14,7 @@ owned twice), (c) prefix closure (parent links, key registration, page alignment
 own ``check_integrity``, (e) node-for-node agreement with the page-keyed reference model.  (e) is
 where regressions actually die; (a)-(d) are cheap tripwires that fire earlier and localize.
 """
+
 from __future__ import annotations
 
 from collections import Counter
@@ -41,21 +42,21 @@ def slots_tensor(slots: Sequence[int]) -> torch.Tensor:
 class MatchOut:
     cached_len: int
     indices: List[int]
-    node: Any                          # opaque implementation node; the lock target
-    second: Optional[int] = None       # hybrid: the GDN snapshot slot to restore from
+    node: Any  # opaque implementation node; the lock target
+    second: Optional[int] = None  # hybrid: the GDN snapshot slot to restore from
 
 
 @dataclass
 class InsertOut:
     matched_len: int
-    freed: List[int]                   # slots the cache itself handed back (SWA only)
+    freed: List[int]  # slots the cache itself handed back (SWA only)
     second_exists: Optional[bool] = None
 
 
 @dataclass
 class EvictOut:
-    primary: List[int]                 # full-KV page indices removed from the tree
-    second: List[int]                  # swa-freed full indices / freed GDN snapshot slots
+    primary: List[int]  # full-KV page indices removed from the tree
+    second: List[int]  # swa-freed full indices / freed GDN snapshot slots
 
 
 @dataclass
@@ -123,20 +124,31 @@ class Adapter:
 
     def records(self) -> List[Tuple[Path, Record]]:
         """One record per node keyed by its end boundary -- the shape the model also emits."""
-        return [(node_end_path(n),
-                 {"length": n.length, "slots": tuple(n.value.tolist()), "ref": n.ref_count,
-                  "tomb": bool(n.swa_tombstone), "swa_ref": n.swa_ref_count,
-                  "swa_uuid": n.swa_uuid, "mamba": n.mamba_value,
-                  "mamba_ref": n.mamba_ref_count})
-                for n in self.nodes()]
+        return [
+            (
+                node_end_path(n),
+                {
+                    "length": n.length,
+                    "slots": tuple(n.value.tolist()),
+                    "ref": n.ref_count,
+                    "tomb": bool(n.swa_tombstone),
+                    "swa_ref": n.swa_ref_count,
+                    "swa_uuid": n.swa_uuid,
+                    "mamba": n.mamba_value,
+                    "mamba_ref": n.mamba_ref_count,
+                },
+            )
+            for n in self.nodes()
+        ]
 
     def structure(self) -> Dict[Path, Record]:
         return dict(self.records())
 
     def recomputed(self, records=None) -> Dict[str, int]:
         """The same sizes recomputed from raw node fields (the counter model)."""
-        return sizes((r for _, r in (self.records() if records is None else records)),
-                     self.second_currency)
+        return sizes(
+            (r for _, r in (self.records() if records is None else records)), self.second_currency
+        )
 
     def tree_slots(self) -> List[int]:
         return [s for n in self.nodes() for s in n.value.tolist()]
@@ -161,11 +173,13 @@ class PlainAdapter(Adapter):
 
     def inc_lock(self, node) -> LockToken:
         from freetoken.kvcache.radix_cache import RadixCacheHandle
+
         self.cache.lock_handle(RadixCacheHandle(0, node))
         return LockToken(node)
 
     def dec_lock(self, token: LockToken, skip_swa: bool = False) -> None:
         from freetoken.kvcache.radix_cache import RadixCacheHandle
+
         self.cache.lock_handle(RadixCacheHandle(0, token.node), unlock=True)
 
     def evict_full(self, n: int) -> EvictOut:
@@ -186,9 +200,12 @@ class SWAAdapter(Adapter):
         return MatchOut(int(m.cached_len), m.kv_indices.tolist(), m.node)
 
     def insert(self, ids, slots, *, swa_evicted: int = 0, update_after: int = 0, **kw) -> InsertOut:
-        matched, freed = self.cache.insert(ids_tensor(ids), slots_tensor(slots),
-                                           swa_evicted_seqlen=swa_evicted,
-                                           update_kv_after_len=update_after)
+        matched, freed = self.cache.insert(
+            ids_tensor(ids),
+            slots_tensor(slots),
+            swa_evicted_seqlen=swa_evicted,
+            update_kv_after_len=update_after,
+        )
         return InsertOut(int(matched), freed.tolist(), None)
 
     def inc_lock(self, node) -> LockToken:
@@ -212,8 +229,12 @@ class SWAAdapter(Adapter):
 
     def counters(self) -> Dict[str, int]:
         c = self.cache
-        return {"full_evictable": c.full_evictable, "full_protected": c.full_protected,
-                "swa_evictable": c.swa_evictable, "swa_protected": c.swa_protected}
+        return {
+            "full_evictable": c.full_evictable,
+            "full_protected": c.full_protected,
+            "swa_evictable": c.swa_evictable,
+            "swa_protected": c.swa_protected,
+        }
 
 
 class HybridAdapter(Adapter):
@@ -247,8 +268,12 @@ class HybridAdapter(Adapter):
 
     def counters(self) -> Dict[str, int]:
         c = self.cache
-        return {"full_evictable": c.full_evictable, "full_protected": c.full_protected,
-                "mamba_evictable": c.mamba_evictable, "mamba_protected": c.mamba_protected}
+        return {
+            "full_evictable": c.full_evictable,
+            "full_protected": c.full_protected,
+            "mamba_evictable": c.mamba_evictable,
+            "mamba_protected": c.mamba_protected,
+        }
 
 
 # --------------------------------------------------------------------------- the battery
@@ -272,11 +297,13 @@ class SlotLedger:
     def release(self, slots: Sequence[int]) -> None:
         for s in slots:
             if s not in self.handed_set:
-                raise InvariantViolation(f"conservation.{self.name}",
-                                         f"slot {s} was handed back but never handed out")
+                raise InvariantViolation(
+                    f"conservation.{self.name}", f"slot {s} was handed back but never handed out"
+                )
             if s in self.free:
-                raise InvariantViolation(f"conservation.{self.name}",
-                                         f"DOUBLE FREE: slot {s} was handed back twice")
+                raise InvariantViolation(
+                    f"conservation.{self.name}", f"DOUBLE FREE: slot {s} was handed back twice"
+                )
             self.free.add(s)
 
     def in_use(self) -> set:
@@ -286,23 +313,28 @@ class SlotLedger:
 def check_counter_model(ad: Adapter, records=None) -> None:
     got, want = ad.counters(), ad.recomputed(records)
     if got != want:
-        diff = {k: (got.get(k), want.get(k)) for k in set(got) | set(want)
-                if got.get(k) != want.get(k)}
-        raise InvariantViolation("counters", f"maintained sizes drifted from the raw-node "
-                                             f"recomputation (counter vs raw): {diff}")
+        diff = {
+            k: (got.get(k), want.get(k)) for k in set(got) | set(want) if got.get(k) != want.get(k)
+        }
+        raise InvariantViolation(
+            "counters",
+            f"maintained sizes drifted from the raw-node recomputation (counter vs raw): {diff}",
+        )
 
 
 def check_conservation(name: str, live: Sequence[int], ledger: SlotLedger) -> None:
     """{live in the tree} + {handed back} == {handed out}, no slot in two places at once."""
     live_set = set(live)
     for suffix, bad, why in (
-            (".aliasing", [s for s, c in Counter(live).items() if c > 1], "owned by two nodes"),
-            ("", live_set & ledger.free, "BOTH live in the tree and handed back"),
-            ("", ledger.handed_set - live_set - ledger.free, "LEAKED: neither live nor handed back"),
-            ("", live_set - ledger.handed_set, "live in the tree but never handed out")):
+        (".aliasing", [s for s, c in Counter(live).items() if c > 1], "owned by two nodes"),
+        ("", live_set & ledger.free, "BOTH live in the tree and handed back"),
+        ("", ledger.handed_set - live_set - ledger.free, "LEAKED: neither live nor handed back"),
+        ("", live_set - ledger.handed_set, "live in the tree but never handed out"),
+    ):
         if bad:
-            raise InvariantViolation(f"conservation.{name}{suffix}",
-                                     f"{len(bad)} slot(s) {sorted(bad)[:8]} are {why}")
+            raise InvariantViolation(
+                f"conservation.{name}{suffix}", f"{len(bad)} slot(s) {sorted(bad)[:8]} are {why}"
+            )
 
 
 def check_prefix_closure(ad: Adapter) -> None:
@@ -310,15 +342,28 @@ def check_prefix_closure(ad: Adapter) -> None:
     seen = set()
     for node, parent in iter_nodes(ad.root):
         for tag, ok, why in (
-                ("cycle", id(node) not in seen, "is reachable twice"),
-                ("parent", node._parent is parent,
-                 "has a _parent other than the node whose children map reached it"),
-                ("key", parent.children.get(ad.cache.key_fn(node._key)) is node,
-                 "is not registered under its own first page key"),
-                ("page_align", node.length % P == 0,
-                 f"has length {node.length}, not a multiple of page_size={P}"),
-                ("key_value", len(node._key) == len(node.value),
-                 f"has {len(node._key)} key tokens but {len(node.value)} values")):
+            ("cycle", id(node) not in seen, "is reachable twice"),
+            (
+                "parent",
+                node._parent is parent,
+                "has a _parent other than the node whose children map reached it",
+            ),
+            (
+                "key",
+                parent.children.get(ad.cache.key_fn(node._key)) is node,
+                "is not registered under its own first page key",
+            ),
+            (
+                "page_align",
+                node.length % P == 0,
+                f"has length {node.length}, not a multiple of page_size={P}",
+            ),
+            (
+                "key_value",
+                len(node._key) == len(node.value),
+                f"has {len(node._key)} key tokens but {len(node.value)} values",
+            ),
+        ):
             if not ok:
                 raise InvariantViolation(f"structure.{tag}", f"node {node_end_path(node)} {why}")
         seen.add(id(node))
@@ -339,28 +384,35 @@ def check_model_agreement(ad: Adapter, model: RefModel, records=None) -> None:
             "model.structure",
             f"tree node set differs from the page-keyed model: {len(impl)} impl nodes vs "
             f"{len(ref)} model nodes; only in cache: {sorted(set(impl) - set(ref))[:4]}; "
-            f"only in model: {sorted(set(ref) - set(impl))[:4]}")
+            f"only in model: {sorted(set(ref) - set(impl))[:4]}",
+        )
     for end, got in impl.items():
         if got != ref[end]:
             diff = {k: (got[k], ref[end][k]) for k in got if got[k] != ref[end][k]}
-            raise InvariantViolation("model.node", f"node ending at {end} disagrees with the "
-                                                   f"model (field: cache vs model): {diff}")
+            raise InvariantViolation(
+                "model.node",
+                f"node ending at {end} disagrees with the model (field: cache vs model): {diff}",
+            )
     got_c, want_c = ad.counters(), model.counters()
     if got_c != want_c:
-        diff = {k: (got_c.get(k), want_c.get(k)) for k in set(got_c) | set(want_c)
-                if got_c.get(k) != want_c.get(k)}
-        raise InvariantViolation("model.counters",
-                                 f"running sizes disagree with the model: {diff}")
+        diff = {
+            k: (got_c.get(k), want_c.get(k))
+            for k in set(got_c) | set(want_c)
+            if got_c.get(k) != want_c.get(k)
+        }
+        raise InvariantViolation("model.counters", f"running sizes disagree with the model: {diff}")
 
 
-def check_all(ad: Adapter, model: RefModel, kv_ledger: SlotLedger,
-              second_ledger: Optional[SlotLedger] = None) -> None:
+def check_all(
+    ad: Adapter, model: RefModel, kv_ledger: SlotLedger, second_ledger: Optional[SlotLedger] = None
+) -> None:
     recs = ad.records()
     check_prefix_closure(ad)
     check_counter_model(ad, recs)
     check_class_integrity(ad)
     check_conservation("kv", [s for _, r in recs for s in r["slots"]], kv_ledger)
-    if second_ledger is not None:            # GDN snapshots: their own currency, their own ledger
-        check_conservation("mamba", [r["mamba"] for _, r in recs if r["mamba"] is not None],
-                           second_ledger)
+    if second_ledger is not None:  # GDN snapshots: their own currency, their own ledger
+        check_conservation(
+            "mamba", [r["mamba"] for _, r in recs if r["mamba"] is not None], second_ledger
+        )
     check_model_agreement(ad, model, recs)

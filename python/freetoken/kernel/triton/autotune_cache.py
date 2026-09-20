@@ -21,17 +21,13 @@ import os
 
 import triton
 
-_SUPPORTS_AUTOTUNE_CACHE = (
-    "cache_results" in inspect.signature(triton.autotune).parameters
-)
+_SUPPORTS_AUTOTUNE_CACHE = "cache_results" in inspect.signature(triton.autotune).parameters
 
 # Escape hatch: FREETOKEN_TRITON_CACHE_RESULTS=0 forces a fresh sweep every run.
 _CACHE_RESULTS = os.getenv("FREETOKEN_TRITON_CACHE_RESULTS", "1") == "1"
 
 # Splat into each @triton.autotune(...): {"cache_results": True} on new triton,
 # {} on old triton so the kwarg is simply absent.
-autotune_cache_kwargs = (
-    {"cache_results": _CACHE_RESULTS} if _SUPPORTS_AUTOTUNE_CACHE else {}
-)
+autotune_cache_kwargs = {"cache_results": _CACHE_RESULTS} if _SUPPORTS_AUTOTUNE_CACHE else {}
 
 __all__ = ["autotune_cache_kwargs"]

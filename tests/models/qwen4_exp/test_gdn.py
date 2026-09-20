@@ -34,8 +34,17 @@ def _state_dict(ref) -> dict[str, torch.Tensor]:
     """HF's four in_proj matrices fused into the op's single qkv|z|b|a GEMM. A_log / dt_bias
     stay fp32, as the weight loader keeps them."""
     return {
-        "in_proj.weight": _bf(torch.cat([ref.in_proj_qkv.weight, ref.in_proj_z.weight,
-                                         ref.in_proj_b.weight, ref.in_proj_a.weight], dim=0)),
+        "in_proj.weight": _bf(
+            torch.cat(
+                [
+                    ref.in_proj_qkv.weight,
+                    ref.in_proj_z.weight,
+                    ref.in_proj_b.weight,
+                    ref.in_proj_a.weight,
+                ],
+                dim=0,
+            )
+        ),
         "conv1d.weight": _bf(ref.conv1d.weight),
         "dt_bias": ref.dt_bias.detach().to(DEV, torch.float32),
         "A_log": ref.A_log.detach().to(DEV, torch.float32),
@@ -49,10 +58,21 @@ def _make_layer(ratio: int, output_gate: str = "sigmoid", seed: int = 0):
     the serving dtype, the way the engine builds a model, so load_state_dict's dtype check bites."""
     num_k, num_v = HEADS[ratio]
     torch.manual_seed(seed)
-    ref = Qwen4ExpGatedDeltaNetReference(
-        hidden_size=HIDDEN, num_k_heads=num_k, num_v_heads=num_v, head_k_dim=HEAD_DIM,
-        head_v_dim=HEAD_DIM, conv_kernel_size=CONV_K, rms_norm_eps=EPS, output_gate=output_gate,
-    ).to(DEV).float().eval()
+    ref = (
+        Qwen4ExpGatedDeltaNetReference(
+            hidden_size=HIDDEN,
+            num_k_heads=num_k,
+            num_v_heads=num_v,
+            head_k_dim=HEAD_DIM,
+            head_v_dim=HEAD_DIM,
+            conv_kernel_size=CONV_K,
+            rms_norm_eps=EPS,
+            output_gate=output_gate,
+        )
+        .to(DEV)
+        .float()
+        .eval()
+    )
     with torch.no_grad():
         # HF inits A_log = log(U(0.01, 16)); a zero dt_bias or a unit gate norm would hide sign errors.
         ref.A_log.uniform_(0.01, 16.0).log_()
@@ -60,8 +80,14 @@ def _make_layer(ratio: int, output_gate: str = "sigmoid", seed: int = 0):
         ref.norm.weight.normal_(1.0, 0.1)
     with torch.device("meta"), torch_dtype(torch.bfloat16):
         op = Qwen4ExpGatedDeltaNet(
-            hidden_size=HIDDEN, num_k_heads=num_k, num_v_heads=num_v, head_k_dim=HEAD_DIM,
-            head_v_dim=HEAD_DIM, conv_kernel_size=CONV_K, rms_norm_eps=EPS, layer_id=0,
+            hidden_size=HIDDEN,
+            num_k_heads=num_k,
+            num_v_heads=num_v,
+            head_k_dim=HEAD_DIM,
+            head_v_dim=HEAD_DIM,
+            conv_kernel_size=CONV_K,
+            rms_norm_eps=EPS,
+            layer_id=0,
             output_gate=output_gate,
         )
     op.load_state_dict(_state_dict(ref))
@@ -74,8 +100,13 @@ def _ctx(ratio: int, num_slots: int = 8) -> Context:
 
     num_k, num_v = HEADS[ratio]
     group = LinearGatedDeltaGroupConfig(
-        name="linear", layer_ids=(0,), num_key_heads=num_k, num_value_heads=num_v,
-        key_head_dim=HEAD_DIM, value_head_dim=HEAD_DIM, conv_kernel_dim=CONV_K,
+        name="linear",
+        layer_ids=(0,),
+        num_key_heads=num_k,
+        num_value_heads=num_v,
+        key_head_dim=HEAD_DIM,
+        value_head_dim=HEAD_DIM,
+        conv_kernel_dim=CONV_K,
         output_gate="sigmoid",
     )
     core._GLOBAL_CTX = None
@@ -91,8 +122,15 @@ def _prefill(op, ctx: Context, lengths: list[int], seed: int):
     torch.manual_seed(seed)
     hidden = [torch.randn(n, HIDDEN, device=DEV, dtype=torch.bfloat16) for n in lengths]
     reqs = [
-        Req(input_ids=torch.zeros(n, dtype=torch.int32), table_idx=i + 1, cached_len=0,
-            output_len=1, uid=i, sampling_params=SamplingParams(), cache_handle=None)
+        Req(
+            input_ids=torch.zeros(n, dtype=torch.int32),
+            table_idx=i + 1,
+            cached_len=0,
+            output_len=1,
+            uid=i,
+            sampling_params=SamplingParams(),
+            cache_handle=None,
+        )
         for i, n in enumerate(lengths)
     ]
     batch = Batch(reqs=reqs, phase="prefill")
@@ -138,14 +176,14 @@ def test_ragged_prefill_then_decode(ratio):
     off = 0
     for h, n in zip(hidden, lengths):
         torch.testing.assert_close(
-            out[off:off + n].float(), _ref_out(ref, h), rtol=RTOL, atol=ATOL
+            out[off : off + n].float(), _ref_out(ref, h), rtol=RTOL, atol=ATOL
         )
         off += n
 
     nxt = torch.randn(len(lengths), HIDDEN, device=DEV, dtype=torch.bfloat16)
     dec = _decode(op, ctx, reqs, nxt)
     for i, h in enumerate(hidden):
-        full = _ref_out(ref, torch.cat([h, nxt[i:i + 1]], dim=0))
+        full = _ref_out(ref, torch.cat([h, nxt[i : i + 1]], dim=0))
         torch.testing.assert_close(dec[i].float(), full[-1], rtol=RTOL, atol=ATOL)
 
 
@@ -166,7 +204,9 @@ def test_output_gate_comes_from_the_config():
     their own reference, and the two are far apart -- so a stuck activation cannot pass."""
     op_silu, ref_silu = _make_layer(3, output_gate="silu", seed=2)
     hidden, _, out_silu = _prefill(op_silu, _ctx(3), [128], seed=19)
-    torch.testing.assert_close(out_silu.float(), _ref_out(ref_silu, hidden[0]), rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(
+        out_silu.float(), _ref_out(ref_silu, hidden[0]), rtol=RTOL, atol=ATOL
+    )
 
     op_sig, ref_sig = _make_layer(3, output_gate="sigmoid", seed=2)
     _, _, out_sig = _prefill(op_sig, _ctx(3), [128], seed=19)
@@ -192,8 +232,15 @@ def test_decode_prefill_gdn_kernel_inequivalence():
     # 1. Decode T=1
     pool.recurrent_states[0, slot].zero_()
     pool.conv_states[0, slot].zero_()
-    req_dec = Req(input_ids=torch.zeros(N + 1, dtype=torch.int32), table_idx=slot, cached_len=0,
-                  output_len=1, uid=10, sampling_params=SamplingParams(), cache_handle=None)
+    req_dec = Req(
+        input_ids=torch.zeros(N + 1, dtype=torch.int32),
+        table_idx=slot,
+        cached_len=0,
+        output_len=1,
+        uid=10,
+        sampling_params=SamplingParams(),
+        cache_handle=None,
+    )
     dec_outs = []
     for i in range(N):
         req_dec.cached_len = i
@@ -202,15 +249,22 @@ def test_decode_prefill_gdn_kernel_inequivalence():
         batch.padded_reqs = [req_dec]
         batch.linear_table_idx = torch.tensor([slot], dtype=torch.int32, device=DEV)
         with ctx.forward_batch(batch):
-            dec_outs.append(op.forward(tokens[i:i+1]))
+            dec_outs.append(op.forward(tokens[i : i + 1]))
     dec_outs = torch.cat(dec_outs, dim=0)
     dec_rec = pool.recurrent_states[0, slot].clone()
 
     # 2. Prefill T=1
     pool.recurrent_states[0, slot].zero_()
     pool.conv_states[0, slot].zero_()
-    req_pref = Req(input_ids=torch.zeros(N + 1, dtype=torch.int32), table_idx=slot, cached_len=0,
-                   output_len=1, uid=20, sampling_params=SamplingParams(), cache_handle=None)
+    req_pref = Req(
+        input_ids=torch.zeros(N + 1, dtype=torch.int32),
+        table_idx=slot,
+        cached_len=0,
+        output_len=1,
+        uid=20,
+        sampling_params=SamplingParams(),
+        cache_handle=None,
+    )
     pref_outs = []
     for i in range(N):
         req_pref.cached_len = i
@@ -218,7 +272,7 @@ def test_decode_prefill_gdn_kernel_inequivalence():
         batch = Batch(reqs=[req_pref], phase="prefill")
         batch.padded_reqs = [req_pref]
         with ctx.forward_batch(batch):
-            pref_outs.append(op.forward(tokens[i:i+1]))
+            pref_outs.append(op.forward(tokens[i : i + 1]))
     pref_outs = torch.cat(pref_outs, dim=0)
     pref_rec = pool.recurrent_states[0, slot].clone()
 
@@ -229,4 +283,3 @@ def test_decode_prefill_gdn_kernel_inequivalence():
     diff_rec = (dec_rec.float() - pref_rec.float()).abs().max().item()
     assert diff_out > 1e-4, f"Expected Bug A output inequivalence, got diff {diff_out}"
     assert diff_rec > 1e-4, f"Expected Bug A recurrent state inequivalence, got diff {diff_rec}"
-

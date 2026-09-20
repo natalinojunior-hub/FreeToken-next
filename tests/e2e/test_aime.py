@@ -161,7 +161,9 @@ def format_chat(tokenizer, messages: list[dict]) -> str:
     encoder = _load_dsv4_encoder_if_needed(tokenizer)
     if encoder is not None:
         return _apply_dsv4_chat_encoder(encoder, messages, None, {"enable_thinking": True})
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
+    return tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
+    )
 
 
 def build_llm(model_path: Path) -> LLM:

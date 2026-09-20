@@ -19,6 +19,19 @@ import shutil
 
 import torch
 
+import sys
+
+venv_bin = os.path.join(sys.prefix, "bin")
+if os.path.isdir(venv_bin) and venv_bin not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = f"{venv_bin}:{os.environ.get('PATH', '')}"
+
+if "CUDA_HOME" not in os.environ and os.path.isdir("/models/outros/cuda-13.3"):
+    os.environ["CUDA_HOME"] = "/models/outros/cuda-13.3"
+if os.path.isdir(
+    "/models/outros/cuda-13.3/bin"
+) and "/models/outros/cuda-13.3/bin" not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = f"/models/outros/cuda-13.3/bin:{os.environ.get('PATH', '')}"
+
 _CSRC = pathlib.Path(__file__).parent / "csrc" / "gguf"
 
 
@@ -47,9 +60,14 @@ def _c_compiler_for(cxx: str) -> str:
     cc = base.replace("g++", "gcc")
     return shutil.which(cc) or cc
 
+
 @functools.cache
 def _module():
     from torch.utils.cpp_extension import load
+
+    from freetoken.kernel._toolchain import check_nvcc_matches_torch
+
+    check_nvcc_matches_torch()
 
     extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
     host_cxx = _host_compiler()
@@ -110,8 +128,15 @@ def ggml_moe_a8(
 ) -> torch.Tensor:
     """MMQ grouped expert matmul over stacked experts ``weight[E, row, *]``."""
     return _module().ggml_moe_a8(
-        x, weight, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        quant_type, row, top_k, tokens,
+        x,
+        weight,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        quant_type,
+        row,
+        top_k,
+        tokens,
     )
 
 

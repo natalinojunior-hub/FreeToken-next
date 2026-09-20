@@ -88,7 +88,9 @@ def _as_error(msg: Any) -> str | None:
     return None
 
 
-def _drain_pending_error(get: Callable[[float], Any], attempts: int = 5, timeout: float = 0.02) -> str | None:
+def _drain_pending_error(
+    get: Callable[[float], Any], attempts: int = 5, timeout: float = 0.02
+) -> str | None:
     """After a worker death, poll the ack queue briefly for a final ("error", reason) ack still
     in flight (the queue feeder flushes on process exit), so the real reason wins over the
     generic message. Bounded so a genuinely reason-less death still fails fast."""
@@ -118,6 +120,7 @@ def drain_ready(
     they are forwarded to ``on_meta`` and do NOT count toward readiness. meta is optional --
     an engine build that never emits it must not stall this drain, so nothing waits for it."""
     if get is None:
+
         def get(timeout: float) -> Any:
             return handle.ack_queue.get(timeout=timeout)
 

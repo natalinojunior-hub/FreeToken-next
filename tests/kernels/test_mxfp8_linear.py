@@ -17,9 +17,9 @@ def _make_mxfp8(N: int, K: int, seed: int = 0):
     wf = torch.randn(N, K, device=DEV) * 0.05
     codes = torch.randint(110, 132, (N, K // 32), device=DEV, dtype=torch.uint8)
     descale = torch.exp2(codes.float() - 127.0)
-    w8 = (
-        (wf.view(N, -1, 32) / descale.unsqueeze(-1)).clamp(-448, 448).view(N, K)
-    ).to(torch.float8_e4m3fn)
+    w8 = ((wf.view(N, -1, 32) / descale.unsqueeze(-1)).clamp(-448, 448).view(N, K)).to(
+        torch.float8_e4m3fn
+    )
     return w8, codes
 
 

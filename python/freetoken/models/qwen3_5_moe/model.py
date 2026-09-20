@@ -68,7 +68,9 @@ class Qwen3_5DecoderLayer(BaseOP):
             hidden = self.input_layernorm.forward(hidden)
         else:
             hidden, residual = self.input_layernorm.forward_add_residual(hidden, residual)
-        hidden = self.linear_attn.forward(hidden) if self._is_linear else self.self_attn.forward(hidden)
+        hidden = (
+            self.linear_attn.forward(hidden) if self._is_linear else self.self_attn.forward(hidden)
+        )
         hidden, residual = self.post_attention_layernorm.forward_add_residual(hidden, residual)
         hidden = self.mlp.forward(hidden)
         return hidden, residual
@@ -135,8 +137,12 @@ class Qwen3_5ForConditionalGeneration(QwenVLVisionMixin, Qwen3_5ForCausalLM):
     def __init__(self, config: ModelConfig):
         super().__init__(config)
         if config.is_multimodal:
-            assert not config.vision_config.deepstack_visual_indexes, "Qwen3.5 consumes no DeepStack features"
-            self.visual = Qwen3VLVisionModel(config.vision_config, quant_config=config.quant, prefix="visual")
+            assert not config.vision_config.deepstack_visual_indexes, (
+                "Qwen3.5 consumes no DeepStack features"
+            )
+            self.visual = Qwen3VLVisionModel(
+                config.vision_config, quant_config=config.quant, prefix="visual"
+            )
 
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):

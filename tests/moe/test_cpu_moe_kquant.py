@@ -50,7 +50,7 @@ def _make_q4_k_rows(S: int, OUT: int, K: int, gen) -> torch.Tensor:
     nb = K // QK_K
     d = 0.02 + 0.03 * torch.rand(S, OUT, nb, generator=gen)
     dmin = 0.01 + 0.02 * torch.rand(S, OUT, nb, generator=gen)
-    dm = torch.cat([_fp16_bytes(d), _fp16_bytes(dmin)], dim=-1)          # [S, OUT, nb, 4]
+    dm = torch.cat([_fp16_bytes(d), _fp16_bytes(dmin)], dim=-1)  # [S, OUT, nb, 4]
     rest = torch.randint(0, 256, (S, OUT, nb, 140), dtype=torch.uint8, generator=gen)
     return torch.cat([dm, rest], dim=-1).reshape(S, OUT, nb * _Q4_K_BYTES).contiguous()
 
@@ -63,15 +63,13 @@ def _make_q6_k_rows(S: int, OUT: int, K: int, gen) -> torch.Tensor:
     nb = K // QK_K
     body = torch.randint(0, 256, (S, OUT, nb, 208), dtype=torch.uint8, generator=gen)
     d = 0.01 + 0.02 * torch.rand(S, OUT, nb, generator=gen)
-    return torch.cat([body, _fp16_bytes(d)], dim=-1).reshape(
-        S, OUT, nb * _Q6_K_BYTES).contiguous()
+    return torch.cat([body, _fp16_bytes(d)], dim=-1).reshape(S, OUT, nb * _Q6_K_BYTES).contiguous()
 
 
 _MAKERS = {"q4_k": (_make_q4_k_rows, GGML_Q4_K), "q6_k": (_make_q6_k_rows, GGML_Q6_K)}
 
 
-def _make_cache(fmt: str, L: int, E: int, H: int, I: int, seed: int = 0,
-                *, as_gguf: bool = False):
+def _make_cache(fmt: str, L: int, E: int, H: int, I: int, seed: int = 0, *, as_gguf: bool = False):
     """Pinned host banks in the native K-quant schema, as the offload path builds them."""
     from freetoken.kernel.pinned import alloc_pinned_tensor
 
@@ -90,8 +88,7 @@ def _make_cache(fmt: str, L: int, E: int, H: int, I: int, seed: int = 0,
         # separately; the executor resolves that to the concrete format.
         quant_format="gguf" if as_gguf else fmt,
         gguf_expert_types=(ggml_type, ggml_type) if as_gguf else None,
-        bank_sources={"gate_up": list(rows(2 * I, H).split(E)),
-                      "down": list(rows(H, I).split(E))},
+        bank_sources={"gate_up": list(rows(2 * I, H).split(E)), "down": list(rows(H, I).split(E))},
         num_layers=L,
         num_experts=E,
         decode_target="cpu",
@@ -105,7 +102,10 @@ def _dequant_bank(packed: torch.Tensor, ggml_type: int, K: int, dev) -> torch.Te
 
     S, OUT, row_bytes = packed.shape
     flat = ggml_dequantize(
-        packed.reshape(-1, row_bytes).to(dev).contiguous(), ggml_type, S * OUT, K,
+        packed.reshape(-1, row_bytes).to(dev).contiguous(),
+        ggml_type,
+        S * OUT,
+        K,
         torch.bfloat16,
     )
     return flat.reshape(S, OUT, K)
@@ -121,14 +121,19 @@ def test_cpu_decode_kquant_matches_dequant_then_gpu(fmt, bs):
     L, E, H, I, top_k, layer = 2, 8, 512, 256, 4, 1
     dev = torch.device("cuda")
     cache = _make_cache(fmt, L, E, H, I, seed=100 + bs)
-    ex = CpuMoeExecutor(cache, top_k=top_k, activation="silu",
-                        apply_router_weight_on_input=False, num_threads=0,
-                        max_tokens=bs, device=dev)
+    ex = CpuMoeExecutor(
+        cache,
+        top_k=top_k,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        num_threads=0,
+        max_tokens=bs,
+        device=dev,
+    )
 
     torch.manual_seed(400 + bs)
     hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16) * 0.5
-    ids = torch.stack([torch.randperm(E, device=dev)[:top_k]
-                       for _ in range(bs)]).to(torch.int32)
+    ids = torch.stack([torch.randperm(E, device=dev)[:top_k] for _ in range(bs)]).to(torch.int32)
     w = torch.rand(bs, top_k, device=dev, dtype=torch.float32)
 
     cpu_out = ex.decode(layer, hidden, w, ids).float()
@@ -139,8 +144,7 @@ def test_cpu_decode_kquant_matches_dequant_then_gpu(fmt, bs):
     dn = _dequant_bank(cache.bank_sources["down"][layer], ggml_type, I, dev)
     gpu_out = fused_experts_decode_impl(hidden, gu, dn, w, ids.clone(), "silu", False).float()
 
-    cos = torch.nn.functional.cosine_similarity(
-        cpu_out.flatten(), gpu_out.flatten(), dim=0).item()
+    cos = torch.nn.functional.cosine_similarity(cpu_out.flatten(), gpu_out.flatten(), dim=0).item()
     rel = ((cpu_out - gpu_out).abs().max() / (gpu_out.abs().max() + 1e-6)).item()
     assert cos > 0.999, f"{fmt} bs={bs}: cosine {cos} (rel {rel})"
     assert rel < 5e-2, f"{fmt} bs={bs}: rel {rel} (cosine {cos})"
@@ -158,9 +162,15 @@ def test_gguf_cache_resolves_to_the_cpu_kernel(fmt):
 
     L, E, H, I = 2, 8, 512, 256
     cache = _make_cache(fmt, L, E, H, I, seed=7, as_gguf=True)
-    ex = CpuMoeExecutor(cache, top_k=4, activation="silu",
-                        apply_router_weight_on_input=False, num_threads=0,
-                        max_tokens=2, device=torch.device("cuda"))
+    ex = CpuMoeExecutor(
+        cache,
+        top_k=4,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        num_threads=0,
+        max_tokens=2,
+        device=torch.device("cuda"),
+    )
     assert ex.quant_format == fmt
 
 
@@ -171,8 +181,7 @@ class TestGgufFormatResolution:
         """Q4_K_M stores gate_up Q4_K and down Q6_K; one weight_format cannot serve both."""
         from freetoken.moe.cpu_executor import _resolve_gguf_format
 
-        c = SimpleNamespace(quant_format="gguf",
-                            gguf_expert_types=(GGML_Q4_K, GGML_Q6_K))
+        c = SimpleNamespace(quant_format="gguf", gguf_expert_types=(GGML_Q4_K, GGML_Q6_K))
         with pytest.raises(NotImplementedError, match="(?i)mixed-type"):
             _resolve_gguf_format(c)
 
@@ -184,8 +193,9 @@ class TestGgufFormatResolution:
         with pytest.raises(NotImplementedError, match="(?i)no cpu kernel"):
             _resolve_gguf_format(c)
 
-    @pytest.mark.parametrize("t,want", [(GGML_Q4_0, "q4_0"), (GGML_Q4_K, "q4_k"),
-                                        (GGML_Q6_K, "q6_k")])
+    @pytest.mark.parametrize(
+        "t,want", [(GGML_Q4_0, "q4_0"), (GGML_Q4_K, "q4_k"), (GGML_Q6_K, "q6_k")]
+    )
     def test_uniform_supported_types_resolve(self, t, want):
         from freetoken.moe.cpu_executor import _resolve_gguf_format
 

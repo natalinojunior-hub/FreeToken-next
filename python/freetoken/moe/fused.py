@@ -274,7 +274,13 @@ def fused_experts_impl(
         config,
         compute_type=compute_type,
     )
-    gated_act_and_mul(activation, intermediate_cache1.view(-1, N), intermediate_cache2, alpha=act_alpha, limit=act_limit)
+    gated_act_and_mul(
+        activation,
+        intermediate_cache1.view(-1, N),
+        intermediate_cache2,
+        alpha=act_alpha,
+        limit=act_limit,
+    )
     fused_moe_kernel_triton(
         intermediate_cache2,
         w2,
@@ -357,7 +363,13 @@ def fused_experts_decode_impl(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    gated_act_and_mul(activation, intermediate_cache1.view(-1, gate_up_dim), intermediate_cache2, alpha=act_alpha, limit=act_limit)
+    gated_act_and_mul(
+        activation,
+        intermediate_cache1.view(-1, gate_up_dim),
+        intermediate_cache2,
+        alpha=act_alpha,
+        limit=act_limit,
+    )
 
     intermediate_cache3 = torch.empty(
         (M, top_k, w2.shape[1]),

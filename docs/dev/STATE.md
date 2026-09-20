@@ -1,73 +1,20 @@
-# STATE — freetoken-next (Root)
+# STATE — freetoken-next
 
-**Snapshot:** 2026-09-18 | **Branch:** `next` @ `cac247a` (v0.1.3) | **Hardware:** RTX 5080 16GB / 96GB RAM
+**Doing:** Auditoria FreeToken vs LTO (TG) no RTX 5080 — encerrada por ora. Premissa original ("comparação NVFP4+Turbo4 justa vs LTO") invalidada: LTO é GGUF-only, não roda o checkpoint NVFP4-Radix. Ver PERFORMANCE.md "Correção de premissa" para os números não-comparáveis disponíveis dos dois lados.
 
----
+**Done:**
+- Kernel cache prebuilt estava faltando (arquivo deletado) — restaurado e rebuildado via `scripts/build-release-wheels.sh`.
+- WIP não commitado do MoE offload trava indefinidamente no caminho de CUDA graph decode (qualquer ctx); `--no-graph` contorna. Diagnosticado com py-spy (processo-pai, `-s --native`) até localizar em `torch/cuda/graphs.py replay()`; mecanismo exato não confirmado, testes de env var (`FUSED_COPY=0`, `SMALL_BANK_FEAT_BYTES=262144`) não resolveram. Ver LESSONS.md.
+- Baseline eager válido obtido: **TG 23.21 tok/s** @ 16384 ctx, `--no-graph`, mem-ratio 0.85, 1089 slots de expert cache (mem-ratio 0.9 dá OOM real, não fragmentação — `expandable_segments` testado e não ajuda).
+- Varredura MTP NVFP4 k=0..6 (via CUDA graph, hoje quebrada no WIP): k=0 TG 27.73, k=1 TG 24.39, k=2 TG 25.09 (melhor MTP, ainda < baseline), k=3 crash (GDN shape mismatch). GGUF Unsloth-IQ4_XS bloqueado (PLE/indexer dims incompatíveis).
 
-## Status Resumido
+**Decisões:** Métrica soberana = TG (tok/s), não taxa de aceitação. Só 2 modelos autorizados (ver AGENTS.md). Working tree tem muitos arquivos modificados não commitados (docs/dev, benchmarks, kernels) — não commitar sem pedido explícito.
 
-| Fase | Item | Status | Evidência |
-|------|------|--------|-----------|
-| 1-3 | Lineage, Build, Baselines | ✅ Done | `git fetch` 0 behind; PP/TG anchors reproduzidos |
-| 4 | Source Audits A1-A9 | ✅ Done | `old/docs/freetoken-next/audits/A1-A9.md` |
-| 5-6 | VRAM Ledger + Governor | ✅ Done | `engine/vram_ledger.py`; 128K/256K working |
-| 7 | GGUF Loader Native | ✅ Committed | Dense IQ3_S measured: PP 2417/TG 25.3, RSS 2.17 GiB |
-| 8 | **Turbo4 + MTP Certified** | ✅ **Closed** | Bit-identical sha1 `614aa7bcdf59`; TG 0.79→25 tok/s |
-| 9 | Phase 7: Expert Pool Geometry | 🔄 In Progress | Keyed by (bank, role, type) |
-| 10 | Phase 10: MTP + TurboKV Fusion | 🔄 Specified (D-022) | Split-kernel path running |
-| 11 | Native MTP qwen4exp | ✅ Validated | EXP-043/044/045: 90.9% accept, MTP2 certificado |
-| 12-18 | TCQ/VBR, PLE, Adaptive, 512K+, Cert Matrix | ⏳ Pending | Gates definidos em ROADMAP.md |
+**Achado principal desta sessão:** regressão real de ~31% intra-FreeToken confirmada — 0.1.2 fazia 34.7 tok/s @ ctx=8192 no NVFP4-Radix; build atual faz 23.94 tok/s no mesmo ctx=8192 (controle direto, não é efeito de escala de contexto: 16K dá 23.21, quase igual). Não é FreeToken perdendo para LTO — é uma regressão entre versões do próprio FreeToken. Ver PERFORMANCE.md.
 
----
-
-## Métricas Atuais (Anchors de Regressão)
-
-```bash
-# 35B-A3B @ 16K (guard: PP≥4600, TG≥158)
-PP: 4611  TG: 158.8  VRAM: 14.98 GiB  RSS: ~20 GiB  GPU: 99.8%
-
-# Flash-Next @ 16K (guard: PP≥1850, TG≥28.5)
-PP: 1858  TG: 28.7  VRAM: 14.86 GiB  RSS: 67.8 GiB  GPU: 99.99%
-
-# 35B-A3B @ 128K
-PP: 3189  TG: 89.3  VRAM: 14.4 GiB  RSS: 22.0 GiB
-
-# 35B-A3B @ 256K
-PP: 2354  TG: 63.8  VRAM: 14.5 GiB  RSS: 22.0 GiB
-```
-
----
-
-## Handoff Crítico (Próxima Sessão)
-
-**Prioridade 1:** Validar split-kernel Turbo4/QSA em 16K (sha1 match baseline)
-**Prioridade 2:** Medir TG + accept-rate MTP=1 com Turbo4 ativo
-**Prioridade 3:** Debug non-determinismo sequential requests (log logits top-2)
-**Prioridade 4:** Live test k=2/k=3 content equivalence
-**Prioridade 5:** Phase 7 expert pool geometry keying
-
----
-
-## Arquivos de Referência Vivos
-
-- **Contexto completo:** `CONTEXT.md`
-- **Roadmap detalhado:** `ROADMAP.md` / `docs/freetoken-next/ROADMAP.md`
-- **Estado detalhado:** `docs/freetoken-next/STATE.md`
-- **Lições aprendidas:** `LESSONS.md`
-- **Decisões imutáveis:** `DECISIONS.md` / `docs/freetoken-next/DECISIONS.md`
-- **Performance medida:** `PERFORMANCE.md` / `docs/freetoken-next/PERFORMANCE.md`
-- **Arquitetura:** `ARCHITECTURE.md` / `docs/freetoken-next/ARCHITECTURE.md`
-- **Experimentos:** `EXPERIMENTS.md` / `docs/freetoken-next/EXPERIMENTS.md`
-- **QA Gates:** `QA.md`
-- **Instruções agentes:** `AGENTS.md`
-
----
-
-## Ambiente
-
-```bash
-cd /models/desenvolvimento/freetoken-next
-source .venv/bin/activate
-export TMPDIR=/models/desenvolvimento/tmp
-# Pre-flight: free -h && nvidia-smi && ps aux | grep -E '(python|tail)'
-```
+**Next:**
+1. Bisectar commits entre 0.1.2+gaf71ba432 e HEAD para achar onde os ~31% de TG foram perdidos (candidatos: mudanças no MoE offload/host-bank cache, dado que RSS 70GB e o host-bank system parecem ter crescido desde então).
+2. Achar causa raiz do hang em CUDA graph replay() (precisa cuda-gdb/nsys — py-spy não vê além do pybind/driver).
+3. Investigar crash k=3 (GDN shape mismatch) em `scheduler/spec.py` verify forward.
+4. Resolver mismatches GGUF Unsloth-IQ4_XS (PLE dims, indexer heads).
+5. Rodar `benchmarks/cert_matrix.py`.

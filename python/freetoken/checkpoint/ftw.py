@@ -244,8 +244,13 @@ class FTWWriter:
 
     def _roll(self) -> None:
         if self._f is not None:
-            self._shards.append({"file": _SHARD_FMT.format(self._shard_idx),
-                                 "global_off": self._shard_start, "nbytes": self._cur})
+            self._shards.append(
+                {
+                    "file": _SHARD_FMT.format(self._shard_idx),
+                    "global_off": self._shard_start,
+                    "nbytes": self._cur,
+                }
+            )
             self._close_shard()
         self._shard_idx += 1
         self._shard_start = self._global
@@ -295,7 +300,7 @@ class FTWWriter:
             if self._cur == self.shard_limit:
                 self._roll()
             take = min(n - off, self.shard_limit - self._cur)
-            self._f.write(data[off:off + take])
+            self._f.write(data[off : off + take])
             off += take
             self._cur += take
             self._global += take
@@ -305,14 +310,23 @@ class FTWWriter:
         raw = t.reshape(-1).view(torch.uint8)
         nbytes = int(raw.numel())
         # A small tensor (<= shard) never splits: roll early so it lands whole in one shard.
-        if self._f is None or (nbytes <= self.shard_limit
-                               and self._cur + nbytes > self.shard_limit):
+        if self._f is None or (
+            nbytes <= self.shard_limit and self._cur + nbytes > self.shard_limit
+        ):
             self._roll()
         global_off = self._global
         assert global_off % ALIGN == 0, "tensor start must be aligned (invariant)"
         self._write_raw(memoryview(raw.numpy()))
-        self._tensors.append({"name": name, "kind": kind, "dtype": _dtype_str(t.dtype),
-                              "shape": list(t.shape), "global_off": global_off, "nbytes": nbytes})
+        self._tensors.append(
+            {
+                "name": name,
+                "kind": kind,
+                "dtype": _dtype_str(t.dtype),
+                "shape": list(t.shape),
+                "global_off": global_off,
+                "nbytes": nbytes,
+            }
+        )
         # pad to ALIGN so the next tensor starts aligned
         pad = _align_up(self._global) - self._global
         if pad:
@@ -321,13 +335,25 @@ class FTWWriter:
 
     def finalize(self, meta: dict) -> dict:
         if self._f is not None:
-            self._shards.append({"file": _SHARD_FMT.format(self._shard_idx),
-                                 "global_off": self._shard_start, "nbytes": self._cur})
+            self._shards.append(
+                {
+                    "file": _SHARD_FMT.format(self._shard_idx),
+                    "global_off": self._shard_start,
+                    "nbytes": self._cur,
+                }
+            )
             self._close_shard()
             self._f = None
-        index = {"format": FORMAT_TAG, "version": FORMAT_VERSION, "align": ALIGN,
-                 "shard_limit": self.shard_limit, "total_bytes": self._global,
-                 "tensors": self._tensors, "shards": self._shards, **meta}
+        index = {
+            "format": FORMAT_TAG,
+            "version": FORMAT_VERSION,
+            "align": ALIGN,
+            "shard_limit": self.shard_limit,
+            "total_bytes": self._global,
+            "tensors": self._tensors,
+            "shards": self._shards,
+            **meta,
+        }
         tmp = os.path.join(self.out_dir, INDEX_NAME + ".tmp")
         with open(tmp, "w") as f:
             json.dump(index, f)
@@ -385,12 +411,17 @@ class FTWReader:
                 return
             if self._direct and self.shards:
                 try:
-                    os.close(os.open(os.path.join(self.dir, self.shards[0]["file"]),
-                                     os.O_RDONLY | self._direct))
+                    os.close(
+                        os.open(
+                            os.path.join(self.dir, self.shards[0]["file"]),
+                            os.O_RDONLY | self._direct,
+                        )
+                    )
                 except OSError:
                     self._direct = 0
-                    logger.warning("O_DIRECT unsupported on %s; using mmap fallback for "
-                                   "FTW load", self.dir)
+                    logger.warning(
+                        "O_DIRECT unsupported on %s; using mmap fallback for FTW load", self.dir
+                    )
             self._probed = True
 
     def _fd(self, file: str) -> int:
@@ -451,8 +482,9 @@ class FTWReader:
         if remaining:
             raise ValueError("tensor range exceeds FTW shards")
 
-    def read_into(self, dest: memoryview, entry: dict, *, workers: int = 8,
-                  chunk: int = _DEFAULT_CHUNK) -> None:
+    def read_into(
+        self, dest: memoryview, entry: dict, *, workers: int = 8, chunk: int = _DEFAULT_CHUNK
+    ) -> None:
         """Read one tensor's bytes into ``dest`` (length >= entry nbytes rounded to ALIGN)."""
         self._ensure_mode()
         jobs = []  # (file, file_off, dest_off, length) all ALIGN-aligned
@@ -467,13 +499,15 @@ class FTWReader:
             touch(file)
 
         if self._direct:
+
             def rd(job):
                 file, fo, do, ln = job
                 try:
-                    _pread_into(self._fd(file), dest[do:do + ln], fo)
+                    _pread_into(self._fd(file), dest[do : do + ln], fo)
                 except OSError as e:
                     raise OSError(f"shard {file}: {e}") from e
         else:
+
             def rd(job):
                 file, fo, do, ln = job
                 mv = self._map(file)
@@ -482,7 +516,7 @@ class FTWReader:
                         f"unexpected EOF reading FTW: shard {file} has "
                         f"{len(mv)} bytes, need {ln} at offset {fo}"
                     )
-                dest[do:do + ln] = mv[fo:fo + ln]
+                dest[do : do + ln] = mv[fo : fo + ln]
 
         if len(jobs) <= 1:
             for j in jobs:
@@ -496,8 +530,15 @@ def _transient_buffer(nbytes: int) -> mmap.mmap:
     return mmap.mmap(-1, _align_up(nbytes))
 
 
-def iter_ftw_weights(path: str, *, kinds=("weight",), keep: Callable[[str], bool] | None = None,
-                       workers: int = 8, chunk: int = _DEFAULT_CHUNK, prefetch: int = 2):
+def iter_ftw_weights(
+    path: str,
+    *,
+    kinds=("weight",),
+    keep: Callable[[str], bool] | None = None,
+    workers: int = 8,
+    chunk: int = _DEFAULT_CHUNK,
+    prefetch: int = 2,
+):
     """Yield ``(name, host_tensor)`` for the requested kinds, reading each tensor via
     chunked O_DIRECT. A background thread prefetches the next ``prefetch`` tensors so the
     disk stays busy while the consumer copies the current one to the GPU. Transient buffers
@@ -538,7 +579,9 @@ def iter_ftw_weights(path: str, *, kinds=("weight",), keep: Callable[[str], bool
                 dt = _dtype_of(e["dtype"])
                 t = torch.frombuffer(buf, dtype=dt, count=e["nbytes"] // _elsize(dt))
                 # a 0-d entry (a per-tensor scale) comes back 0-d, not [1]
-                if not _put((e["name"], t.view(*e["shape"]) if e["shape"] else t.view(()), buf, e["nbytes"])):
+                if not _put(
+                    (e["name"], t.view(*e["shape"]) if e["shape"] else t.view(()), buf, e["nbytes"])
+                ):
                     return
         except BaseException as ex:  # surface to consumer
             err.append(ex)
@@ -567,7 +610,11 @@ def iter_ftw_weights(path: str, *, kinds=("weight",), keep: Callable[[str], bool
 
 
 def load_ftw_banks(
-    path: str, *, num_layers: int, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
+    path: str,
+    *,
+    num_layers: int,
+    workers: int = 8,
+    chunk: int = _DEFAULT_CHUNK,
     layer_residency: list[str] | None = None,
 ):
     """Reconstruct the offload :class:`ExpertBanks` from the FTW's ``experts_bank``
@@ -600,7 +647,11 @@ def load_ftw_banks(
     ``cache_budget.expert_bytes_per_slot``).
     """
     from freetoken.moe.host_banks import (
-        HostBank, HostResidency, PinPipeline, alloc_banks, born_pinned_default,
+        HostBank,
+        HostResidency,
+        PinPipeline,
+        alloc_banks,
+        born_pinned_default,
     )
     from freetoken.utils.progress import byte_bar
 
@@ -676,7 +727,9 @@ def load_ftw_banks(
             head_pad = off - win_off
             bank = HostBank((win_end - win_off,), torch.uint8, backing=_backing(layer_id))
             row_hb[name].append(bank)
-            row_view_args[name].append((head_pad, layer_bytes, num_experts, tuple(row_shape), dtype))
+            row_view_args[name].append(
+                (head_pad, layer_bytes, num_experts, tuple(row_shape), dtype)
+            )
             row_jobs.append((name, bank, win_off, win_end - win_off, layer_bytes, layer_id))
 
     for base, by_layer in per_layer_groups.items():
@@ -688,7 +741,11 @@ def load_ftw_banks(
         row_view_args[base] = []
         for layer_id in range(num_layers):
             e = by_layer[layer_id]
-            assert e["global_off"] % ALIGN == 0, (base, layer_id, e["global_off"])  # writer invariant
+            assert e["global_off"] % ALIGN == 0, (
+                base,
+                layer_id,
+                e["global_off"],
+            )  # writer invariant
             bank = HostBank(tuple(e["shape"]), _dtype_of(e["dtype"]), backing=_backing(layer_id))
             row_hb[base].append(bank)
             row_view_args[base].append(None)
@@ -711,8 +768,12 @@ def load_ftw_banks(
 
             def _read_row(job):
                 _name, bank, win_off, win_len, layer_bytes, layer_id = job
-                reader.read_into(bank.memoryview(), {"global_off": win_off, "nbytes": win_len},
-                                 workers=workers, chunk=chunk)
+                reader.read_into(
+                    bank.memoryview(),
+                    {"global_off": win_off, "nbytes": win_len},
+                    workers=workers,
+                    chunk=chunk,
+                )
                 pins.submit(bank, residency[layer_id])
                 bar.update(layer_bytes)
 
@@ -740,7 +801,7 @@ def load_ftw_banks(
                 views.append(bank.tensor)
                 continue
             head_pad, layer_bytes, num_experts, row_shape, dtype = view_args
-            raw = bank.tensor[head_pad:head_pad + layer_bytes].view(dtype)
+            raw = bank.tensor[head_pad : head_pad + layer_bytes].view(dtype)
             views.append(raw.view(num_experts, *row_shape) if row_shape else raw.view(num_experts))
         sources[name] = views
 
@@ -756,8 +817,10 @@ def load_ftw_banks(
     applied = list(residency)
     for banks in row_hb.values():
         for layer_id, bank in enumerate(banks):
-            if (applied[layer_id] == HostResidency.LOCKED.value
-                    and bank.residency is not HostResidency.LOCKED):
+            if (
+                applied[layer_id] == HostResidency.LOCKED.value
+                and bank.residency is not HostResidency.LOCKED
+            ):
                 applied[layer_id] = HostResidency.PAGEABLE.value
     unpinned = [i for i, r in enumerate(applied) if r != HostResidency.PINNED.value]
     if unpinned:
@@ -788,13 +851,26 @@ def load_ftw_banks(
     # (not a separate kind); everything else under experts_bank is a weight source.
     alpha_kw = {n: alpha_hb[n].tensor for n in alpha_hb}
     return ExpertBanks(
-        quant_format, sources, **alpha_kw,
-        layer_residency=applied, kind=kind, kernel=kernel,
+        quant_format,
+        sources,
+        **alpha_kw,
+        layer_residency=applied,
+        kind=kind,
+        kernel=kernel,
     )
 
 
 __all__ = [
-    "INDEX_NAME", "FORMAT_TAG", "FORMAT_VERSION", "ALIGN", "DEFAULT_SHARD_LIMIT",
-    "is_ftw_checkpoint", "ftw_tensor_names", "FTWWriter", "FTWReader",
-    "iter_ftw_weights", "load_ftw_banks", "layer_bank_entry_name",
+    "INDEX_NAME",
+    "FORMAT_TAG",
+    "FORMAT_VERSION",
+    "ALIGN",
+    "DEFAULT_SHARD_LIMIT",
+    "is_ftw_checkpoint",
+    "ftw_tensor_names",
+    "FTWWriter",
+    "FTWReader",
+    "iter_ftw_weights",
+    "load_ftw_banks",
+    "layer_bank_entry_name",
 ]

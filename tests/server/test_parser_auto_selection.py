@@ -73,9 +73,7 @@ def test_only_the_families_without_a_thinking_format_get_no_reasoning_parser():
 
 
 def test_only_the_families_without_a_tool_format_get_the_generic_fallback():
-    fell_through = {
-        a for a in ARCHITECTURES if _inferred(a)[0] == GENERIC_TOOL_CALL_FALLBACK
-    }
+    fell_through = {a for a in ARCHITECTURES if _inferred(a)[0] == GENERIC_TOOL_CALL_FALLBACK}
     assert fell_through == NO_DEDICATED_TOOL_FORMAT
 
 

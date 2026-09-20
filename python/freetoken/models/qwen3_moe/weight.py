@@ -105,14 +105,19 @@ def iter_weights_parallel(
         ):
             name = raw_name.removeprefix("language_model.")
             tensor = shard_tensor(
-                name, raw, rank=tp_info.rank, world_size=tp_info.size,
+                name,
+                raw,
+                rank=tp_info.rank,
+                world_size=tp_info.size,
                 num_kv_heads=config.num_kv_heads,
             )
             yield name, tensor
 
     merged = iter_merged_tensors(raw_experts(), _MERGE_RULES, model_name="qwen3_moe")
     yield from iter_stacked_experts(
-        merged, num_experts=config.num_experts, model_name="qwen3_moe",
+        merged,
+        num_experts=config.num_experts,
+        model_name="qwen3_moe",
         expert_pattern=_EXPERT_PATTERN,
     )
 

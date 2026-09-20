@@ -66,9 +66,7 @@ def fused_recurrent_kda_fwd(
     num_warps = 1
 
     if compute_gate:
-        assert a_log is not None and g_bias is not None, (
-            "compute_gate requires a_log and g_bias"
-        )
+        assert a_log is not None and g_bias is not None, "compute_gate requires a_log and g_bias"
         assert lower_bound is not None, (
             "compute_gate implements the bounded (safe_gate) branch only"
         )
@@ -251,9 +249,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     A += (bos * H + i_h) * BT
     Aqk += (bos * H + i_h) * BT
 
-    p_b = tl.make_block_ptr(
-        beta + bos * H + i_h, (T,), (H,), (i_t * BT + i_i * BC,), (BC,), (0,)
-    )
+    p_b = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT + i_i * BC,), (BC,), (0,))
     b_b = tl.load(p_b, boundary_check=(0,))
 
     b_A = tl.zeros([BC, BC], dtype=tl.float32)
@@ -625,9 +621,7 @@ def recompute_w_u_fwd_kernel(
 
             o_k = i_k * BK + tl.arange(0, BK)
             m_k = o_k < K
-            b_gn = tl.load(
-                gk + ((bos + last_idx) * H + i_h) * K + o_k, mask=m_k, other=0.0
-            )
+            b_gn = tl.load(gk + ((bos + last_idx) * H + i_h) * K + o_k, mask=m_k, other=0.0)
             b_kg = b_k * exp2(b_gn - b_gk)
 
             p_kg = tl.make_block_ptr(
@@ -861,9 +855,7 @@ def chunk_gla_fwd_o_gk(
 )
 @triton.autotune(
     configs=[
-        triton.Config({"BD": BD}, num_warps=num_warps)
-        for BD in [32, 64]
-        for num_warps in [2, 4, 8]
+        triton.Config({"BD": BD}, num_warps=num_warps) for BD in [32, 64] for num_warps in [2, 4, 8]
     ],
     key=["H", "D", "BT", "IS_VARLEN"],
 )
@@ -965,9 +957,7 @@ def fused_kda_gate_chunk_cumsum(
     lower_bound: float = -5.0,
 ) -> torch.Tensor:
     if cu_seqlens is not None:
-        assert raw_g.shape[0] == 1, (
-            "Only batch size 1 is supported when cu_seqlens are provided"
-        )
+        assert raw_g.shape[0] == 1, "Only batch size 1 is supported when cu_seqlens are provided"
     B, T, H, D = raw_g.shape
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
@@ -1102,9 +1092,7 @@ def chunk_kda_fwd(
 ):
     chunk_size = FLA_CHUNK_SIZE
     chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, chunk_size)
-        if cu_seqlens is not None
-        else None
+        prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
     )
     g = chunk_local_cumsum(
         g,
@@ -1148,9 +1136,7 @@ def chunk_kda_with_fused_gate_fwd(
 ):
     chunk_size = FLA_CHUNK_SIZE
     chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, chunk_size)
-        if cu_seqlens is not None
-        else None
+        prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
     )
     g = fused_kda_gate_chunk_cumsum(
         raw_g,
@@ -1320,9 +1306,7 @@ def kda_gate_fwd_kernel(
     if HAS_BIAS:
         n_d = tl.arange(0, BD)
         bias_mask = n_d < D
-        b_bias = tl.load(g_bias + i_h * D + n_d, mask=bias_mask, other=0.0).to(
-            tl.float32
-        )
+        b_bias = tl.load(g_bias + i_h * D + n_d, mask=bias_mask, other=0.0).to(tl.float32)
         b_g = b_g + b_bias[None, :]
 
     if SAFE_GATE:
@@ -1393,4 +1377,3 @@ def fused_kda_gate(
 
     y = y.view(*orig_shape, H, head_k_dim)
     return y
-

@@ -47,14 +47,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
     if not layer_types:
         layer_types = tuple("full_attention" for _ in range(hf_config.num_hidden_layers))
     swa_layers = tuple(
-        idx
-        for idx, layer_type in enumerate(layer_types)
-        if layer_type == "sliding_attention"
+        idx for idx, layer_type in enumerate(layer_types) if layer_type == "sliding_attention"
     )
     full_layers = tuple(
-        idx
-        for idx, layer_type in enumerate(layer_types)
-        if layer_type != "sliding_attention"
+        idx for idx, layer_type in enumerate(layer_types) if layer_type != "sliding_attention"
     )
     num_kv_heads = getattr(
         hf_config,

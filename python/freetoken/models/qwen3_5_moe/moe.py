@@ -23,12 +23,18 @@ class _SharedExpert(BaseOP):
         self, config: ModelConfig, hidden_size: int, intermediate_size: int, *, prefix: str = ""
     ):
         self.gate_up_proj = LinearColParallelMerged(
-            hidden_size, [intermediate_size, intermediate_size], has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.gate_up_proj",
+            hidden_size,
+            [intermediate_size, intermediate_size],
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = LinearRowParallel(
-            intermediate_size, hidden_size, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.down_proj",
+            intermediate_size,
+            hidden_size,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.down_proj",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -64,7 +70,9 @@ class Qwen3_5MoE(BaseOP):
         # routers stay bf16 whatever the checkpoint quantizes
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
         self.shared_expert = _SharedExpert(
-            config, config.hidden_size, config.shared_expert_intermediate_size,
+            config,
+            config.hidden_size,
+            config.shared_expert_intermediate_size,
             prefix=f"{prefix}.shared_expert",
         )
         self.shared_expert_gate = LinearReplicated(config.hidden_size, 1, has_bias=False)

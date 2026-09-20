@@ -80,9 +80,9 @@ def _router_triton_kernel(
         max_val = tl.max(cur, axis=1)[:, None]
         lane_id = tl.where(cur == max_val, offs_n[None, :], N + 1)  # lowest expert id wins ties
         win_lane = tl.min(lane_id, axis=1)[:, None].to(tl.int32)
-        win_activated = tl.sum(
-            tl.where(offs_n[None, :] == win_lane, activated, 0.0), axis=1
-        )[:, None]
+        win_activated = tl.sum(tl.where(offs_n[None, :] == win_lane, activated, 0.0), axis=1)[
+            :, None
+        ]
         slot = offs_k[None, :] == k
         selected_vals = tl.where(slot, win_activated, selected_vals)
         selected_idx = tl.where(slot, win_lane, selected_idx)
@@ -99,8 +99,12 @@ def _router_triton_kernel(
         limit = tl.load(num_token_non_padded_ptr)
         selected_idx = tl.where(offs_m[:, None] < limit, selected_idx, -1)
 
-    out_w_ptr = out_weights_ptr + offs_m[:, None].to(tl.int64) * stride_wm + offs_k[None, :] * stride_wk
-    out_i_ptr = out_indices_ptr + offs_m[:, None].to(tl.int64) * stride_im + offs_k[None, :] * stride_ik
+    out_w_ptr = (
+        out_weights_ptr + offs_m[:, None].to(tl.int64) * stride_wm + offs_k[None, :] * stride_wk
+    )
+    out_i_ptr = (
+        out_indices_ptr + offs_m[:, None].to(tl.int64) * stride_im + offs_k[None, :] * stride_ik
+    )
     store_mask = mask_m[:, None] & mask_k[None, :]
     tl.store(out_w_ptr, selected_vals, mask=store_mask)
     tl.store(out_i_ptr, selected_idx, mask=store_mask)

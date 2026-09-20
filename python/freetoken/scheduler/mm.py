@@ -31,7 +31,14 @@ def mm_chunk_end(items: List[MMItem], chunk_lo: int, end: int, align: int) -> in
 
 def cut_image_spans(reqs) -> List[Tuple[int, int]]:
     """The image spans the reqs' current chunks end inside of; mm_chunk_end leaves such a cut only for an image longer than the chunk."""
-    return [(lo, hi) for req in reqs if req.mm_items for item in req.mm_items for lo, hi in item.offsets if lo < req.device_len < hi]
+    return [
+        (lo, hi)
+        for req in reqs
+        if req.mm_items
+        for item in req.mm_items
+        for lo, hi in item.offsets
+        if lo < req.device_len < hi
+    ]
 
 
 def plan_mm_chunk(
@@ -50,7 +57,9 @@ def plan_mm_chunk(
     plan: List[Tuple[int, int, int, int, int, int]] = []
     for item in items:
         num_tokens = item.num_tokens
-        needs_encode = item.hash not in queued and (encoder_cache is None or not encoder_cache.has(item.hash))
+        needs_encode = item.hash not in queued and (
+            encoder_cache is None or not encoder_cache.has(item.hash)
+        )
         row_base = 0
         for span_lo, span_hi in item.offsets:
             lo, hi = max(span_lo, window_lo), min(span_hi, window_hi)
@@ -59,12 +68,23 @@ def plan_mm_chunk(
                     jobs.append(item)
                     queued.add(item.hash)
                     needs_encode = False
-                plan.append((uid, item.hash, row_base + lo - span_lo, row_base + hi - span_lo, num_tokens, lo - window_lo))
+                plan.append(
+                    (
+                        uid,
+                        item.hash,
+                        row_base + lo - span_lo,
+                        row_base + hi - span_lo,
+                        num_tokens,
+                        lo - window_lo,
+                    )
+                )
             row_base += span_hi - span_lo
     return jobs, plan
 
 
-def plan_mm_batch(reqs, encoder_cache: EncoderCache | None) -> tuple[List[MMItem], List[Tuple[int, int, int, int, int, int]], List[int], List[int]]:
+def plan_mm_batch(
+    reqs, encoder_cache: EncoderCache | None
+) -> tuple[List[MMItem], List[Tuple[int, int, int, int, int, int]], List[int], List[int]]:
     """Jobs, plan, the batch rows of every gathered embedding row and, per batch token, the end of the image span holding it (0 for text), over the reqs in batch order (each spans [cached_len, device_len))."""
     jobs: List[MMItem] = []
     plan: List[Tuple[int, int, int, int, int, int]] = []
@@ -73,7 +93,9 @@ def plan_mm_batch(reqs, encoder_cache: EncoderCache | None) -> tuple[List[MMItem
     offset = 0
     for req in reqs:
         if req.mm_items:
-            req_jobs, req_plan = plan_mm_chunk(req.uid, req.mm_items, req.cached_len, req.device_len, encoder_cache)
+            req_jobs, req_plan = plan_mm_chunk(
+                req.uid, req.mm_items, req.cached_len, req.device_len, encoder_cache
+            )
             jobs.extend(req_jobs)
             plan.extend(req_plan)
             for _, _, row_lo, row_hi, _, pos in req_plan:

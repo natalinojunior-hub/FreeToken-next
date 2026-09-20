@@ -63,8 +63,11 @@ class GlmDsaIndexer(BaseOP):
         self.head_dim = args.index_head_dim
         self.softmax_scale = args.index_head_dim**-0.5
         self.wq_b = LinearReplicated(
-            args.q_lora_rank, self.n_heads * self.head_dim, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.wq_b",
+            args.q_lora_rank,
+            self.n_heads * self.head_dim,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.wq_b",
         )
         self.wk = LinearReplicated(args.hidden_size, self.head_dim, has_bias=False)
         self.k_norm = _IdxLayerNorm(self.head_dim, eps=1e-6)
@@ -130,17 +133,26 @@ class GlmMoeDsaAttention(BaseOP):
         )
 
         self.q_a_proj = LinearReplicated(
-            args.hidden_size, args.q_lora_rank, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.q_a_proj",
+            args.hidden_size,
+            args.q_lora_rank,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.q_a_proj",
         )
         self.q_a_layernorm = RMSNorm(args.q_lora_rank, eps=args.norm_eps)
         self.q_b_proj = LinearReplicated(
-            args.q_lora_rank, self.num_heads * self.qk_head_dim, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.q_b_proj",
+            args.q_lora_rank,
+            self.num_heads * self.qk_head_dim,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.q_b_proj",
         )
         self.kv_a_proj_with_mqa = LinearReplicated(
-            args.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.kv_a_proj_with_mqa",
+            args.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.kv_a_proj_with_mqa",
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=args.norm_eps)
         # the MLA absorption reads kv_b_proj.weight as bmm operands, so only an unquantized scheme is served
@@ -148,12 +160,18 @@ class GlmMoeDsaAttention(BaseOP):
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.kv_b_proj",
+            quant_config=config.quant,
+            prefix=f"{prefix}.kv_b_proj",
         )
-        assert self.kv_b_proj.quant_method.kind is QuantKind.NONE, f"{prefix}.kv_b_proj: a quantized kv_b_proj needs a dequantized copy for the MLA absorption"
+        assert self.kv_b_proj.quant_method.kind is QuantKind.NONE, (
+            f"{prefix}.kv_b_proj: a quantized kv_b_proj needs a dequantized copy for the MLA absorption"
+        )
         self.o_proj = LinearReplicated(
-            self.num_heads * self.v_head_dim, args.hidden_size, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.o_proj",
+            self.num_heads * self.v_head_dim,
+            args.hidden_size,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.o_proj",
         )
         # Contiguous per-head kv_b split, cached on first forward (see _kv_b). Absorbing
         # kv_b into Q/O runs as a per-head bf16 bmm on these instead of re-slicing +
@@ -226,8 +244,13 @@ class GlmMoeDsaAttention(BaseOP):
         # The pool scatters the two latent halves (c_kv | k_rope) directly -- no
         # concatenated latent copy on the hot path.
         o_latent = ctx.attn_backend.mla_forward(
-            q_absorbed.contiguous(), q_rope.contiguous(), c_kv.contiguous(),
-            k_rope.contiguous(), self.layer_id, ctx.batch, indexer_inputs=indexer_inputs,
+            q_absorbed.contiguous(),
+            q_rope.contiguous(),
+            c_kv.contiguous(),
+            k_rope.contiguous(),
+            self.layer_id,
+            ctx.batch,
+            indexer_inputs=indexer_inputs,
         )  # [T, H, kv_lora_rank]
 
         # Absorb kv_b's v-part onto the output: o_latent[H,T,lora] @ W_uv_t[H,lora,v].

@@ -172,7 +172,9 @@ def is_ft_serve_on_port(pid: int, port: int, *, starttime: int | None = None) ->
         return False
     joined = " ".join(argv)
     looks_like_serve = "serve" in argv and (
-        "freetoken.cli" in joined or "freetoken" in joined or os.path.basename(argv[0]) in {"ft", "ft.exe"}
+        "freetoken.cli" in joined
+        or "freetoken" in joined
+        or os.path.basename(argv[0]) in {"ft", "ft.exe"}
     )
     if not looks_like_serve:
         return False

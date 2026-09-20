@@ -63,8 +63,11 @@ class Glm5NextDecoderLayer(BaseOP):
             self.mlp: BaseOP = Glm5NextSparseBlock(config, layer_id, prefix=f"{prefix}.mlp")
         else:
             self.mlp = Glm5NextGatedMLP(
-                config.hidden_size, config.intermediate_size, swiglu_limit=config.swiglu_limit,
-                quant_config=config.quant, prefix=f"{prefix}.mlp",
+                config.hidden_size,
+                config.intermediate_size,
+                swiglu_limit=config.swiglu_limit,
+                quant_config=config.quant,
+                prefix=f"{prefix}.mlp",
             )
         self.input_layernorm = RMSNorm(size=config.hidden_size, eps=args.norm_eps)
         self.post_attention_layernorm = RMSNorm(size=config.hidden_size, eps=args.norm_eps)
@@ -87,19 +90,42 @@ class Glm5NextDecoderLayer(BaseOP):
         if residual.is_cuda:
             _, post, comb, x = mhc_fused_post_pre(
                 residual.new_empty(residual.shape[0], residual.shape[-1]),
-                residual, None, None, fn, scale, base,
-                self._rms_eps, self._hc_eps, self._post_mult, self._sinkhorn,
+                residual,
+                None,
+                None,
+                fn,
+                scale,
+                base,
+                self._rms_eps,
+                self._hc_eps,
+                self._post_mult,
+                self._sinkhorn,
             )
             return post, comb, x
         return mhc_pre(
-            residual, fn, scale, base,
-            self._rms_eps, self._hc_eps, self._post_mult, self._sinkhorn,
+            residual,
+            fn,
+            scale,
+            base,
+            self._rms_eps,
+            self._hc_eps,
+            self._post_mult,
+            self._sinkhorn,
         )
 
     def _fused(self, x, residual, post, comb, fn, scale, base):
         return mhc_fused_post_pre(
-            x, residual, post, comb, fn, scale, base,
-            self._rms_eps, self._hc_eps, self._post_mult, self._sinkhorn,
+            x,
+            residual,
+            post,
+            comb,
+            fn,
+            scale,
+            base,
+            self._rms_eps,
+            self._hc_eps,
+            self._post_mult,
+            self._sinkhorn,
         )
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
@@ -118,15 +144,25 @@ class Glm5NextDecoderLayer(BaseOP):
             )
         else:
             residual, post, comb, x = self._fused(
-                x, residual, post, comb,
-                self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+                x,
+                residual,
+                post,
+                comb,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
             )
         x = self.input_layernorm.forward(x)
         x = self.self_attn.forward(x)
 
         residual, post, comb, x = self._fused(
-            x, residual, post, comb,
-            self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
+            x,
+            residual,
+            post,
+            comb,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
         )
         x = self.post_attention_layernorm.forward(x)
         x = self.mlp.forward(x)
@@ -144,7 +180,10 @@ class Glm5NextModel(BaseOP):
             embedding_dim=config.hidden_size,
         )
         self.layers = OPList(
-            [Glm5NextDecoderLayer(config, i, prefix=f"{prefix}.layers.{i}") for i in range(config.num_layers)]
+            [
+                Glm5NextDecoderLayer(config, i, prefix=f"{prefix}.layers.{i}")
+                for i in range(config.num_layers)
+            ]
         )
         self.norm = RMSNorm(size=config.hidden_size, eps=config.rms_norm_eps)
 

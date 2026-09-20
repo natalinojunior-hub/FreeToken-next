@@ -48,12 +48,14 @@ def _source_fingerprint(model_path: str, model_config, *, device) -> str:
     except Exception:
         pass
     files = sorted(
-        glob.glob(os.path.join(model_path, "*.safetensors")) + glob.glob(os.path.join(model_path, "*.gguf"))
+        glob.glob(os.path.join(model_path, "*.safetensors"))
+        + glob.glob(os.path.join(model_path, "*.gguf"))
     )
     for f in files:
         st = os.stat(f)
         h.update(f"{os.path.basename(f)}:{st.st_size}:{int(st.st_mtime)}|".encode())
     return h.hexdigest()[:16]
+
 
 # Checkpoint metadata to carry over so the FTW dir is a usable checkpoint on its own.
 # (Weight shards + the safetensors index are intentionally NOT copied.)
@@ -89,8 +91,11 @@ def _copy_metadata(model_path: str, out_dir: str) -> list[str]:
     out_abs = os.path.abspath(out_dir)
     copied = []
     for root, dirs, files in os.walk(model_path):
-        dirs[:] = [d for d in dirs
-                   if d not in _SKIP_DIRS and os.path.abspath(os.path.join(root, d)) != out_abs]
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in _SKIP_DIRS and os.path.abspath(os.path.join(root, d)) != out_abs
+        ]
         for name in files:
             if name.endswith(_WEIGHT_SUFFIXES) or name in _SKIP_NAMES:
                 continue
@@ -119,7 +124,13 @@ class _ConvertSink:
     under one lock (disk-bound anyway).
     """
 
-    def __init__(self, writer: FTWWriter, desc: str = "Converting expert banks", *, names: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        writer: FTWWriter,
+        desc: str = "Converting expert banks",
+        *,
+        names: dict[str, str] | None = None,
+    ) -> None:
         self._writer = writer
         self._desc = desc
         # canonical role -> the bank name the file stores
@@ -207,8 +218,13 @@ def convert_checkpoint(
     torch.cuda.set_device(dev)
     torch.zeros(1, device=dev)  # init CUDA context (needed by nvfp4 backend pick / pinning)
 
-    cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(tp.rank, tp.size),
-                       dtype=dtype, moe_strategy=moe_backend, quant_backend=quant_backend)
+    cfg = EngineConfig(
+        model_path=model_path,
+        tp_info=DistributedInfo(tp.rank, tp.size),
+        dtype=dtype,
+        moe_strategy=moe_backend,
+        quant_backend=quant_backend,
+    )
     mc = cfg.model_config
     offload = moe_backend == "offload" and getattr(mc, "is_moe", False)
     include_moe_experts = not offload
@@ -236,9 +252,10 @@ def convert_checkpoint(
     # 1) dense weights (host tensors; load straight to CPU to avoid GPU pressure)
     _progress("dense", 0, 0)  # phase start; per-tensor cumulative bytes follow (total unknown)
     dense_bytes = 0
-    for name, tensor in count_bar(load_weight(model_path, torch.device("cpu"),
-                                              include_moe_experts=include_moe_experts),
-                                  "Converting dense weights"):
+    for name, tensor in count_bar(
+        load_weight(model_path, torch.device("cpu"), include_moe_experts=include_moe_experts),
+        "Converting dense weights",
+    ):
         writer.validate_tensor(name, tensor)
         if writer.tensor_entry(name) is None:
             writer.add_tensor(name, tensor, kind="weight")
@@ -264,7 +281,11 @@ def convert_checkpoint(
         # every method-packed format streams each layer to its own FTW entry as it completes (via the sink); the GGUF provider reports through ExpertBanks.streamed whether it engaged the sink or materialized the whole bank set first
         from freetoken.moe.legacy_format import legacy_bank_names, legacy_format_for
 
-        names = legacy_bank_names(legacy_format_for(method.kind, method.kernel.name)) if method is not None else {}
+        names = (
+            legacy_bank_names(legacy_format_for(method.kind, method.kernel.name))
+            if method is not None
+            else {}
+        )
         sink = _ConvertSink(writer, names=names)
         banks = load_expert_banks(
             model_path, mc, method=method, device=dev, dtype=dtype, layer_sink=sink
@@ -312,7 +333,12 @@ def convert_checkpoint(
                     num_layers = len(per_layer)
                 else:
                     assert len(per_layer) == num_layers, (name, len(per_layer), num_layers)
-                items.append((names.get(name, name), torch.cat(per_layer, dim=0) if len(per_layer) > 1 else per_layer[0]))
+                items.append(
+                    (
+                        names.get(name, name),
+                        torch.cat(per_layer, dim=0) if len(per_layer) > 1 else per_layer[0],
+                    )
+                )
             for an in ("gate_up_alpha", "down_alpha"):
                 if getattr(banks, an, None) is not None:
                     items.append((an, getattr(banks, an)))
@@ -343,23 +369,25 @@ def convert_checkpoint(
     except Exception:
         fingerprint = None
 
-    index = writer.finalize({
-        "source_model_path": os.path.abspath(model_path),
-        "fingerprint": fingerprint,
-        # quant_format records the actual on-disk bank layout (e.g. nvfp4_marlin vs
-        # nvfp4_b12x): the suffix is a runtime backend pick (GPU capability / env), NOT in
-        # config, and the stored bytes are physically repacked into it -- so it's kept and
-        # read back at load (ftw.load_ftw_banks). dtype/moe_backend were dropped: each
-        # tensor already carries its own dtype, and nothing reads a model-level backend.
-        "quant_format": quant_format,
-        # The reader takes num_layers from the model config (copied into this
-        # checkpoint); recording it here too gives load_ftw_banks a cross-check that
-        # the banks match the config they ship with. None for non-offload checkpoints.
-        "expert_bank_num_layers": num_layers,
-        "counts": {"weight": n_weight, "experts_bank": n_bank + n_alpha},
-        "copied_metadata": copied,
-        "side_files": side_files,
-    })
+    index = writer.finalize(
+        {
+            "source_model_path": os.path.abspath(model_path),
+            "fingerprint": fingerprint,
+            # quant_format records the actual on-disk bank layout (e.g. nvfp4_marlin vs
+            # nvfp4_b12x): the suffix is a runtime backend pick (GPU capability / env), NOT in
+            # config, and the stored bytes are physically repacked into it -- so it's kept and
+            # read back at load (ftw.load_ftw_banks). dtype/moe_backend were dropped: each
+            # tensor already carries its own dtype, and nothing reads a model-level backend.
+            "quant_format": quant_format,
+            # The reader takes num_layers from the model config (copied into this
+            # checkpoint); recording it here too gives load_ftw_banks a cross-check that
+            # the banks match the config they ship with. None for non-offload checkpoints.
+            "expert_bank_num_layers": num_layers,
+            "counts": {"weight": n_weight, "experts_bank": n_bank + n_alpha},
+            "copied_metadata": copied,
+            "side_files": side_files,
+        }
+    )
     return index
 
 

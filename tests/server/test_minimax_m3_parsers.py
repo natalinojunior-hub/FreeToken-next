@@ -90,9 +90,15 @@ def _tools():
                 },
             )
         ),
-        Tool(function=Function(name="get_weather", parameters={
-            "type": "object", "properties": {"city": {"type": "string"}},
-        })),
+        Tool(
+            function=Function(
+                name="get_weather",
+                parameters={
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            )
+        ),
     ]
 
 
@@ -139,8 +145,7 @@ def test_detect_and_parse_recursive_args():
 def test_detect_and_parse_multiple_invokes():
     det = MiniMaxM3Detector()
     two = (
-        _NESTED_INVOKE
-        + f'{NS}<invoke name="get_weather">{NS}<city>Paris{NS}</city>{NS}</invoke>\n'
+        _NESTED_INVOKE + f'{NS}<invoke name="get_weather">{NS}<city>Paris{NS}</city>{NS}</invoke>\n'
     )
     res = det.detect_and_parse(_block(two), _tools())
     assert [c.name for c in res.calls] == ["create_order", "get_weather"]
@@ -171,9 +176,7 @@ def test_quoted_invoke_opener_is_data_not_call():
     a raw regex over the block used to spawn a phantom call and diverge from
     streaming."""
     quoted = f'see {NS}<invoke name="write_file"> for the syntax'
-    text = _block(
-        f'{NS}<invoke name="get_weather">{NS}<city>{quoted}{NS}</city>{NS}</invoke>\n'
-    )
+    text = _block(f'{NS}<invoke name="get_weather">{NS}<city>{quoted}{NS}</city>{NS}</invoke>\n')
     res = MiniMaxM3Detector().detect_and_parse(text, _tools())
     assert [c.name for c in res.calls] == ["get_weather"]
     assert json.loads(res.calls[0].parameters) == {"city": quoted}
@@ -210,10 +213,15 @@ def test_multiline_string_argument_verbatim():
     them verbatim too (stripping ate the trailing newline of multi-line string
     arguments)."""
     tools = [
-        Tool(function=Function(name="write_file", parameters={
-            "type": "object",
-            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-        }))
+        Tool(
+            function=Function(
+                name="write_file",
+                parameters={
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                },
+            )
+        )
     ]
     content = "line1\nline2\n"
     text = _block(
@@ -231,20 +239,25 @@ def test_nested_schema_types_string_leaves():
     strings instead of loose-JSON numbers/bools); undeclared nested leaves keep
     the loose-JSON fallback."""
     tools = [
-        Tool(function=Function(name="create_order", parameters={
-            "type": "object",
-            "properties": {
-                "shipping": {
+        Tool(
+            function=Function(
+                name="create_order",
+                parameters={
                     "type": "object",
                     "properties": {
-                        "zip": {"type": "string"},
-                        "note": {"type": "string"},
-                        "floor": {"type": "integer"},
+                        "shipping": {
+                            "type": "object",
+                            "properties": {
+                                "zip": {"type": "string"},
+                                "note": {"type": "string"},
+                                "floor": {"type": "integer"},
+                            },
+                        },
+                        "tags": {"type": "array", "items": {"type": "string"}},
                     },
                 },
-                "tags": {"type": "array", "items": {"type": "string"}},
-            },
-        }))
+            )
+        )
     ]
     text = _block(
         f'{NS}<invoke name="create_order">'
@@ -289,8 +302,7 @@ def test_streaming_text_then_call():
 def test_streaming_multiple_invokes_and_indices():
     det = MiniMaxM3Detector()
     two = (
-        _NESTED_INVOKE
-        + f'{NS}<invoke name="get_weather">{NS}<city>Paris{NS}</city>{NS}</invoke>\n'
+        _NESTED_INVOKE + f'{NS}<invoke name="get_weather">{NS}<city>Paris{NS}</city>{NS}</invoke>\n'
     )
     full = _block(two)
     chunks = [full[i : i + 13] for i in range(0, len(full), 13)]
@@ -441,7 +453,9 @@ def test_streaming_truncated_call_suppressed_and_recovered():
     parser = FunctionCallParser(_tools(), "minimax_m3")
     det = parser.detector
     truncated = (
-        "Let me order. " + NS + "<tool_call>\n"
+        "Let me order. "
+        + NS
+        + "<tool_call>\n"
         + f'{NS}<invoke name="create_order">{NS}<user_id>42{NS}</user_id>{NS}<note>hi'
     )
     normal = ""
@@ -495,23 +509,23 @@ def test_element_semantics_reference_batch():
     dangling-closer leniency, single-quoted invoke name, $text for mixed
     content, and float preservation."""
     tools = [
-        Tool(function=Function(name="t", parameters={
-            "type": "object",
-            "properties": {
-                "obj": {"type": "object"},
-                "arr": {"type": "array"},
-                "uni": {"anyOf": [{"type": "integer"}, {"type": "string"}]},
-                "price": {"type": "number"},
-            },
-        }))
+        Tool(
+            function=Function(
+                name="t",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "obj": {"type": "object"},
+                        "arr": {"type": "array"},
+                        "uni": {"anyOf": [{"type": "integer"}, {"type": "string"}]},
+                        "price": {"type": "number"},
+                    },
+                },
+            )
+        )
     ]
     det = MiniMaxM3Detector()
-    body = (
-        f"{NS}<obj>{NS}</obj>"
-        f"{NS}<arr>{NS}</arr>"
-        f"{NS}<uni>42{NS}</uni>"
-        f"{NS}<price>5.0{NS}</price>"
-    )
+    body = f"{NS}<obj>{NS}</obj>{NS}<arr>{NS}</arr>{NS}<uni>42{NS}</uni>{NS}<price>5.0{NS}</price>"
     text = _block(f'{NS}<invoke name="t">{body}{NS}</invoke>\n')
     args = json.loads(det.detect_and_parse(text, tools).calls[0].parameters)
     assert args["obj"] == {} and args["arr"] == []  # typed empty containers
@@ -571,9 +585,7 @@ def test_reasoning_one_shot_verbatim_no_strip():
     )
     assert r.reasoning_text == "\nthink\n"
     assert r.normal_text == "\nanswer\n"
-    r2 = MiniMaxM3ReasoningParser(force_reasoning=True).detect_and_parse(
-        "th\n</mm:think>\nans\n"
-    )
+    r2 = MiniMaxM3ReasoningParser(force_reasoning=True).detect_and_parse("th\n</mm:think>\nans\n")
     assert r2.reasoning_text == "th\n" and r2.normal_text == "\nans\n"
 
 

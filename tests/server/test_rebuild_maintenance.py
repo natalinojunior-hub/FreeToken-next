@@ -136,9 +136,9 @@ def test_late_reply_cannot_resurrect_a_fatal_latch():
 
         FrontendManager._resolve_rebuild(state, _reply("r1", "ok", num_pages=2048))
 
-        assert state.maintenance_state == "failed"          # gate stays latched
+        assert state.maintenance_state == "failed"  # gate stays latched
         assert fut.done() and fut.result()["num_pages"] == 2048  # waiter still woken
-        assert state.rebuild_futures == {}                  # future consumed, not leaked
+        assert state.rebuild_futures == {}  # future consumed, not leaked
         # The reply is still recorded for observability; the gate stays latched.
         assert state.last_rebuild["num_pages"] == 2048
 
@@ -202,7 +202,7 @@ def test_crash_during_rebuild_latches_failed_via_watchdog():
             dispatch_rebuild(state, moe_cache_size=8, num_pages=None, timeout=30.0)
         )
         await asyncio.sleep(0)
-        assert state.rebuild_futures          # a waiter is parked
+        assert state.rebuild_futures  # a waiter is parked
         assert state.maintenance_state == "rebuilding"
 
         proc._alive = False  # …and the scheduler crashes mid-rebuild
@@ -213,7 +213,7 @@ def test_crash_during_rebuild_latches_failed_via_watchdog():
         assert "scheduler" in result["error"]
         assert state.maintenance_state == "failed"  # escaped "rebuilding" to a definite state
         assert "scheduler" in state.fatal_error
-        assert state.rebuild_futures == {}          # waiter resolved and cleared, not leaked
+        assert state.rebuild_futures == {}  # waiter resolved and cleared, not leaked
         sup.join(timeout=1.0)
 
     asyncio.run(_run())

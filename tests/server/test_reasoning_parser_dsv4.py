@@ -1,6 +1,7 @@
 """The deepseekv32 reasoning parser (server/reasoning_parser.py), whose DSML tool-call markup
 makes it the only family that ends reasoning on something other than ``</think>``. The other
 families are covered in test_reasoning_parser_all_models.py."""
+
 from __future__ import annotations
 
 import pytest
@@ -176,7 +177,13 @@ def test_stream_skip_end_token_split_leading_marker_char():
     parser = ReasoningParser("deepseekv32", force_reasoning=True)
     reasoning, content = _stream(
         parser,
-        ["I will look it up", ".<", f"{DSML_TOKEN}tool_calls>", "\nbody", f"</{DSML_TOKEN}tool_calls>"],
+        [
+            "I will look it up",
+            ".<",
+            f"{DSML_TOKEN}tool_calls>",
+            "\nbody",
+            f"</{DSML_TOKEN}tool_calls>",
+        ],
     )
     assert reasoning == "I will look it up."
     assert content.startswith(TC_OPEN)
@@ -187,10 +194,12 @@ def test_stream_matches_non_stream_under_split_leading_char():
     # Same full text, two deliveries: as one blob (non-stream) and with the
     # marker's leading '<' glued to the preceding char. Results must agree.
     full = f"thinking it through.{TC_OPEN}\n{'x'}\n</{DSML_TOKEN}tool_calls>"
-    ns_reasoning, ns_content = ReasoningParser("deepseekv32", force_reasoning=True).parse_non_stream(full)
+    ns_reasoning, ns_content = ReasoningParser(
+        "deepseekv32", force_reasoning=True
+    ).parse_non_stream(full)
     s_reasoning, s_content = _stream(
         ReasoningParser("deepseekv32", force_reasoning=True),
-        ["thinking it through", ".<", full[len("thinking it through.<"):]],
+        ["thinking it through", ".<", full[len("thinking it through.<") :]],
     )
     assert s_reasoning == ns_reasoning
     assert s_content == ns_content

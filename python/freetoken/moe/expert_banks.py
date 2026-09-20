@@ -27,6 +27,24 @@ logger = init_logger(__name__)
 _PARALLEL_READER_SUPPORTED = hasattr(os, "O_DIRECT") and hasattr(os, "preadv")
 
 
+def make_pool_key(bank: int, role: str, quant_type: str | int) -> tuple[int, str, str]:
+    from freetoken.models.gguf.dequant import GGML_NAME
+
+    qt_str = (
+        GGML_NAME.get(quant_type, quant_type) if isinstance(quant_type, int) else str(quant_type)
+    )
+    return (int(bank), str(role), qt_str)
+
+
+def validate_pool_key(key: object) -> tuple[int, str, str]:
+    if not (isinstance(key, (tuple, list)) and len(key) == 3):
+        raise KeyError(
+            f"expert_geometry / geometria inválida: {key!r}. "
+            f"MoE pool key mismatch: expected (bank, role, type)"
+        )
+    return make_pool_key(key[0], key[1], key[2])
+
+
 @dataclass(frozen=True)
 class ExpertBanks:
     """Loaded expert banks, normalized for ``OffloadMoeCache`` wiring."""
@@ -47,11 +65,27 @@ class ExpertBanks:
     # For quant_format == "gguf": the (gate_up, down) ggml types the checkpoint used.
     # Carried here so the engine can hand them to OffloadMoeCache, which hands them to
     # the MoE kernels -- a GGUF bank's row stride is a property of the file, not the format.
-    gguf_expert_types: tuple[int, int] | None = field(default=None)
+    gguf_expert_types: tuple[int, int] | list[tuple[int, int]] | None = field(default=None)
     # the expert (kind, kernel) the banks were packed for; None for the legacy providers
     kind: QuantKind | None = None
     kernel: str | None = None
     layout: dict | None = None
+    # Phase 7 exact geometry keying: (bank_idx, role, quant_type) -> (shape, dtype)
+    expert_geometry: dict[tuple[int, str, str], tuple[tuple[int, ...], torch.dtype]] = field(
+        default_factory=dict
+    )
+
+    def __getitem__(self, key):
+        if isinstance(key, (tuple, list)):
+            valid_key = validate_pool_key(key)
+            if valid_key not in self.expert_geometry:
+                raise KeyError(
+                    f"expert_geometry / geometria inválida: {key!r}. "
+                    f"MoE pool key mismatch: expected (bank, role, type)"
+                )
+            bank_idx, role, _ = valid_key
+            return self.sources[role][bank_idx]
+        return self.sources[key]
 
 
 def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
@@ -69,7 +103,6 @@ def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
         tensor.view(torch.uint8).random_(0, 16)  # small codes, no NaN / inf
     else:
         tensor.normal_()
-
 
 
 def build_expert_banks(
@@ -95,7 +128,9 @@ def build_expert_banks(
     kernel = method.kernel
     layout = method.layout()
     E = method.cfg.num_experts
-    specs = {role: ((E, *spec.shape), spec.dtype) for role, spec in layout.items() if not spec.resident}
+    specs = {
+        role: ((E, *spec.shape), spec.dtype) for role, spec in layout.items() if not spec.resident
+    }
 
     if layer_sink is not None and not dummy:
         # Conversion does not need a resident bank table after a layer has been written. The
@@ -107,7 +142,8 @@ def build_expert_banks(
         written = torch.zeros(num_layers, E, dtype=torch.int32)
         alphas = {
             role: torch.empty(num_layers * E, dtype=spec.dtype, device=device)
-            for role, spec in layout.items() if spec.resident
+            for role, spec in layout.items()
+            if spec.resident
         }
 
         for layer_id, e0, e1, piece in pieces:
@@ -156,7 +192,8 @@ def build_expert_banks(
     banks = {role: [b.tensor for b in hb[role]] for role in specs}
     alphas = {
         role: torch.empty(num_layers * E, dtype=spec.dtype, device=device)
-        for role, spec in layout.items() if spec.resident
+        for role, spec in layout.items()
+        if spec.resident
     }
 
     if dummy:
@@ -168,9 +205,13 @@ def build_expert_banks(
         if torch.cuda.is_available():
             pin_banks(hb)
         return ExpertBanks(
-            legacy_format_for(method.kind, kernel.name), banks,
-            gate_up_alpha=alphas.get("gate_up_alpha"), down_alpha=alphas.get("down_alpha"),
-            kind=method.kind, kernel=kernel.name, layout=layout,
+            legacy_format_for(method.kind, kernel.name),
+            banks,
+            gate_up_alpha=alphas.get("gate_up_alpha"),
+            down_alpha=alphas.get("down_alpha"),
+            kind=method.kind,
+            kernel=kernel.name,
+            layout=layout,
         )
 
     def _fill(sink) -> None:
@@ -179,10 +220,14 @@ def build_expert_banks(
         written = torch.zeros(num_layers, E, dtype=torch.int32)
         for layer_id, e0, e1, piece in pieces:
             if not (0 <= layer_id < num_layers and 0 <= e0 < e1 <= E):
-                raise ValueError(f"expert piece out of range: layer {layer_id}, experts {e0}:{e1} of {num_layers} x {E}")
+                raise ValueError(
+                    f"expert piece out of range: layer {layer_id}, experts {e0}:{e1} of {num_layers} x {E}"
+                )
             # refuse before writing: a duplicate row would also complete the layer early and hand the sink a half-filled bank
             if written[layer_id, e0:e1].any():
-                raise ValueError(f"expert rows written more than once: layer {layer_id}, experts {e0}:{e1}")
+                raise ValueError(
+                    f"expert rows written more than once: layer {layer_id}, experts {e0}:{e1}"
+                )
             written[layer_id, e0:e1] = 1
             out = {role: banks[role][layer_id][e0:e1] for role in specs}
             got = method.pack(piece, out)
@@ -193,7 +238,9 @@ def build_expert_banks(
                     tracker.note(layer_id)
         missing = (written == 0).nonzero().tolist()
         if missing:
-            raise ValueError(f"expert banks were not filled: {len(missing)} (layer, expert) rows missing (first {missing[:4]})")
+            raise ValueError(
+                f"expert banks were not filled: {len(missing)} (layer, expert) rows missing (first {missing[:4]})"
+            )
 
     if layer_sink is not None:
         _fill(layer_sink)
@@ -204,16 +251,32 @@ def build_expert_banks(
         _fill(None)
 
     return ExpertBanks(
-        legacy_format_for(method.kind, kernel.name), banks,
-        gate_up_alpha=alphas.get("gate_up_alpha"), down_alpha=alphas.get("down_alpha"),
-        streamed=layer_sink is not None, kind=method.kind, kernel=kernel.name, layout=layout,
+        legacy_format_for(method.kind, kernel.name),
+        banks,
+        gate_up_alpha=alphas.get("gate_up_alpha"),
+        down_alpha=alphas.get("down_alpha"),
+        streamed=layer_sink is not None,
+        kind=method.kind,
+        kernel=kernel.name,
+        layout=layout,
     )
 
 
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
 
 
-def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _q4_0_banks(
+    model_path,
+    model_config,
+    device,
+    dtype,
+    dummy,
+    parallel=False,
+    workers=8,
+    chunk=_PARALLEL_CHUNK,
+    decode_target="gpu",
+    layer_sink=None,
+) -> ExpertBanks:
     if parallel:
         raise NotImplementedError(
             "parallel reader not implemented for q4_0: GGUF is a single packed file "
@@ -233,7 +296,18 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
-def _gguf_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _gguf_banks(
+    model_path,
+    model_config,
+    device,
+    dtype,
+    dummy,
+    parallel=False,
+    workers=8,
+    chunk=_PARALLEL_CHUNK,
+    decode_target="gpu",
+    layer_sink=None,
+) -> ExpertBanks:
     """Native GGUF routed experts of any MMVQ-capable ggml type (generalizes ``q4_0``).
 
     Like the q4_0 provider, the packed block bytes are streamed to the GPU and dequantized
@@ -257,37 +331,32 @@ def _gguf_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
 
     sink = None if dummy else layer_sink
     types = types_fn(model_path, model_config.num_layers)
-    # One pool per bank is shared by every layer, and moe_vec.cuh addresses it without a
-    # padding allowance, so a bank whose type varies by layer cannot be served. Reject it
-    # here with the layers named rather than reading every block at the wrong offset.
-    resolved = {}
-    for name in ("gate_up", "down"):
-        distinct = sorted(set(types[name]))
-        if len(distinct) != 1:
-            from freetoken.models.gguf.dequant import GGML_NAME
-
-            spread = {
-                GGML_NAME.get(t, t): [i for i, x in enumerate(types[name]) if x == t]
-                for t in distinct
-            }
-            raise NotImplementedError(
-                f"GGUF expert bank {name!r} mixes ggml types across layers ({spread}). "
-                f"The offload slot pool is a single allocation shared by every layer and "
-                f"moe_vec.cuh addresses it as expert * nrows * (ncols / qk) with no padding "
-                f"allowance, so one pool cannot hold two row strides. "
-                f"llama.cpp's mixed quant levels (the *_M and *_XXS families) raise the "
-                f"precision of the first few layers' ffn_down_exps, which is what trips this. "
-                f"Re-quantize with `llama-quantize --pure` to get one type throughout, or pick "
-                f"a level that is already uniform."
-            )
-        resolved[name] = distinct[0]
+    from freetoken.models.gguf.dequant import GGML_NAME
 
     sources = loader(model_path, model_config, layer_sink=sink)
+    is_uniform = len(set(types["gate_up"])) == 1 and len(set(types["down"])) == 1
+    gguf_types = (
+        (types["gate_up"][0], types["down"][0])
+        if is_uniform
+        else [(types["gate_up"][l], types["down"][l]) for l in range(model_config.num_layers)]
+    )
+
+    # Keying by exact geometry (bank, role, type) - Phase 7
+    geometry: dict[tuple[int, str, str], tuple[tuple[int, ...], torch.dtype]] = {}
+    for layer in range(model_config.num_layers):
+        for role in ("gate_up", "down"):
+            t = types[role][layer]
+            t_name = GGML_NAME.get(t, str(t))
+            key = make_pool_key(layer, role, t_name)
+            t_tensor = sources[role][layer]
+            geometry[key] = (tuple(t_tensor.shape), t_tensor.dtype)
+
     return ExpertBanks(
         "gguf",
         {name: sources[name] for name in _BANK_SCHEMAS["gguf"]},
         streamed=sink is not None,
-        gguf_expert_types=(resolved["gate_up"], resolved["down"]),
+        gguf_expert_types=gguf_types,
+        expert_geometry=geometry,
     )
 
 
@@ -298,7 +367,18 @@ _PROVIDERS = {
 }
 
 
-def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _legacy_expert_banks(
+    model_path,
+    model_config,
+    device,
+    dtype,
+    dummy,
+    parallel,
+    workers,
+    chunk,
+    decode_target="gpu",
+    layer_sink=None,
+) -> ExpertBanks:
     expert_quant = model_config.expert_quant
     if expert_quant not in _PROVIDERS:
         raise ValueError(
@@ -306,13 +386,22 @@ def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, paralle
             f"only {sorted(_PROVIDERS)} still have a format provider"
         )
     return _PROVIDERS[expert_quant](
-        model_path, model_config, device, dtype, dummy,
-        parallel=parallel, workers=workers, chunk=chunk, decode_target=decode_target,
+        model_path,
+        model_config,
+        device,
+        dtype,
+        dummy,
+        parallel=parallel,
+        workers=workers,
+        chunk=chunk,
+        decode_target=decode_target,
         layer_sink=layer_sink,
     )
 
 
-def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None) -> ExpertBanks:
+def _method_expert_banks(
+    model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None
+) -> ExpertBanks:
     from freetoken.moe.expert_pieces import iter_expert_pieces
 
     num_layers = model_config.num_moe_layers
@@ -375,12 +464,15 @@ def bank_bytes_estimate(model_config, method=None) -> int | None:
     if method is not None and layers:
         per_expert = sum(
             math.prod(spec.shape) * torch.empty((), dtype=spec.dtype).element_size()
-            for spec in method.layout().values() if not spec.resident
+            for spec in method.layout().values()
+            if not spec.resident
         )
         return layers * method.cfg.num_experts * per_expert
     expert_quant = getattr(model_config, "expert_quant", "none")
-    fmt = expert_quant if expert_quant != "none" else (
-        getattr(model_config, "moe_weight_format", None) or "bf16"
+    fmt = (
+        expert_quant
+        if expert_quant != "none"
+        else (getattr(model_config, "moe_weight_format", None) or "bf16")
     )
     layers = getattr(model_config, "num_moe_layers", None)
     experts = getattr(model_config, "num_experts", None)
@@ -396,6 +488,14 @@ def bank_bytes_estimate(model_config, method=None) -> int | None:
             return None
         from freetoken.models.gguf.dequant import row_bytes
 
+        if isinstance(types, list) or (
+            isinstance(types, tuple) and isinstance(types[0], (tuple, list))
+        ):
+            total = 0
+            for t_gate_up, t_down in types:
+                per = 2 * inter * row_bytes(hidden, t_gate_up) + hidden * row_bytes(inter, t_down)
+                total += experts * per
+            return total
         t_gate_up, t_down = types
         per = 2 * inter * row_bytes(hidden, t_gate_up) + hidden * row_bytes(inter, t_down)
         return layers * experts * per
@@ -448,7 +548,10 @@ def load_expert_banks(
 
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
         banks = load_ftw_banks(
-            model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
+            model_path,
+            num_layers=model_config.num_moe_layers,
+            workers=workers,
+            chunk=chunk,
             layer_residency=layer_residency,
         )
         if banks is not None:
@@ -487,8 +590,21 @@ def load_expert_banks(
 
     def _build(par: bool) -> ExpertBanks:
         if method is not None:
-            return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink)
-        return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink)
+            return _method_expert_banks(
+                model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink
+            )
+        return _legacy_expert_banks(
+            model_path,
+            model_config,
+            device,
+            dtype,
+            dummy,
+            par,
+            workers,
+            chunk,
+            decode_target,
+            layer_sink,
+        )
 
     with requested_residency(layer_residency) as residency_plan:
         try:
@@ -496,7 +612,9 @@ def load_expert_banks(
         except NotImplementedError as exc:
             if not parallel:
                 raise
-            logger.warning_rank0(f"parallel reader unavailable ({exc}); falling back to serial build")
+            logger.warning_rank0(
+                f"parallel reader unavailable ({exc}); falling back to serial build"
+            )
             banks = _build(False)
     return _echo_residency(banks, layer_residency, residency_plan)
 

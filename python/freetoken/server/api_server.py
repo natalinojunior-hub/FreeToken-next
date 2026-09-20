@@ -211,7 +211,8 @@ class FrontendManager:
                 from freetoken.utils import load_tokenizer
 
                 self._frontend_tokenizer = TokenizeManager(
-                    load_tokenizer(self.config.model_path), get_mm_processor(self.config.model_path, self.config.mm)
+                    load_tokenizer(self.config.model_path),
+                    get_mm_processor(self.config.model_path, self.config.mm),
                 )
             return self._frontend_tokenizer
 
@@ -233,9 +234,7 @@ class FrontendManager:
 
     def new_user(self) -> int:
         if self.maintenance_state != "serving":
-            raise AdmissionClosedError(
-                f"server unavailable: engine is {self.maintenance_state}"
-            )
+            raise AdmissionClosedError(f"server unavailable: engine is {self.maintenance_state}")
         uid = self.uid_counter
         self.uid_counter += 1
         self.ack_map[uid] = []
@@ -559,8 +558,10 @@ def _resolve_num_swa_pages(state: FrontendManager, req: CacheRebuildRequest) -> 
     pools = getattr(state, "cache_pools", None) or {}
     last = getattr(state, "last_rebuild", None) or {}
     num_pages = req.num_pages or int(
-        last.get("num_pages") or getattr(state.stats, "kv_total_pages", 0)
-        or pools.get("num_pages", 0) or 0
+        last.get("num_pages")
+        or getattr(state.stats, "kv_total_pages", 0)
+        or pools.get("num_pages", 0)
+        or 0
     )
     page_size = int(pools.get("page_size", 0) or getattr(config, "page_size", 1) or 1)
     is_dsv4 = getattr(getattr(config, "model_config", None), "dsv4_args", None) is not None
@@ -763,7 +764,12 @@ def cache_geometry(state: Any) -> dict:
             "swa_per_token": int(ub.get("swa_bytes_per_token", 0) or 0),
         }
     except Exception:
-        unit_bytes = {"kv_per_token": 0, "moe_per_expert": 0, "mamba_per_slot": 0, "swa_per_token": 0}
+        unit_bytes = {
+            "kv_per_token": 0,
+            "moe_per_expert": 0,
+            "mamba_per_slot": 0,
+            "swa_per_token": 0,
+        }
     # Thinking control: the gears a client can offer and the chat_template_kwargs
     # each selects, derived from the checkpoint's own probed template (no
     # per-family registry). None until the frontend tokenizer is warm — the
@@ -826,10 +832,16 @@ async def generate(req: GenerateRequest, request: Request):
     log_request("/generate", req, request)
     state = get_global_state()
     if state.maintenance_state != "serving":
-        detail = "model is still loading" if state.maintenance_state == "loading" else "cache rebuild in progress"
+        detail = (
+            "model is still loading"
+            if state.maintenance_state == "loading"
+            else "cache rebuild in progress"
+        )
         return JSONResponse({"error": f"server unavailable: {detail}"}, status_code=503)
     if req.max_tokens < 1:
-        return JSONResponse({"error": f"max_tokens must be at least 1, got {req.max_tokens}"}, status_code=400)
+        return JSONResponse(
+            {"error": f"max_tokens must be at least 1, got {req.max_tokens}"}, status_code=400
+        )
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(

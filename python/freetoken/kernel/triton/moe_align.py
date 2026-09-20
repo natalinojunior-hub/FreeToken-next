@@ -60,14 +60,14 @@ def _moe_align_small(
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_pad_ptr,
-    cumsum_ptr,        # scratch [effective_E+1]: spills cumsum across the barrier
+    cumsum_ptr,  # scratch [effective_E+1]: spills cumsum across the barrier
     fill_counter_ptr,  # scratch [effective_E]: scatter rank counters
     numel,
     sentinel,
     effective_E: tl.constexpr,
     block_size: tl.constexpr,
-    N_PAD: tl.constexpr,   # next_pow2(numel)
-    HIST: tl.constexpr,    # next_pow2(effective_E+1) -> top bin is a spare for invalid ids
+    N_PAD: tl.constexpr,  # next_pow2(numel)
+    HIST: tl.constexpr,  # next_pow2(effective_E+1) -> top bin is a spare for invalid ids
     FILL: tl.constexpr,
 ):
     tn = tl.arange(0, N_PAD)
@@ -111,9 +111,9 @@ def _fill_and_count(
     sorted_token_ids_ptr,
     counts_ptr,
     fill_counter_ptr,
-    numel,             # #valid flattened tokens
-    sorted_numel,      # len(sorted_token_ids) == max_num_tokens_padded
-    sentinel,          # == numel
+    numel,  # #valid flattened tokens
+    sorted_numel,  # len(sorted_token_ids) == max_num_tokens_padded
+    sentinel,  # == numel
     effective_E: tl.constexpr,
     HIST: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -151,8 +151,8 @@ def _cumsum_experts(
     lane = tl.arange(0, E_PADDED)
     m = lane < effective_E
     c = tl.load(counts_ptr + lane, mask=m, other=0)
-    nblk = tl.where(m, (c + block_size - 1) // block_size, 0)   # padded blocks per expert
-    excl = tl.cumsum(nblk, axis=0) - nblk                        # exclusive block offset
+    nblk = tl.where(m, (c + block_size - 1) // block_size, 0)  # padded blocks per expert
+    excl = tl.cumsum(nblk, axis=0) - nblk  # exclusive block offset
     tl.store(cumsum_ptr + lane, excl * block_size, mask=m)
     total_tok = tl.sum(nblk, axis=0) * block_size
     tl.store(cumsum_ptr + effective_E, total_tok)
@@ -252,12 +252,12 @@ def moe_align_block_size(
             cumsum,
             fill_counter,
             numel,
-            numel,          # sentinel
+            numel,  # sentinel
             effective_E,
             block_size,
             triton.next_power_of_2(numel),
             triton.next_power_of_2(effective_E + 1),
-            1024,           # FILL
+            1024,  # FILL
             num_warps=num_warps,
             num_stages=3,
         )
@@ -277,7 +277,7 @@ def moe_align_block_size(
         fill_counter,
         numel,
         sorted_numel,
-        numel,          # sentinel
+        numel,  # sentinel
         effective_E,
         triton.next_power_of_2(effective_E + 1),
         BLOCK_SIZE=256,

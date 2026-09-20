@@ -37,7 +37,7 @@ def hadamard_transform(x: torch.Tensor) -> torch.Tensor:
     Computed in FP32 (WHT then scale) and cast back to ``x``'s dtype (reference is bf16)."""
     d = x.shape[-1]
     H = _hadamard_matrix(d, x.device)
-    y = (x.float().reshape(-1, d) @ H) * (d ** -0.5)
+    y = (x.float().reshape(-1, d) @ H) * (d**-0.5)
     return y.reshape(x.shape).to(x.dtype)
 
 

@@ -18,17 +18,17 @@ from .df11 import DF11_CHUNK, DF11_LMAX
 
 @triton.jit
 def _df11_decode_kernel(
-    low8_ptr,        # [N]       uint8  : (sign<<7)|mantissa, original order
-    bitstream_ptr,   # [NWORDS]  int32  : MSB-first packed exponent codes
-    chunk_start_ptr, # [G]       int32  : starting bit of each chunk
-    lut_ptr,         # [2^LMAX]  int32  : peek-bits -> (symbol << 8) | length
-    out_ptr,         # [N]       int16  : reconstructed bf16 bit pattern
+    low8_ptr,  # [N]       uint8  : (sign<<7)|mantissa, original order
+    bitstream_ptr,  # [NWORDS]  int32  : MSB-first packed exponent codes
+    chunk_start_ptr,  # [G]       int32  : starting bit of each chunk
+    lut_ptr,  # [2^LMAX]  int32  : peek-bits -> (symbol << 8) | length
+    out_ptr,  # [N]       int16  : reconstructed bf16 bit pattern
     N,
-    G,               # number of chunks (= interleave stride)
+    G,  # number of chunks (= interleave stride)
     NWORDS,
     ROWS: tl.constexpr,
     LMAX: tl.constexpr,
-    BLOCK: tl.constexpr,   # chunks decoded in parallel per program (one per lane)
+    BLOCK: tl.constexpr,  # chunks decoded in parallel per program (one per lane)
 ):
     # Each lane owns one chunk j and decodes its symbols serially (Huffman is variable-length).
     # Interleaving means lane j handles position i*G+j at step i, so consecutive lanes touch
@@ -87,26 +87,35 @@ def df11_decompress(c: dict, out: torch.Tensor | None = None, block: int = 128) 
     assert out.dtype == torch.int16 and out.is_contiguous()
     grid = ((num_chunks + block - 1) // block,)
     _df11_decode_kernel[grid](
-        c["low8"], c["bitstream"], c["chunk_start"], c["lut"],
-        out, n, num_chunks, c["bitstream"].numel(),
-        ROWS=rows, LMAX=lmax, BLOCK=block, num_warps=block // 32,
+        c["low8"],
+        c["bitstream"],
+        c["chunk_start"],
+        c["lut"],
+        out,
+        n,
+        num_chunks,
+        c["bitstream"].numel(),
+        ROWS=rows,
+        LMAX=lmax,
+        BLOCK=block,
+        num_warps=block // 32,
     )
     return out.view(torch.bfloat16)
 
 
 @triton.jit
 def _df11_gather_kernel(
-    low8_ptr,        # [R*C]     uint8  : (sign<<7)|mantissa, row-major
-    bitstream_ptr,   # [NWORDS]  int32  : MSB-first packed exponent codes
-    chunk_start_ptr, # [R]       int64  : starting bit of each row's codes
-    lut_ptr,         # [2^LMAX]  int32  : peek-bits -> (symbol << 8) | length
-    ids_ptr,         # [T]              : row (token) id to decode for each output slot
-    out_ptr,         # [T*C]     int16  : reconstructed bf16 bit pattern
+    low8_ptr,  # [R*C]     uint8  : (sign<<7)|mantissa, row-major
+    bitstream_ptr,  # [NWORDS]  int32  : MSB-first packed exponent codes
+    chunk_start_ptr,  # [R]       int64  : starting bit of each row's codes
+    lut_ptr,  # [2^LMAX]  int32  : peek-bits -> (symbol << 8) | length
+    ids_ptr,  # [T]              : row (token) id to decode for each output slot
+    out_ptr,  # [T*C]     int16  : reconstructed bf16 bit pattern
     T,
-    C,               # embedding dim (row length)
+    C,  # embedding dim (row length)
     NWORDS,
     LMAX: tl.constexpr,
-    BLOCK: tl.constexpr,   # rows decoded in parallel per program (one per lane)
+    BLOCK: tl.constexpr,  # rows decoded in parallel per program (one per lane)
 ):
     # One lane decodes one gathered row r = ids[t] serially, reading its contiguous code stream
     # via the same 64-bit bit-buffer as the matmul decoder. Embedding lookups touch very few rows
@@ -162,8 +171,18 @@ def df11_gather_decode(
     assert out.dtype == torch.int16 and out.is_contiguous()
     grid = ((t + block - 1) // block,)
     _df11_gather_kernel[grid](
-        c["low8"], c["bitstream"], c["chunk_start"], c["lut"], ids, out,
-        t, cols, c["bitstream"].numel(), LMAX=lmax, BLOCK=block, num_warps=block // 32,
+        c["low8"],
+        c["bitstream"],
+        c["chunk_start"],
+        c["lut"],
+        ids,
+        out,
+        t,
+        cols,
+        c["bitstream"].numel(),
+        LMAX=lmax,
+        BLOCK=block,
+        num_warps=block // 32,
     )
     return out.view(torch.bfloat16)
 

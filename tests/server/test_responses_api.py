@@ -40,9 +40,9 @@ def _collect(events, req):
             data = None
             for line in frame.split("\n"):
                 if line.startswith("event:"):
-                    etype = line[len("event:"):].strip()
+                    etype = line[len("event:") :].strip()
                 elif line.startswith("data:"):
-                    data = json.loads(line[len("data:"):].strip())
+                    data = json.loads(line[len("data:") :].strip())
             out.append((etype, data))
         return out
 
@@ -65,11 +65,19 @@ def test_convert_string_input_and_instructions():
 def test_convert_defaults_max_output_tokens_when_omitted():
     # codex omits max_output_tokens; must NOT fall to the 16-token floor (bug b1).
     req = ResponsesRequest.model_validate({"model": "gpt-x", "input": "hi"})
-    assert RP.convert_responses_to_genspec(req, {}).sampling_params.max_tokens == RP.DEFAULT_MAX_OUTPUT_TOKENS
+    assert (
+        RP.convert_responses_to_genspec(req, {}).sampling_params.max_tokens
+        == RP.DEFAULT_MAX_OUTPUT_TOKENS
+    )
     assert RP.convert_responses_to_genspec(req, {}).sampling_params.max_tokens >= 1024
-    req2 = ResponsesRequest.model_validate({"model": "gpt-x", "input": "hi", "max_output_tokens": 123})
+    req2 = ResponsesRequest.model_validate(
+        {"model": "gpt-x", "input": "hi", "max_output_tokens": 123}
+    )
     assert RP.convert_responses_to_genspec(req2, {}).sampling_params.max_tokens == 123
-    assert RP.convert_responses_to_genspec(req, {}, default_max_tokens=2048).sampling_params.max_tokens == 2048
+    assert (
+        RP.convert_responses_to_genspec(req, {}, default_max_tokens=2048).sampling_params.max_tokens
+        == 2048
+    )
 
 
 def test_convert_list_input_with_tool_roundtrip_and_tools():
@@ -77,12 +85,26 @@ def test_convert_list_input_with_tool_roundtrip_and_tools():
         {
             "model": "gpt-x",
             "input": [
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "weather?"}]},
-                {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": '{"city": "SF"}'},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "weather?"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "get_weather",
+                    "arguments": '{"city": "SF"}',
+                },
                 {"type": "function_call_output", "call_id": "call_1", "output": "72F"},
             ],
             "tools": [
-                {"type": "function", "name": "get_weather", "description": "d", "parameters": {"type": "object"}}
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "d",
+                    "parameters": {"type": "object"},
+                }
             ],
             "tool_choice": "auto",
         }
@@ -93,7 +115,11 @@ def test_convert_list_input_with_tool_roundtrip_and_tools():
     assert asst["role"] == "assistant" and asst["tool_calls"][0]["id"] == "call_1"
     assert asst["tool_calls"][0]["function"]["name"] == "get_weather"
     tool_msg = spec.messages[2]
-    assert tool_msg["role"] == "tool" and tool_msg["tool_call_id"] == "call_1" and tool_msg["content"] == "72F"
+    assert (
+        tool_msg["role"] == "tool"
+        and tool_msg["tool_call_id"] == "call_1"
+        and tool_msg["content"] == "72F"
+    )
     assert spec.template_tools[0]["function"]["name"] == "get_weather"
     assert spec.parse_tools
 
@@ -104,8 +130,17 @@ def test_convert_function_call_output_image_moves_to_a_user_turn():
         {
             "model": "gpt-x",
             "input": [
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "look"}]},
-                {"type": "function_call", "call_id": "call_1", "name": "view_image", "arguments": '{"path": "a.png"}'},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "look"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "view_image",
+                    "arguments": '{"path": "a.png"}',
+                },
                 {
                     "type": "function_call_output",
                     "call_id": "call_1",
@@ -131,14 +166,27 @@ def test_convert_reasoning_item_merges_into_assistant_turn():
         {
             "model": "gpt-x",
             "input": [
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "weather?"}]},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "weather?"}],
+                },
                 {
                     "type": "reasoning",
                     "summary": [],
                     "content": [{"type": "reasoning_text", "text": "need the tool"}],
                 },
-                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "checking"}]},
-                {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{}"},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "checking"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "{}",
+                },
                 {"type": "function_call_output", "call_id": "call_1", "output": "72F"},
             ],
         }
@@ -160,7 +208,11 @@ def test_convert_parallel_function_calls_merge_into_one_turn():
         {
             "model": "gpt-x",
             "input": [
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "both?"}]},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "both?"}],
+                },
                 {"type": "function_call", "call_id": "call_1", "name": "a", "arguments": "{}"},
                 {"type": "function_call", "call_id": "call_2", "name": "b", "arguments": "{}"},
                 {"type": "function_call_output", "call_id": "call_1", "output": "1"},
@@ -181,11 +233,31 @@ def test_convert_distinct_assistant_messages_not_merged():
         {
             "model": "gpt-x",
             "input": [
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
-                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "A"}]},
-                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "B"}]},
-                {"type": "reasoning", "summary": [], "content": [{"type": "reasoning_text", "text": "r1"}]},
-                {"type": "reasoning", "summary": [], "content": [{"type": "reasoning_text", "text": "r2"}]},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "A"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "B"}],
+                },
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "r1"}],
+                },
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "r2"}],
+                },
             ],
         }
     )
@@ -201,8 +273,16 @@ def test_convert_reasoning_only_assistant_turn_gets_empty_content():
         {
             "model": "gpt-x",
             "input": [
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
-                {"type": "reasoning", "summary": [], "content": [{"type": "reasoning_text", "text": "partial"}]},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "partial"}],
+                },
             ],
         }
     )
@@ -218,9 +298,21 @@ def test_convert_encrypted_only_reasoning_item_is_dropped():
         {
             "model": "gpt-x",
             "input": [
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
-                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "s"}], "encrypted_content": "opaque"},
-                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "s"}],
+                    "encrypted_content": "opaque",
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello"}],
+                },
             ],
         }
     )
@@ -237,8 +329,16 @@ def test_convert_developer_role_maps_to_system():
         {
             "model": "gpt-x",
             "input": [
-                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "be a calculator"}]},
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "2+2"}]},
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "be a calculator"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "2+2"}],
+                },
             ],
         }
     )
@@ -345,8 +445,10 @@ class FakeState:
         self.maintenance_state = "serving"
         self.config = SimpleNamespace(
             mm=SimpleNamespace(text_model_only=False, disabled_encoders=frozenset()),
-            reasoning_parser=None, tool_call_parser="llama3",
-            served_model_name="test-model", model_path="/test",
+            reasoning_parser=None,
+            tool_call_parser="llama3",
+            served_model_name="test-model",
+            model_path="/test",
         )
         self._uid = 0
         self.last_sent = None
@@ -361,10 +463,15 @@ class FakeState:
 
     async def wait_for_ack(self, uid):
         for i, (text, finished, pt, ct) in enumerate(self._outputs):
-            yield UserReply(uid=uid, incremental_output=text, finished=finished,
-                            finish_reason=self._finish_reason if finished else None,
-                            prompt_tokens_delta=pt, completion_tokens_delta=ct,
-                            cached_tokens=self._cached_tokens if i == 0 else 0)
+            yield UserReply(
+                uid=uid,
+                incremental_output=text,
+                finished=finished,
+                finish_reason=self._finish_reason if finished else None,
+                prompt_tokens_delta=pt,
+                completion_tokens_delta=ct,
+                cached_tokens=self._cached_tokens if i == 0 else 0,
+            )
 
     async def stream_with_cancellation(self, gen, request, uid):
         async for chunk in gen:
@@ -401,9 +508,9 @@ def test_route_stream_text():
         data = None
         for line in block.split("\n"):
             if line.startswith("event:"):
-                etype = line[len("event:"):].strip()
+                etype = line[len("event:") :].strip()
             elif line.startswith("data:"):
-                raw = line[len("data:"):].strip()
+                raw = line[len("data:") :].strip()
                 if raw:
                     data = json.loads(raw)
         if etype:
@@ -444,7 +551,7 @@ def test_route_stream_completed_usage_carries_cached_tokens():
     for block in r.text.split("\n\n"):
         for line in block.split("\n"):
             if line.startswith("data:"):
-                data = json.loads(line[len("data:"):].strip())
+                data = json.loads(line[len("data:") :].strip())
                 if data.get("type") == "response.completed":
                     completed = data
     assert completed is not None
@@ -481,9 +588,9 @@ def test_route_stream_gemma4_tools_do_not_force_reasoning():
         data = None
         for line in block.split("\n"):
             if line.startswith("event:"):
-                etype = line[len("event:"):].strip()
+                etype = line[len("event:") :].strip()
             elif line.startswith("data:"):
-                raw = line[len("data:"):].strip()
+                raw = line[len("data:") :].strip()
                 if raw:
                     data = json.loads(raw)
         if etype == "response.output_text.delta":
@@ -529,9 +636,9 @@ def test_route_stream_gemma4_parses_codex_namespaced_tool_call():
         data = None
         for line in block.split("\n"):
             if line.startswith("event:"):
-                etype = line[len("event:"):].strip()
+                etype = line[len("event:") :].strip()
             elif line.startswith("data:"):
-                raw = line[len("data:"):].strip()
+                raw = line[len("data:") :].strip()
                 if raw:
                     data = json.loads(raw)
         if etype:
@@ -588,9 +695,9 @@ def test_route_stream_gemma4_forwards_namespaced_skill_call_without_declared_too
         data = None
         for line in block.split("\n"):
             if line.startswith("event:"):
-                etype = line[len("event:"):].strip()
+                etype = line[len("event:") :].strip()
             elif line.startswith("data:"):
-                raw = line[len("data:"):].strip()
+                raw = line[len("data:") :].strip()
                 if raw:
                     data = json.loads(raw)
         if etype:
@@ -610,7 +717,9 @@ def test_route_stateful_stubs():
     client = _client(FakeState([("x", True, 1, 1)]))
     assert client.get("/v1/responses/resp_abc").status_code == 404
     assert client.post("/v1/responses/resp_abc/cancel").status_code == 404
-    r = client.post("/v1/responses", json={"model": "gpt-x", "input": "hi", "previous_response_id": "resp_1"})
+    r = client.post(
+        "/v1/responses", json={"model": "gpt-x", "input": "hi", "previous_response_id": "resp_1"}
+    )
     assert r.status_code == 400
 
 
@@ -624,9 +733,21 @@ def test_convert_merges_instructions_and_developer_into_one_system():
             "model": "gpt-x",
             "instructions": "agent system prompt",
             "input": [
-                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "permissions"}]},
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "env ctx"}]},
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "the task"}]},
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "permissions"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "env ctx"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "the task"}],
+                },
             ],
         }
     )
@@ -652,9 +773,9 @@ def test_stream_surfaces_generation_error_as_failed():
         async for frame in RP.responses_stream_generator(boom(), req, "resp_1", 0):
             for line in frame.split("\n"):
                 if line.startswith("event:"):
-                    out.append(line[len("event:"):].strip())
+                    out.append(line[len("event:") :].strip())
                 elif line.startswith("data:"):
-                    out[-1] = (out[-1], json.loads(line[len("data:"):].strip()))
+                    out[-1] = (out[-1], json.loads(line[len("data:") :].strip()))
         return out
 
     events = asyncio.run(run())
@@ -673,8 +794,9 @@ def test_stream_failure_keeps_the_error_code_codex_matches_on():
     from freetoken.server.generation import GenerationError
 
     async def boom():
-        raise GenerationError("prompt is too long: 8178 tokens > 7223 maximum",
-                              "context_length_exceeded")
+        raise GenerationError(
+            "prompt is too long: 8178 tokens > 7223 maximum", "context_length_exceeded"
+        )
         yield  # noqa: unreachable — makes this an async generator
 
     req = ResponsesRequest.model_validate({"model": "gpt-x", "input": "hi", "stream": True})
@@ -694,7 +816,9 @@ class _ErrState(FakeState):
     """Engine that reports a per-request error (tokenizer/scheduler rejection) via UserReply."""
 
     async def wait_for_ack(self, uid):
-        yield UserReply(uid=uid, incremental_output="", finished=True, error="input too long for KV budget")
+        yield UserReply(
+            uid=uid, incremental_output="", finished=True, error="input too long for KV budget"
+        )
 
 
 def test_route_nonstream_error_returns_400():
@@ -709,7 +833,7 @@ def test_route_stream_error_emits_failed_event():
     r = client.post("/v1/responses", json={"model": "gpt-x", "input": "hi", "stream": True})
     assert r.status_code == 200, r.text  # stream already started; failure is in-band
     etypes = [
-        line[len("event:"):].strip()
+        line[len("event:") :].strip()
         for block in r.text.split("\n\n")
         for line in block.split("\n")
         if line.startswith("event:")
@@ -726,8 +850,12 @@ def test_default_max_output_tokens_is_large():
 
 def test_build_response_length_truncation_is_incomplete():
     result = GenResult(
-        reasoning="", content="partial ans", tool_calls=[],
-        finish_reason="length", prompt_tokens=5, completion_tokens=8192,
+        reasoning="",
+        content="partial ans",
+        tool_calls=[],
+        finish_reason="length",
+        prompt_tokens=5,
+        completion_tokens=8192,
     )
     req = ResponsesRequest.model_validate({"model": "gpt-x", "input": "hi"})
     body = RP.build_responses_response(result, req, "resp_1", 0).model_dump(mode="json")
@@ -744,9 +872,24 @@ def test_build_response_length_truncation_is_incomplete():
 
 def test_max_output_tokens_must_be_positive():
     client = _client(FakeState([("hi", True, 1, 1)]))
-    assert client.post("/v1/responses", json={"model": "gpt-x", "input": "hi", "max_output_tokens": 0}).status_code == 400
-    assert client.post("/v1/responses", json={"model": "gpt-x", "input": "hi", "max_output_tokens": -5}).status_code == 400
-    assert client.post("/v1/responses", json={"model": "gpt-x", "input": "hi", "max_output_tokens": 100}).status_code == 200
+    assert (
+        client.post(
+            "/v1/responses", json={"model": "gpt-x", "input": "hi", "max_output_tokens": 0}
+        ).status_code
+        == 400
+    )
+    assert (
+        client.post(
+            "/v1/responses", json={"model": "gpt-x", "input": "hi", "max_output_tokens": -5}
+        ).status_code
+        == 400
+    )
+    assert (
+        client.post(
+            "/v1/responses", json={"model": "gpt-x", "input": "hi", "max_output_tokens": 100}
+        ).status_code
+        == 200
+    )
 
 
 def test_stream_unexpected_error_emits_failed():
@@ -761,7 +904,7 @@ def test_stream_unexpected_error_emits_failed():
         async for frame in RP.responses_stream_generator(boom(), req, "resp_1", 0):
             for line in frame.split("\n"):
                 if line.startswith("event:"):
-                    out.append(line[len("event:"):].strip())
+                    out.append(line[len("event:") :].strip())
         return out
 
     types = asyncio.run(run())
@@ -789,7 +932,7 @@ def test_route_length_truncation_reports_incomplete():
     client = _client(FakeState([("partial", True, 5, 8192)], finish_reason="length"))
     r = client.post("/v1/responses", json={"model": "gpt-x", "input": "hi", "stream": True})
     etypes = [
-        line[len("event:"):].strip()
+        line[len("event:") :].strip()
         for block in r.text.split("\n\n")
         for line in block.split("\n")
         if line.startswith("event:")
@@ -828,12 +971,12 @@ def test_stream_reasoning_events():
     assert types == [
         "response.created",
         "response.in_progress",
-        "response.output_item.added",       # reasoning item
+        "response.output_item.added",  # reasoning item
         "response.reasoning_text.delta",
         "response.reasoning_text.delta",
         "response.reasoning_text.done",
-        "response.output_item.done",        # reasoning item closed
-        "response.output_item.added",       # message item
+        "response.output_item.done",  # reasoning item closed
+        "response.output_item.added",  # message item
         "response.content_part.added",
         "response.output_text.delta",
         "response.output_text.done",
@@ -868,7 +1011,9 @@ def test_stream_tool_call_item_closes_before_following_text():
     collected = _collect(events, req)
     types = [e[0] for e in collected]
     fc_done = types.index("response.output_item.done")
-    msg_added = types.index("response.output_item.added", types.index("response.function_call_arguments.done"))
+    msg_added = types.index(
+        "response.output_item.added", types.index("response.function_call_arguments.done")
+    )
     assert fc_done < msg_added, types
     completed = collected[-1][1]["response"]
     assert [item["type"] for item in completed["output"]] == ["function_call", "message"]
@@ -876,8 +1021,12 @@ def test_stream_tool_call_item_closes_before_following_text():
 
 def test_build_response_includes_reasoning_item():
     result = GenResult(
-        reasoning="Thought about it.", content="Answer.", tool_calls=[],
-        finish_reason="stop", prompt_tokens=5, completion_tokens=3,
+        reasoning="Thought about it.",
+        content="Answer.",
+        tool_calls=[],
+        finish_reason="stop",
+        prompt_tokens=5,
+        completion_tokens=3,
     )
     req = ResponsesRequest.model_validate({"model": "gpt-x", "input": "hi"})
     response = RP.build_responses_response(result, req, "resp_1", 0)
@@ -894,24 +1043,36 @@ def test_convert_reasoning_field_enables_thinking():
     )
     spec = RP.convert_responses_to_genspec(req, {})
     assert spec.chat_template_kwargs == {
-        "enable_thinking": True, "thinking_mode": "enabled", "reasoning_effort": "high"
+        "enable_thinking": True,
+        "thinking_mode": "enabled",
+        "reasoning_effort": "high",
     }
 
     # an explicit thinking-related chat_template_kwargs key wins over the mapping
     req2 = ResponsesRequest.model_validate(
-        {"model": "m", "input": "hi", "reasoning": {"effort": "low"},
-         "chat_template_kwargs": {"thinking_mode": "chat"}}
+        {
+            "model": "m",
+            "input": "hi",
+            "reasoning": {"effort": "low"},
+            "chat_template_kwargs": {"thinking_mode": "chat"},
+        }
     )
     spec2 = RP.convert_responses_to_genspec(req2, {})
     assert spec2.chat_template_kwargs == {"thinking_mode": "chat"}
 
     # unrelated extra kwargs ride along without discarding the reasoning mapping
     req3 = ResponsesRequest.model_validate(
-        {"model": "m", "input": "hi", "reasoning": {"effort": "none"},
-         "chat_template_kwargs": {"custom_var": 1}}
+        {
+            "model": "m",
+            "input": "hi",
+            "reasoning": {"effort": "none"},
+            "chat_template_kwargs": {"custom_var": 1},
+        }
     )
     assert RP.convert_responses_to_genspec(req3, {}).chat_template_kwargs == {
-        "enable_thinking": False, "thinking_mode": "disabled", "custom_var": 1,
+        "enable_thinking": False,
+        "thinking_mode": "disabled",
+        "custom_var": 1,
     }
 
     # absent reasoning -> no kwargs
@@ -925,7 +1086,8 @@ def test_convert_reasoning_effort_none_disables_thinking():
         {"model": "m", "input": "hi", "reasoning": {"effort": "none"}}
     )
     assert RP.convert_responses_to_genspec(req, {}).chat_template_kwargs == {
-        "enable_thinking": False, "thinking_mode": "disabled"
+        "enable_thinking": False,
+        "thinking_mode": "disabled",
     }
 
 
@@ -945,7 +1107,8 @@ def test_convert_reasoning_toggle_broadcasts_every_spelling():
         assert spec.chat_template_kwargs == on, parser
         spec = RP.convert_responses_to_genspec(off, {}, reasoning_parser=parser)
         assert spec.chat_template_kwargs == {
-            "enable_thinking": False, "thinking_mode": "disabled"
+            "enable_thinking": False,
+            "thinking_mode": "disabled",
         }, parser
 
 
@@ -954,12 +1117,19 @@ def test_convert_function_call_output_text_list_stays_a_plain_tool_message():
         {
             "model": "gpt-x",
             "input": [
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "go"}],
+                },
                 {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{}"},
                 {
                     "type": "function_call_output",
                     "call_id": "call_1",
-                    "output": [{"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}],
+                    "output": [
+                        {"type": "input_text", "text": "a"},
+                        {"type": "input_text", "text": "b"},
+                    ],
                 },
             ],
         }

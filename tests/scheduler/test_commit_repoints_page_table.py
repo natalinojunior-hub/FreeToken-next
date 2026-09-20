@@ -2,6 +2,7 @@
 the request's OWN pages for the shared span. Its page-table row must then name the tree's pages
 instead: the attention backends read that row every decode step, and the freed pages go to the
 next allocation. CPU, real CacheManager + real trees, no engine."""
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -22,9 +23,15 @@ def _pend(ids):
 
 
 def _admit(cm, page_table, table_idx, ids, handle):
-    req = Req(input_ids=torch.tensor(ids, dtype=torch.int32), table_idx=table_idx,
-              cached_len=0, output_len=0, uid=table_idx, sampling_params=SamplingParams(),
-              cache_handle=handle)
+    req = Req(
+        input_ids=torch.tensor(ids, dtype=torch.int32),
+        table_idx=table_idx,
+        cached_len=0,
+        output_len=0,
+        uid=table_idx,
+        sampling_params=SamplingParams(),
+        cache_handle=handle,
+    )
     req.device_len = len(ids)
     cm.lock(handle)
     cm.allocate_paged([req])
@@ -44,7 +51,7 @@ def test_radix_unfinished_commit_repoints_the_row_off_the_freed_pages():
     b = _admit(cm, page_table, 1, PROMPT, cm.match_req(_pend(PROMPT)).cuda_handle)
     assert _live_row(page_table, a).isdisjoint(_live_row(page_table, b))
 
-    with cm.lazy_free_region():          # the scheduler drains commits inside this region
+    with cm.lazy_free_region():  # the scheduler drains commits inside this region
         cm.cache_req(a, finished=False)
         cm.cache_req(b, finished=False)
 
@@ -58,11 +65,18 @@ def test_radix_unfinished_commit_repoints_the_row_off_the_freed_pages():
 
 def test_hybrid_unfinished_commit_repoints_the_row_off_the_freed_pages():
     g = LinearGatedDeltaGroupConfig(
-        name="linear", layer_ids=(0,), num_key_heads=2, num_value_heads=4,
-        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate=True,
+        name="linear",
+        layer_ids=(0,),
+        num_key_heads=2,
+        num_value_heads=4,
+        key_head_dim=16,
+        value_head_dim=16,
+        conv_kernel_dim=4,
+        output_gate=True,
     )
-    pool = LinearStatePool(group=g, num_slots=16, dtype=torch.bfloat16,
-                           device=torch.device("cpu"), tp_size=1)
+    pool = LinearStatePool(
+        group=g, num_slots=16, dtype=torch.bfloat16, device=torch.device("cpu"), tp_size=1
+    )
     page_table = torch.zeros(4, 32, dtype=torch.int32)
     cm = CacheManager(32, 1, page_table, "hybrid_radix", linear_state_pool=pool)
 
@@ -95,7 +109,7 @@ def test_lazy_free_snapshots_the_rows_it_was_handed():
         cm._free(page_table[0, :4])
         page_table[0, :4] = torch.tensor([0, 1, 2, 3], dtype=torch.int32)  # a re-point
 
-    appended = cm.free_slots[len(before):].tolist()
+    appended = cm.free_slots[len(before) :].tolist()
     assert appended == [4, 5, 6, 7]
 
 
@@ -116,13 +130,19 @@ def test_radix_subspan_commit_repoints_only_the_deduped_slice():
         m = cm.match_req(_pend(LONG))
         matched = m.cuda_handle.cached_len
         assert matched > 0, "the seeded prefix should match"
-        req = Req(input_ids=torch.tensor(LONG, dtype=torch.int32), table_idx=table_idx,
-                  cached_len=matched, output_len=0, uid=table_idx,
-                  sampling_params=SamplingParams(), cache_handle=m.cuda_handle)
+        req = Req(
+            input_ids=torch.tensor(LONG, dtype=torch.int32),
+            table_idx=table_idx,
+            cached_len=matched,
+            output_len=0,
+            uid=table_idx,
+            sampling_params=SamplingParams(),
+            cache_handle=m.cuda_handle,
+        )
         req.device_len = len(LONG)
         cm.lock(m.cuda_handle)
         page_table[table_idx, :matched] = m.cuda_handle.get_matched_indices()[:matched]
-        cm.allocate_paged([req])          # only [matched, 16) -- the row prefix is canonical
+        cm.allocate_paged([req])  # only [matched, 16) -- the row prefix is canonical
         req.cached_len = len(LONG)
         return req, matched
 
@@ -131,12 +151,15 @@ def test_radix_subspan_commit_repoints_only_the_deduped_slice():
     own_suffix_d = set(page_table[2, matched:].tolist())
 
     with cm.lazy_free_region():
-        cm.cache_req(b, finished=False)   # b publishes [matched, 15)
-        cm.cache_req(d, finished=False)   # d dedups against b: frees its own sub-span
+        cm.cache_req(b, finished=False)  # b publishes [matched, 15)
+        cm.cache_req(d, finished=False)  # d dedups against b: frees its own sub-span
 
     free = set(cm.free_slots.tolist())
     assert free & own_suffix_d, "d's duplicate sub-span pages should have been freed"
     assert _live_row(page_table, d).isdisjoint(free)
     canonical = d.cache_handle.get_matched_indices()
-    assert page_table[2, : d.cache_handle.cached_len].tolist() == canonical[: d.cache_handle.cached_len].tolist()
+    assert (
+        page_table[2, : d.cache_handle.cached_len].tolist()
+        == canonical[: d.cache_handle.cached_len].tolist()
+    )
     cm.check_integrity()

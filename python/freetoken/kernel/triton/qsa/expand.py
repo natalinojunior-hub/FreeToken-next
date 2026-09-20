@@ -104,9 +104,7 @@ def expand_qsa_block_indices(
     if not block_indices.shape[0]:
         return out
     column_block = 256
-    _expand_qsa_indices_kernel[
-        (block_indices.shape[0], triton.cdiv(output_width, column_block))
-    ](
+    _expand_qsa_indices_kernel[(block_indices.shape[0], triton.cdiv(output_width, column_block))](
         block_indices,
         query_positions,
         sequence_lengths,

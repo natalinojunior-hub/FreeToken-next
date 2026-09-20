@@ -86,13 +86,9 @@ def test_snapshot_restore_roundtrip(monkeypatch):
 
     # --- restore: copy snapshot -> fresh slot 4, continue [64, 100)
     pool.copy_from(2, 4)
-    out_cont = _prefill(
-        op, pool, monkeypatch, x[CHUNK:], slot=4, t0=CHUNK, has_init=True
-    )
+    out_cont = _prefill(op, pool, monkeypatch, x[CHUNK:], slot=4, t0=CHUNK, has_init=True)
     _assert_close(out_cont, out_full[CHUNK:], "restored continuation outputs")
-    _assert_close(
-        pool.recurrent_states[0, 4], pool.recurrent_states[0, 1], "final states agree"
-    )
+    _assert_close(pool.recurrent_states[0, 4], pool.recurrent_states[0, 1], "final states agree")
 
     # kpool alignment is subsumed by the x64 snapshot boundary.
     assert CHUNK % 4 == 0

@@ -102,42 +102,113 @@ GGML_NAME = {
 
 # CUDA kernel dispatch: which types each C function handles.
 # Mirrors switch (type) in ggml_get_to_cuda (dequantize.cuh:541)
-DEQUANT_TYPES = frozenset({
-    GGML_Q4_0, GGML_Q4_1, GGML_Q5_0, GGML_Q5_1, GGML_Q8_0,
-    GGML_Q2_K, GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K,
-    GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ3_XXS, GGML_IQ1_S, GGML_IQ4_NL,
-    GGML_IQ3_S, GGML_IQ2_S, GGML_IQ4_XS, GGML_IQ1_M,
-})
+DEQUANT_TYPES = frozenset(
+    {
+        GGML_Q4_0,
+        GGML_Q4_1,
+        GGML_Q5_0,
+        GGML_Q5_1,
+        GGML_Q8_0,
+        GGML_Q2_K,
+        GGML_Q3_K,
+        GGML_Q4_K,
+        GGML_Q5_K,
+        GGML_Q6_K,
+        GGML_IQ2_XXS,
+        GGML_IQ2_XS,
+        GGML_IQ3_XXS,
+        GGML_IQ1_S,
+        GGML_IQ4_NL,
+        GGML_IQ3_S,
+        GGML_IQ2_S,
+        GGML_IQ4_XS,
+        GGML_IQ1_M,
+    }
+)
 
 # Mirrors switch (type) in ggml_mul_mat_vec_a8 (gguf_kernel.cu:116)
-MMVQ_TYPES = frozenset({
-    GGML_Q4_0, GGML_Q4_1, GGML_Q5_0, GGML_Q5_1, GGML_Q8_0,
-    GGML_Q2_K, GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K,
-    GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ3_XXS, GGML_IQ1_S, GGML_IQ4_NL,
-    GGML_IQ3_S, GGML_IQ2_S, GGML_IQ4_XS, GGML_IQ1_M,
-})
+MMVQ_TYPES = frozenset(
+    {
+        GGML_Q4_0,
+        GGML_Q4_1,
+        GGML_Q5_0,
+        GGML_Q5_1,
+        GGML_Q8_0,
+        GGML_Q2_K,
+        GGML_Q3_K,
+        GGML_Q4_K,
+        GGML_Q5_K,
+        GGML_Q6_K,
+        GGML_IQ2_XXS,
+        GGML_IQ2_XS,
+        GGML_IQ3_XXS,
+        GGML_IQ1_S,
+        GGML_IQ4_NL,
+        GGML_IQ3_S,
+        GGML_IQ2_S,
+        GGML_IQ4_XS,
+        GGML_IQ1_M,
+    }
+)
 
 # Mirrors switch (type) in ggml_mul_mat_a8 (gguf_kernel.cu:219)
 # I-quants do not have an MMQ (large-batch matmul) kernel.
-MMQ_TYPES = frozenset({
-    GGML_Q4_0, GGML_Q4_1, GGML_Q5_0, GGML_Q5_1, GGML_Q8_0,
-    GGML_Q2_K, GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K,
-})
+MMQ_TYPES = frozenset(
+    {
+        GGML_Q4_0,
+        GGML_Q4_1,
+        GGML_Q5_0,
+        GGML_Q5_1,
+        GGML_Q8_0,
+        GGML_Q2_K,
+        GGML_Q3_K,
+        GGML_Q4_K,
+        GGML_Q5_K,
+        GGML_Q6_K,
+    }
+)
 
 # Mirrors switch (type) in ggml_moe_a8_vec (gguf_kernel.cu:577)
-MOE_VEC_TYPES = frozenset({
-    GGML_Q4_0, GGML_Q4_1, GGML_Q5_0, GGML_Q5_1, GGML_Q8_0,
-    GGML_Q2_K, GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K,
-    GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ3_XXS, GGML_IQ1_S, GGML_IQ4_NL,
-    GGML_IQ3_S, GGML_IQ2_S, GGML_IQ4_XS, GGML_IQ1_M,
-})
+MOE_VEC_TYPES = frozenset(
+    {
+        GGML_Q4_0,
+        GGML_Q4_1,
+        GGML_Q5_0,
+        GGML_Q5_1,
+        GGML_Q8_0,
+        GGML_Q2_K,
+        GGML_Q3_K,
+        GGML_Q4_K,
+        GGML_Q5_K,
+        GGML_Q6_K,
+        GGML_IQ2_XXS,
+        GGML_IQ2_XS,
+        GGML_IQ3_XXS,
+        GGML_IQ1_S,
+        GGML_IQ4_NL,
+        GGML_IQ3_S,
+        GGML_IQ2_S,
+        GGML_IQ4_XS,
+        GGML_IQ1_M,
+    }
+)
 
 # Mirrors switch (type) in ggml_moe_a8 (gguf_kernel.cu:369), whose coverage ggml_moe_get_block_size (gguf_kernel.cu:835) mirrors
 # I-quants do not have an MMQ (grouped MoE large-batch) kernel.
-MOE_MMQ_TYPES = frozenset({
-    GGML_Q4_0, GGML_Q4_1, GGML_Q5_0, GGML_Q5_1, GGML_Q8_0,
-    GGML_Q2_K, GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K,
-})
+MOE_MMQ_TYPES = frozenset(
+    {
+        GGML_Q4_0,
+        GGML_Q4_1,
+        GGML_Q5_0,
+        GGML_Q5_1,
+        GGML_Q8_0,
+        GGML_Q2_K,
+        GGML_Q3_K,
+        GGML_Q4_K,
+        GGML_Q5_K,
+        GGML_Q6_K,
+    }
+)
 
 # Unquantized types: no dequantization needed, handled by separate path in layers/gguf.py.
 GGML_UNQUANTIZED = frozenset({GGML_F32, GGML_F16, GGML_BF16})
@@ -188,11 +259,11 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
 
     y = torch.empty((n, 256), dtype=torch.float32, device=raw.device)
     # l in 0..15 -> is=0; l in 16..31 -> is=1 (per ggml: is = l/16).
-    is_idx = (torch.arange(32, device=raw.device) // 16)  # [32] in {0,1}
+    is_idx = torch.arange(32, device=raw.device) // 16  # [32] in {0,1}
     for h in range(2):  # two 128-elem halves of the super-block
-        qlh = ql[:, h * 64:(h + 1) * 64]  # [n,64]
-        qhh = qh[:, h * 32:(h + 1) * 32]  # [n,32]
-        sch = sc[:, h * 8:(h + 1) * 8]  # [n,8]
+        qlh = ql[:, h * 64 : (h + 1) * 64]  # [n,64]
+        qhh = qh[:, h * 32 : (h + 1) * 32]  # [n,32]
+        sch = sc[:, h * 8 : (h + 1) * 8]  # [n,8]
         a = qlh[:, 0:32].to(torch.int32)  # ql[l]
         b = qlh[:, 32:64].to(torch.int32)  # ql[l+32]
         hb = qhh.to(torch.int32)  # qh[l]
@@ -205,10 +276,10 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
         s3 = sch.index_select(1, is_idx + 4).to(torch.float32)
         s4 = sch.index_select(1, is_idx + 6).to(torch.float32)
         base = h * 128
-        y[:, base + 0:base + 32] = d * s1 * q1.to(torch.float32)
-        y[:, base + 32:base + 64] = d * s2 * q2.to(torch.float32)
-        y[:, base + 64:base + 96] = d * s3 * q3.to(torch.float32)
-        y[:, base + 96:base + 128] = d * s4 * q4.to(torch.float32)
+        y[:, base + 0 : base + 32] = d * s1 * q1.to(torch.float32)
+        y[:, base + 32 : base + 64] = d * s2 * q2.to(torch.float32)
+        y[:, base + 64 : base + 96] = d * s3 * q3.to(torch.float32)
+        y[:, base + 96 : base + 128] = d * s4 * q4.to(torch.float32)
     return y.reshape(-1).to(out_dtype)
 
 

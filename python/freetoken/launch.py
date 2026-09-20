@@ -157,9 +157,7 @@ def resolve_server_url(server: str | None) -> ServerURL:
 
     path = parsed.path.rstrip("/")
     if path not in ("", "/v1"):
-        raise ValueError(
-            "FreeToken launch --server accepts only an origin or /v1 base URL"
-        )
+        raise ValueError("FreeToken launch --server accepts only an origin or /v1 base URL")
 
     host = _connectable_host(parsed.hostname)
     netloc = _format_netloc(host, parsed.port)
@@ -994,8 +992,7 @@ def ensure_agent_installed(
     path = resolve_agent_binary(agent, binary)
     if path is None:
         raise RuntimeError(
-            f"{binary} was installed but was not found\n\n"
-            "You may need to restart your shell"
+            f"{binary} was installed but was not found\n\nYou may need to restart your shell"
         )
 
     print(f"{installer.display_name} installed successfully\n", file=sys.stderr)

@@ -81,6 +81,25 @@ export TMPDIR=/models/desenvolvimento/tmp
 - Bug fix = teste que falha antes + passa depois.
 - Mudança de performance = números A/B contra `main`.
 
+**Suite Mínima Obrigatória (reduzida — < 60s):**
+```bash
+pytest tests/scheduler/test_spec_reject_frees_pages.py tests/engine/test_spec.py \
+       tests/models/qwen4_exp/test_gdn.py -q --basetemp=/models/desenvolvimento/tmp
+```
+Apenas 3 suites canônicas: MTP spec page accounting, accept_drafts/rollback, GDN prefill/decode equivalence.
+Subsistema alterado -> roda **apenas sua suite**, não repo inteiro.
+
+---
+
+## DIRETRIZ ESTRITA DE MODELO (FAMÍLIA QWEN 3.8 FLASH NEXT)
+
+**Atenção Máxima:** De agora em diante, **TODO** o desenvolvimento, otimização, depuração e benchmarks devem ser implementados e validados **EXCLUSIVAMENTE** com a família **Qwen 3.8 Flash Next**:
+1. **`Qwen3.8-Flash-Next-NVFP4-Radix`** (`/models/Qwen3.8-Flash-Next-NVFP4-Radix`): Modelo nativo NVFP4, baseline de arquitetura híbrida GDN + QSA + MTP em Blackwell SM120.
+2. **`Qwen3.8-Flash-Next-Unsloth-IQ4_XS`** (`/models/Qwen3.8-Flash-Next-Unsloth-IQ4_XS/UD-IQ4_XS` e heads MTP em `MTP/`): Modelo GGUF sharded com quantização compacta IQ4_XS e suporte a MTP, com potencial de maior velocidade TG e menor pegada de memória.
+
+- **OUTROS MODELOS ESTÃO BLOQUEADOS POR ENQUANTO:** Não gastar ciclos, memória ou validações com Qwen 35B-A3B, Ornith, Tiel-Coder ou quaisquer outros checkpoints até segunda ordem.
+- O foco absoluto do motor é a arquitetura híbrida GDN + QSA + MTP em Blackwell SM120 da família Qwen 3.8 Flash Next.
+
 ---
 
 ## Regra Crítica: NUNCA Use RAM Como Storage
@@ -203,7 +222,7 @@ make bench
 
 ---
 
-## Próximas Ações Prioritárias (Contexto Atual)
+## Próximos Ações Prioritárias (Contexto Atual)
 
 1. Validar split-kernel Turbo4/QSA 16K (sha1 match baseline)
 2. Medir TG + accept-rate MTP=1 com Turbo4 ativo
@@ -212,3 +231,116 @@ make bench
 5. Phase 7: Expert pool keyed by (bank, role, type)
 
 > **Detalhes completos em:** `docs/dev/CONTEXT.md` → "Próximos Passos Imediatos" e `docs/dev/STATE.md` → "Handoff Crítico"
+
+---
+
+## Automation First — Use Scripts, Not Manual Edits
+
+**REGRA OBRIGATÓRIA:** Sempre que precisar atualizar documentação viva, executar validações, ou fazer tarefas repetitivas, **USE OS SCRIPTS EXISTENTES**. Não edite arquivos manualmente se há script para isso.
+
+| Tarefa | Script/Programa | Comando | NÃO faça manualmente |
+|--------|-----------------|---------|----------------------|
+| Atualizar ERRORS.md | `scripts/doc-append.py` | `make doc-append ARGS="--errors 'CODE | sintoma | causa | fix | prev | arquivo'"` | Editar ERRORS.md direto |
+| Adicionar lição LESSONS.md | `scripts/doc-append.py` | `make doc-append ARGS="--lessons 'sintoma -> causa -> fix'"` | Editar LESSONS.md direto |
+| Novo runbook RUNBOOKS.md | `scripts/doc-append.py` | `make doc-append ARGS="--runbooks 'Título' 'Sintoma' 'Diag' 'Fix'"` | Editar RUNBOOKS.md direto |
+| Novo experimento EXPERIMENTS.md | `scripts/doc-append.py` | `make doc-append ARGS="--experiments 'EXP-XX' 'Foco' 'Setup' 'Resultado' 'Verdict'"` | Editar EXPERIMENTS.md direto |
+| Novo checkpoint CHECKPOINTS.md | `scripts/doc-append.py` | `make doc-append ARGS="--checkpoints 'Modelo' 'Arch' 'Experts' 'Ativos' 'Quant' 'Fmt' 'Path' 'Status'"` | Editar CHECKPOINTS.md direto |
+| Validar cross-references | `scripts/validate-crossref.py` | `make crossref` | grep/verificar à mão |
+| Pre-flight completo | `scripts/preflight.sh` | `make preflight` | `free -h && nvidia-smi` à mão |
+| Benchmark + validação anchors | `scripts/bench-profile.py` | `make profile` | Rodar bench e comparar à mão |
+| Validar sha1 equiv k=0 vs spec-mtp k=N | `scripts/bench-mtp-equiv.sh` | `make mtp-equiv MODEL=... K=1` | Rodar 2 bench_pp_tg.py manuais e diff sha1 à mão |
+| CI local completa | Makefile targets | `make ci` | `make lint && make typecheck && make test` separado |
+| Rebuild C++ extensions | Makefile | `make rebuild` | `python setup.py build_ext --inplace` à mão |
+| Matar zumbis / limpar | `scripts/preflight.sh --strict` | `make preflight` | `pkill`/`killall` à mão |
+| Wait for server (event-driven) | `./scripts/wait-for-server.sh <port> <pid>` | Obrigatório | `sleep 10` ou `background: true` |
+| Formatar código | ruff via Makefile | `make format` | Editar estilo à mão |
+| Typecheck | mypy via Makefile | `make typecheck` | Ignorar tipos |
+
+**Princípio:** Se existe script → use o script. Scripts têm: validação anti-duplicação, posicionamento correto em tabelas, formatação consistente, cross-ref automática, timestamps.
+
+**Exceção:** Mudanças arquiteturais complexas (novos arquivos, refatoração de estrutura) — aí sim, edite direto mas rode `make crossref` e `make ci` depois.
+
+---
+
+## Event-Driven Execution — Zero Idle, Max Efficiency
+
+**REGRA OBRIGATÓRIA:** Tudo que espera, monitora, ou roda em background DEVE ser event-driven. Nada de `sleep`, `polling`, `timeout` manual.
+
+| Operação | Event-Driven Way | Proibido |
+|----------|-----------------|----------|
+| Subir servidor + bench | `ft serve & PID=$!; ./scripts/wait-for-server.sh 8000 $PID` | `sleep 10`, `background: true` sem monitor |
+| Rodar teste com timeout | `pytest --timeout=60` (já no pyproject.toml) | `timeout 60 pytest`, loops manuais |
+| Benchmark multi-run | `make bench` → `scripts/bench-profile.py` captura saída JSON | Copiar/colar logs manualmente |
+| Logs em tempo real | `./scripts/wait-for-server.sh` bloqueia até ping verde | `tail -f` em background sem PID guard |
+| Matar processo travado | `scripts/preflight.sh --strict` mata por PID conhecido | `pkill -9` sem saber o quê |
+| CI pipeline | `make ci` (lint→typecheck→test sequencial) | Rodar comandos separados manualmente |
+
+**Padrão obrigatório para servidores:**
+```bash
+ft serve --model ... &
+PID=$!
+./scripts/wait-for-server.sh 8000 $PID  # bloqueia AQUI até health check OK
+# servidor garantidamente vivo, PID conhecido
+benchmarks/bench_pp_tg.py ...
+kill $PID  # cleanup garantido
+```
+
+**Timeouts globais já configurados:**
+- `pytest --timeout=60` injetado no `pyproject.toml` — testes C++ travados abortam sozinhos
+- Não crie timeouts customizados no bash
+
+**Monitoramento de recursos (event-driven, não polling):**
+```bash
+# VRAM: nvidia-smi --query-gpu=memory.used --format=csv -l 1 (stream)
+# RAM: watch -n 1 free -h  (apenas observação, não lógica de controle)
+# Lógica de controle: scripts/preflight.sh valida ANTES, falha rápido
+```
+
+**Benchmarks automatizados (zero manual):**
+```bash
+# make profile roda bench + valida anchors PERFORMANCE.md automaticamente
+# Saída: PASS/FAIL + diff vs baseline — zero interpretação manual
+# make bench roda config padrão 35B-A3B 3 repeats, salva JSONL
+```
+
+**Testes (subsistema completo, não arquivos tocados):**
+```bash
+# Fix em cache/paginação/scheduler → pytest tests/scheduler/ tests/kvcache/ -q
+# Não rode só o arquivo alterado — regressão vem de integração
+```
+
+**Regra de Ouro:** Se o script falha, o script te diz o quê e onde. Se você faz manual, você gasta horas debugando o óbvio.
+
+---
+
+## Benchmarks & Tests — Automation Coverage
+
+| Área | Script/Target | O que Automatiza |
+|------|---------------|------------------|
+| **PP/TG baseline** | `make bench` | 35B-A3B 16K 3 repeats, serve args, JSONL output |
+| **Profile + anchors** | `make profile` | `scripts/bench-profile.py` valida PP/TG/VRAM/SHA1 vs PERFORMANCE.md |
+| **Cert matrix** | `python benchmarks/cert_matrix.py` | Todas rows native + GGUF, gates de regressão, dry-run |
+| **MoE decode** | `python benchmarks/bench_decode_moe.py` | Spawna `ft serve` por backend, mede TG bs=1 |
+| **Load weight** | `python benchmarks/bench_load_weight_generic.py` | Serial vs parallel vs FTW expert load |
+| **Offload cache** | `python benchmarks/bench_offload_cache_copy.py` | Synthetic sweep: layout x slots x batch x miss rate |
+| **Test suite rápida** | `make test` | `pytest tests -m "not slow" -q --basetemp=/models/desenvolvimento/tmp` |
+| **Test suite completa** | `make test-all` | `pytest tests -q --basetemp=/models/desenvolvimento/tmp` |
+| **Subsistema específico** | `pytest tests/scheduler/ tests/kvcache/ -q` | Fix cache/paginação → roda subsistema inteiro |
+| **Tokenizer** | `pytest tests/tokenizer/ -q` | Detokenize, tokenize, effort, mm |
+| **Lint + format** | `make lint` / `make format` | Ruff check/fix |
+| **Typecheck** | `make typecheck` | MyPy python/freetoken |
+| **CI local completa** | `make ci` | format → lint → typecheck → test sequencial |
+
+**Protocolo benchmark novo modelo:**
+1. `make preflight` (limpa zumbis, checa RAM/VRAM)
+2. `make profile --model /models/NOVO-MODELO` (valida anchors automaticamente)
+3. Se PASS → `python benchmarks/cert_matrix.py --model /models/NOVO-MODELO --dry-run`
+4. Se dry-run OK → `python benchmarks/cert_matrix.py --model /models/NOVO-MODELO --json /tmp/cert.jsonl`
+5. Compara output com `docs/dev/PERFORMANCE.md`
+
+**Protocolo bug fix:**
+1. Reproduz com teste que falha antes + passa depois
+2. Fix minimal no código
+3. `make test` (suite rápida) + `make lint` + `make typecheck`
+4. Se muda performance → `make bench` + `make profile`
+5. `make crossref` (docs consistentes)

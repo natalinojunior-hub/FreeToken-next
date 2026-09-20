@@ -61,19 +61,23 @@ def _run(b, n: int) -> torch.Tensor:
     from freetoken.moe.fused_q4_0 import fused_experts_gguf
 
     return fused_experts_gguf(
-        b["x"][:n].contiguous(), b["gate_up"], b["down"],
-        b["w"][:n].contiguous(), b["ids"][:n].contiguous(),
-        "silu", GGML_Q4_0,
+        b["x"][:n].contiguous(),
+        b["gate_up"],
+        b["down"],
+        b["w"][:n].contiguous(),
+        b["ids"][:n].contiguous(),
+        "silu",
+        GGML_Q4_0,
     )
 
 
 @pytest.mark.parametrize(
     "n",
     [
-        CEIL - 1,        # 65528: last z that fits
-        CEIL,            # 65528 + 8: first launch that used to fail
+        CEIL - 1,  # 65528: last z that fits
+        CEIL,  # 65528 + 8: first launch that used to fail
         CEIL + 1,
-        2 * CEIL + 7,    # several chunks, deliberately not a chunk multiple
+        2 * CEIL + 7,  # several chunks, deliberately not a chunk multiple
     ],
 )
 def test_moe_vec_launches_past_grid_z_ceiling(banks, n):

@@ -423,8 +423,7 @@ def _rebuild_body(targets: dict[str, int], geometry: dict[str, Any]) -> dict[str
     for pool, value in targets.items():
         if pool not in pools.targets:
             raise ControlCliError(
-                f"this server's model has no {pool} pool "
-                f"(it has: {', '.join(pools.targets)})",
+                f"this server's model has no {pool} pool (it has: {', '.join(pools.targets)})",
                 exit_code=2,
             )
         if pool == "kv":

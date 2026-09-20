@@ -50,7 +50,9 @@ _EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]
 
 
 class TokenizeManager:
-    def __init__(self, tokenizer: PreTrainedTokenizerBase, mm_processor: MMProcessor | None = None) -> None:
+    def __init__(
+        self, tokenizer: PreTrainedTokenizerBase, mm_processor: MMProcessor | None = None
+    ) -> None:
         self.tokenizer = tokenizer
         self.mm_processor = mm_processor  # None: the model takes no images
         self._dsv4_encoder = _load_dsv4_encoder_if_needed(tokenizer)
@@ -71,9 +73,7 @@ class TokenizeManager:
             # encoder path keep the default.
             templated = isinstance(msg.text, list) and self._dsv4_encoder is None
             input_ids: torch.Tensor = (  # type: ignore
-                self.tokenizer.encode(
-                    prompt, return_tensors="pt", add_special_tokens=not templated
-                )
+                self.tokenizer.encode(prompt, return_tensors="pt", add_special_tokens=not templated)
             )
             input_ids = input_ids.view(-1).to(torch.int32)
             if msg.images:
@@ -162,9 +162,7 @@ class TokenizeManager:
                 self._thinking_profile = probe_thinking_profile(self._probe_render, efforts)
             return self._thinking_profile
 
-    def _probe_render(
-        self, kwargs: dict[str, Any], tools: list[dict[str, Any]] | None
-    ) -> str:
+    def _probe_render(self, kwargs: dict[str, Any], tools: list[dict[str, Any]] | None) -> str:
         return self._render(_EFFORT_PROBE_MESSAGES, tools, kwargs)
 
     def _sanitize_effort(self, chat_template_kwargs: dict[str, Any]) -> dict[str, Any]:

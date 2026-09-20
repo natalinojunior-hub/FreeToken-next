@@ -38,10 +38,12 @@ class FLAMetadata:
     # recurrent + conv state into a donatable pool slot, written on the forward stream by the
     # GDN op (see Qwen3_5GatedDeltaNet._write_track_snapshot). Built by the scheduler in P2;
     # left None by build_fla_metadata so the existing path is unchanged.
-    track_dst: torch.Tensor | None = None        # [nt] int64 dst pool slot per tracked req
-    track_h_row: torch.Tensor | None = None      # [nt] int64 row into h (boh_i + aligned//CHUNK)
-    track_conv_src: torch.Tensor | None = None   # [nt, kernel-1] int64 conv-input token positions
-    track_boundary_row: torch.Tensor | None = None  # [nt] int64 forward-local row of the track boundary; states with their own left context (qwen4_exp PLE) derive their windows from it
+    track_dst: torch.Tensor | None = None  # [nt] int64 dst pool slot per tracked req
+    track_h_row: torch.Tensor | None = None  # [nt] int64 row into h (boh_i + aligned//CHUNK)
+    track_conv_src: torch.Tensor | None = None  # [nt, kernel-1] int64 conv-input token positions
+    track_boundary_row: torch.Tensor | None = (
+        None  # [nt] int64 forward-local row of the track boundary; states with their own left context (qwen4_exp PLE) derive their windows from it
+    )
 
 
 def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:

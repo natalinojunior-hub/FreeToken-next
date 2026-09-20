@@ -20,9 +20,14 @@ def _pool(num_pages: int):
     from freetoken.kvcache.dsa_pool import DSAKVCache
 
     return DSAKVCache(
-        latent_dim=LATENT, num_layers=2, num_pages=num_pages, page_size=1,
-        dtype=torch.bfloat16, device=torch.device("cuda"),
-        index_head_dim=IDX_DIM, num_index_layers=1,
+        latent_dim=LATENT,
+        num_layers=2,
+        num_pages=num_pages,
+        page_size=1,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+        index_head_dim=IDX_DIM,
+        num_index_layers=1,
     )
 
 
@@ -59,11 +64,15 @@ def test_sparse_decode_reads_grown_pool_through_backend_kernels():
     pool.rebuild(257)
     live = 180  # > original 33: every one of these rows would have been OOB before
     rows_live = torch.randperm(256, device="cuda")[:live].to(torch.int32)
-    pool.store_index_k(torch.randn(live, IDX_DIM, device="cuda", dtype=torch.bfloat16),
-                       rows_live.long(), slot=0)
-    pool.store_kv(torch.randn(live, LATENT - 16, device="cuda", dtype=torch.bfloat16),
-                  torch.randn(live, 16, device="cuda", dtype=torch.bfloat16),
-                  rows_live.long(), layer_id=0)
+    pool.store_index_k(
+        torch.randn(live, IDX_DIM, device="cuda", dtype=torch.bfloat16), rows_live.long(), slot=0
+    )
+    pool.store_kv(
+        torch.randn(live, LATENT - 16, device="cuda", dtype=torch.bfloat16),
+        torch.randn(live, 16, device="cuda", dtype=torch.bfloat16),
+        rows_live.long(),
+        layer_id=0,
+    )
 
     rows = torch.full((1, 257), -1, device="cuda", dtype=torch.int32)
     rows[0, :live] = rows_live
@@ -82,9 +91,14 @@ def test_sparse_decode_reads_grown_pool_through_backend_kernels():
     sel = rows.gather(1, cols)
     sel = torch.where(vals == float("-inf"), sel.new_full((), -1), sel)
     q = torch.randn(1, 1, 4, LATENT, device="cuda", dtype=torch.bfloat16)
-    o = glm_dsa_sparse_attn(q, pool.latent_rows(0), sel.view(1, 1, topk), 0.1,
-                            counts=torch.tensor([[topk]], device="cuda", dtype=torch.int32),
-                            d_v=LATENT - 16)
+    o = glm_dsa_sparse_attn(
+        q,
+        pool.latent_rows(0),
+        sel.view(1, 1, topk),
+        0.1,
+        counts=torch.tensor([[topk]], device="cuda", dtype=torch.int32),
+        d_v=LATENT - 16,
+    )
     picked = pool.latent_rows(0)[sel.view(-1).long()].float()
     s2 = (q[0, 0].float() @ picked.T) * 0.1
     ref_o = s2.softmax(-1) @ picked[:, : LATENT - 16]
@@ -101,27 +115,52 @@ def test_mla_pool_selected_by_group_spec():
     def cfg(index_dim, n_idx):
         rc = RotaryConfig(head_dim=LATENT, rotary_dim=16, max_position=512, base=1e4, scaling=None)
         return ModelConfig(
-            num_layers=2, num_qo_heads=4, num_kv_heads=1, head_dim=LATENT,
-            hidden_size=64, vocab_size=64, num_experts=0,
-            intermediate_size=128, rms_norm_eps=1e-6, hidden_act="silu",
-            tie_word_embeddings=False, num_experts_per_tok=0,
-            moe_intermediate_size=0, norm_topk_prob=False,
-            model_type="test_mla", architectures=("TestMLA",),
+            num_layers=2,
+            num_qo_heads=4,
+            num_kv_heads=1,
+            head_dim=LATENT,
+            hidden_size=64,
+            vocab_size=64,
+            num_experts=0,
+            intermediate_size=128,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            tie_word_embeddings=False,
+            num_experts_per_tok=0,
+            moe_intermediate_size=0,
+            norm_topk_prob=False,
+            model_type="test_mla",
+            architectures=("TestMLA",),
             rotary_config=rc,
             attention_groups=(
                 FullAttentionGroupConfig(
-                    name="full", layer_ids=(0, 1), num_kv_heads=1, head_dim=LATENT,
-                    rotary_config=rc, mla=True,
-                    index_head_dim=index_dim, num_index_layers=n_idx,
+                    name="full",
+                    layer_ids=(0, 1),
+                    num_kv_heads=1,
+                    head_dim=LATENT,
+                    rotary_config=rc,
+                    mla=True,
+                    index_head_dim=index_dim,
+                    num_index_layers=n_idx,
                 ),
             ),
         )
 
-    dsa = create_kvcache_pool(model_config=cfg(IDX_DIM, 1), num_pages=8, page_size=1,
-                              device=torch.device("cuda"), dtype=torch.bfloat16)
+    dsa = create_kvcache_pool(
+        model_config=cfg(IDX_DIM, 1),
+        num_pages=8,
+        page_size=1,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+    )
     assert isinstance(dsa, DSAKVCache)
-    mla = create_kvcache_pool(model_config=cfg(0, 0), num_pages=8, page_size=1,
-                              device=torch.device("cuda"), dtype=torch.bfloat16)
+    mla = create_kvcache_pool(
+        model_config=cfg(0, 0),
+        num_pages=8,
+        page_size=1,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+    )
     assert isinstance(mla, MLAKVCache) and not isinstance(mla, DSAKVCache)
 
 

@@ -18,6 +18,7 @@ LRU: FreeToken heapq + timestamp, but ``match_prefix`` stamps the matched path w
 DECREASING timestamps toward root (sglang ``_match_post_processor``) so the heap evicts near-root
 SWA nodes first -- the same victim order as sglang's maintained LRUList.
 """
+
 from __future__ import annotations
 
 import heapq
@@ -46,6 +47,7 @@ class SWACacheHandle(BaseCacheHandle):
     def get_matched_indices(self) -> torch.Tensor:
         return self.kv_indices
 
+
 # A logical-clock event id is multiplied by this so a single match/insert event leaves room to
 # encode per-node depth offsets below it (decreasing toward root) without colliding with the next
 # event. Bounds the max radix path depth -- 2^24 nodes is far beyond any real prefix.
@@ -53,14 +55,16 @@ _EVENT_STRIDE = 1 << 24
 
 
 class SWAMatch(NamedTuple):
-    kv_indices: torch.Tensor   # reused full-pool KV page indices for [0:cached_len) (windowed-safe)
-    cached_len: int            # truncated to the windowed-reuse boundary
-    node: RadixTreeNode        # the matched windowed-safe node (lock target)
+    kv_indices: torch.Tensor  # reused full-pool KV page indices for [0:cached_len) (windowed-safe)
+    cached_len: int  # truncated to the windowed-reuse boundary
+    node: RadixTreeNode  # the matched windowed-safe node (lock target)
 
 
 class SWAEvictResult(NamedTuple):
-    kv_indices: torch.Tensor   # full-pool page indices removed from the tree (-> free_slots)
-    swa_indices: torch.Tensor  # full-pool indices whose swa slots to free_swa (tombstoned + removed)
+    kv_indices: torch.Tensor  # full-pool page indices removed from the tree (-> free_slots)
+    swa_indices: (
+        torch.Tensor
+    )  # full-pool indices whose swa slots to free_swa (tombstoned + removed)
 
 
 class SWARadixCache:
@@ -78,11 +82,11 @@ class SWARadixCache:
         self.root.ref_count = 1  # root is always protected
         self.full_evictable = 0
         self.full_protected = 0
-        self.swa_evictable = 0   # tokens of live (non-tombstone), unlocked swa
+        self.swa_evictable = 0  # tokens of live (non-tombstone), unlocked swa
         self.swa_protected = 0
-        self._clk = 0            # logical access clock (tie-free, for near-root-first order)
-        self._uuid = 0           # monotonic swa window-boundary handle counter
-        self._revives = 0        # observability: # of insert-side tombstone revives (Branches 1/2)
+        self._clk = 0  # logical access clock (tie-free, for near-root-first order)
+        self._uuid = 0  # monotonic swa window-boundary handle counter
+        self._revives = 0  # observability: # of insert-side tombstone revives (Branches 1/2)
 
     # ---------------------------------------------------------------- match / insert
     def match_prefix(self, input_ids: torch.Tensor) -> SWAMatch:
@@ -94,7 +98,7 @@ class SWARadixCache:
         value: List[torch.Tensor] = []
         # path connected to root without a tombstone is always reusable -> start at +inf.
         match_since_tomb = float("inf")
-        best_value_len = 0       # number of leading entries of ``value`` that are windowed-safe
+        best_value_len = 0  # number of leading entries of ``value`` that are windowed-safe
         best_node = self.root
         prefix_pos, total = 0, len(input_ids)
 
@@ -134,9 +138,13 @@ class SWARadixCache:
         kv = torch.cat(value[:best_value_len]) if best_value_len else self.empty
         return SWAMatch(kv, int(kv.numel()), best_node)
 
-    def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
-               swa_evicted_seqlen: int = 0, update_kv_after_len: int = 0
-               ) -> Tuple[int, torch.Tensor]:
+    def insert(
+        self,
+        input_ids: torch.Tensor,
+        kv_indices: torch.Tensor,
+        swa_evicted_seqlen: int = 0,
+        update_kv_after_len: int = 0,
+    ) -> Tuple[int, torch.Tensor]:
         """Insert the committed full KV prefix. ``kv_indices`` are the request's full-pool page
         indices (the swa rides along via the full->swa mapping, live where the request allocated
         it). Two frontiers drive the sglang ``_insert_helper`` reconcile:
@@ -170,7 +178,7 @@ class SWARadixCache:
             partial = match_len < child.length
             if partial:
                 child = child.split_at(match_len)
-            seg_kv = kv_indices[total:total + match_len]   # request's fresh slots for this span
+            seg_kv = kv_indices[total : total + match_len]  # request's fresh slots for this span
             if update_kv_after_len < total + match_len:
                 if child.swa_tombstone:
                     assert child.swa_ref_count == 0, "a tombstoned node cannot hold a swa lock"
@@ -193,9 +201,9 @@ class SWARadixCache:
                         # Branch 2: the request's freed-swa frontier falls inside the node. Split;
                         # the head [:start] stays tombstone (full KV kept), revive the live tail.
                         start = swa_evicted_seqlen - total
-                        child.split_at(start)            # head=[:start] tombstone; child=tail[start:]
-                        freed.append(child.value)        # tail's old (sentinel) tree slots
-                        freed.append(seg_kv[:start].clone())   # dup for the still-tombstone head
+                        child.split_at(start)  # head=[:start] tombstone; child=tail[start:]
+                        freed.append(child.value)  # tail's old (sentinel) tree slots
+                        freed.append(seg_kv[:start].clone())  # dup for the still-tombstone head
                         child.set_key_value(child._key, seg_kv[start:].clone())
                         child.swa_tombstone = False
                         child.timestamp = self._tick()
@@ -220,15 +228,17 @@ class SWARadixCache:
             boundary = max(0, min(swa_evicted_seqlen, insert_len) - total)
             boundary = min(boundary, max(0, len(suffix_ids) - self.page_size))
             if boundary > 0:
-                node = self._add_child(node, suffix_ids[:boundary], suffix_kv[:boundary],
-                                       tombstone=True)
+                node = self._add_child(
+                    node, suffix_ids[:boundary], suffix_kv[:boundary], tombstone=True
+                )
                 suffix_ids, suffix_kv = suffix_ids[boundary:], suffix_kv[boundary:]
             if len(suffix_ids):
                 self._add_child(node, suffix_ids, suffix_kv, tombstone=False)
         return total, (torch.cat(freed) if freed else self.empty)
 
-    def _add_child(self, parent: RadixTreeNode, ids: torch.Tensor, kv: torch.Tensor,
-                   *, tombstone: bool) -> RadixTreeNode:
+    def _add_child(
+        self, parent: RadixTreeNode, ids: torch.Tensor, kv: torch.Tensor, *, tombstone: bool
+    ) -> RadixTreeNode:
         child = RadixTreeNode(self.key_fn, self._tick())
         child.set_key_value(ids, kv)
         child.set_parent(parent)
@@ -266,8 +276,9 @@ class SWARadixCache:
             cur = cur.parent
         return swa_uuid_for_lock
 
-    def dec_lock(self, node: RadixTreeNode, swa_uuid_for_lock: Optional[int] = None,
-                 skip_swa: bool = False) -> None:
+    def dec_lock(
+        self, node: RadixTreeNode, swa_uuid_for_lock: Optional[int] = None, skip_swa: bool = False
+    ) -> None:
         dec_swa = not skip_swa
         cur = node
         while not cur.is_root():
@@ -301,7 +312,7 @@ class SWARadixCache:
             kv.append(node.value)
             self.full_evictable -= node.length
             if not node.swa_tombstone:
-                swa.append(node.value)          # its swa is still live -> free it too
+                swa.append(node.value)  # its swa is still live -> free it too
                 self.swa_evictable -= node.length
             parent, casc = self._cascade_swa_tombstone_leaves(self._unlink(node), kv)
             freed += casc
@@ -309,8 +320,9 @@ class SWARadixCache:
             # been unlinked/freed by the cascade -- re-pushing it would double-free / KeyError).
             if parent.is_leaf() and parent.ref_count == 0 and not parent.is_root():
                 heapq.heappush(leaves, parent)
-        return SWAEvictResult(torch.cat(kv) if kv else self.empty,
-                              torch.cat(swa) if swa else self.empty)
+        return SWAEvictResult(
+            torch.cat(kv) if kv else self.empty, torch.cat(swa) if swa else self.empty
+        )
 
     def evict_swa(self, num_tokens: int) -> SWAEvictResult:
         """Evict swa KV by LRU over UNLOCKED, non-tombstone swa-bearing nodes -- internal nodes
@@ -333,12 +345,13 @@ class SWARadixCache:
                 node.swa_tombstone = True
                 self._cascade_swa_tombstone_leaves(self._unlink(node), kv)
             else:
-                swa.append(node.value)          # tombstone internal / full-locked leaf in place
+                swa.append(node.value)  # tombstone internal / full-locked leaf in place
                 self.swa_evictable -= node.length
                 freed += node.length
                 node.swa_tombstone = True
-        return SWAEvictResult(torch.cat(kv) if kv else self.empty,
-                              torch.cat(swa) if swa else self.empty)
+        return SWAEvictResult(
+            torch.cat(kv) if kv else self.empty, torch.cat(swa) if swa else self.empty
+        )
 
     def trim_head_swa(self, input_ids: torch.Tensor, keep_from: int) -> torch.Tensor:
         """Tombstone the swa currency of the path strictly below ``keep_from`` (full KV stays),
@@ -374,6 +387,7 @@ class SWARadixCache:
     @property
     def size_info(self):
         from .base import SizeInfo
+
         return SizeInfo(evictable_size=self.full_evictable, protected_size=self.full_protected)
 
     def check_integrity(self) -> None:
@@ -398,8 +412,12 @@ class SWARadixCache:
         Returns ``(surviving_ancestor, freed_full_tokens)`` -- the caller MUST use the returned
         ancestor (the passed-in ``parent`` may itself have been unlinked/freed by the cascade)."""
         freed = 0
-        while (parent.swa_tombstone and parent.is_leaf()
-               and parent.ref_count == 0 and not parent.is_root()):
+        while (
+            parent.swa_tombstone
+            and parent.is_leaf()
+            and parent.ref_count == 0
+            and not parent.is_root()
+        ):
             kv_out.append(parent.value)
             self.full_evictable -= parent.length
             freed += parent.length
@@ -450,5 +468,6 @@ class SWARadixCache:
                 out.append(n)
             stack.extend(n.children.values())
         return out
+
 
 __all__ = ["SWARadixCache", "SWAMatch", "SWAEvictResult", "SWACacheHandle"]

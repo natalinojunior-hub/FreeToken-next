@@ -23,25 +23,33 @@ from freetoken.server.reasoning_parser import (
 
 def _tools():
     return [
-        Tool(function=Function(name="weather.get", parameters={
-            "type": "object",
-            "properties": {
-                "city": {"type": "string"},
-                "days": {"type": "integer"},
-                "units": {"type": "object"},
-            },
-        })),
-        Tool(function=Function(name="fs.write", parameters={
-            "type": "object",
-            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-        })),
+        Tool(
+            function=Function(
+                name="weather.get",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "days": {"type": "integer"},
+                        "units": {"type": "object"},
+                    },
+                },
+            )
+        ),
+        Tool(
+            function=Function(
+                name="fs.write",
+                parameters={
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                },
+            )
+        ),
     ]
 
 
 def _atem(name: str, params: dict[str, str]) -> str:
-    body = "".join(
-        f'<atem:parameter name="{k}">{v}</atem:parameter>\n' for k, v in params.items()
-    )
+    body = "".join(f'<atem:parameter name="{k}">{v}</atem:parameter>\n' for k, v in params.items())
     return (
         f'<atem:function_calls>\n<atem:invoke name="{name}">\n{body}'
         f"</atem:invoke>\n</atem:function_calls>"
@@ -245,9 +253,11 @@ def test_streaming_matches_one_shot_with_channel_markup():
     det = MuseGlimmerDetector()
     normal, calls = _stream_detect(det, text, _tools())
     assert normal.strip() == one.normal_text.strip() == "Checking."
-    assert _assemble(calls) == [
-        (c.name, json.loads(c.parameters)) for c in one.calls
-    ] == [("weather.get", {"city": "Paris", "days": 3})]
+    assert (
+        _assemble(calls)
+        == [(c.name, json.loads(c.parameters)) for c in one.calls]
+        == [("weather.get", {"city": "Paris", "days": 3})]
+    )
     # ledgers the serving layer reads at stream end
     assert det.prev_tool_call_arr[0]["name"] == "weather.get"
     assert det.prev_tool_call_arr[0]["arguments"] == {"city": "Paris", "days": 3}
@@ -295,9 +305,8 @@ def test_streaming_self_channel_swallowed_without_reasoning_parser():
 
 
 def test_streaming_two_tool_channels_sequential_indices():
-    text = (
-        _tool_channel("weather.get", {"city": "Paris"}, closer="<|eom|>")
-        + _tool_channel("weather.get", {"city": "Rome"})
+    text = _tool_channel("weather.get", {"city": "Paris"}, closer="<|eom|>") + _tool_channel(
+        "weather.get", {"city": "Rome"}
     )
     _, calls = _stream_detect(MuseGlimmerDetector(), text, _tools())
     assembled = _assemble(calls)
@@ -457,9 +466,15 @@ def test_doubled_tool_name_collapses_to_registered_head():
     """MED-1: the template renders a bare-name tool's namespace as name.*, so the
     model emits get_weather.get_weather; collapse iff the head is registered."""
     tools = [
-        Tool(function=Function(name="get_weather", parameters={
-            "type": "object", "properties": {"city": {"type": "string"}},
-        }))
+        Tool(
+            function=Function(
+                name="get_weather",
+                parameters={
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            )
+        )
     ]
     text = (
         "<|start|>assistant to=get_weather.get_weather<|message|>"
@@ -478,9 +493,7 @@ def test_doubled_tool_name_collapses_to_registered_head():
         _tool_channel("weather.get", {"city": "Rome"}), _tools()
     )
     assert [c.name for c in res2.calls] == ["weather.get"]
-    tools_doubled = tools + [
-        Tool(function=Function(name="get_weather.get_weather", parameters={}))
-    ]
+    tools_doubled = tools + [Tool(function=Function(name="get_weather.get_weather", parameters={}))]
     res3 = MuseGlimmerDetector().detect_and_parse(text, tools_doubled)
     assert [c.name for c in res3.calls] == ["get_weather.get_weather"]
 
@@ -810,9 +823,7 @@ def test_truncated_channel_prose_residue_trade_pinned():
         "</atem:invoke>\n</atem:function_calls><|eot|>"
         "<|start|>assistant to=user<|message|>Done.<|eot|>"
     )
-    expected = (
-        "please</atem:parameter>\n</atem:invoke>\n</atem:function_calls>Done."
-    )
+    expected = "please</atem:parameter>\n</atem:invoke>\n</atem:function_calls>Done."
     for step in (4, len(text)):
         det = MuseGlimmerDetector()
         normal, calls = _stream_detect(det, text, _tools(), step=step)
@@ -927,7 +938,8 @@ def test_stray_start_before_a_real_header_does_not_form_a_giant_header():
     recipient), and streaming must agree with one-shot."""
     junk = "P" * 300
     text = (
-        " to=user<|message|>ok<|eom|><|start|>" + junk
+        " to=user<|message|>ok<|eom|><|start|>"
+        + junk
         + "<|start|>assistant to=user<|message|>more<|eot|>"
     )
     p = MuseGlimmerReasoningParser()
@@ -946,7 +958,8 @@ def test_stray_start_before_a_real_header_does_not_form_a_giant_header():
 
     # a to=self inside the junk must not hijack the following user reply
     hijack = (
-        " to=user<|message|>first.<|eom|><|start|>x to=self y" + "Q" * 250
+        " to=user<|message|>first.<|eom|><|start|>x to=self y"
+        + "Q" * 250
         + "<|start|>assistant to=user<|message|>the actual answer<|eot|>"
     )
     one = MuseGlimmerReasoningParser().detect_and_parse(hijack)
@@ -960,9 +973,17 @@ def test_protocol_legal_long_tool_names_survive_streaming(name_len):
     <|message|> is still mid-arrival; the tool call AND the trailing reply
     survive at every step size, matching one-shot."""
     name = "t" * name_len
-    tools = [Tool(function=Function(name=name, parameters={
-        "type": "object", "properties": {"city": {"type": "string"}},
-    }))]
+    tools = [
+        Tool(
+            function=Function(
+                name=name,
+                parameters={
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            )
+        )
+    ]
     text = (
         f" to=self<|message|>go<|eom|><|start|>assistant to={name}<|message|>"
         + _atem(name, {"city": "Paris"})
@@ -1012,7 +1033,8 @@ def test_reply_after_stray_start_junk_segment_survives(junk_len):
     must never be dropped -- previously the released marker + junk + reply sat
     under the detector's hold threshold and died in finish_streaming."""
     wire = (
-        " to=user<|message|>ok<|eom|><|start|>" + "J" * junk_len
+        " to=user<|message|>ok<|eom|><|start|>"
+        + "J" * junk_len
         + "<|start|>assistant to=user<|message|>Here you go.<|eot|>"
     )
     for step in (1, 7, 4096):
@@ -1035,7 +1057,8 @@ def test_detector_giant_header_bound_pinned():
     assertion."""
     junk = "J" * 300
     text = (
-        "ok<|eom|><|start|>" + junk
+        "ok<|eom|><|start|>"
+        + junk
         + _tool_channel("weather.get", {"city": "P"})
         + "<|start|>assistant to=user<|message|>done<|eot|>"
     )
@@ -1071,10 +1094,7 @@ def test_junk_recipient_past_cap_yields_empty_channel_not_empty_turn():
 def test_glued_assistant_recipient_header_parses():
     """``assistantto=x<|message|>``: the recipient regex still finds to=x, so
     the segment routes as a (junk) tool channel and the next reply flows."""
-    wire = (
-        "assistantto=x<|message|>hello<|eot|>"
-        "<|start|>assistant to=user<|message|>Hi.<|eot|>"
-    )
+    wire = "assistantto=x<|message|>hello<|eot|><|start|>assistant to=user<|message|>Hi.<|eot|>"
     for step in (1, 7, 4096):
         _, piped, _ = _pipe(wire, _tools(), step=step)
         assert "Hi." in piped, (step, piped)
@@ -1112,7 +1132,8 @@ def test_prose_before_first_full_header_not_swallowed_into_seed():
     assert "Pre." in r.normal_text and "think" in r.reasoning_text
     # and with a tool channel: the call still parses, the prose still flows
     wire2 = (
-        "Pre. " + _tool_channel("weather.get", {"city": "P"})
+        "Pre. "
+        + _tool_channel("weather.get", {"city": "P"})
         + "<|start|>assistant to=user<|message|>Post.<|eot|>"
     )
     for step in (1, 7, 4096):
@@ -1142,11 +1163,13 @@ _WIRE_CORPUS = [
     # clean turn
     " to=self<|message|>think<|eom|><|start|>assistant to=user<|message|>All good.<|eot|>",
     # tool channel then reply
-    " to=self<|message|>t<|eom|>" + _tool_channel("weather.get", {"city": "P"}, closer="<|eom|>")
+    " to=self<|message|>t<|eom|>"
+    + _tool_channel("weather.get", {"city": "P"}, closer="<|eom|>")
     + "<|start|>assistant to=user<|message|>All good.<|eot|>",
     # headerless switches everywhere
     " to=self<|message|>t to=weather.get<|message|>"
-    + _atem("weather.get", {"city": "P"}) + "to=user<|message|>All good.<|eot|>",
+    + _atem("weather.get", {"city": "P"})
+    + "to=user<|message|>All good.<|eot|>",
     # truncated invoke then abutting user header
     " to=weather.get<|message|><atem:function_calls>\n"
     '<atem:invoke name="weather.get">\n<atem:parameter name="city">P'
@@ -1158,7 +1181,8 @@ _WIRE_CORPUS = [
     # bare first segment is the reply
     " to=user<|message|>All good.<|eom|>",
     # stray <|start|>+junk segment ahead of the real reply (R5 HIGH-1 shape)
-    " to=user<|message|>prelude<|eom|><|start|>" + "J" * 115
+    " to=user<|message|>prelude<|eom|><|start|>"
+    + "J" * 115
     + "<|start|>assistant to=user<|message|>All good.<|eot|>",
     # stream dies inside an unfinished header candidate (R5 EOS-family shape)
     " to=user<|message|>All good.<|eot|><|start|>" + "p" * 119 + "<|end_of_text|>",

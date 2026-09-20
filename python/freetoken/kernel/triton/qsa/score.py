@@ -73,10 +73,7 @@ def _qsa_mqa_paged_kernel(
 
     # Pad the small head axis to a tensor-core-compatible N dimension.
     query = tl.load(
-        q_ptr
-        + row * stride_q_row
-        + heads[None, :] * stride_q_head
-        + dims[:, None] * stride_q_dim,
+        q_ptr + row * stride_q_row + heads[None, :] * stride_q_head + dims[:, None] * stride_q_dim,
         mask=(heads[None, :] < NUM_HEADS) & (dims[:, None] < HEAD_DIM),
         other=0.0,
     )
@@ -87,9 +84,7 @@ def _qsa_mqa_paged_kernel(
         logical_page = tl.minimum(columns // PAGE_SIZE, PAGE_TABLE_WIDTH - 1)
         page_offset = columns % PAGE_SIZE
         physical_page = tl.load(
-            page_table_ptr
-            + safe_request * stride_table_req
-            + logical_page * stride_table_page,
+            page_table_ptr + safe_request * stride_table_req + logical_page * stride_table_page,
             mask=live,
             other=-1,
         )
@@ -148,9 +143,7 @@ def qsa_mqa_paged(
     MAX_N = max(16, triton.next_power_of_2(q.shape[1]))
     # Tuned on GB300: larger row batches provide enough parallelism to reuse Q.
     tiles_per_program = 1 if q.shape[0] <= 32 else 8
-    _qsa_mqa_paged_kernel[
-        (q.shape[0], triton.cdiv(columns, BLOCK_N * tiles_per_program))
-    ](
+    _qsa_mqa_paged_kernel[(q.shape[0], triton.cdiv(columns, BLOCK_N * tiles_per_program))](
         q,
         k_cache,
         page_table,

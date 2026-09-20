@@ -162,7 +162,12 @@ class DSAKVCache(MLAKVCache):
         self._index_head_dim = index_head_dim
         self._num_index_layers = num_index_layers
         super().__init__(
-            latent_dim, num_layers, num_pages, page_size, dtype, device,
+            latent_dim,
+            num_layers,
+            num_pages,
+            page_size,
+            dtype,
+            device,
             layer_ids=layer_ids,
         )
 
@@ -223,8 +228,7 @@ class KpoolDSAKVCache(DSAKVCache):
         self._index_ratio = index_ratio
         super().__init__(*args, **kwargs)
         assert self._page_size % index_ratio == 0, (
-            f"kpool needs page_size ({self._page_size}) divisible by "
-            f"index_ratio ({index_ratio})"
+            f"kpool needs page_size ({self._page_size}) divisible by index_ratio ({index_ratio})"
         )
 
     def _index_rows(self, num_pages: int) -> int:
@@ -239,8 +243,12 @@ class KpoolDSAKVCache(DSAKVCache):
     def _alloc(self, num_pages: int) -> None:
         super()._alloc(num_pages)
         self._tail_k = torch.zeros(
-            self._num_index_layers, self._num_req_slots, self._index_ratio,
-            self._index_head_dim, dtype=torch.bfloat16, device=self._device,
+            self._num_index_layers,
+            self._num_req_slots,
+            self._index_ratio,
+            self._index_head_dim,
+            dtype=torch.bfloat16,
+            device=self._device,
         )
         self._tail_gate = torch.zeros_like(self._tail_k)
 

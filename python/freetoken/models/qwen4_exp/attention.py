@@ -85,8 +85,11 @@ class Qwen4ExpIndexer(BaseOP):
         self.eps = config.rms_norm_eps
         self._split = [self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim]
         self.index_qk_proj = LinearReplicated(
-            args.hidden_size, sum(self._split), has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.index_qk_proj",
+            args.hidden_size,
+            sum(self._split),
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.index_qk_proj",
         )
         self.q_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
         self.k_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
@@ -125,12 +128,18 @@ class Qwen4ExpAttention(BaseOP):
         self.kv_attn_dim = self.num_kv * self.head_dim
         self._qkv_split = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
         self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkv_split, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
+            config.hidden_size,
+            self._qkv_split,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = LinearReplicated(
-            self.qo_attn_dim, config.hidden_size, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.o_proj",
+            self.qo_attn_dim,
+            config.hidden_size,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.o_proj",
         )
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)

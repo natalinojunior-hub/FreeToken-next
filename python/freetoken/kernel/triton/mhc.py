@@ -20,12 +20,19 @@ import triton.language as tl
 
 @triton.jit
 def _mhc_stage1_kernel(
-    x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr,
+    x_ptr,
+    res_ptr,
+    post_ptr,
+    comb_ptr,
+    fn_ptr,
     res_out_ptr,
-    sq_part_ptr,    # [T, NS] fp32
-    mix_part_ptr,   # [T, NS, BLK_MIX] fp32
-    H: tl.constexpr, N: tl.constexpr, MIX: tl.constexpr, BLK_MIX: tl.constexpr,
-    SPLIT: tl.constexpr,     # hidden elems per split (multiple of BLOCK_H)
+    sq_part_ptr,  # [T, NS] fp32
+    mix_part_ptr,  # [T, NS, BLK_MIX] fp32
+    H: tl.constexpr,
+    N: tl.constexpr,
+    MIX: tl.constexpr,
+    BLK_MIX: tl.constexpr,
+    SPLIT: tl.constexpr,  # hidden elems per split (multiple of BLOCK_H)
     BLOCK_H: tl.constexpr,
     NS: tl.constexpr,
     HAS_POST: tl.constexpr,
@@ -54,8 +61,12 @@ def _mhc_stage1_kernel(
             if HAS_POST:
                 r_new = tl.zeros([BLOCK_H], dtype=tl.float32)
                 for i in tl.static_range(N):
-                    r_i = tl.load(res_ptr + (t * N + i) * H + offs_h, mask=h_mask, other=0.0).to(tl.float32)
-                    c_in = tl.sum(tl.where((offs_n == i)[:, None] & (offs_n == n)[None, :], b_comb, 0.0))
+                    r_i = tl.load(res_ptr + (t * N + i) * H + offs_h, mask=h_mask, other=0.0).to(
+                        tl.float32
+                    )
+                    c_in = tl.sum(
+                        tl.where((offs_n == i)[:, None] & (offs_n == n)[None, :], b_comb, 0.0)
+                    )
                     r_new += c_in * r_i
                 p_n = tl.sum(tl.where(offs_n == n, b_post, 0.0))
                 r_new += p_n * b_x
@@ -63,14 +74,25 @@ def _mhc_stage1_kernel(
                 # the torch reference reads back what it stored (dtype-generic --
                 # fp16/fp32 residuals must not be silently bf16-rounded).
                 r_new = r_new.to(res_out_ptr.dtype.element_ty).to(tl.float32)
-                tl.store(res_out_ptr + (t * N + n) * H + offs_h, r_new.to(res_out_ptr.dtype.element_ty), mask=h_mask)
+                tl.store(
+                    res_out_ptr + (t * N + n) * H + offs_h,
+                    r_new.to(res_out_ptr.dtype.element_ty),
+                    mask=h_mask,
+                )
             else:
-                r_new = tl.load(res_ptr + (t * N + n) * H + offs_h, mask=h_mask, other=0.0).to(tl.float32)
-                tl.store(res_out_ptr + (t * N + n) * H + offs_h, r_new.to(res_out_ptr.dtype.element_ty), mask=h_mask)
+                r_new = tl.load(res_ptr + (t * N + n) * H + offs_h, mask=h_mask, other=0.0).to(
+                    tl.float32
+                )
+                tl.store(
+                    res_out_ptr + (t * N + n) * H + offs_h,
+                    r_new.to(res_out_ptr.dtype.element_ty),
+                    mask=h_mask,
+                )
             sqsum += tl.sum(r_new * r_new)
             fn_tile = tl.load(
                 fn_ptr + offs_mix[:, None] * (N * H) + (n * H + offs_h)[None, :],
-                mask=mix_mask[:, None] & h_mask[None, :], other=0.0,
+                mask=mix_mask[:, None] & h_mask[None, :],
+                other=0.0,
             )
             acc += tl.sum(fn_tile * r_new[None, :], axis=1)
 
@@ -80,11 +102,21 @@ def _mhc_stage1_kernel(
 
 @triton.jit
 def _mhc_stage2_kernel(
-    sq_part_ptr, mix_part_ptr, scale_ptr, base_ptr,
-    post_out_ptr, comb_out_ptr, pre_out_ptr,
-    rms_eps, hc_eps, post_mult,
+    sq_part_ptr,
+    mix_part_ptr,
+    scale_ptr,
+    base_ptr,
+    post_out_ptr,
+    comb_out_ptr,
+    pre_out_ptr,
+    rms_eps,
+    hc_eps,
+    post_mult,
     SINKHORN: tl.constexpr,
-    H: tl.constexpr, N: tl.constexpr, MIX: tl.constexpr, BLK_MIX: tl.constexpr,
+    H: tl.constexpr,
+    N: tl.constexpr,
+    MIX: tl.constexpr,
+    BLK_MIX: tl.constexpr,
     NS: tl.constexpr,
 ):
     """Reduce the split partials and run the tiny gate math (sigmoid gates,
@@ -119,9 +151,7 @@ def _mhc_stage2_kernel(
         for c in tl.static_range(N):
             lane = 2 * N + r * N + c
             v = tl.sum(tl.where(offs_mix == lane, logits, 0.0))
-            comb_logits += tl.where(
-                (offs_n2 == r)[:, None] & (offs_n2 == c)[None, :], v, 0.0
-            )
+            comb_logits += tl.where((offs_n2 == r)[:, None] & (offs_n2 == c)[None, :], v, 0.0)
     row_max = tl.max(comb_logits, axis=1)
     e = tl.exp(comb_logits - row_max[:, None])
     comb = e / tl.sum(e, axis=1)[:, None] + hc_eps
@@ -134,9 +164,7 @@ def _mhc_stage2_kernel(
         tl.where((offs_mix[None, :] - N) == offs_n2[:, None], post_new[None, :], 0.0),
         axis=1,
     )
-    pre_g = tl.sum(
-        tl.where(offs_mix[None, :] == offs_n2[:, None], pre[None, :], 0.0), axis=1
-    )
+    pre_g = tl.sum(tl.where(offs_mix[None, :] == offs_n2[:, None], pre[None, :], 0.0), axis=1)
     tl.store(post_out_ptr + t * N + offs_n2, post_g)
     tl.store(pre_out_ptr + t * N + offs_n2, pre_g)
     tl.store(comb_out_ptr + t * N * N + offs_n2[:, None] * N + offs_n2[None, :], comb)
@@ -144,8 +172,12 @@ def _mhc_stage2_kernel(
 
 @triton.jit
 def _mhc_stage3_kernel(
-    res_out_ptr, pre_ptr, li_out_ptr,
-    H: tl.constexpr, N: tl.constexpr, BLOCK_H: tl.constexpr,
+    res_out_ptr,
+    pre_ptr,
+    li_out_ptr,
+    H: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
 ):
     """layer_input = sum_n pre_n * res_new_n, parallel over hidden chunks."""
     t = tl.program_id(0).to(tl.int64)
@@ -207,23 +239,47 @@ def mhc_fused_post_pre_triton(
         residual,
         post_mix.contiguous().view(t, n) if has_post else post_out,
         comb_mix.contiguous() if has_post else comb_out,
-        fn, res_out, sq_part, mix_part,
-        H=h, N=n, MIX=mix, BLK_MIX=blk_mix,
-        SPLIT=split, BLOCK_H=block_h, NS=ns,
+        fn,
+        res_out,
+        sq_part,
+        mix_part,
+        H=h,
+        N=n,
+        MIX=mix,
+        BLK_MIX=blk_mix,
+        SPLIT=split,
+        BLOCK_H=block_h,
+        NS=ns,
         HAS_POST=has_post,
-        num_warps=4, num_stages=2,
+        num_warps=4,
+        num_stages=2,
     )
     _mhc_stage2_kernel[(t,)](
-        sq_part, mix_part, hc_scale, hc_base,
-        post_out, comb_out, pre_out,
-        rms_eps, hc_eps, post_mult,
+        sq_part,
+        mix_part,
+        hc_scale,
+        hc_base,
+        post_out,
+        comb_out,
+        pre_out,
+        rms_eps,
+        hc_eps,
+        post_mult,
         SINKHORN=sinkhorn_repeat,
-        H=h, N=n, MIX=mix, BLK_MIX=blk_mix, NS=ns,
+        H=h,
+        N=n,
+        MIX=mix,
+        BLK_MIX=blk_mix,
+        NS=ns,
         num_warps=1,
     )
     _mhc_stage3_kernel[(t, triton.cdiv(h, 1024))](
-        res_out, pre_out, li_out,
-        H=h, N=n, BLOCK_H=min(1024, triton.next_power_of_2(h)),
+        res_out,
+        pre_out,
+        li_out,
+        H=h,
+        N=n,
+        BLOCK_H=min(1024, triton.next_power_of_2(h)),
         num_warps=4,
     )
     return res_out, post_out.view(t, n, 1), comb_out, li_out

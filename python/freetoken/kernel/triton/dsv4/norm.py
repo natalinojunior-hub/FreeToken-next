@@ -17,9 +17,17 @@ _TL = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl
 
 @triton.jit
 def _rmsnorm_kernel(
-    x_ptr, w_ptr, out_ptr, M, D, eps,
-    stride_xm, stride_om,
-    BLOCK_D: tl.constexpr, HAS_W: tl.constexpr, compute_type: tl.constexpr,
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    M,
+    D,
+    eps,
+    stride_xm,
+    stride_om,
+    BLOCK_D: tl.constexpr,
+    HAS_W: tl.constexpr,
+    compute_type: tl.constexpr,
 ):
     row = tl.program_id(0)
     if row >= M:
@@ -44,10 +52,18 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.
     BLOCK_D = triton.next_power_of_2(D)
     num_warps = 4 if BLOCK_D <= 1024 else (8 if BLOCK_D <= 4096 else 16)
     _rmsnorm_kernel[(M,)](
-        x2d, weight, out, M, D, eps,
-        x2d.stride(0), out.stride(0),
-        BLOCK_D=BLOCK_D, HAS_W=weight is not None,
-        compute_type=_TL[out_dtype], num_warps=num_warps,
+        x2d,
+        weight,
+        out,
+        M,
+        D,
+        eps,
+        x2d.stride(0),
+        out.stride(0),
+        BLOCK_D=BLOCK_D,
+        HAS_W=weight is not None,
+        compute_type=_TL[out_dtype],
+        num_warps=num_warps,
     )
     return out.reshape(x.shape)
 

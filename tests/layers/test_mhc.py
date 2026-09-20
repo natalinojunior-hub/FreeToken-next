@@ -79,9 +79,7 @@ def test_fused_equals_decomposed():
         x, res, post0, comb0, fn, scale, base, RMS_EPS, EPS, POST_MULT, SINKHORN
     )
     r_ref = mhc_post(x, res, post0, comb0)
-    p_ref, c_ref, li_ref = mhc_pre(
-        r_ref, fn, scale, base, RMS_EPS, EPS, POST_MULT, SINKHORN
-    )
+    p_ref, c_ref, li_ref = mhc_pre(r_ref, fn, scale, base, RMS_EPS, EPS, POST_MULT, SINKHORN)
     assert torch.equal(r1, r_ref)
     assert torch.equal(p1, p_ref)
     assert torch.equal(c1, c_ref)
@@ -165,12 +163,19 @@ def test_triton_pre_only_matches_torch():
     base = torch.randn(mix, dtype=torch.float32, device="cuda") * 0.3
     res = torch.randn(t, N, hidden, dtype=torch.bfloat16, device="cuda")
 
-    ref_post, ref_comb, ref_li = mhc_pre(
-        res, fn, scale, base, RMS_EPS, EPS, POST_MULT, SINKHORN
-    )
+    ref_post, ref_comb, ref_li = mhc_pre(res, fn, scale, base, RMS_EPS, EPS, POST_MULT, SINKHORN)
     got_res, got_post, got_comb, got_li = mhc_fused_post_pre_triton(
-        res.new_empty(t, hidden), res, None, None, fn, scale, base,
-        RMS_EPS, EPS, POST_MULT, SINKHORN,
+        res.new_empty(t, hidden),
+        res,
+        None,
+        None,
+        fn,
+        scale,
+        base,
+        RMS_EPS,
+        EPS,
+        POST_MULT,
+        SINKHORN,
     )
     assert torch.equal(got_res, res)  # pass-through when no post
     assert (got_post.float() - ref_post.float()).abs().max().item() < 2e-3

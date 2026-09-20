@@ -347,11 +347,28 @@ def test_decode_triton_attention_non_pow2_group(num_q_heads: int, num_kv_heads: 
     num_kv_splits = torch.full((batch,), max_kv_splits, dtype=torch.int32, device=device)
 
     actual = decode_paged_attention(
-        q, k_cache, v_cache, indptr, indices, q_positions,
-        attn_logits, attn_lse, num_kv_splits, max_kv_splits, sm_scale,
+        q,
+        k_cache,
+        v_cache,
+        indptr,
+        indices,
+        q_positions,
+        attn_logits,
+        attn_lse,
+        num_kv_splits,
+        max_kv_splits,
+        sm_scale,
     )
     expected = _reference_paged_attention(
-        q, k_cache, v_cache, indptr, indices, q_to_req, q_positions, sm_scale, None,
+        q,
+        k_cache,
+        v_cache,
+        indptr,
+        indices,
+        q_to_req,
+        q_positions,
+        sm_scale,
+        None,
     )
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
@@ -517,7 +534,9 @@ def test_extend_triton_attention_matches_reference(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
 @pytest.mark.parametrize("use_split_inputs", [False, True])
 @pytest.mark.parametrize("sliding_window", [None, 48])
-def test_extend_triton_attention_with_bidirectional_blocks_matches_reference(use_split_inputs: bool, sliding_window: int | None):
+def test_extend_triton_attention_with_bidirectional_blocks_matches_reference(
+    use_split_inputs: bool, sliding_window: int | None
+):
     """Rows of an image span see the span's later keys across q tiles, text rows stay causal, the window still bounds the past."""
     from freetoken.kernel.triton.attention import extend_paged_attention
 
@@ -539,25 +558,58 @@ def test_extend_triton_attention_with_bidirectional_blocks_matches_reference(use
     q_positions = torch.empty(total_q, dtype=torch.int64, device=device)
     block_ends = torch.zeros(total_q, dtype=torch.int32, device=device)
     offset = kv_offset = 0
-    for req_idx, (cached_len, extend_len, (lo, hi)) in enumerate(zip(cached_lens, extend_lens, spans)):
+    for req_idx, (cached_len, extend_len, (lo, hi)) in enumerate(
+        zip(cached_lens, extend_lens, spans)
+    ):
         q_to_req[offset : offset + extend_len].fill_(req_idx)
-        q_positions[offset : offset + extend_len] = torch.arange(cached_len, cached_len + extend_len, device=device)
-        block_ends[offset + max(lo, cached_len) - cached_len : offset + min(hi, cached_len + extend_len) - cached_len] = hi
+        q_positions[offset : offset + extend_len] = torch.arange(
+            cached_len, cached_len + extend_len, device=device
+        )
+        block_ends[
+            offset + max(lo, cached_len) - cached_len : offset
+            + min(hi, cached_len + extend_len)
+            - cached_len
+        ] = hi
         offset += extend_len
         kv_offset += cached_len + extend_len
-    k_extend = torch.cat([k_cache[kv_indptr[i] + cached_lens[i] : kv_indptr[i + 1]] for i in range(2)])
-    v_extend = torch.cat([v_cache[kv_indptr[i] + cached_lens[i] : kv_indptr[i + 1]] for i in range(2)])
+    k_extend = torch.cat(
+        [k_cache[kv_indptr[i] + cached_lens[i] : kv_indptr[i + 1]] for i in range(2)]
+    )
+    v_extend = torch.cat(
+        [v_cache[kv_indptr[i] + cached_lens[i] : kv_indptr[i + 1]] for i in range(2)]
+    )
     sm_scale = head_dim**-0.5
 
     actual = extend_paged_attention(
-        q, k_cache, v_cache, qo_indptr, kv_indptr, indices, prefix_lens, max(extend_lens), sm_scale,
-        sliding_window=sliding_window, block_ends=block_ends,
-        k_extend=k_extend if use_split_inputs else None, v_extend=v_extend if use_split_inputs else None,
+        q,
+        k_cache,
+        v_cache,
+        qo_indptr,
+        kv_indptr,
+        indices,
+        prefix_lens,
+        max(extend_lens),
+        sm_scale,
+        sliding_window=sliding_window,
+        block_ends=block_ends,
+        k_extend=k_extend if use_split_inputs else None,
+        v_extend=v_extend if use_split_inputs else None,
     )
     expected = _reference_paged_attention(
-        q, k_cache, v_cache, kv_indptr, indices, q_to_req, q_positions, sm_scale, sliding_window, block_ends=block_ends
+        q,
+        k_cache,
+        v_cache,
+        kv_indptr,
+        indices,
+        q_to_req,
+        q_positions,
+        sm_scale,
+        sliding_window,
+        block_ends=block_ends,
     )
-    causal_only = _reference_paged_attention(q, k_cache, v_cache, kv_indptr, indices, q_to_req, q_positions, sm_scale, sliding_window)
+    causal_only = _reference_paged_attention(
+        q, k_cache, v_cache, kv_indptr, indices, q_to_req, q_positions, sm_scale, sliding_window
+    )
 
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
     assert not torch.allclose(expected.float(), causal_only.float(), atol=2e-2, rtol=2e-2)
@@ -761,7 +813,9 @@ def test_triton_backend_applies_the_batch_block_ends_only_when_the_spec_asks(mon
     device = torch.device("cuda")
     head_dim = 256
     kv_cache = FakeKVCache(device, head_dim)
-    ctx = SimpleNamespace(kv_cache=kv_cache, page_table=torch.tensor([[0, 1, 2]], dtype=torch.int32, device=device))
+    ctx = SimpleNamespace(
+        kv_cache=kv_cache, page_table=torch.tensor([[0, 1, 2]], dtype=torch.int32, device=device)
+    )
     monkeypatch.setattr("freetoken.attention.triton.get_global_ctx", lambda: ctx)
     backend = TritonAttentionBackend(SimpleNamespace())
     # one request: cached token 0, chunk tokens 1 and 2 forming one image span [1, 3)
@@ -778,13 +832,35 @@ def test_triton_backend_applies_the_batch_block_ends_only_when_the_spec_asks(mon
     backend.prepare_metadata(batch)
     md = batch.attn_metadata
     ref = lambda ends: _reference_paged_attention(
-        q, kv_cache.k, kv_cache.v, md.indptr, md.indices, md.q_to_req, md.q_positions, head_dim**-0.5, None, block_ends=ends
+        q,
+        kv_cache.k,
+        kv_cache.v,
+        md.indptr,
+        md.indices,
+        md.q_to_req,
+        md.q_positions,
+        head_dim**-0.5,
+        None,
+        block_ends=ends,
     )
-    causal = backend.forward(q, k, v, layer_id=0, batch=batch, attn_spec=AttentionSpec(sm_scale=head_dim**-0.5))
+    causal = backend.forward(
+        q, k, v, layer_id=0, batch=batch, attn_spec=AttentionSpec(sm_scale=head_dim**-0.5)
+    )
     torch.testing.assert_close(causal.float(), ref(None).float(), atol=2e-2, rtol=2e-2)
-    blocks = backend.forward(q, k, v, layer_id=0, batch=batch, attn_spec=AttentionSpec(sm_scale=head_dim**-0.5, bidirectional_mm_blocks=True))
-    torch.testing.assert_close(blocks.float(), ref(batch.mm_block_ends).float(), atol=2e-2, rtol=2e-2)
-    assert not torch.allclose(blocks[0].float(), causal[0].float(), atol=2e-2, rtol=2e-2)  # token 1 now sees token 2
+    blocks = backend.forward(
+        q,
+        k,
+        v,
+        layer_id=0,
+        batch=batch,
+        attn_spec=AttentionSpec(sm_scale=head_dim**-0.5, bidirectional_mm_blocks=True),
+    )
+    torch.testing.assert_close(
+        blocks.float(), ref(batch.mm_block_ends).float(), atol=2e-2, rtol=2e-2
+    )
+    assert not torch.allclose(
+        blocks[0].float(), causal[0].float(), atol=2e-2, rtol=2e-2
+    )  # token 1 now sees token 2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")

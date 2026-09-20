@@ -11,7 +11,11 @@ import os
 import pytest
 import torch
 
-from freetoken.moe.bench_profile import default_profile_path, load_backend_recommendation, load_hybrid_fetch_fraction
+from freetoken.moe.bench_profile import (
+    default_profile_path,
+    load_backend_recommendation,
+    load_hybrid_fetch_fraction,
+)
 from freetoken.moe.offload_cache import OffloadMoeCache
 
 Q = 1 << 16
@@ -46,12 +50,14 @@ def test_load_hybrid_fetch_fraction(tmp_path):
         "dtype_kernels": {
             "bf16": {"cpu_moe_gbs": 100.0, "pcie_gather_gbs": 40.0},
             # overlapped (contended) pair wins over the standalone numbers when present
-            "nvfp4_x": {"cpu_moe_gbs": 100.0, "pcie_gather_gbs": 40.0,
-                        "cpu_moe_overlap_gbs": 90.0, "pcie_gather_overlap_gbs": 30.0},
+            "nvfp4_x": {
+                "cpu_moe_gbs": 100.0,
+                "pcie_gather_gbs": 40.0,
+                "cpu_moe_overlap_gbs": 90.0,
+                "pcie_gather_overlap_gbs": 30.0,
+            },
         },
-        "workloads": {
-            "m": {"kernels": {"ds_fp4": {"cpu_moe_gbs": 80.0, "pcie_gather_gbs": 50.0}}}
-        },
+        "workloads": {"m": {"kernels": {"ds_fp4": {"cpu_moe_gbs": 80.0, "pcie_gather_gbs": 50.0}}}},
     }
     path = tmp_path / "benchbw.json"
     path.write_text(json.dumps(prof))
@@ -92,9 +98,14 @@ def test_hybrid_fraction_gpu_matches_cpu_reference():
 
     def make():
         return OffloadMoeCache(
-            num_layers=2, num_experts=num_experts, cache_size=cache_size,
-            device=torch.device("cuda"), quant_format="bf16", decode_target="hybrid",
-            hybrid_max_fetch=num_experts, hybrid_fetch_fraction=frac,
+            num_layers=2,
+            num_experts=num_experts,
+            cache_size=cache_size,
+            device=torch.device("cuda"),
+            quant_format="bf16",
+            decode_target="hybrid",
+            hybrid_max_fetch=num_experts,
+            hybrid_fetch_fraction=frac,
         )
 
     gpu, ref = make(), make()
@@ -119,8 +130,13 @@ def test_hybrid_fraction_gpu_matches_cpu_reference():
 def test_hybrid_fixed_cap_unchanged():
     # fraction 0 (no profile / explicit --moe-hybrid-max-fetch) keeps the fixed cap.
     cache = OffloadMoeCache(
-        num_layers=1, num_experts=32, cache_size=40, device=torch.device("cuda"),
-        quant_format="bf16", decode_target="hybrid", hybrid_max_fetch=1,
+        num_layers=1,
+        num_experts=32,
+        cache_size=40,
+        device=torch.device("cuda"),
+        quant_format="bf16",
+        decode_target="hybrid",
+        hybrid_max_fetch=1,
     )
     ids = torch.arange(8, dtype=torch.int32).cuda()
     cache.ensure_experts_hybrid(0, ids)

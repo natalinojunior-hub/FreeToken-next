@@ -118,8 +118,12 @@ def test_mtp_registration_gives_the_draft_layer_its_own_kv_storage(monkeypatch):
     )
     cfg = with_mtp_layer(parse_config(_hf_config()), 48)
     pool = create_kvcache_pool(
-        cfg, num_pages=8, page_size=16, dtype=torch.bfloat16,
-        device=torch.device("cpu"), num_req_slots=4,
+        cfg,
+        num_pages=8,
+        page_size=16,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        num_req_slots=4,
     )
     assert pool.num_layers == 49
     assert pool.k_cache(48).data_ptr() != pool.k_cache(47).data_ptr()
@@ -218,9 +222,7 @@ def test_output_gate_null_falls_back_to_hidden_act():
     hf = _hf_config()
     hf.text_config.output_gate_type = None
     linear = [
-        g
-        for g in parse_config(hf).attention_groups
-        if isinstance(g, LinearGatedDeltaGroupConfig)
+        g for g in parse_config(hf).attention_groups if isinstance(g, LinearGatedDeltaGroupConfig)
     ]
     assert linear[0].output_gate == "silu"
 
@@ -234,8 +236,16 @@ def test_eos_token_id_list_uses_the_first_entry():
 
 def _vision_config():
     return SimpleNamespace(
-        hidden_size=1152, depth=27, num_heads=16, intermediate_size=4304, patch_size=16, temporal_patch_size=2,
-        spatial_merge_size=2, num_position_embeddings=2304, out_hidden_size=2560, in_channels=3,
+        hidden_size=1152,
+        depth=27,
+        num_heads=16,
+        intermediate_size=4304,
+        patch_size=16,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        num_position_embeddings=2304,
+        out_hidden_size=2560,
+        in_channels=3,
         deepstack_visual_indexes=[],
     )
 
@@ -246,22 +256,37 @@ def test_vision_turns_on_mrope_and_the_tower():
     config = parse_config(hf)
     assert config.is_multimodal and config.model_is_mrope
     assert config.rotary_config.mrope_section == [11, 11, 10]
-    assert config.rotary_config.mrope_layout == "interleaved" and config.rotary_config.rotary_dim == 64
-    assert config.vision_config.out_hidden_size == 2560 and config.vision_config.deepstack_visual_indexes == ()
+    assert (
+        config.rotary_config.mrope_layout == "interleaved" and config.rotary_config.rotary_dim == 64
+    )
+    assert (
+        config.vision_config.out_hidden_size == 2560
+        and config.vision_config.deepstack_visual_indexes == ()
+    )
     assert config.qwen4_args.image_token_id == 248056
 
 
 def test_text_only_keeps_the_1d_rope():
     config = parse_config(_hf_config())
-    assert not config.is_multimodal and not config.model_is_mrope and config.rotary_config.mrope_section is None
+    assert (
+        not config.is_multimodal
+        and not config.model_is_mrope
+        and config.rotary_config.mrope_section is None
+    )
+
+
 # the merged-projection prefixes the model asks the QuantConfig about (attention.py / gdn.py)
 DENSE_PREFIXES = (
-    "model.layers.3.self_attn.qkv_proj", "model.layers.3.self_attn.o_proj",
-    "model.layers.0.linear_attn.in_proj_qkvz", "model.layers.0.linear_attn.out_proj",
+    "model.layers.3.self_attn.qkv_proj",
+    "model.layers.3.self_attn.o_proj",
+    "model.layers.0.linear_attn.in_proj_qkvz",
+    "model.layers.0.linear_attn.out_proj",
 )
 BF16_PREFIXES = (
-    "model.layers.0.linear_attn.in_proj_ba", "model.layers.0.mlp.shared_expert.gate_up_proj",
-    "model.layers.3.self_attn.indexer.index_qk_proj", "lm_head",
+    "model.layers.0.linear_attn.in_proj_ba",
+    "model.layers.0.mlp.shared_expert.gate_up_proj",
+    "model.layers.3.self_attn.indexer.index_qk_proj",
+    "lm_head",
 )
 
 
@@ -282,7 +307,9 @@ def test_block_fp8_dense_schemes(tmp_path):
     assert parse_config(_hf_config(LOVEDHEART_NVFP4_FP8)).expert_quant == "nvfp4"
 
 
-@pytest.mark.parametrize("quantization_config", [RADIXARK_NVFP4, NVIDIA_NVFP4, None], ids=["RadixArk", "nvidia", "bf16"])
+@pytest.mark.parametrize(
+    "quantization_config", [RADIXARK_NVFP4, NVIDIA_NVFP4, None], ids=["RadixArk", "nvidia", "bf16"]
+)
 def test_released_checkpoints_keep_the_dense_projections_bf16(quantization_config, tmp_path):
     quant = _quant(_hf_config(quantization_config), tmp_path)
     for prefix in DENSE_PREFIXES + BF16_PREFIXES:

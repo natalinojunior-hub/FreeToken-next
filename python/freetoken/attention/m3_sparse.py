@@ -82,8 +82,7 @@ def _pick_inner_backend(block_size: int) -> str:
                 info = attention_backend_info(part)
             except KeyError:
                 raise ValueError(
-                    f"FREETOKEN_M3_INNER_BACKEND={override!r}: unknown attention "
-                    f"backend {part!r}"
+                    f"FREETOKEN_M3_INNER_BACKEND={override!r}: unknown attention backend {part!r}"
                 ) from None
             if AttnType.FULL not in info.supported_types:
                 raise ValueError(
@@ -288,8 +287,14 @@ class M3SparseAttnBackend(BaseAttnBackend):
         )
         out = torch.empty_like(q)
         m3_sparse_attn_decode(
-            q, self._k_rows(layer_id), self._v_rows(layer_id),
-            topk_idx, block_rows, kvlen, self.sm_scale, out,
+            q,
+            self._k_rows(layer_id),
+            self._v_rows(layer_id),
+            topk_idx,
+            block_rows,
+            kvlen,
+            self.sm_scale,
+            out,
         )
         return out
 
@@ -327,13 +332,15 @@ class M3SparseAttnBackend(BaseAttnBackend):
             chunks = []
             for s0 in range(0, m, chunk):
                 s1 = min(s0 + chunk, m)
-                chunks.append((
-                    slice(qo[i] + s0, qo[i] + s1),
-                    torch.tensor([0, s1 - s0], dtype=torch.int32, device=self.device),
-                    seq,
-                    torch.tensor([r.cached_len + s0], dtype=torch.int32, device=self.device),
-                    s1 - s0,
-                ))
+                chunks.append(
+                    (
+                        slice(qo[i] + s0, qo[i] + s1),
+                        torch.tensor([0, s1 - s0], dtype=torch.int32, device=self.device),
+                        seq,
+                        torch.tensor([r.cached_len + s0], dtype=torch.int32, device=self.device),
+                        s1 - s0,
+                    )
+                )
             plan.append((block_rows, kv_len, chunks))
         md.prefill_plan = plan
         return plan
@@ -353,17 +360,37 @@ class M3SparseAttnBackend(BaseAttnBackend):
         for block_rows, kv_len, chunks in self._prefill_plan(md, batch):
             for sl, cu, seq, prefix, chunk_len in chunks:
                 score = m3_index_score_prefill(
-                    index_q[sl], ik_rows, block_rows, cu, seq, prefix,
-                    chunk_len, kv_len,
+                    index_q[sl],
+                    ik_rows,
+                    block_rows,
+                    cu,
+                    seq,
+                    prefix,
+                    chunk_len,
+                    kv_len,
                 )
                 topk_idx = m3_index_topk_prefill(
-                    score, cu, prefix, chunk_len,
-                    self.topk_blocks, self.args.init_blocks, self.args.local_blocks,
+                    score,
+                    cu,
+                    prefix,
+                    chunk_len,
+                    self.topk_blocks,
+                    self.args.init_blocks,
+                    self.args.local_blocks,
                 )
                 del score
                 m3_sparse_attn_prefill(
-                    q[sl], k_rows, v_rows, topk_idx, block_rows,
-                    cu, seq, prefix, chunk_len, self.sm_scale, out[sl],
+                    q[sl],
+                    k_rows,
+                    v_rows,
+                    topk_idx,
+                    block_rows,
+                    cu,
+                    seq,
+                    prefix,
+                    chunk_len,
+                    self.sm_scale,
+                    out[sl],
                 )
         return out
 

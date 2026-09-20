@@ -44,7 +44,10 @@ class CachePools:
         return tuple(
             name
             for name, present in (
-                ("moe", self.moe), ("kv", self.kv), ("mamba", self.mamba), ("swa", self.swa)
+                ("moe", self.moe),
+                ("kv", self.kv),
+                ("mamba", self.mamba),
+                ("swa", self.swa),
             )
             if present
         )
@@ -200,9 +203,11 @@ def format_cache_status(doc: dict, *, prefix: str = "cache: ") -> str:
 
     with_vram = bool(known)
     with_range = any(resize for _pool, _detail, _size, resize in rows)
-    table = [["pool", "size"] + (["vram"] if with_vram else []) + (
-        ["resizable to"] if with_range else []
-    )]
+    table = [
+        ["pool", "size"]
+        + (["vram"] if with_vram else [])
+        + (["resizable to"] if with_range else [])
+    ]
     for pool, detail, size, resize in rows:
         cells = [pool, detail]
         if with_vram:

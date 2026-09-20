@@ -93,9 +93,7 @@ async def prepare_stop_accounting(
 
         config = state.config
         ready_at = getattr(state, "ready_at", None)
-        uptime_s = (
-            max(0, int(time.monotonic() - ready_at)) if ready_at is not None else 0
-        )
+        uptime_s = max(0, int(time.monotonic() - ready_at)) if ready_at is not None else 0
         sealed = {
             "instance_id": state.instance_id,
             "model_id": getattr(config, "served_model_name", None),

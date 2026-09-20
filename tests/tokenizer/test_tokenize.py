@@ -156,7 +156,10 @@ def encode_messages(messages, thinking_mode, reasoning_effort=None):
                     "id": "call0",
                     "type": "function",
                     # dict form, as produced by server render_messages
-                    "function": {"name": "exec", "arguments": {"command": "gog calendar time", "n": 2}},
+                    "function": {
+                        "name": "exec",
+                        "arguments": {"command": "gog calendar time", "n": 2},
+                    },
                 }
             ],
         },

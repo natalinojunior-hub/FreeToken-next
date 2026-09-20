@@ -55,8 +55,16 @@ def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capaci
     )
 
 
-def _spec(*, index_ratio=4, attn_type=AttnType.QSA, num_kv_heads=2, head_dim=64,
-          index_head_dim=32, num_index_layers=4, layer_ids=(1, 3, 5, 7)):
+def _spec(
+    *,
+    index_ratio=4,
+    attn_type=AttnType.QSA,
+    num_kv_heads=2,
+    head_dim=64,
+    index_head_dim=32,
+    num_index_layers=4,
+    layer_ids=(1, 3, 5, 7),
+):
     return KVCacheGroupSpec(
         name="full",
         layer_ids=layer_ids,
@@ -71,7 +79,9 @@ def _spec(*, index_ratio=4, attn_type=AttnType.QSA, num_kv_heads=2, head_dim=64,
 
 
 def _config(spec, *, page_size=64, max_running_req=3):
-    mc = SimpleNamespace(num_layers=8, has_swa_attention=False, has_linear_attention=True, model_is_mrope=False)
+    mc = SimpleNamespace(
+        num_layers=8, has_swa_attention=False, has_linear_attention=True, model_is_mrope=False
+    )
     mc.kv_cache_group_specs = lambda: (spec,)
     return SimpleNamespace(
         model_config=mc,
@@ -128,9 +138,18 @@ def test_group_must_not_straddle_a_page():
 def test_index_slab_needs_a_two_byte_dtype():
     with pytest.raises(AssertionError, match="2 bytes"):
         QSAKVCache(
-            num_kv_heads=2, num_layers=8, head_dim=64, num_pages=4, page_size=64,
-            dtype=torch.float32, device=DEV, index_head_dim=32, num_index_layers=4,
-            index_ratio=4, num_req_slots=4, layer_ids=(1, 3, 5, 7),
+            num_kv_heads=2,
+            num_layers=8,
+            head_dim=64,
+            num_pages=4,
+            page_size=64,
+            dtype=torch.float32,
+            device=DEV,
+            index_head_dim=32,
+            num_index_layers=4,
+            index_ratio=4,
+            num_req_slots=4,
+            layer_ids=(1, 3, 5, 7),
         )
 
 
@@ -163,15 +182,27 @@ def test_rebuild_resizes_every_tier_and_keeps_identity():
 
 
 def test_spec_bytes_per_token_divides_the_index_slab():
-    spec = _spec(num_kv_heads=2, head_dim=256, index_head_dim=128, num_index_layers=12,
-                 layer_ids=FULL_LAYER_IDS)
+    spec = _spec(
+        num_kv_heads=2,
+        head_dim=256,
+        index_head_dim=128,
+        num_index_layers=12,
+        layer_ids=FULL_LAYER_IDS,
+    )
     config = _config(spec)
     assert spec_kv_bytes_per_token(spec, config) == REAL_KV_BYTES + REAL_INDEX_BYTES
     assert spec_kv_bytes_per_token(spec, config) == 24576 + 768
 
     # BSA/DSA keep one index row per token (ratio 1)
-    bsa = _spec(num_kv_heads=2, head_dim=256, index_head_dim=128, num_index_layers=12,
-                layer_ids=FULL_LAYER_IDS, index_ratio=1, attn_type=AttnType.BSA)
+    bsa = _spec(
+        num_kv_heads=2,
+        head_dim=256,
+        index_head_dim=128,
+        num_index_layers=12,
+        layer_ids=FULL_LAYER_IDS,
+        index_ratio=1,
+        attn_type=AttnType.BSA,
+    )
     assert spec_kv_bytes_per_token(bsa, config) == REAL_KV_BYTES + 128 * 12 * 2
 
 
@@ -212,8 +243,12 @@ def test_resolve_pool_class_and_factory():
     spec = _spec()
     mc = SimpleNamespace(
         model_is_mrope=False,
-        num_layers=8, has_swa_attention=False, has_linear_attention=True,
-        num_kv_heads=2, head_dim=64, dsv4_args=None,
+        num_layers=8,
+        has_swa_attention=False,
+        has_linear_attention=True,
+        num_kv_heads=2,
+        head_dim=64,
+        dsv4_args=None,
     )
     mc.kv_cache_group_specs = lambda: (spec,)
     assert resolve_pool_class(mc) is QSAKVCache
@@ -240,3 +275,62 @@ def test_free_req_clears_pending_ring_and_scratch():
     pool.free_req(1)
     assert pool._pending_ring[1].abs().sum().item() == 0.0
     assert pool._cmp_k_buffer[:, pool.cmp_scratch_base + 1].abs().sum().item() == 0.0
+
+
+def test_free_req_clears_mtp_draft_slot():
+    pool = QSAKVCache(
+        num_kv_heads=2,
+        num_layers=9,
+        head_dim=64,
+        num_pages=4,
+        page_size=64,
+        dtype=torch.bfloat16,
+        device=DEV,
+        index_head_dim=32,
+        num_index_layers=5,
+        index_ratio=4,
+        num_req_slots=4,
+        layer_ids=(1, 3, 5, 7, 8),
+        mtp_layer_id=8,
+    )
+    assert pool._mtp_slot == 4
+
+    # Dirty MTP slot across tiers
+    pool._cmp_k_buffer[4].fill_(11.0)
+    pool._pending_ring[:, 4].fill_(13.0)
+    if hasattr(pool._pool, "_kv_buffer") and pool._pool._kv_buffer is not None:
+        pool._pool._kv_buffer[:, 4].fill_(17.0)
+    assert pool._cmp_k_buffer[4].abs().sum().item() > 0
+    assert pool._pending_ring[:, 4].abs().sum().item() > 0
+
+    pool.free_req(0)
+    assert pool._cmp_k_buffer[4].abs().sum().item() == 0.0
+    assert pool._pending_ring[:, 4].abs().sum().item() == 0.0
+    if hasattr(pool._pool, "_kv_buffer") and pool._pool._kv_buffer is not None:
+        assert pool._pool._kv_buffer[:, 4].abs().sum().item() == 0.0
+
+    # Also verify Turbo4 variant
+    pool_t4 = QSAKVCache(
+        num_kv_heads=2,
+        num_layers=9,
+        head_dim=128,
+        num_pages=4,
+        page_size=64,
+        dtype=torch.bfloat16,
+        device=DEV,
+        index_head_dim=32,
+        num_index_layers=5,
+        index_ratio=4,
+        num_req_slots=4,
+        layer_ids=(1, 3, 5, 7, 8),
+        mtp_layer_id=8,
+        kv_format="turbo4",
+    )
+    assert pool_t4._mtp_slot == 4
+    pool_t4._pool._k_codes[4].fill_(5)
+    pool_t4._pool._k_norm[4].fill_(1.5)
+    assert pool_t4._pool._k_codes[4].abs().sum().item() > 0
+    assert pool_t4._pool._k_norm[4].abs().sum().item() > 0
+    pool_t4.free_req(0)
+    assert pool_t4._pool._k_codes[4].abs().sum().item() == 0
+    assert pool_t4._pool._k_norm[4].abs().sum().item() == 0.0

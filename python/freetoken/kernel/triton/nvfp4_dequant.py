@@ -10,8 +10,22 @@ from freetoken.kernel.triton.e4m3_compat import e4m3_kernel_view, e4m3_native_cx
 
 # E2M1 (NVFP4) value table indexed by the 4-bit code.
 _E2M1_VALUES = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
 ]
 
 
@@ -24,15 +38,15 @@ def _e2m1_lut(device_index: int) -> torch.Tensor:
 
 @triton.jit
 def _dequant_nvfp4_kernel(
-    packed_ptr,      # [S, OUT, IN // 2] uint8
-    scale_ptr,       # [S, OUT, IN // 16] fp8-e4m3 per-block scale (checkpoint native)
-    global_ptr,      # [S, OUT] fp16 per-output-row global scale (weight_scale_2)
-    slots_ptr,       # [N] int32 -> cache slot for each output expert
-    out_ptr,         # [N, OUT, IN] compute dtype
-    lut_ptr,         # [16] float32 E2M1 values
+    packed_ptr,  # [S, OUT, IN // 2] uint8
+    scale_ptr,  # [S, OUT, IN // 16] fp8-e4m3 per-block scale (checkpoint native)
+    global_ptr,  # [S, OUT] fp16 per-output-row global scale (weight_scale_2)
+    slots_ptr,  # [N] int32 -> cache slot for each output expert
+    out_ptr,  # [N, OUT, IN] compute dtype
+    lut_ptr,  # [16] float32 E2M1 values
     OUT: tl.constexpr,
     IN: tl.constexpr,
-    IN_PACKED: tl.constexpr,   # IN // 2
+    IN_PACKED: tl.constexpr,  # IN // 2
     NUM_BLOCKS: tl.constexpr,  # IN // 16
     BLOCK_BYTES: tl.constexpr,
 ):
@@ -67,7 +81,9 @@ def _dequant_nvfp4_kernel(
     scale_idx = byte_off // 8
     scale_base = row * NUM_BLOCKS
     if e4m3_native_cx():
-        scale = tl.load(scale_ptr + scale_base + scale_idx, mask=byte_mask, other=0.0).to(tl.float32)
+        scale = tl.load(scale_ptr + scale_base + scale_idx, mask=byte_mask, other=0.0).to(
+            tl.float32
+        )
     else:
         scale = e4m3_u8_to_f32(tl.load(scale_ptr + scale_base + scale_idx, mask=byte_mask, other=0))
     scale = scale * g
@@ -77,7 +93,9 @@ def _dequant_nvfp4_kernel(
 
     out_base = pid_row.to(tl.int64) * IN
     tl.store(out_ptr + out_base + 2 * byte_off, val_lo.to(out_ptr.dtype.element_ty), mask=byte_mask)
-    tl.store(out_ptr + out_base + 2 * byte_off + 1, val_hi.to(out_ptr.dtype.element_ty), mask=byte_mask)
+    tl.store(
+        out_ptr + out_base + 2 * byte_off + 1, val_hi.to(out_ptr.dtype.element_ty), mask=byte_mask
+    )
 
 
 def dequant_nvfp4(

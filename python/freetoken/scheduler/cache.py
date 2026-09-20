@@ -12,6 +12,7 @@ from freetoken.utils import align_down, div_ceil
 if TYPE_CHECKING:
     from .utils import PendingReq
 
+
 # Proactive out-of-window free_swa runs every `interval` forwards (== sglang SWA_EVICTION_INTERVAL).
 def _swa_eviction_interval() -> int:
     raw = os.environ.get("FREETOKEN_SWA_EVICTION_INTERVAL", "128")
@@ -30,8 +31,16 @@ _SWA_RETAIN_GAP = 16
 
 
 class CacheManager:
-    def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
-                 linear_state_pool=None, swa_pool=None, sliding_window_size=None):
+    def __init__(
+        self,
+        num_pages: int,
+        page_size: int,
+        page_table: torch.Tensor,
+        type: str,
+        linear_state_pool=None,
+        swa_pool=None,
+        sliding_window_size=None,
+    ):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -77,16 +86,21 @@ class CacheManager:
         """(used_pages, total_pages): allocated, non-evictable pages over the pool total
         (active requests + protected prefix; evictable prefix-cache pages are excluded)."""
         total = self.num_pages
-        evictable = (self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)
-                     else self.prefix_cache.size_info.evictable_size)
+        evictable = (
+            self.prefix_cache.full_evictable_size
+            if (self.is_hybrid or self.is_swa)
+            else self.prefix_cache.size_info.evictable_size
+        )
         return total - len(self.free_slots) - evictable // self.page_size, total
 
     def _make_prefix_cache(self, device, page_size, type):
         if type == "hybrid_radix":
             from freetoken.kvcache.hybrid_radix_cache import HybridRadixCache
+
             return HybridRadixCache(device, page_size)
         if type == "swa_radix":
             from freetoken.kvcache.swa_radix_cache import SWARadixCache
+
             return SWARadixCache(device, page_size, self.sliding_window_size)
         return create_prefix_cache(device=device, type=type, page_size=page_size)
 
@@ -96,19 +110,25 @@ class CacheManager:
         ids = req.input_ids[: input_len - 1]
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
+
             m = self.prefix_cache.match_prefix(ids)
             return MatchResult(SWACacheHandle(m.cached_len, m.node, m.kv_indices))
         if self.is_hybrid:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
+
             m = self.prefix_cache.match_prefix(ids)
             return MatchResult(
-                HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value)
+                HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value
+            )
         return self.prefix_cache.match_prefix(ids)
 
     @property
     def available_size(self) -> int:
-        evictable = (self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)
-                     else self.prefix_cache.size_info.evictable_size)
+        evictable = (
+            self.prefix_cache.full_evictable_size
+            if (self.is_hybrid or self.is_swa)
+            else self.prefix_cache.size_info.evictable_size
+        )
         return evictable + len(self.free_slots) * self.page_size
 
     @property
@@ -186,8 +206,8 @@ class CacheManager:
         window = self.sliding_window_size
         for req in reqs:
             if req.decode_batch_idx < 1:
-                continue                       # overlap guard: extend forward may still be running
-            floor = req.cache_handle.cached_len   # reused prefix -> its swa is tree-owned, not ours
+                continue  # overlap guard: extend forward may still be running
+            floor = req.cache_handle.cached_len  # reused prefix -> its swa is tree-owned, not ours
             threshold = (req.device_len - 1) - window - self.page_size
             if req.toolcall_anchor_len is not None:
                 # Keep the window ending at the anchor resumable: a client-side rewrite of the
@@ -227,7 +247,7 @@ class CacheManager:
             return
         window = self.sliding_window_size
         for req in reqs:
-            floor = req.cache_handle.cached_len   # reused prefix -> its swa is tree-owned, not ours
+            floor = req.cache_handle.cached_len  # reused prefix -> its swa is tree-owned, not ours
             new_evicted = align_down(req.cached_len - window - self.page_size, self.page_size)
             start = max(req.swa_evicted_seqlen, floor)
             if new_evicted > start:
@@ -325,7 +345,8 @@ class CacheManager:
             if cached_len > old_handle.cached_len:
                 canonical = new_handle.get_matched_indices()
                 self.page_table[req.table_idx, old_handle.cached_len : cached_len].copy_(
-                    canonical[old_handle.cached_len : cached_len])
+                    canonical[old_handle.cached_len : cached_len]
+                )
             req.cache_handle = new_handle
             self.lock(new_handle)
 
@@ -360,7 +381,8 @@ class CacheManager:
                 frozen_idx = 1 - req.mamba_next_track_idx
                 frozen = req.mamba_ping_pong[frozen_idx]
                 prefix_len, mamba_exist = self.prefix_cache.insert(
-                    req.input_ids[:L], page_indices[:L], frozen)
+                    req.input_ids[:L], page_indices[:L], frozen
+                )
                 pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
                 req.mamba_ping_pong = None
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
@@ -374,13 +396,14 @@ class CacheManager:
             keep_live = False
             if insert_len == req.cached_len and insert_len > 0:
                 prefix_len, mamba_exist = self.prefix_cache.insert(
-                    req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
+                    req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx
+                )
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
-                keep_live = not mamba_exist           # tree now owns linear_slot_idx
+                keep_live = not mamba_exist  # tree now owns linear_slot_idx
             else:
                 self.unlock(old_handle)
-                self._free(page_indices[free_upto :])
+                self._free(page_indices[free_upto:])
             self._free_req_slots(req, keep_live=keep_live)
             return
 
@@ -394,10 +417,11 @@ class CacheManager:
             # state. Skip; the next aligned boundary (or the finish-donate) commits instead.
             req.mamba_last_track_seqlen = None
             return
-        frozen_idx = 1 - req.mamba_next_track_idx          # the slot the forward just wrote
+        frozen_idx = 1 - req.mamba_next_track_idx  # the slot the forward just wrote
         frozen = req.mamba_ping_pong[frozen_idx]
         prefix_len, mamba_exist = self.prefix_cache.insert(
-            req.input_ids[:L], page_indices[:L], frozen)
+            req.input_ids[:L], page_indices[:L], frozen
+        )
         self.unlock(old_handle)
         self._free(page_indices[old_handle.cached_len : prefix_len])
         # Lock the committed snapshot node FIRST: the replacement-slot alloc below can trigger
@@ -408,10 +432,11 @@ class CacheManager:
         # pages for [old_handle.cached_len, prefix_len) while its row still named them.
         if prefix_len > old_handle.cached_len:
             self.page_table[req.table_idx, old_handle.cached_len : prefix_len].copy_(
-                m.kv_indices[old_handle.cached_len : prefix_len])
+                m.kv_indices[old_handle.cached_len : prefix_len]
+            )
         req.cache_handle = HybridCacheHandle(m.cached_len, m.node, m.kv_indices)
         self.lock(req.cache_handle)
-        if not mamba_exist:                                # tree took `frozen`; replace it
+        if not mamba_exist:  # tree took `frozen`; replace it
             self.ensure_mamba_slots(1)
             pp = list(req.mamba_ping_pong)
             pp[frozen_idx] = pool.alloc(1)[0]
@@ -440,11 +465,15 @@ class CacheManager:
             # unfinished chunk's frontier is already > 0 and must be honored (else insert adopts
             # sentinel slots -> the request's later SWA gathers read slot 0 -> corruption).
             _, freed = self.prefix_cache.insert(
-                req.input_ids[:insert_len], page_indices[:insert_len],
+                req.input_ids[:insert_len],
+                page_indices[:insert_len],
                 swa_evicted_seqlen=req.swa_evicted_seqlen,
-                update_kv_after_len=old_handle.cached_len)
+                update_kv_after_len=old_handle.cached_len,
+            )
         self.unlock(old_handle)
-        self._free_swa(freed)   # idempotent: revived/out-of-window slots are already sentinel -> no-op
+        self._free_swa(
+            freed
+        )  # idempotent: revived/out-of-window slots are already sentinel -> no-op
         self._free(freed)
         if finished:
             # Page-unaligned tail (page_size>1) not inserted. The padded slice reaches to the
@@ -468,7 +497,8 @@ class CacheManager:
                 )
                 if keep_from > 0:
                     self._free_swa(
-                        self.prefix_cache.trim_head_swa(req.input_ids[:prompt_len], keep_from))
+                        self.prefix_cache.trim_head_swa(req.input_ids[:prompt_len], keep_from)
+                    )
                 self.prefix_cache.match_prefix(req.input_ids[:prompt_len])
         else:
             # inc_lock is node-granular, and the suffix insert just made this chunk's whole
@@ -478,7 +508,8 @@ class CacheManager:
             # alone. The head stays live and unlocked -- still reusable while the pool is
             # roomy, evictable the moment it is not.
             keep_from = align_down(
-                max(insert_len - self.sliding_window_size - _SWA_RETAIN_GAP, 0), self.page_size)
+                max(insert_len - self.sliding_window_size - _SWA_RETAIN_GAP, 0), self.page_size
+            )
             if keep_from > 0:
                 self.prefix_cache.match_prefix(req.input_ids[:keep_from])
             m = self.prefix_cache.match_prefix(req.input_ids[:insert_len])

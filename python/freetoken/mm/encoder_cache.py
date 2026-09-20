@@ -43,7 +43,9 @@ class EncoderCache:
             return
         if self._storage == "cpu":
             stored = torch.empty(
-                embedding.shape, dtype=embedding.dtype, device="cpu",
+                embedding.shape,
+                dtype=embedding.dtype,
+                device="cpu",
                 pin_memory=torch.cuda.is_available(),
             )
             stored.copy_(embedding, non_blocking=True)
@@ -61,7 +63,9 @@ class EncoderCache:
         """Account rows uid gathered; the last row of the last holder frees the entry."""
         entry = self._entries[item_hash]
         left = entry.remaining[uid] - rows
-        assert left >= 0, f"request {uid} gathered more rows of image {item_hash} than it registered"
+        assert left >= 0, (
+            f"request {uid} gathered more rows of image {item_hash} than it registered"
+        )
         if left:
             entry.remaining[uid] = left
             return

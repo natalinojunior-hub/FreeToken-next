@@ -50,7 +50,8 @@ def test_table_manager_rebuild_reallocs_token_pool_and_frees_slots():
 
     pt = _page_table(4, 64)
     tm = TableManager(max_running_reqs=4, page_table=pt)
-    tm.allocate(); tm.allocate()  # consume 2 slots
+    tm.allocate()
+    tm.allocate()  # consume 2 slots
 
     new_pt = _page_table(4, 128)
     tm.rebuild(new_pt)
@@ -106,36 +107,6 @@ def test_normal_loop_defers_pending_rebuild_while_busy():
     assert sched._pending_rebuild is pending  # still queued
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def test_rebuild_cache_refreshes_prefill_budget(monkeypatch):
     # A rebuild that shrank the DSV4 window pool must shrink Scheduler.prefill_budget to the new
     # prefill_chunk_budget, or the next long prompt is chunked against the stale (larger) cap.
@@ -158,7 +129,8 @@ def test_rebuild_cache_refreshes_prefill_budget(monkeypatch):
     # DSV4-like manager: prefill_chunk_budget tracks the (about-to-shrink) window pool; no shared
     # page table, so rebuild_cache's prefix-cache rebuild branch is skipped.
     cache_manager = SimpleNamespace(
-        prefill_chunk_budget=5000, rebuild=lambda *a: None, check_integrity=lambda: None)
+        prefill_chunk_budget=5000, rebuild=lambda *a: None, check_integrity=lambda: None
+    )
     sched.cache_manager = cache_manager
     sched.table_manager.rebuild = lambda pt: None
     sched.table_manager.token_pool = None

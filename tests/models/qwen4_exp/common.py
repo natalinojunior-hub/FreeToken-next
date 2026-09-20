@@ -43,8 +43,7 @@ def hf_config(
         num_attention_heads=num_q,
         num_key_value_heads=num_kv,
         layer_types=[
-            "full_attention" if (i + 1) % 4 == 0 else "linear_attention"
-            for i in range(num_layers)
+            "full_attention" if (i + 1) % 4 == 0 else "linear_attention" for i in range(num_layers)
         ],
         rope_parameters={
             "rope_type": "default",
@@ -95,8 +94,16 @@ def hf_config(
 def toy_hf_config(num_layers: int = 4, **text_overrides) -> SimpleNamespace:
     """The small-geometry config the PLE/skeleton tests share (hidden 128, head_dim 64)."""
     return hf_config(
-        num_layers=num_layers, head_dim=64, num_kv=1, index_head_dim=64, index_heads=2,
-        budget=16, hidden=128, max_position=4096, rope_theta=10000.0, **text_overrides,
+        num_layers=num_layers,
+        head_dim=64,
+        num_kv=1,
+        index_head_dim=64,
+        index_heads=2,
+        budget=16,
+        hidden=128,
+        max_position=4096,
+        rope_theta=10000.0,
+        **text_overrides,
     )
 
 
@@ -177,9 +184,7 @@ class Fixture:
             (self.num_req_slots, num_pages * page_size), dtype=torch.int32, device=self.device
         )
         self.page_table[max_running_req].fill_(num_pages * page_size)  # dummy page
-        self.ctx = fresh_ctx(
-            page_size=page_size, page_table=self.page_table, kv_cache=self.pool
-        )
+        self.ctx = fresh_ctx(page_size=page_size, page_table=self.page_table, kv_cache=self.pool)
         self.backend = QSASparseAttnBackend(config)
         self.ctx.attn_backend = self.backend
         self._free = list(range(num_pages))
@@ -291,11 +296,22 @@ NVIDIA_NVFP4 = {
     "quant_algo": "MIXED_PRECISION",
     "quant_method": "modelopt",
     "quantized_layers": {
-        **{f"model.language_model.layers.{i}.mlp.experts": {"quant_algo": "NVFP4", "group_size": 16} for i in range(48)},
+        **{
+            f"model.language_model.layers.{i}.mlp.experts": {
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+            }
+            for i in range(48)
+        },
         "model.language_model.layers.1.ple.ple_embedding.ngram_embedding": {"quant_algo": "FP8"},
         "mtp.layers.0.mlp.experts": {"quant_algo": "FP8_PB_WO", "group_size": 128},
     },
-    "ignore": ["lm_head", "model.language_model.embed_tokens", "model.language_model.layers.0.mlp.shared_expert*", "model.visual*"],
+    "ignore": [
+        "lm_head",
+        "model.language_model.embed_tokens",
+        "model.language_model.layers.0.mlp.shared_expert*",
+        "model.visual*",
+    ],
 }
 
 # Qwen/Qwen3.8-Flash-Next-FP8: 128x128 block-fp8 experts, everything else listed in modules_to_not_convert
@@ -324,16 +340,37 @@ def mixed_precision_quant(gdn_layers, attn_layers, moe_layers) -> dict:
         "quant_method": "modelopt",
         "quant_algo": "MIXED_PRECISION",
         "quantized_layers": {
-            **{f"{LM}.layers.{i}.mlp.experts": {"quant_algo": "NVFP4", "group_size": 16} for i in moe_layers},
-            **{f"{LM}.layers.{i}.linear_attn.{p}": {"quant_algo": "FP8_PB_WO", "group_size": 128}
-               for i in gdn_layers for p in ("in_proj_qkv", "in_proj_z", "out_proj")},
-            **{f"{LM}.layers.{i}.self_attn.{p}_proj": {"quant_algo": "FP8_PB_WO", "group_size": 128}
-               for i in attn_layers for p in "qkvo"},
+            **{
+                f"{LM}.layers.{i}.mlp.experts": {"quant_algo": "NVFP4", "group_size": 16}
+                for i in moe_layers
+            },
+            **{
+                f"{LM}.layers.{i}.linear_attn.{p}": {"quant_algo": "FP8_PB_WO", "group_size": 128}
+                for i in gdn_layers
+                for p in ("in_proj_qkv", "in_proj_z", "out_proj")
+            },
+            **{
+                f"{LM}.layers.{i}.self_attn.{p}_proj": {
+                    "quant_algo": "FP8_PB_WO",
+                    "group_size": 128,
+                }
+                for i in attn_layers
+                for p in "qkvo"
+            },
         },
         "ignore": [
-            "model.embed_tokens", "mtp.*", "model.mtp.*", "*.mlp.gate*", "*.mlp.shared_expert.*",
-            "*.mlp.shared_expert_gate*", "*hyper_connection*", "*.ple.*", "model.visual.*",
-            "model.language_model.embed_tokens", "lm_head", "*.self_attn.indexer*",
+            "model.embed_tokens",
+            "mtp.*",
+            "model.mtp.*",
+            "*.mlp.gate*",
+            "*.mlp.shared_expert.*",
+            "*.mlp.shared_expert_gate*",
+            "*hyper_connection*",
+            "*.ple.*",
+            "model.visual.*",
+            "model.language_model.embed_tokens",
+            "lm_head",
+            "*.self_attn.indexer*",
         ],
     }
 
@@ -363,8 +400,13 @@ def meta_state_dict(model_path: str) -> dict[str, torch.Tensor]:
 
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
-    config = EngineConfig(model_path=model_path, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy="offload",
-                          mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)))
+    config = EngineConfig(
+        model_path=model_path,
+        tp_info=try_get_tp_info(),
+        dtype=torch.bfloat16,
+        moe_strategy="offload",
+        mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)),
+    )
     object.__setattr__(config.model_config, "moe_strategy", "offload")
     object.__setattr__(config.model_config, "decode_target", _decode_target(config))
     saved = rotary._ROPE_DEVICE

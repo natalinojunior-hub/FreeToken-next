@@ -1,20 +1,20 @@
-[tool.ruff]
 line-length = 100
 target-version = "py310"
 
-[tool.ruff.lint]
+[lint]
 select = [
-    "E",  # pycodestyle errors
-    "W",  # pycodestyle warnings
-    "F",  # pyflakes
-    "I",  # isort
-    "B",  # flake8-bugbear
+    "E9",
+    "F63",
+    "F7",
+    "F82",
 ]
 ignore = [
-    "E501",  # line too long (handled by formatter)
+    "F821",
+    "F822",
+    "E501",
 ]
 
-[tool.ruff.format]
+[format]
 quote-style = "double"
 indent-style = "space"
 skip-magic-trailing-comma = false

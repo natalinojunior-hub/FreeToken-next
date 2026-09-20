@@ -54,7 +54,9 @@ def parse_vision_config(hf_config: Any) -> VisionConfig | None:
     if vc.pos_emb_height != vc.pos_emb_width:
         raise NotImplementedError("muse_glimmer vision tower: the position table must be square")
     layer_types = tuple(vc.layer_types)
-    assert set(layer_types) <= _VISION_LAYER_TYPES, f"unknown vision layer types in {set(layer_types)}"
+    assert set(layer_types) <= _VISION_LAYER_TYPES, (
+        f"unknown vision layer types in {set(layer_types)}"
+    )
     rope_params = getattr(vc, "rope_parameters", None) or {}
     text = _text_config(hf_config)
     config = VisionConfig(
@@ -165,8 +167,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         norm_topk_prob=False,
         model_type=getattr(hf_config, "model_type", "muse_glimmer"),
         architectures=(
-            getattr(hf_config, "architectures", None)
-            or ["MuseGlimmerForConditionalGeneration"]
+            getattr(hf_config, "architectures", None) or ["MuseGlimmerForConditionalGeneration"]
         ),
         use_qk_norm=True,
         attn_sm_scale=attn_sm_scale,

@@ -27,11 +27,21 @@ import triton.language as tl
 
 @triton.jit(do_not_specialize=["nnz"])
 def _rope_tiled(
-    Q, K, POS, CACHE,
-    stride_qbs, stride_qh, stride_qd,
-    stride_kbs, stride_kh, stride_kd,
+    Q,
+    K,
+    POS,
+    CACHE,
+    stride_qbs,
+    stride_qh,
+    stride_qd,
+    stride_kbs,
+    stride_kh,
+    stride_kd,
     nnz,
-    HEAD_Q, HEAD_K, rotary_dim, half,
+    HEAD_Q,
+    HEAD_K,
+    rotary_dim,
+    half,
     HAS_K: tl.constexpr,
     INTERLEAVE: tl.constexpr,
     BLOCK_SEQ: tl.constexpr,
@@ -41,19 +51,19 @@ def _rope_tiled(
     seq_pid = tl.program_id(0)
     head_pid = tl.program_id(1)
 
-    seq_range = seq_pid * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)      # (S,)
+    seq_range = seq_pid * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)  # (S,)
     head_range = head_pid * BLOCK_HEAD + tl.arange(0, BLOCK_HEAD)  # (H,)
-    d = tl.arange(0, BLOCK_DHALF)                                  # (D,)
+    d = tl.arange(0, BLOCK_DHALF)  # (D,)
 
     seq_mask = seq_range < nnz
     dmask = d < half
 
-    pos = tl.load(POS + seq_range, mask=seq_mask, other=0).to(tl.int64)   # (S,)
+    pos = tl.load(POS + seq_range, mask=seq_mask, other=0).to(tl.int64)  # (S,)
     cache_row = CACHE + pos[:, None] * rotary_dim
     cs_mask = seq_mask[:, None] & dmask[None, :]
-    cos = tl.load(cache_row + d[None, :], mask=cs_mask, other=0.0)         # (S,D) fp32
+    cos = tl.load(cache_row + d[None, :], mask=cs_mask, other=0.0)  # (S,D) fp32
     sin = tl.load(cache_row + half + d[None, :], mask=cs_mask, other=0.0)  # (S,D) fp32
-    cos = cos[:, None, :]   # (S,1,D)
+    cos = cos[:, None, :]  # (S,1,D)
     sin = sin[:, None, :]
 
     if INTERLEAVE:
@@ -66,9 +76,7 @@ def _rope_tiled(
     d1 = d1[None, None, :]
 
     # --- Q ---
-    qmask = (seq_mask[:, None, None]
-             & (head_range[None, :, None] < HEAD_Q)
-             & dmask[None, None, :])
+    qmask = seq_mask[:, None, None] & (head_range[None, :, None] < HEAD_Q) & dmask[None, None, :]
     base_q = seq_range[:, None, None] * stride_qbs + head_range[None, :, None] * stride_qh
     q0 = tl.load(Q + base_q + d0 * stride_qd, mask=qmask, other=0.0).to(tl.float32)
     q1 = tl.load(Q + base_q + d1 * stride_qd, mask=qmask, other=0.0).to(tl.float32)
@@ -79,9 +87,9 @@ def _rope_tiled(
 
     # --- K ---
     if HAS_K:
-        kmask = (seq_mask[:, None, None]
-                 & (head_range[None, :, None] < HEAD_K)
-                 & dmask[None, None, :])
+        kmask = (
+            seq_mask[:, None, None] & (head_range[None, :, None] < HEAD_K) & dmask[None, None, :]
+        )
         base_k = seq_range[:, None, None] * stride_kbs + head_range[None, :, None] * stride_kh
         k0 = tl.load(K + base_k + d0 * stride_kd, mask=kmask, other=0.0).to(tl.float32)
         k1 = tl.load(K + base_k + d1 * stride_kd, mask=kmask, other=0.0).to(tl.float32)
@@ -126,10 +134,21 @@ def apply_rope_with_cos_sin_cache_inplace(
     # Fixed via H100 sweep (27-config grid; 16/1/w4 within 5% of the winner at
     # every nnz 1..4096, faster than tuned on average).
     _rope_tiled[grid](
-        qv, kv, positions, cos_sin_cache,
-        qv.stride(0), qv.stride(1), qv.stride(2),
-        kv.stride(0), kv.stride(1), kv.stride(2),
-        nnz, head_q, head_k, rotary_dim, half,
+        qv,
+        kv,
+        positions,
+        cos_sin_cache,
+        qv.stride(0),
+        qv.stride(1),
+        qv.stride(2),
+        kv.stride(0),
+        kv.stride(1),
+        kv.stride(2),
+        nnz,
+        head_q,
+        head_k,
+        rotary_dim,
+        half,
         HAS_K=True,
         INTERLEAVE=not is_neox,
         BLOCK_DHALF=block_dhalf,
@@ -145,11 +164,22 @@ __all__ = ["apply_rope_with_cos_sin_cache_inplace"]
 
 @triton.jit(do_not_specialize=["nnz"])
 def _mrope_tiled(
-    Q, K, POS, CACHE, SEC,
-    stride_qbs, stride_qh, stride_qd,
-    stride_kbs, stride_kh, stride_kd,
+    Q,
+    K,
+    POS,
+    CACHE,
+    SEC,
+    stride_qbs,
+    stride_qh,
+    stride_qd,
+    stride_kbs,
+    stride_kh,
+    stride_kd,
     nnz,
-    HEAD_Q, HEAD_K, rotary_dim, half,
+    HEAD_Q,
+    HEAD_K,
+    rotary_dim,
+    half,
     BLOCK_SEQ: tl.constexpr,
     BLOCK_HEAD: tl.constexpr,
     BLOCK_DHALF: tl.constexpr,
@@ -178,18 +208,14 @@ def _mrope_tiled(
     d0 = d[None, None, :]
     d1 = (half + d)[None, None, :]
 
-    qmask = (seq_mask[:, None, None]
-             & (head_range[None, :, None] < HEAD_Q)
-             & dmask[None, None, :])
+    qmask = seq_mask[:, None, None] & (head_range[None, :, None] < HEAD_Q) & dmask[None, None, :]
     base_q = seq_range[:, None, None] * stride_qbs + head_range[None, :, None] * stride_qh
     q0 = tl.load(Q + base_q + d0 * stride_qd, mask=qmask, other=0.0).to(tl.float32)
     q1 = tl.load(Q + base_q + d1 * stride_qd, mask=qmask, other=0.0).to(tl.float32)
     tl.store(Q + base_q + d0 * stride_qd, (q0 * cos - q1 * sin).to(Q.dtype.element_ty), mask=qmask)
     tl.store(Q + base_q + d1 * stride_qd, (q1 * cos + q0 * sin).to(Q.dtype.element_ty), mask=qmask)
 
-    kmask = (seq_mask[:, None, None]
-             & (head_range[None, :, None] < HEAD_K)
-             & dmask[None, None, :])
+    kmask = seq_mask[:, None, None] & (head_range[None, :, None] < HEAD_K) & dmask[None, None, :]
     base_k = seq_range[:, None, None] * stride_kbs + head_range[None, :, None] * stride_kh
     k0 = tl.load(K + base_k + d0 * stride_kd, mask=kmask, other=0.0).to(tl.float32)
     k1 = tl.load(K + base_k + d1 * stride_kd, mask=kmask, other=0.0).to(tl.float32)
@@ -229,10 +255,22 @@ def apply_mrope_with_cos_sin_cache_inplace(
         triton.cdiv(max_head, META["BLOCK_HEAD"]),
     )
     _mrope_tiled[grid](
-        qv, kv, positions, cos_sin_cache, section_table,
-        qv.stride(0), qv.stride(1), qv.stride(2),
-        kv.stride(0), kv.stride(1), kv.stride(2),
-        nnz, head_q, head_k, rotary_dim, half,
+        qv,
+        kv,
+        positions,
+        cos_sin_cache,
+        section_table,
+        qv.stride(0),
+        qv.stride(1),
+        qv.stride(2),
+        kv.stride(0),
+        kv.stride(1),
+        kv.stride(2),
+        nnz,
+        head_q,
+        head_k,
+        rotary_dim,
+        half,
         BLOCK_DHALF=triton.next_power_of_2(half),
         BLOCK_SEQ=16,
         BLOCK_HEAD=1,

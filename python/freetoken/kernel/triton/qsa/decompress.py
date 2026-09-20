@@ -76,9 +76,9 @@ def _decompress_turbo_paged_kernel(
             k_idx = ((low_k.to(tl.int32) >> ((dim_offs % 4) * 2)[None, :]) & 3) | (
                 ((bit_k.to(tl.int32) >> (dim_offs % 8)[None, :]) & 1) << 2
             )
-            kn = tl.load(
-                k_norm_ptr + slots * stride_kn_token + head_idx * stride_kn_head + g
-            ).to(tl.float32)
+            kn = tl.load(k_norm_ptr + slots * stride_kn_token + head_idx * stride_kn_head + g).to(
+                tl.float32
+            )
             k_val = (tl.load(cent_ptr + k_idx) * kn[:, None]).to(tl.bfloat16)
             tl.store(
                 workspace_k_ptr
@@ -104,9 +104,9 @@ def _decompress_turbo_paged_kernel(
             v_idx = ((low_v.to(tl.int32) >> ((dim_offs % 4) * 2)[None, :]) & 3) | (
                 ((bit_v.to(tl.int32) >> (dim_offs % 8)[None, :]) & 1) << 2
             )
-            vn = tl.load(
-                v_norm_ptr + slots * stride_vn_token + head_idx * stride_vn_head + g
-            ).to(tl.float32)
+            vn = tl.load(v_norm_ptr + slots * stride_vn_token + head_idx * stride_vn_head + g).to(
+                tl.float32
+            )
             v_val = (tl.load(cent_ptr + v_idx) * vn[:, None]).to(tl.bfloat16)
             tl.store(
                 workspace_v_ptr
@@ -128,12 +128,9 @@ def _decompress_turbo_paged_kernel(
                 + head_idx * stride_kc_head
                 + c_offs[None, :]
             )
-            kn = tl.load(
-                k_norm_ptr
-                + slots * stride_kn_token
-                + head_idx * stride_kn_head
-                + g
-            ).to(tl.float32)
+            kn = tl.load(k_norm_ptr + slots * stride_kn_token + head_idx * stride_kn_head + g).to(
+                tl.float32
+            )
 
             k_idx = (kc.to(tl.int32) >> shift[None, :]) & 0x0F
             k_val = (tl.load(cent_ptr + k_idx) * kn[:, None]).to(tl.bfloat16)
@@ -153,12 +150,9 @@ def _decompress_turbo_paged_kernel(
                 + head_idx * stride_vc_head
                 + c_offs[None, :]
             )
-            vn = tl.load(
-                v_norm_ptr
-                + slots * stride_vn_token
-                + head_idx * stride_vn_head
-                + g
-            ).to(tl.float32)
+            vn = tl.load(v_norm_ptr + slots * stride_vn_token + head_idx * stride_vn_head + g).to(
+                tl.float32
+            )
 
             v_idx = (vc.to(tl.int32) >> shift[None, :]) & 0x0F
             v_val = (tl.load(cent_ptr + v_idx) * vn[:, None]).to(tl.bfloat16)
@@ -187,7 +181,7 @@ def decompress_turbo4_to_workspace(
     selected_pages: torch.Tensor | None = None,
 ) -> None:
     """Decompress Turbo3 / Turbo4 KV pages into dense workspace buffers.
-    
+
     When `selected_pages` is provided (1-D int32 tensor of physical page ids), only
     those active pages are decompressed, bounding decode decompression cost to O(1)
     with respect to context length.

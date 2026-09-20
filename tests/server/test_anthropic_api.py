@@ -48,14 +48,16 @@ def _collect_events(events, model="claude-x", uid=1, cache_report=False):
 
     async def run():
         out = []
-        async for frame in A.anthropic_event_stream(_aiter(events), model, uid, cache_report=cache_report):
+        async for frame in A.anthropic_event_stream(
+            _aiter(events), model, uid, cache_report=cache_report
+        ):
             etype = None
             data = None
             for line in frame.split("\n"):
                 if line.startswith("event:"):
-                    etype = line[len("event:"):].strip()
+                    etype = line[len("event:") :].strip()
                 elif line.startswith("data:"):
-                    raw = line[len("data:"):].strip()
+                    raw = line[len("data:") :].strip()
                     data = raw if raw == "[DONE]" else json.loads(raw)
             out.append((etype, data))
         return out
@@ -107,7 +109,12 @@ def test_convert_request_tool_use_and_result_roundtrip():
                     "role": "assistant",
                     "content": [
                         {"type": "text", "text": "let me check"},
-                        {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "SF"}},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "get_weather",
+                            "input": {"city": "SF"},
+                        },
                     ],
                 },
                 {
@@ -165,10 +172,12 @@ def test_convert_thinking_toggle_broadcasts_every_spelling():
     """The toggle is broadcast in every spelling templates read (enable_thinking
     bool + M3's thinking_mode); each template picks the knob it knows and Jinja
     ignores the rest, so the kwargs are family-independent."""
+
     def _req(ttype):
         return AnthropicMessagesRequest.model_validate(
             {
-                "model": "m", "max_tokens": 16,
+                "model": "m",
+                "max_tokens": 16,
                 "messages": [{"role": "user", "content": "hi"}],
                 "thinking": {"type": ttype, "budget_tokens": 1024},
             }
@@ -218,7 +227,10 @@ def test_convert_thinking_replay_in_tool_loop():
                         {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}},
                     ],
                 },
-                {"role": "user", "content": [{"type": "tool_result", "id": "toolu_1", "content": "72F"}]},
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "id": "toolu_1", "content": "72F"}],
+                },
             ],
         }
     )
@@ -281,8 +293,12 @@ def test_full_response_text_and_tool():
 
 def test_full_response_length_truncation_is_max_tokens():
     result = GenResult(
-        reasoning="", content="partial", tool_calls=[],
-        finish_reason="length", prompt_tokens=11, completion_tokens=4096,
+        reasoning="",
+        content="partial",
+        tool_calls=[],
+        finish_reason="length",
+        prompt_tokens=11,
+        completion_tokens=4096,
     )
     resp = A.anthropic_full_response(result, "claude-x", uid=9)
     assert resp.stop_reason == "max_tokens"
@@ -290,8 +306,13 @@ def test_full_response_length_truncation_is_max_tokens():
 
 def test_full_response_cache_report_flips_input_tokens():
     result = GenResult(
-        reasoning="", content="hi", tool_calls=[], finish_reason="stop",
-        prompt_tokens=11, completion_tokens=5, cached_tokens=8,
+        reasoning="",
+        content="hi",
+        tool_calls=[],
+        finish_reason="stop",
+        prompt_tokens=11,
+        completion_tokens=5,
+        cached_tokens=8,
     )
     # Flag on: Anthropic billing semantics — input_tokens excludes the cached prefix.
     resp = A.anthropic_full_response(result, "claude-x", uid=9, cache_report=True)
@@ -305,8 +326,12 @@ def test_full_response_cache_report_flips_input_tokens():
 
 def test_full_response_cache_report_zero_hit_keeps_field_absent():
     result = GenResult(
-        reasoning="", content="hi", tool_calls=[], finish_reason="stop",
-        prompt_tokens=11, completion_tokens=5,
+        reasoning="",
+        content="hi",
+        tool_calls=[],
+        finish_reason="stop",
+        prompt_tokens=11,
+        completion_tokens=5,
     )
     resp = A.anthropic_full_response(result, "claude-x", uid=9, cache_report=True)
     assert resp.usage.input_tokens == 11
@@ -362,12 +387,12 @@ def test_stream_reasoning_as_thinking_block():
     types = [e[0] for e in collected if e[0]]
     assert types == [
         "message_start",
-        "content_block_start",   # thinking block
-        "content_block_delta",   # thinking_delta
-        "content_block_delta",   # signature_delta (empty, shape compliance)
+        "content_block_start",  # thinking block
+        "content_block_delta",  # thinking_delta
+        "content_block_delta",  # signature_delta (empty, shape compliance)
         "content_block_stop",
-        "content_block_start",   # text block
-        "content_block_delta",   # text_delta
+        "content_block_start",  # text block
+        "content_block_delta",  # text_delta
         "content_block_stop",
         "message_delta",
         "message_stop",
@@ -472,7 +497,11 @@ def test_route_nonstream_text():
     client = _client(fake)
     r = client.post(
         "/v1/messages",
-        json={"model": "claude-x", "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}]},
+        json={
+            "model": "claude-x",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
     )
     assert r.status_code == 200, r.text
     body = r.json()
@@ -506,9 +535,9 @@ def test_route_stream_text():
         data = None
         for line in block.split("\n"):
             if line.startswith("event:"):
-                etype = line[len("event:"):].strip()
+                etype = line[len("event:") :].strip()
             elif line.startswith("data:"):
-                raw = line[len("data:"):].strip()
+                raw = line[len("data:") :].strip()
                 if raw and raw != "[DONE]":
                     data = json.loads(raw)
         if etype:
@@ -528,8 +557,9 @@ def test_stream_request_error_is_invalid_request_not_internal():
     from freetoken.server.generation import GenerationError
 
     async def boom():
-        raise GenerationError("prompt is too long: 8181 tokens > 7223 maximum",
-                              "context_length_exceeded")
+        raise GenerationError(
+            "prompt is too long: 8181 tokens > 7223 maximum", "context_length_exceeded"
+        )
         yield  # noqa: unreachable — makes this an async generator
 
     async def run():
@@ -538,9 +568,9 @@ def test_stream_request_error_is_invalid_request_not_internal():
             etype = data = None
             for line in frame.split("\n"):
                 if line.startswith("event:"):
-                    etype = line[len("event:"):].strip()
+                    etype = line[len("event:") :].strip()
                 elif line.startswith("data:"):
-                    data = json.loads(line[len("data:"):].strip())
+                    data = json.loads(line[len("data:") :].strip())
             out.append((etype, data))
         return out
 
@@ -566,10 +596,10 @@ def test_stream_tool_block_closes_before_following_text():
     types = [e[0] for e in collected if e[0]]
     assert types == [
         "message_start",
-        "content_block_start",   # tool_use (index 0)
-        "content_block_delta",   # input_json_delta (complete args)
+        "content_block_start",  # tool_use (index 0)
+        "content_block_delta",  # input_json_delta (complete args)
         "content_block_stop",
-        "content_block_start",   # text (index 1)
+        "content_block_start",  # text (index 1)
         "content_block_delta",
         "content_block_stop",
         "message_delta",
@@ -584,8 +614,12 @@ def test_stream_tool_block_closes_before_following_text():
 
 def test_full_response_includes_thinking_block():
     result = GenResult(
-        reasoning="Pondered.", content="Answer.", tool_calls=[],
-        finish_reason="stop", prompt_tokens=5, completion_tokens=3,
+        reasoning="Pondered.",
+        content="Answer.",
+        tool_calls=[],
+        finish_reason="stop",
+        prompt_tokens=5,
+        completion_tokens=3,
     )
     response = A.anthropic_full_response(result, "claude-x", 1)
     assert [b.type for b in response.content] == ["thinking", "text"]
@@ -596,7 +630,10 @@ def test_full_response_includes_thinking_block():
 def test_convert_native_thinking_toggle():
     base = {"model": "claude-x", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}
     on = A.convert_anthropic_to_genspec(
-        AnthropicMessagesRequest.model_validate({**base, "thinking": {"type": "enabled", "budget_tokens": 1024}}), {}
+        AnthropicMessagesRequest.model_validate(
+            {**base, "thinking": {"type": "enabled", "budget_tokens": 1024}}
+        ),
+        {},
     )
     assert on.chat_template_kwargs == {"enable_thinking": True, "thinking_mode": "enabled"}
     off = A.convert_anthropic_to_genspec(
@@ -621,7 +658,11 @@ class _FakeTokenizeManager:
 
         self.msgs.extend(msgs)
         return [
-            UserMsg(uid=m.uid, input_ids=torch.zeros(len(str(m.text)), dtype=torch.int32), sampling_params=m.sampling_params)
+            UserMsg(
+                uid=m.uid,
+                input_ids=torch.zeros(len(str(m.text)), dtype=torch.int32),
+                sampling_params=m.sampling_params,
+            )
             for m in msgs
         ]
 
@@ -735,8 +776,14 @@ def test_count_tokens_excluded_from_request_ring():
 
     # A real /v1/messages request IS tracked, proving the exclusion is scoped to the subpath.
     client2 = _client(FakeState([("hi", True, 3, 1)]))
-    client2.post("/v1/messages", json={"model": "claude-x", "max_tokens": 8,
-                                       "messages": [{"role": "user", "content": "hi"}]})
+    client2.post(
+        "/v1/messages",
+        json={
+            "model": "claude-x",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert request_ring.requests_count() == 1
     request_ring.reset()
 
@@ -750,7 +797,10 @@ def test_count_tokens_image_only_message_400():
         json={
             "model": "claude-x",
             "messages": [
-                {"role": "user", "content": [{"type": "image", "source": {"type": "url", "url": "x"}}]}
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "source": {"type": "url", "url": "x"}}],
+                }
             ],
         },
     )
@@ -782,7 +832,9 @@ def test_validation_error_uses_anthropic_envelope():
     assert body["error"]["type"] == "invalid_request_error"
     assert "messages" in body["error"]["message"]
     # /v1/messages inherits the same envelope
-    r = client.post("/v1/messages", json={"model": "claude-x", "messages": [{"role": "user", "content": "hi"}]})
+    r = client.post(
+        "/v1/messages", json={"model": "claude-x", "messages": [{"role": "user", "content": "hi"}]}
+    )
     assert r.status_code == 400
     assert r.json()["error"]["type"] == "invalid_request_error"
     # non-Anthropic routes keep FastAPI's default 422 shape
@@ -866,7 +918,9 @@ def test_tool_result_carries_the_wire_tool_use_id():
     spec = A.convert_anthropic_to_genspec(req, {})
     results = [m for m in spec.messages if m["role"] == "tool"]
     assert [(m["tool_call_id"], m["content"]) for m in results] == [
-        ("toolu_b", "60F"), ("toolu_a", "72F")]
+        ("toolu_b", "60F"),
+        ("toolu_a", "72F"),
+    ]
 
 
 def test_count_tokens_reads_the_real_manager_return_contract():
@@ -896,7 +950,10 @@ def test_tool_result_image_moves_to_the_following_user_turn():
         "max_tokens": 16,
         "messages": [
             {"role": "user", "content": "take a screenshot"},
-            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "shot", "input": {}}]},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "shot", "input": {}}],
+            },
             {
                 "role": "user",
                 "content": [
@@ -905,7 +962,14 @@ def test_tool_result_image_moves_to_the_following_user_turn():
                         "tool_use_id": "toolu_1",
                         "content": [
                             {"type": "text", "text": "shot taken"},
-                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "aGk=",
+                                },
+                            },
                         ],
                     },
                     {"type": "text", "text": "<system-reminder>look</system-reminder>"},
@@ -941,7 +1005,16 @@ def test_tool_result_image_outside_a_user_message_is_rejected():
                     {
                         "type": "tool_result",
                         "tool_use_id": "toolu_1",
-                        "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}],
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "aGk=",
+                                },
+                            }
+                        ],
                     }
                 ],
             },
@@ -957,14 +1030,26 @@ def test_image_only_tool_result_keeps_an_empty_tool_message():
         "max_tokens": 16,
         "messages": [
             {"role": "user", "content": "take a screenshot"},
-            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "shot", "input": {}}]},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "shot", "input": {}}],
+            },
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "tool_result",
                         "tool_use_id": "toolu_1",
-                        "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}],
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "aGk=",
+                                },
+                            }
+                        ],
                     }
                 ],
             },

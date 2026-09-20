@@ -23,10 +23,10 @@ def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 def recurrent_gated_delta_rule(
     query: torch.Tensor,  # [B, T, Hv, Dk]
-    key: torch.Tensor,    # [B, T, Hv, Dk]
+    key: torch.Tensor,  # [B, T, Hv, Dk]
     value: torch.Tensor,  # [B, T, Hv, Dv]
-    g: torch.Tensor,      # [B, T, Hv]   (log-decay; per-step decay = exp(g))
-    beta: torch.Tensor,   # [B, T, Hv]
+    g: torch.Tensor,  # [B, T, Hv]   (log-decay; per-step decay = exp(g))
+    beta: torch.Tensor,  # [B, T, Hv]
     *,
     initial_state: torch.Tensor | None = None,
     use_qk_l2norm: bool = True,
@@ -37,12 +37,11 @@ def recurrent_gated_delta_rule(
         query = _l2norm(query, eps=1e-6)
         key = _l2norm(key, eps=1e-6)
     query, key, value, beta, g = [
-        t.transpose(1, 2).contiguous().to(torch.float32)
-        for t in (query, key, value, beta, g)
+        t.transpose(1, 2).contiguous().to(torch.float32) for t in (query, key, value, beta, g)
     ]
     b, h, t_len, dk = key.shape
     dv = value.shape[-1]
-    scale = 1.0 / (dk ** 0.5)
+    scale = 1.0 / (dk**0.5)
     query = query * scale
 
     out = torch.zeros(b, h, t_len, dv, dtype=value.dtype, device=value.device)
@@ -69,10 +68,10 @@ def recurrent_gated_delta_rule(
 
 def chunk_gated_delta_rule(
     query: torch.Tensor,  # [B, T, Hv, Dk]
-    key: torch.Tensor,    # [B, T, Hv, Dk]
+    key: torch.Tensor,  # [B, T, Hv, Dk]
     value: torch.Tensor,  # [B, T, Hv, Dv]
-    g: torch.Tensor,      # [B, T, Hv]
-    beta: torch.Tensor,   # [B, T, Hv]
+    g: torch.Tensor,  # [B, T, Hv]
+    beta: torch.Tensor,  # [B, T, Hv]
     *,
     chunk_size: int = 64,
     initial_state: torch.Tensor | None = None,
@@ -87,8 +86,7 @@ def chunk_gated_delta_rule(
         query = _l2norm(query, eps=1e-6)
         key = _l2norm(key, eps=1e-6)
     query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32)
-        for x in (query, key, value, beta, g)
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
     ]
 
     batch_size, num_heads, sequence_length, k_head_dim = key.shape
@@ -128,8 +126,12 @@ def chunk_gated_delta_rule(
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
     last_recurrent_state = (
         torch.zeros(
-            batch_size, num_heads, k_head_dim, v_head_dim,
-            dtype=value.dtype, device=value.device,
+            batch_size,
+            num_heads,
+            k_head_dim,
+            v_head_dim,
+            dtype=value.dtype,
+            device=value.device,
         )
         if initial_state is None
         else initial_state.to(value)
@@ -146,8 +148,7 @@ def chunk_gated_delta_rule(
         core_attn_out[:, :, i] = attn_inter + attn @ v_new
         last_recurrent_state = (
             last_recurrent_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2)
-            @ v_new
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
         )
 
     core_attn_out = core_attn_out.reshape(
@@ -196,7 +197,9 @@ class Qwen4ExpGatedDeltaNetReference(nn.Module):
     ):
         super().__init__()
         if hidden_act != "silu":
-            raise ValueError(f"GDN reference only supports silu conv activation, got {hidden_act!r}")
+            raise ValueError(
+                f"GDN reference only supports silu conv activation, got {hidden_act!r}"
+            )
         if output_gate not in _GATE_ACTS:
             raise ValueError(f"unsupported GDN output gate {output_gate!r}")
         self.num_k_heads = num_k_heads
@@ -213,8 +216,12 @@ class Qwen4ExpGatedDeltaNetReference(nn.Module):
         self.in_proj_b = nn.Linear(hidden_size, num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(hidden_size, num_v_heads, bias=False)
         self.conv1d = nn.Conv1d(
-            self.conv_dim, self.conv_dim, kernel_size=conv_kernel_size,
-            groups=self.conv_dim, padding=conv_kernel_size - 1, bias=False,
+            self.conv_dim,
+            self.conv_dim,
+            kernel_size=conv_kernel_size,
+            groups=self.conv_dim,
+            padding=conv_kernel_size - 1,
+            bias=False,
         )
         self.dt_bias = nn.Parameter(torch.zeros(num_v_heads))
         self.A_log = nn.Parameter(torch.zeros(num_v_heads))

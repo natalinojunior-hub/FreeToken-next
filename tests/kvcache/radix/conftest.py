@@ -5,6 +5,7 @@ single ``time.monotonic_ns()`` read, so nodes tie within a call by construction;
 ties *between* calls too (its resolution is coarser than one walk), which makes any LRU /
 eviction-order assertion flaky.
 """
+
 from __future__ import annotations
 
 import pytest

@@ -63,9 +63,7 @@ class PrefillAdder:
     def _kv_reservation_size(self, total_len: int, cached_len: int) -> int:
         """Return the token-equivalent cost of the additional KV pages for a request."""
         page_size = self.cache_manager.page_size
-        return (
-            div_ceil(total_len, page_size) - div_ceil(cached_len, page_size)
-        ) * page_size
+        return (div_ceil(total_len, page_size) - div_ceil(cached_len, page_size)) * page_size
 
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
@@ -77,9 +75,7 @@ class PrefillAdder:
         cached_len = handle.cached_len
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
-        estimated_size = self._kv_reservation_size(
-            req.input_len + req.output_len, cached_len
-        )
+        estimated_size = self._kv_reservation_size(req.input_len + req.output_len, cached_len)
 
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
             return None
@@ -104,9 +100,10 @@ class PrefillAdder:
             ps = self.cache_manager.page_size
             # swa is charged per WHOLE page (allocate_paged -> alloc_swa), so the seat check is
             # in page units too; identical at page_size==1.
-            need_swa = div_ceil(
-                min(max(extend_len, 1), self.cache_manager.sliding_window_size) + 1, ps
-            ) * ps
+            need_swa = (
+                div_ceil(min(max(extend_len, 1), self.cache_manager.sliding_window_size) + 1, ps)
+                * ps
+            )
             if self.cache_manager.swa_available_size - self.reserved_swa < need_swa:
                 return self.cache_manager.unlock(handle)
 
@@ -183,16 +180,28 @@ class PrefillAdder:
             chunk_size = aligned if aligned > 0 else chunk_size
         if self.keep_images_whole and pending_req.mm_items and chunk_size < remain_len:
             # a cut image would attend within only the part already in the cache: end the chunk before it, decided last because the caps above only move the end earlier and would undo it
-            unit = math.lcm(self.cache_manager.page_size if self.cache_manager.swa_paged else 1, align if align > 1 else 1)
+            unit = math.lcm(
+                self.cache_manager.page_size if self.cache_manager.swa_paged else 1,
+                align if align > 1 else 1,
+            )
             end = mm_chunk_end(pending_req.mm_items, cached_len, cached_len + chunk_size, unit)
-            cut = next((hi for item in pending_req.mm_items for lo, hi in item.offsets if lo < end < hi), None)
-            if cut is not None and self.token_budget < self.pass_budget and cut - cached_len <= self.pass_budget:
+            cut = next(
+                (hi for item in pending_req.mm_items for lo, hi in item.offsets if lo < end < hi),
+                None,
+            )
+            if (
+                cut is not None
+                and self.token_budget < self.pass_budget
+                and cut - cached_len <= self.pass_budget
+            ):
                 # other requests took part of this pass; a pass of its own holds the image whole
                 return None
             chunk_size = end - cached_len
         if self.cache_manager.swa_paged:
             ps = self.cache_manager.page_size
-            self.reserved_swa += (div_ceil(cached_len + chunk_size, ps) - div_ceil(cached_len, ps)) * ps
+            self.reserved_swa += (
+                div_ceil(cached_len + chunk_size, ps) - div_ceil(cached_len, ps)
+            ) * ps
         is_chunked = chunk_size < remain_len
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size

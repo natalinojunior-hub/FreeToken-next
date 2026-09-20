@@ -188,8 +188,14 @@ class GatedRMSNorm(BaseOP):
         from freetoken.kernel.fla import rms_norm_gated
 
         return rms_norm_gated(
-            x=x, weight=self.weight, bias=None, z=z, eps=self.eps,
-            is_rms_norm=True, norm_before_gate=True, activation=self.activation,
+            x=x,
+            weight=self.weight,
+            bias=None,
+            z=z,
+            eps=self.eps,
+            is_rms_norm=True,
+            norm_before_gate=True,
+            activation=self.activation,
         )
 
 

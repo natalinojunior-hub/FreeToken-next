@@ -37,6 +37,7 @@ _ROPE_POS_BYTES = 3 * 4
 
 from .base import BaseKVCachePool
 
+
 class QSAKVCache(BaseKVCachePool):
     """MHA paged pool + the compressed index-key slab + the per-request pending ring.
 
@@ -69,6 +70,8 @@ class QSAKVCache(BaseKVCachePool):
         layer_ids: Sequence[int] | None = None,
         mrope: bool = False,
         kv_format: str = "auto",
+        mtp_layer_id: int | None = None,
+        tcq_policy=None,
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -96,21 +99,52 @@ class QSAKVCache(BaseKVCachePool):
         self._index_dtype = dtype
         self._page_size = page_size
         self._mrope = mrope
-        if kv_format in ["turbo3", "turbo4"]:
+        if kv_format in ["turbo3", "turbo4", "vbr", "tcq"] or tcq_policy is not None:
             from .turbo_pool import TurboMHAKVCache
+            from .tcq_policy import TCQPolicy
+
+            if tcq_policy is not None or kv_format in ["vbr", "tcq"]:
+                if isinstance(tcq_policy, TCQPolicy):
+                    policy = tcq_policy
+                else:
+                    vbr_pol = tcq_policy if isinstance(tcq_policy, str) else "balanced"
+                    policy = TCQPolicy(
+                        num_layers=num_layers, base_format="turbo4", vbr_policy=vbr_pol
+                    )
+            else:
+                policy = None
+            self.tcq_policy = policy
+
             self._pool = TurboMHAKVCache(
-                num_kv_heads=num_kv_heads, num_layers=num_layers, head_dim=head_dim,
-                num_pages=num_pages, page_size=page_size, dtype=dtype, device=device,
-                layer_ids=layer_ids, book=kv_format
+                num_kv_heads=num_kv_heads,
+                num_layers=num_layers,
+                head_dim=head_dim,
+                num_pages=num_pages,
+                page_size=page_size,
+                dtype=dtype,
+                device=device,
+                layer_ids=layer_ids,
+                book="turbo4" if kv_format in ["vbr", "tcq"] else kv_format,
+                policy=policy,
             )
         else:
+            self.tcq_policy = None
             from .mha_pool import MHAKVCache
+
             self._pool = MHAKVCache(
-                num_kv_heads=num_kv_heads, num_layers=num_layers, head_dim=head_dim,
-                num_pages=num_pages, page_size=page_size, dtype=dtype, device=device,
-                layer_ids=layer_ids
+                num_kv_heads=num_kv_heads,
+                num_layers=num_layers,
+                head_dim=head_dim,
+                num_pages=num_pages,
+                page_size=page_size,
+                dtype=dtype,
+                device=device,
+                layer_ids=layer_ids,
             )
         self.kv_format = kv_format
+        self._mtp_slot: int | None = None
+        if mtp_layer_id is not None and layer_ids is not None and mtp_layer_id in layer_ids:
+            self._mtp_slot = list(layer_ids).index(mtp_layer_id)
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
 
@@ -126,6 +160,11 @@ class QSAKVCache(BaseKVCachePool):
     def _zero_kv_slabs(self) -> None:
         if hasattr(self._pool, "_kv_buffer"):
             self._pool._kv_buffer.zero_()
+        if hasattr(self._pool, "_k_codes"):
+            self._pool._k_codes.zero_()
+            self._pool._k_norm.zero_()
+            self._pool._v_codes.zero_()
+            self._pool._v_norm.zero_()
 
     def _alloc_index_tiers(self, num_pages: int) -> None:
         # ZERO-initialized: the score kernel reads whole rows of blocks unmasked and relies on
@@ -190,7 +229,9 @@ class QSAKVCache(BaseKVCachePool):
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
                 spec_mtp = getattr(config, "spec_mtp", 0)
-                fixed += num_req_slots * row * (cls.ring_capacity_for(spec.index_ratio, spec_mtp) + 1)
+                fixed += (
+                    num_req_slots * row * (cls.ring_capacity_for(spec.index_ratio, spec_mtp) + 1)
+                )
                 if config.model_config.model_is_mrope:
                     per_token += _ROPE_POS_BYTES
         return per_token * config.page_size, fixed, config.page_size, 0
@@ -209,39 +250,54 @@ class QSAKVCache(BaseKVCachePool):
         )
         return kv + slab // tokens + (_ROPE_POS_BYTES if self._mrope else 0), swa
 
-
-
     def rebuild_from_config(self, config, num_pages: int, **kwargs) -> None:
         self.rebuild(num_pages + 1)
 
     @property
-    def device(self) -> torch.device: return self._pool.device
+    def device(self) -> torch.device:
+        return self._pool.device
+
     @property
-    def dtype(self) -> torch.dtype: return self._pool.dtype
+    def dtype(self) -> torch.dtype:
+        return self._pool.dtype
+
     @property
-    def num_layers(self) -> int: return self._pool.num_layers
+    def num_layers(self) -> int:
+        return self._pool.num_layers
+
     def k_cache(self, index: int) -> torch.Tensor:
         if getattr(self._pool, "compressed", False):
             return self._pool._k_codes[self._pool._dense(index)]
         return self._pool.k_cache(index)
+
     def v_cache(self, index: int) -> torch.Tensor:
         if getattr(self._pool, "compressed", False):
             return self._pool._v_codes[self._pool._dense(index)]
         return self._pool.v_cache(index)
+
     def k_slab(self, index: int):
         return self._pool.k_slab(index)
+
     def v_slab(self, index: int):
         return self._pool.v_slab(index)
+
     @property
     def compressed(self) -> bool:
         return getattr(self._pool, "compressed", False)
+
     @property
     def book3(self) -> bool:
         return getattr(self._pool, "book3", False)
+
+    def is_book3(self, layer_id: int, side: str = "k") -> bool:
+        return getattr(self._pool, "is_book3", lambda lid, s="k": self.book3)(layer_id, side)
+
     @property
     def cent_tensor(self) -> torch.Tensor | None:
         return getattr(self._pool, "cent_tensor", None)
-    def store_kv(self, *args, **kwargs) -> None: return self._pool.store_kv(*args, **kwargs)
+
+    def store_kv(self, *args, **kwargs) -> None:
+        return self._pool.store_kv(*args, **kwargs)
 
     def cmp_k_cache(self, slot: int) -> torch.Tensor:
         """Compressed index keys of one sparse layer: ``[rows, index_head_dim]``."""
@@ -279,12 +335,30 @@ class QSAKVCache(BaseKVCachePool):
     def num_req_slots(self) -> int:
         return self._num_req_slots
 
+    def clear_mtp_slot(self) -> None:
+        """Zero the MTP draft layer KV slab and compressed index buffer to avoid carrier leak."""
+        slot = self._mtp_slot
+        if slot is None:
+            return
+        if self._cmp_k_buffer is not None:
+            self._cmp_k_buffer[slot].zero_()
+        if self._pending_ring is not None:
+            self._pending_ring[:, slot].zero_()
+        if hasattr(self._pool, "_k_codes"):
+            self._pool._k_codes[slot].zero_()
+            self._pool._k_norm[slot].zero_()
+            self._pool._v_codes[slot].zero_()
+            self._pool._v_norm[slot].zero_()
+        elif hasattr(self._pool, "_kv_buffer") and self._pool._kv_buffer is not None:
+            self._pool._kv_buffer[:, slot].zero_()
+
     def free_req(self, table_idx: int) -> None:
         """Zero the per-request pending ring and scratch cmp buffer when table_idx is released."""
         if self._pending_ring is not None and 0 <= table_idx < self._num_req_slots:
             self._pending_ring[table_idx].zero_()
         if self._cmp_k_buffer is not None and 0 <= table_idx < self._num_req_slots:
             self._cmp_k_buffer[:, self._cmp_scratch_base + table_idx].zero_()
+        self.clear_mtp_slot()
 
 
 __all__ = ["QSAKVCache"]

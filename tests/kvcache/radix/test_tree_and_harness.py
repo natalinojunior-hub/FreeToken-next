@@ -12,6 +12,7 @@ Two jobs no single-class module can do:
 2. HARNESS SELF-TEST -- wrap a cache in a deliberately broken proxy and prove the invariant
    battery and the reference model actually fire.  A model that cannot fail is decoration.
 """
+
 from __future__ import annotations
 
 from typing import List, Sequence, Tuple
@@ -99,13 +100,13 @@ def test_split_at_keeps_the_original_object_as_the_suffix() -> None:
     assert len(root.children) == 1 and len(prefix.children) == 1
 
     # per-field split rules (each one a different class's invariant)
-    assert prefix.ref_count == 2 and node.ref_count == 2          # full lock covers both halves
+    assert prefix.ref_count == 2 and node.ref_count == 2  # full lock covers both halves
     assert prefix.swa_ref_count == 1 and node.swa_ref_count == 1  # window covers both halves
-    assert prefix.swa_tombstone and node.swa_tombstone            # a tombstone covers all tokens
-    assert prefix.swa_uuid == 77 and node.swa_uuid is None        # boundary MIGRATES root-side
+    assert prefix.swa_tombstone and node.swa_tombstone  # a tombstone covers all tokens
+    assert prefix.swa_uuid == 77 and node.swa_uuid is None  # boundary MIGRATES root-side
     assert prefix.mamba_value is None and node.mamba_value == 99  # a snapshot cannot be split
     assert prefix.mamba_ref_count == 0 and node.mamba_ref_count == 1
-    assert prefix.timestamp == stamp                              # LRU age is inherited
+    assert prefix.timestamp == stamp  # LRU age is inherited
 
     # the split point must land strictly inside the node
     with pytest.raises(AssertionError):
@@ -124,11 +125,11 @@ def test_key_fn_buckets_a_whole_page_not_a_token() -> None:
     """
     k1, k4 = _get_key_fn(1), _get_key_fn(4)
 
-    assert k1(_t([5, 9, 9])) == 5 and isinstance(k1(_t([5])), int)   # scalar at page_size 1
-    assert k1(_t([1, 7])) == k1(_t([1, 9]))                          # tail ignored
-    assert k4(_t([1, 7, 7, 2])) == (1, 7, 7, 2)                      # tuple at page_size > 1
+    assert k1(_t([5, 9, 9])) == 5 and isinstance(k1(_t([5])), int)  # scalar at page_size 1
+    assert k1(_t([1, 7])) == k1(_t([1, 9]))  # tail ignored
+    assert k4(_t([1, 7, 7, 2])) == (1, 7, 7, 2)  # tuple at page_size > 1
     assert k4(_t([1, 7, 7, 2, 3, 3, 3, 3])) == k4(_t([1, 7, 7, 2]))  # tail ignored
-    assert k4(_t([1, 7, 7, 2])) != k4(_t([1, 7, 7, 3]))              # same lead, different page
+    assert k4(_t([1, 7, 7, 2])) != k4(_t([1, 7, 7, 3]))  # same lead, different page
 
     # ... and the consequence in every one of the three trees: two pages sharing three leading
     # tokens share NO prefix at all.
@@ -160,10 +161,10 @@ def test_get_match_len_and_align_down_bound_reuse_to_whole_pages(page_size: int)
     """
     key_fn = _get_key_fn(page_size)
     node = _bare_node(key_fn, list(range(100, 108)), list(range(200, 208)))
-    assert node.get_match_len(_t(range(100, 108))) == 8               # identical
+    assert node.get_match_len(_t(range(100, 108))) == 8  # identical
     assert node.get_match_len(_t(list(range(100, 106)) + [0, 0])) == 6  # first diff at 6
-    assert node.get_match_len(_t([100, 101, 102])) == 3               # query shorter than key
-    assert node.get_match_len(_t([0, 101, 102])) == 0                 # diff at 0
+    assert node.get_match_len(_t([100, 101, 102])) == 3  # query shorter than key
+    assert node.get_match_len(_t([0, 101, 102])) == 0  # diff at 0
 
     assert align_down(6, page_size) == (6 // page_size) * page_size
     assert align_down(0, page_size) == 0
@@ -172,8 +173,8 @@ def test_get_match_len_and_align_down_bound_reuse_to_whole_pages(page_size: int)
     P = page_size
     b = _blocks(P)
     ids = b[0] + b[1]
-    ragged = ids[: 2 * P - 1]                       # one token short of the second page
-    for kind in ("plain", "swa"):                   # (hybrid truncation is snapshot-driven)
+    ragged = ids[: 2 * P - 1]  # one token short of the second page
+    for kind in ("plain", "swa"):  # (hybrid truncation is snapshot-driven)
         s = Session(_spec(kind, P))
         s.do_insert(ids)
         got, _ = s.do_match(ragged)
@@ -191,7 +192,7 @@ class _Proxy:
     def __init__(self, inner) -> None:
         object.__setattr__(self, "_inner", inner)
 
-    def __getattr__(self, name):          # only reached for attrs the proxy does not define
+    def __getattr__(self, name):  # only reached for attrs the proxy does not define
         return getattr(self._inner, name)
 
 
@@ -251,8 +252,9 @@ _BROKEN = [
 ]
 
 
-@pytest.mark.parametrize("factory,trigger,tag", _BROKEN,
-                         ids=[f.__name__.lstrip("_") for f, _, _ in _BROKEN])
+@pytest.mark.parametrize(
+    "factory,trigger,tag", _BROKEN, ids=[f.__name__.lstrip("_") for f, _, _ in _BROKEN]
+)
 def test_harness_catches_a_broken_implementation(factory, trigger: str, tag: str) -> None:
     """The battery is only worth its runtime if it can fail.
 
@@ -264,19 +266,22 @@ def test_harness_catches_a_broken_implementation(factory, trigger: str, tag: str
     b = _blocks(P)
     keys = [b[0], b[1], b[2]]
     s = Session(_spec("plain", P))
-    for k in keys:                       # three one-page leaves with distinct LRU stamps
+    for k in keys:  # three one-page leaves with distinct LRU stamps
         s.do_insert(k)
         s.check()
     assert len(s.ad.nodes()) == 3
 
-    s.ad.cache = factory(s.ad.cache)     # the implementation goes bad from here on
-    run = {"insert": lambda: s.do_insert(b[3]),
-           "evict": lambda: s.do_evict_full(P),
-           "match": lambda: s.do_match(keys[0])}[trigger]
+    s.ad.cache = factory(s.ad.cache)  # the implementation goes bad from here on
+    run = {
+        "insert": lambda: s.do_insert(b[3]),
+        "evict": lambda: s.do_evict_full(P),
+        "match": lambda: s.do_match(keys[0]),
+    }[trigger]
 
     with pytest.raises(HarnessFailure) as excinfo:
-        run()                            # either the op's own comparison against the model ...
-        s.check()                        # ... or the battery that follows every op
+        run()  # either the op's own comparison against the model ...
+        s.check()  # ... or the battery that follows every op
     assert excinfo.value.tag == tag, (
         f"the broken cache was caught by {excinfo.value.tag!r}, expected {tag!r}: "
-        f"{excinfo.value.detail}")
+        f"{excinfo.value.detail}"
+    )

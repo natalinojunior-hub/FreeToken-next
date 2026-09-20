@@ -66,7 +66,7 @@ ROWS = [
         "model": "/models/Ornith-1.5-35B-A3B-APEX-MTP-I-Compact.gguf",
         "mem_ratio": 0.9,
         "blocked_by": "mixed expert ggml types across layers (Q3_K x30 + Q4_K x10) against "
-                      "the single-stride expert slot pool; needs the exact-geometry pool",
+        "the single-stride expert slot pool; needs the exact-geometry pool",
     },
     {
         "id": "gguf-tiel-coder",
@@ -90,8 +90,7 @@ ROWS = [
         "pair": "qwen4exp",
         "model": "/models/Qwen3.8-Flash-Next-Unsloth-IQ4_XS/UD-IQ4_XS",
         "mem_ratio": 0.86,
-        "blocked_by": "3-shard split needs GGUF shard joining, and qwen4exp has no GGUF "
-                      "adapter yet; per_layer_token_embd (IQ4_NL, ~45 GiB) must map to PLE",
+        "note": "GGUF UD-IQ4_XS sharded with PLE UVA/mmap and native GGUF operators",
     },
     {
         "id": "gguf-flash-ad-q4km",
@@ -108,14 +107,16 @@ ROWS = [
         "model": "/models/Qwen3.8-27B-GSQ-RCO-IQ3_S-MTP-Q4XS-Q3S.gguf",
         "mem_ratio": 0.86,
         "note": "dense qwen35: no expert banks, so the single-stride rule does not apply; "
-                "I-quants have no MMQ case, so prefill dequantizes -- measure it, do not hide it",
+        "I-quants have no MMQ case, so prefill dequantizes -- measure it, do not hide it",
         "parity_against": None,
     },
 ]
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--contexts", default="16384", help="comma list of prompt token counts")
     p.add_argument("--decode", type=int, default=128)
     p.add_argument("--repeats", type=int, default=3)
@@ -129,12 +130,22 @@ def command(row, ctx, args):
     serve = list(COMMON)
     serve = [str(ctx + args.decode + 64) if a == "{ctx_plus}" else a for a in serve]
     return [
-        sys.executable, str(BENCH),
-        "--model", row["model"],
-        "--tokens", str(ctx), "--decode", str(args.decode), "--repeats", str(args.repeats),
-        "--mem-ratio", str(row["mem_ratio"]),
-        "--label", f"{row['id']}@{ctx}",
-        "--serve-arg", " ".join(serve),
+        sys.executable,
+        str(BENCH),
+        "--model",
+        row["model"],
+        "--tokens",
+        str(ctx),
+        "--decode",
+        str(args.decode),
+        "--repeats",
+        str(args.repeats),
+        "--mem-ratio",
+        str(row["mem_ratio"]),
+        "--label",
+        f"{row['id']}@{ctx}",
+        "--serve-arg",
+        " ".join(serve),
     ]
 
 
@@ -148,8 +159,10 @@ def main(argv=None) -> int:
     contexts = [int(c) for c in args.contexts.split(",") if c.strip()]
     rows = [r for r in ROWS if not args.only or r["family"] == args.only]
 
-    print(f"certification matrix: {len(rows)} rows x {len(contexts)} contexts "
-          f"({', '.join(str(c) for c in contexts)} tokens)")
+    print(
+        f"certification matrix: {len(rows)} rows x {len(contexts)} contexts "
+        f"({', '.join(str(c) for c in contexts)} tokens)"
+    )
 
     if args.dry_run:
         for row in rows:
@@ -157,8 +170,10 @@ def main(argv=None) -> int:
                 why = row.get("blocked_by")
                 print(f"\n[{row['id']} @{ctx}] {'BLOCKED: ' + why if why else 'run'}")
                 print("  " + " ".join(command(row, ctx, args)))
-        print(f"\ndry run only; {sum(1 for r in rows if r.get('blocked_by'))} rows carry a "
-              f"known blocker and would report BLOCKED rather than be skipped")
+        print(
+            f"\ndry run only; {sum(1 for r in rows if r.get('blocked_by'))} rows carry a "
+            f"known blocker and would report BLOCKED rather than be skipped"
+        )
         return 0
 
     probe = Path("/tmp/cert-matrix.jsonl")
@@ -167,8 +182,9 @@ def main(argv=None) -> int:
         for ctx in contexts:
             if row.get("blocked_by"):
                 print(f"[{row['id']} @{ctx}] BLOCKED {row['blocked_by']}")
-                results.append({"id": row["id"], "ctx": ctx, "status": "BLOCKED",
-                                "reason": row["blocked_by"]})
+                results.append(
+                    {"id": row["id"], "ctx": ctx, "status": "BLOCKED", "reason": row["blocked_by"]}
+                )
                 continue
             cmd = command(row, ctx, args)
             proc = subprocess.run(cmd + ["--json", str(probe)])
@@ -184,30 +200,55 @@ def main(argv=None) -> int:
                 if m.get("PP_mean", 0) < guard["pp"] or m.get("TG_mean", 0) < guard["tg"]:
                     status = f"REGRESSION (guard PP>={guard['pp']}, TG>={guard['tg']})"
                     failures += 1
-            print(f"[{row['id']} @{ctx}] PP {m.get('PP_mean', 0):.1f} TG {m.get('TG_mean', 0):.2f} "
-                  f"TTFT {m.get('TTFT_mean', 0):.0f}ms VRAM {m.get('vram_gib_mean', 0):.2f}GiB "
-                  f"RSS {m.get('server_rss_gib_mean', 0):.1f}GiB  {status}")
-            results.append({"id": row["id"], "pair": row["pair"], "family": row["family"],
-                            "ctx": ctx, "status": status, **{k: m.get(k) for k in
-                            ("PP_mean", "TG_mean", "TTFT_mean", "vram_gib_mean",
-                             "server_rss_gib_mean", "itl_p50_mean", "itl_p95_mean")}})
+            print(
+                f"[{row['id']} @{ctx}] PP {m.get('PP_mean', 0):.1f} TG {m.get('TG_mean', 0):.2f} "
+                f"TTFT {m.get('TTFT_mean', 0):.0f}ms VRAM {m.get('vram_gib_mean', 0):.2f}GiB "
+                f"RSS {m.get('server_rss_gib_mean', 0):.1f}GiB  {status}"
+            )
+            results.append(
+                {
+                    "id": row["id"],
+                    "pair": row["pair"],
+                    "family": row["family"],
+                    "ctx": ctx,
+                    "status": status,
+                    **{
+                        k: m.get(k)
+                        for k in (
+                            "PP_mean",
+                            "TG_mean",
+                            "TTFT_mean",
+                            "vram_gib_mean",
+                            "server_rss_gib_mean",
+                            "itl_p50_mean",
+                            "itl_p95_mean",
+                        )
+                    },
+                }
+            )
 
     gguf = {}
     for r in results:
         if r.get("family") == "gguf" and r.get("status") == "OK":
             gguf.setdefault(r["pair"], []).append(r)
     for pair, items in gguf.items():
-        base = next((r for r in results if r.get("pair") == pair and r.get("family") == "native"), None)
+        base = next(
+            (r for r in results if r.get("pair") == pair and r.get("family") == "native"), None
+        )
         if not base:
-            print(f"\n[parity {pair}] no native row on this host -- GGUF numbers have no "
-                  f"reference; add a native {pair} checkpoint to close the gate")
+            print(
+                f"\n[parity {pair}] no native row on this host -- GGUF numbers have no "
+                f"reference; add a native {pair} checkpoint to close the gate"
+            )
             continue
         for r in items:
-            print(f"\n[parity {r['id']} vs {base['id']} @{r['ctx']}] "
-                  f"PP {100.0 * r['PP_mean'] / base['PP_mean']:.1f}% of native, "
-                  f"TG {100.0 * r['TG_mean'] / base['TG_mean']:.1f}%, "
-                  f"VRAM {r['vram_gib_mean'] - base['vram_gib_mean']:+.2f} GiB "
-                  f"(weights differ between these files: throughput/capacity only)")
+            print(
+                f"\n[parity {r['id']} vs {base['id']} @{r['ctx']}] "
+                f"PP {100.0 * r['PP_mean'] / base['PP_mean']:.1f}% of native, "
+                f"TG {100.0 * r['TG_mean'] / base['TG_mean']:.1f}%, "
+                f"VRAM {r['vram_gib_mean'] - base['vram_gib_mean']:+.2f} GiB "
+                f"(weights differ between these files: throughput/capacity only)"
+            )
 
     out = Path(args.json_out) if args.json_out else None
     if out:
@@ -215,9 +256,11 @@ def main(argv=None) -> int:
             for r in results:
                 f.write(json.dumps(r) + "\n")
         print(f"\nrows appended to {out}")
-    print(f"\n{'PASS' if not failures else f'FAIL ({failures} rows)'} -- "
-          f"{sum(1 for r in results if r.get('status') == 'BLOCKED')} blocked, "
-          f"clear blockers or remove the row; do not leave it silent")
+    print(
+        f"\n{'PASS' if not failures else f'FAIL ({failures} rows)'} -- "
+        f"{sum(1 for r in results if r.get('status') == 'BLOCKED')} blocked, "
+        f"clear blockers or remove the row; do not leave it silent"
+    )
     return 1 if failures else 0
 
 

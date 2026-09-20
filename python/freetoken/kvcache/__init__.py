@@ -178,8 +178,7 @@ def create_kvcache_pool(
     kv_specs = [s for s in model_config.kv_cache_group_specs() if s.num_layers > 0]
     if model_config.has_linear_attention:
         assert len(kv_specs) == 1, (
-            f"hybrid-linear models support one paged-KV group, got "
-            f"{[s.name for s in kv_specs]}"
+            f"hybrid-linear models support one paged-KV group, got {[s.name for s in kv_specs]}"
         )
         layer_ids = kv_specs[0].layer_ids
 
@@ -235,6 +234,8 @@ def create_kvcache_pool(
             layer_ids=spec.layer_ids,
             mrope=model_config.model_is_mrope,
             kv_format=kv_format,
+            mtp_layer_id=mtp_layer_id,
+            tcq_policy=getattr(model_config, "tcq_policy", None),
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:

@@ -26,10 +26,16 @@ class CompressedTensorsConfig(QuantConfig):
     # the NVFP4 globals are the quant-side scales (vLLM: alpha = 1 / (input_global_scale * weight_global_scale))
     STORAGE: ClassVar[dict[QuantKind, dict[str, str | Stored]]] = {
         QuantKind.NVFP4: {
-            "weight": "weight_packed", "weight_scale": "weight_scale",
-            "weight_global": Stored("weight_global_scale", reciprocal=True), "input_scale": Stored("input_global_scale", reciprocal=True),
+            "weight": "weight_packed",
+            "weight_scale": "weight_scale",
+            "weight_global": Stored("weight_global_scale", reciprocal=True),
+            "input_scale": Stored("input_global_scale", reciprocal=True),
         },
-        QuantKind.FP8_TENSOR: {"weight": "weight", "weight_scale": "weight_scale", "input_scale": "input_scale"},
+        QuantKind.FP8_TENSOR: {
+            "weight": "weight",
+            "weight_scale": "weight_scale",
+            "input_scale": "input_scale",
+        },
         QuantKind.FP8_BLOCK: {"weight": "weight", "weight_scale_inv": "weight_scale"},
     }
 
@@ -38,7 +44,8 @@ class CompressedTensorsConfig(QuantConfig):
         self.ignore = ct_set(tuple(q.get("ignore") or ()), class_names=False)
         groups = q.get("config_groups") or {}
         self.groups: list[tuple[Matcher, QuantScheme]] = [
-            (ct_set(tuple(spec.get("targets") or ()), class_names=True), self._scheme_of(spec)) for spec in groups.values()
+            (ct_set(tuple(spec.get("targets") or ()), class_names=True), self._scheme_of(spec))
+            for spec in groups.values()
         ]
 
     def scheme_for_name(self, name: str) -> QuantScheme | None:
@@ -59,11 +66,19 @@ class CompressedTensorsConfig(QuantConfig):
         group = int(w.get("group_size") or 0)
         if bits == 4 and wtype == "float":
             if strategy == "tensor_group" and group == 16:
-                return cls.SCHEMES["NVFP4_LOCAL" if act and act.get("dynamic") == "local" else "NVFP4"]
-            raise NotImplementedError(f"compressed-tensors 4-bit float scheme (strategy={strategy!r}, group_size={group}) is not supported; only NVFP4 is")
+                return cls.SCHEMES[
+                    "NVFP4_LOCAL" if act and act.get("dynamic") == "local" else "NVFP4"
+                ]
+            raise NotImplementedError(
+                f"compressed-tensors 4-bit float scheme (strategy={strategy!r}, group_size={group}) is not supported; only NVFP4 is"
+            )
         if bits == 8 and wtype == "float":
             if strategy == "tensor":
-                return cls.SCHEMES["FP8_TENSOR_DYNAMIC" if act is None or act.get("dynamic") else "FP8_TENSOR_STATIC"]
+                return cls.SCHEMES[
+                    "FP8_TENSOR_DYNAMIC"
+                    if act is None or act.get("dynamic")
+                    else "FP8_TENSOR_STATIC"
+                ]
             if strategy == "channel":
                 return cls.SCHEMES["FP8_CHANNEL"]
             if strategy == "block":

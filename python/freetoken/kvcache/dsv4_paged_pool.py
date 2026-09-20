@@ -93,7 +93,6 @@ class FreeListAllocator:
         self._free = self._fresh_free()
 
 
-
 class CompressStateRing:
     """Per-layer fp32 compress-state ring: ``[n_slots + 1, 2*(1+overlap)*head_dim]``.
 
@@ -343,8 +342,11 @@ class DSV4PagedKVCache(BaseKVCachePool):
         num_pages = config.num_page_override
         if num_pages is None:
             sizes = dsv4_solve_num_pages(
-                available_memory, dsv4_args, _dsv4_swa_ratio(config),
-                floor_win_pages=_dsv4_window_floor_pages(config, P), P=P,
+                available_memory,
+                dsv4_args,
+                _dsv4_swa_ratio(config),
+                floor_win_pages=_dsv4_window_floor_pages(config, P),
+                P=P,
                 n_scratch=config.max_running_req + 1,
             )
             # The solver fits PHYSICAL pages to memory; one is the dummy page, so the
@@ -379,10 +381,20 @@ class DSV4PagedKVCache(BaseKVCachePool):
         return _dsv4_window_floor_pages(config, P) * P
 
     def validate_rebuild(
-        self, config, *, num_pages: int | None, target_moe: int, per_expert_bytes: int,
-        baseline_free: int, weights_bytes: int, current_num_pages: int,
-        extra_fixed_bytes: int = 0, reserve_bytes: int = 0, extra_note: str = "",
-        num_swa_pages: int | None = None, **targets,
+        self,
+        config,
+        *,
+        num_pages: int | None,
+        target_moe: int,
+        per_expert_bytes: int,
+        baseline_free: int,
+        weights_bytes: int,
+        current_num_pages: int,
+        extra_fixed_bytes: int = 0,
+        reserve_bytes: int = 0,
+        extra_note: str = "",
+        num_swa_pages: int | None = None,
+        **targets,
     ) -> None:
         from freetoken.engine.cache_budget import net_cache_budget_bytes
         from freetoken.utils import mem_GB
@@ -466,6 +478,7 @@ class DSV4PagedKVCache(BaseKVCachePool):
         ``full_token - P`` (== the generic ``fill_(num_tokens)`` convention with num_tokens = the
         allocatable token count), permanently bound so graph-padded rows scatter to a real slot."""
         from .dsv4_cost_model import dsv4_reserved_window_pages
+
         P = self.P
         self._paged_params = (int(max_running_req), bool(radix))
         self.full_to_window.fill_(-1)
@@ -577,9 +590,7 @@ class DSV4PagedKVCache(BaseKVCachePool):
         n += sum(t.numel() * t.element_size() for t in self.cmp_pool if t is not None)
         n += sum(t.numel() * t.element_size() for t in self.idx_pool if t is not None)
         n += sum(
-            r.buffer.numel() * r.buffer.element_size()
-            for r in self.state_ring
-            if r is not None
+            r.buffer.numel() * r.buffer.element_size() for r in self.state_ring if r is not None
         )
         n += sum(
             r.buffer.numel() * r.buffer.element_size()

@@ -204,11 +204,7 @@ def parse_args(
             return "gemma4"
         if "qwen4_exp" in marker or "qwen4exp" in marker or "qwen3.8-flash" in marker:
             return "qwen3_coder"
-        if (
-            "qwen3_5" in marker
-            or "qwen3.5" in marker
-            or ("qwen3" in marker and "coder" in marker)
-        ):
+        if "qwen3_5" in marker or "qwen3.5" in marker or ("qwen3" in marker and "coder" in marker):
             return "qwen3_coder"
         if "qwen" in marker:
             return "qwen25"
@@ -598,8 +594,16 @@ def parse_args(
         type=str,
         default="auto",
         choices=[
-            "auto", "off", "deepseekv32", "gpt_oss", "qwen3", "glm",
-            "minimax", "minimax_m3", "muse_glimmer", "gemma4",
+            "auto",
+            "off",
+            "deepseekv32",
+            "gpt_oss",
+            "qwen3",
+            "glm",
+            "minimax",
+            "minimax_m3",
+            "muse_glimmer",
+            "gemma4",
         ],
         help=(
             "Reasoning parser that splits chain-of-thought into reasoning_content "
@@ -714,6 +718,13 @@ def parse_args(
             " minimal expert cache would not fit. Buys long context out of the expert cache"
             " without hand-computing --kv-reserve-tokens."
         ),
+    )
+
+    parser.add_argument(
+        "--allow-rope-extend",
+        action="store_true",
+        default=ServerArgs.allow_rope_extend,
+        help="Allow auto-extending RoPE table past checkpoint max_position for 512K/1M long context.",
     )
 
     parser.add_argument(
@@ -854,7 +865,9 @@ def parse_args(
     entry = kwargs.pop("nvfp4_backend", None)
     if entry is not None:
         if kwargs["quant_backend"] is not None:
-            parser.error("--nvfp4-backend cannot be combined with --quant-backend; write --quant-backend moe.nvfp4=... instead")
+            parser.error(
+                "--nvfp4-backend cannot be combined with --quant-backend; write --quant-backend moe.nvfp4=... instead"
+            )
         if entry:
             kwargs["quant_backend"] = entry
 
@@ -916,8 +929,11 @@ def parse_args(
         cfg = cached_load_hf_config(kwargs["model_path"]).to_dict()
         text_cfg = cfg.get("text_config") or {}
         dtype_str = (
-            cfg.get("torch_dtype") or cfg.get("dtype")
-            or text_cfg.get("torch_dtype") or text_cfg.get("dtype") or "bfloat16"
+            cfg.get("torch_dtype")
+            or cfg.get("dtype")
+            or text_cfg.get("torch_dtype")
+            or text_cfg.get("dtype")
+            or "bfloat16"
         )
 
     DTYPE_MAP = {
@@ -931,9 +947,18 @@ def parse_args(
 
     disabled = set(ENCODER_KINDS) if kwargs.pop("text_model_only") else set()
     disabled.update(kwargs.pop("mm_disable"))
-    image_min_tokens, image_max_tokens = kwargs.pop("image_min_tokens"), kwargs.pop("image_max_tokens")
-    if image_min_tokens is not None and image_max_tokens is not None and image_min_tokens > image_max_tokens:
-        parser.error(f"--image-min-tokens {image_min_tokens} exceeds --image-max-tokens {image_max_tokens}")
+    image_min_tokens, image_max_tokens = (
+        kwargs.pop("image_min_tokens"),
+        kwargs.pop("image_max_tokens"),
+    )
+    if (
+        image_min_tokens is not None
+        and image_max_tokens is not None
+        and image_min_tokens > image_max_tokens
+    ):
+        parser.error(
+            f"--image-min-tokens {image_min_tokens} exceeds --image-max-tokens {image_max_tokens}"
+        )
     kwargs["mm"] = MultimodalConfig(
         disabled_encoders=frozenset(disabled),
         embed_cache_device=kwargs.pop("mm_embed_cache_device"),

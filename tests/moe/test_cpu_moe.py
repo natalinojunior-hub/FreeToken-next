@@ -100,9 +100,12 @@ def _make_nvfp4_cache(L, E, H, I, seed=0):
     return SimpleNamespace(
         quant_format="nvfp4",
         bank_sources={
-            "gate_up_packed": list(gup.split(E)), "gate_up_scale": list(gus.split(E)),
-            "gate_up_global": list(gug.split(E)), "down_packed": list(dnp.split(E)),
-            "down_scale": list(dns.split(E)), "down_global": list(dng.split(E)),
+            "gate_up_packed": list(gup.split(E)),
+            "gate_up_scale": list(gus.split(E)),
+            "gate_up_global": list(gug.split(E)),
+            "down_packed": list(dnp.split(E)),
+            "down_scale": list(dns.split(E)),
+            "down_global": list(dng.split(E)),
         },
         num_layers=L,
         num_experts=E,
@@ -149,12 +152,18 @@ def test_cpu_decode_nvfp4_matches_dequant_then_gpu(bs):
     b = cache.bank_sources
     slots = torch.arange(E, device=dev, dtype=torch.int32)  # layer-local expert rows
     gate_up_layer = dequant_nvfp4(
-        b["gate_up_packed"][layer].to(dev), b["gate_up_scale"][layer].to(dev),
-        b["gate_up_global"][layer].to(dev), slots, dtype=torch.bfloat16,
+        b["gate_up_packed"][layer].to(dev),
+        b["gate_up_scale"][layer].to(dev),
+        b["gate_up_global"][layer].to(dev),
+        slots,
+        dtype=torch.bfloat16,
     )  # [E, 2I, H]
     down_layer = dequant_nvfp4(
-        b["down_packed"][layer].to(dev), b["down_scale"][layer].to(dev),
-        b["down_global"][layer].to(dev), slots, dtype=torch.bfloat16,
+        b["down_packed"][layer].to(dev),
+        b["down_scale"][layer].to(dev),
+        b["down_global"][layer].to(dev),
+        slots,
+        dtype=torch.bfloat16,
     )  # [E, H, I]
     gpu_out = fused_experts_decode_impl(
         hidden, gate_up_layer, down_layer, w, ids.clone(), "silu", False
@@ -201,12 +210,18 @@ def test_cpu_decode_nvfp4_swigluoai_matches_dequant_reference(bs):
     b = cache.bank_sources
     slots = torch.arange(E, device=dev, dtype=torch.int32)
     gate_up_layer = dequant_nvfp4(
-        b["gate_up_packed"][layer].to(dev), b["gate_up_scale"][layer].to(dev),
-        b["gate_up_global"][layer].to(dev), slots, dtype=torch.bfloat16,
+        b["gate_up_packed"][layer].to(dev),
+        b["gate_up_scale"][layer].to(dev),
+        b["gate_up_global"][layer].to(dev),
+        slots,
+        dtype=torch.bfloat16,
     ).float()  # [E, 2I, H]
     down_layer = dequant_nvfp4(
-        b["down_packed"][layer].to(dev), b["down_scale"][layer].to(dev),
-        b["down_global"][layer].to(dev), slots, dtype=torch.bfloat16,
+        b["down_packed"][layer].to(dev),
+        b["down_scale"][layer].to(dev),
+        b["down_global"][layer].to(dev),
+        slots,
+        dtype=torch.bfloat16,
     ).float()  # [E, H, I]
 
     ref = torch.zeros(bs, H, device=dev, dtype=torch.float32)
@@ -232,7 +247,8 @@ def test_stale_extension_rejected_for_kquant_weight_formats(monkeypatch):
     ``max_weight_format_id`` symbol is itself the evidence, so it must fail closed."""
     from freetoken.kernel import _cpu_moe
     from freetoken.moe.cpu_executor import (
-        CpuMoeExecutor, compiled_extension_supports_format,
+        CpuMoeExecutor,
+        compiled_extension_supports_format,
     )
 
     monkeypatch.delattr(_cpu_moe, "max_weight_format_id", raising=False)
@@ -248,8 +264,14 @@ def test_stale_extension_rejected_for_kquant_weight_formats(monkeypatch):
     cache = _make_nvfp4_cache(1, 4, 256, 128)
     with pytest.raises(RuntimeError, match="rebuild"):
         CpuMoeExecutor(
-            cache, top_k=2, activation="silu", apply_router_weight_on_input=False,
-            num_threads=0, max_tokens=1, device=torch.device("cuda"), fmt="q4_k",
+            cache,
+            top_k=2,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            num_threads=0,
+            max_tokens=1,
+            device=torch.device("cuda"),
+            fmt="q4_k",
         )
 
     # A probe that reports a lower ceiling than the Python id table must be honoured too: the
@@ -275,14 +297,24 @@ def test_stale_extension_rejected_for_swigluoai(monkeypatch):
     cache = _make_nvfp4_cache(1, 4, 256, 128)
     with pytest.raises(RuntimeError, match="rebuild"):
         CpuMoeExecutor(
-            cache, top_k=2, activation="swigluoai",
-            apply_router_weight_on_input=False, num_threads=0, max_tokens=1,
-            device=torch.device("cuda"), swiglu_alpha=1.702, swiglu_limit=7.0,
+            cache,
+            top_k=2,
+            activation="swigluoai",
+            apply_router_weight_on_input=False,
+            num_threads=0,
+            max_tokens=1,
+            device=torch.device("cuda"),
+            swiglu_alpha=1.702,
+            swiglu_limit=7.0,
         )
     # silu predates the marker and must keep working on a stale build.
     CpuMoeExecutor(
-        cache, top_k=2, activation="silu",
-        apply_router_weight_on_input=False, num_threads=0, max_tokens=1,
+        cache,
+        top_k=2,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        num_threads=0,
+        max_tokens=1,
         device=torch.device("cuda"),
     )
 
@@ -318,9 +350,12 @@ def _make_mxfp4_cache(L, E, H, I, seed=0):
     return SimpleNamespace(
         quant_format="mxfp4_triton",
         bank_sources={
-            "gate_up_blocks": list(gub.split(E)), "gate_up_scales": list(gus.split(E)),
-            "gate_up_bias": list(gob.split(E)), "down_blocks": list(dnb.split(E)),
-            "down_scales": list(dns.split(E)), "down_bias": list(dob.split(E)),
+            "gate_up_blocks": list(gub.split(E)),
+            "gate_up_scales": list(gus.split(E)),
+            "gate_up_bias": list(gob.split(E)),
+            "down_blocks": list(dnb.split(E)),
+            "down_scales": list(dns.split(E)),
+            "down_bias": list(dob.split(E)),
         },
         num_layers=L,
         num_experts=E,
@@ -334,7 +369,9 @@ def test_cpu_decode_mxfp4_matches_gpu_splitk(bs):
     """CPU mxfp4 N-accumulator GEMV vs. gpt-oss production split-K decode, on
     byte-identical transposed banks (same dequant, clamped swiglu, bias, router wt)."""
     from freetoken.moe.cpu_executor import CpuMoeExecutor
-    from freetoken.moe.fused_mxfp4 import run_mxfp4_splitk_decode_experts as _run_mxfp4_splitk_decode_experts
+    from freetoken.moe.fused_mxfp4 import (
+        run_mxfp4_splitk_decode_experts as _run_mxfp4_splitk_decode_experts,
+    )
 
     torch.manual_seed(200 + bs)
     L, E, H, I, top_k = 2, 8, 256, 256, 2
@@ -364,10 +401,18 @@ def test_cpu_decode_mxfp4_matches_gpu_splitk(bs):
 
     b = cache.bank_sources
     gpu_out = _run_mxfp4_splitk_decode_experts(
-        hidden, w, ids.clone(),
-        b["gate_up_blocks"][layer].to(dev), b["gate_up_scales"][layer].to(dev), b["gate_up_bias"][layer].to(dev),
-        b["down_blocks"][layer].to(dev), b["down_scales"][layer].to(dev), b["down_bias"][layer].to(dev),
-        top_k=top_k, hidden_act_alpha=alpha, swiglu_limit=limit,
+        hidden,
+        w,
+        ids.clone(),
+        b["gate_up_blocks"][layer].to(dev),
+        b["gate_up_scales"][layer].to(dev),
+        b["gate_up_bias"][layer].to(dev),
+        b["down_blocks"][layer].to(dev),
+        b["down_scales"][layer].to(dev),
+        b["down_bias"][layer].to(dev),
+        top_k=top_k,
+        hidden_act_alpha=alpha,
+        swiglu_limit=limit,
     ).float()
 
     rel = (cpu_out - gpu_out).abs().max() / (gpu_out.abs().max() + 1e-6)
@@ -392,8 +437,10 @@ def _make_dsfp4_cache(L, E, H, I, seed=0):
     return SimpleNamespace(
         quant_format="ds_fp4",
         bank_sources={
-            "gate_up_packed": list(gup.split(E)), "gate_up_scale": list(gus.split(E)),
-            "down_packed": list(dnp.split(E)), "down_scale": list(dns.split(E)),
+            "gate_up_packed": list(gup.split(E)),
+            "gate_up_scale": list(gus.split(E)),
+            "down_packed": list(dnp.split(E)),
+            "down_scale": list(dns.split(E)),
         },
         num_layers=L,
         num_experts=E,
@@ -437,9 +484,13 @@ def test_cpu_decode_dsfp4_matches_gpu(bs):
 
     b = cache.bank_sources
     gpu_out = routed_experts_fp4(
-        hidden, ids.clone(), w.contiguous(),
-        b["gate_up_packed"][layer].to(dev), b["gate_up_scale"][layer].to(dev),
-        b["down_packed"][layer].to(dev), b["down_scale"][layer].to(dev),
+        hidden,
+        ids.clone(),
+        w.contiguous(),
+        b["gate_up_packed"][layer].to(dev),
+        b["gate_up_scale"][layer].to(dev),
+        b["down_packed"][layer].to(dev),
+        b["down_scale"][layer].to(dev),
         swiglu_limit,
     ).float()
 
@@ -548,7 +599,9 @@ def test_cpu_moe_decode_cuda_graph_replay_mxfp4():
     """gpt-oss mxfp4 path under capture/replay: the host nodes must recompute the
     clamped-swiglu+bias GEMV from the freshly written pinned routing on each replay."""
     from freetoken.moe.cpu_executor import CpuMoeExecutor
-    from freetoken.moe.fused_mxfp4 import run_mxfp4_splitk_decode_experts as _run_mxfp4_splitk_decode_experts
+    from freetoken.moe.fused_mxfp4 import (
+        run_mxfp4_splitk_decode_experts as _run_mxfp4_splitk_decode_experts,
+    )
 
     torch.manual_seed(7)
     L, E, H, I, top_k = 2, 8, 256, 256, 2
@@ -560,19 +613,38 @@ def test_cpu_moe_decode_cuda_graph_replay_mxfp4():
     torch.cuda.set_stream(stream)
 
     ex = CpuMoeExecutor(
-        cache, top_k=top_k, activation="gpt_oss_swiglu",
-        apply_router_weight_on_input=False, num_threads=8, max_tokens=bs, device=dev,
-        swiglu_alpha=alpha, swiglu_limit=limit,
+        cache,
+        top_k=top_k,
+        activation="gpt_oss_swiglu",
+        apply_router_weight_on_input=False,
+        num_threads=8,
+        max_tokens=bs,
+        device=dev,
+        swiglu_alpha=alpha,
+        swiglu_limit=limit,
     )
     b = cache.bank_sources
-    layer_banks = [b[n][layer].to(dev) for n in (
-        "gate_up_blocks", "gate_up_scales", "gate_up_bias",
-        "down_blocks", "down_scales", "down_bias")]
+    layer_banks = [
+        b[n][layer].to(dev)
+        for n in (
+            "gate_up_blocks",
+            "gate_up_scales",
+            "gate_up_bias",
+            "down_blocks",
+            "down_scales",
+            "down_bias",
+        )
+    ]
 
     def reference(hidden, ids, w):
         return _run_mxfp4_splitk_decode_experts(
-            hidden, w, ids.clone(), *layer_banks,
-            top_k=top_k, hidden_act_alpha=alpha, swiglu_limit=limit,
+            hidden,
+            w,
+            ids.clone(),
+            *layer_banks,
+            top_k=top_k,
+            hidden_act_alpha=alpha,
+            swiglu_limit=limit,
         ).float()
 
     hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
@@ -618,13 +690,20 @@ def test_cpu_moe_decode_cuda_graph_replay_dsfp4():
     torch.cuda.set_stream(stream)
 
     ex = CpuMoeExecutor(
-        cache, top_k=top_k, activation="silu",
-        apply_router_weight_on_input=False, num_threads=8, max_tokens=bs, device=dev,
+        cache,
+        top_k=top_k,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        num_threads=8,
+        max_tokens=bs,
+        device=dev,
         swiglu_limit=limit,
     )
     b = cache.bank_sources
-    layer_banks = [b[n][layer].to(dev) for n in (
-        "gate_up_packed", "gate_up_scale", "down_packed", "down_scale")]
+    layer_banks = [
+        b[n][layer].to(dev)
+        for n in ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale")
+    ]
 
     def reference(hidden, ids, w):
         return routed_experts_fp4(hidden, ids.clone(), w.contiguous(), *layer_banks, limit).float()
@@ -685,8 +764,13 @@ def test_cpu_moe_executor_is_collectable():
 
     cache = _make_cache(2, 4, 64, 32)
     ex = CpuMoeExecutor(
-        cache, top_k=2, activation="silu", apply_router_weight_on_input=False,
-        num_threads=2, max_tokens=1, device=torch.device("cuda"),
+        cache,
+        top_k=2,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        num_threads=2,
+        max_tokens=1,
+        device=torch.device("cuda"),
     )
     watchdog = ex._watchdog if ex._flag_sync else None
     ref = weakref.ref(ex)

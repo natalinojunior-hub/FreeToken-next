@@ -21,10 +21,14 @@ import triton.language as tl
 
 @triton.jit
 def _rope_decode_kernel(
-    x_ptr, freqs_ptr,
+    x_ptr,
+    freqs_ptr,
     rope_dim,
-    stride_x_batch, stride_x_head, stride_x_dim,
-    stride_freq_pos, stride_freq_dim,
+    stride_x_batch,
+    stride_x_head,
+    stride_x_dim,
+    stride_freq_pos,
+    stride_freq_dim,
     IS_INVERSE: tl.constexpr,
     IS_3D: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -58,7 +62,9 @@ def _rope_decode_kernel(
     tl.store(x_ptr + offs_imag, out_imag, mask=mask)
 
 
-def rope_decode_inplace(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
+def rope_decode_inplace(
+    x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
+) -> torch.Tensor:
     """In-place interleaved RoPE on the last ``rope_dim`` of ``x``, per-row complex ``freqs_cis``.
 
     ``x``: ``[B, 1, (H,) rope_dim]`` (one decode token per row; rope applies to the last dim, which
@@ -75,11 +81,17 @@ def rope_decode_inplace(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool 
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()  # [B, rope_dim] (cos,sin)
     grid = (B, H, triton.cdiv(rope_dim // 2, 128))
     _rope_decode_kernel[grid](
-        xv, freqs_real,
+        xv,
+        freqs_real,
         rope_dim,
-        xv.stride(0), xv.stride(1) if is_3d else 0, xv.stride(-1),
-        freqs_real.stride(0), freqs_real.stride(1),
-        IS_INVERSE=inverse, IS_3D=is_3d, BLOCK_SIZE=128,
+        xv.stride(0),
+        xv.stride(1) if is_3d else 0,
+        xv.stride(-1),
+        freqs_real.stride(0),
+        freqs_real.stride(1),
+        IS_INVERSE=inverse,
+        IS_3D=is_3d,
+        BLOCK_SIZE=128,
     )
     return x
 

@@ -5,6 +5,7 @@ ops; otherwise they fall back to the pure-Triton kernels in
 ``freetoken.kernel.triton``. ``find_spec`` only checks that the package is
 importable (no import side effects), and the result is cached.
 """
+
 from __future__ import annotations
 
 import functools

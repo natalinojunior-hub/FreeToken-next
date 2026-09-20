@@ -46,7 +46,9 @@ class HybridSWAKVCache(BaseKVCachePool):
         self._device = device
         self._dtype = dtype
         self._full_num_tokens = num_full_pages * page_size
-        self._swa_num_tokens = num_swa_tokens if num_swa_tokens is not None else self._full_num_tokens
+        self._swa_num_tokens = (
+            num_swa_tokens if num_swa_tokens is not None else self._full_num_tokens
+        )
         self._page_size = page_size
         # Global-paged SWA (== sglang SWAKVPool): a swa pool reached through a dense full->swa
         # slot mapping + an independent swa free-list. Used by BOTH SWA cache paths -- naive
@@ -273,7 +275,9 @@ class HybridSWAKVCache(BaseKVCachePool):
         """
         page_size = self.full_kv_pool.buffer.shape[3]
         self._full_num_tokens = num_full_pages * page_size
-        self._swa_num_tokens = num_swa_tokens if num_swa_tokens is not None else self._full_num_tokens
+        self._swa_num_tokens = (
+            num_swa_tokens if num_swa_tokens is not None else self._full_num_tokens
+        )
         # Capture geometry, then DROP all references to the old buffers before allocating
         # the replacements so empty_cache() can actually reclaim them. Otherwise the old
         # and new KV buffers are live simultaneously and the rebuild can OOM even when the
@@ -286,8 +290,12 @@ class HybridSWAKVCache(BaseKVCachePool):
         if self._device.type == "cuda":
             torch.cuda.synchronize(self._device)
             torch.cuda.empty_cache()
-        self.full_kv_pool = self._alloc_group(full_geom, outer_size=num_full_pages, inner_size=page_size)
-        self.swa_kv_pool = self._alloc_group(swa_geom, outer_size=self._swa_num_tokens, inner_size=1)
+        self.full_kv_pool = self._alloc_group(
+            full_geom, outer_size=num_full_pages, inner_size=page_size
+        )
+        self.swa_kv_pool = self._alloc_group(
+            swa_geom, outer_size=self._swa_num_tokens, inner_size=1
+        )
         self._storages = {"full": self.full_kv_pool, "swa": self.swa_kv_pool}
         if self._swa_paged:
             # Reset the full->swa mapping (all 0) + swa free-list (all free) to the new
@@ -305,10 +313,7 @@ class HybridSWAKVCache(BaseKVCachePool):
         else the ratio)."""
         from .base import spec_kv_bytes_per_token
 
-        swa_pin = (
-            num_swa_pages if num_swa_pages is not None
-            else config.swa_num_pages_override
-        )
+        swa_pin = num_swa_pages if num_swa_pages is not None else config.swa_num_pages_override
         cache_per_page = 0
         fixed_cache_size = 0
         for spec in config.model_config.kv_cache_group_specs():
@@ -322,9 +327,7 @@ class HybridSWAKVCache(BaseKVCachePool):
                 fixed_cache_size += per_token * _naive_swa_num_tokens(config)
             elif swa_pin is not None:
                 # pinned window == _swa_paged_num_tokens(override): max(floor, pin) + 1.
-                fixed_cache_size += per_token * (
-                    max(_swa_pool_floor(config), int(swa_pin)) + 1
-                )
+                fixed_cache_size += per_token * (max(_swa_pool_floor(config), int(swa_pin)) + 1)
             else:
                 cache_per_page += int(per_token * config.page_size * config.swa_full_tokens_ratio)
                 fixed_cache_size += per_token * _swa_pool_floor(config)  # concurrency floor

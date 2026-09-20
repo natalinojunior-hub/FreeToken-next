@@ -66,13 +66,13 @@ AIME_REPO = "math-ai/aime25"
 AIME_FILE = "test.jsonl"
 # Reasoning models need the answer format spelled out; the boxed answer is also what makes
 # a run spot-checkable by eye.
-BOXED_INSTRUCTION = (
-    "Please reason step by step, and put your final answer within \\boxed{}."
-)
+BOXED_INSTRUCTION = "Please reason step by step, and put your final answer within \\boxed{}."
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--model", required=True, help="checkpoint dir (or .ftw)")
     p.add_argument(
         "--backend",
@@ -92,7 +92,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0,
         help="GPU expert cache slots; 0 = auto-size from free VRAM",
     )
-    p.add_argument("--cache-rate", type=float, default=None, help="cache slots as a fraction of L*E")
+    p.add_argument(
+        "--cache-rate", type=float, default=None, help="cache slots as a fraction of L*E"
+    )
     p.add_argument(
         "--hybrid-fetch",
         type=int,
@@ -100,8 +102,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="hybrid: max PCIe fetches/layer; -1 = auto (benched pcie/cpu bandwidth fraction)",
     )
     p.add_argument("--mem-ratio", type=float, default=0.9, help="target VRAM utilization")
-    p.add_argument("--gpu", default=None,
-                   help="GPU for the serve: a UUID or nvidia-smi index (as ft serve --gpu)")
+    p.add_argument(
+        "--gpu",
+        default=None,
+        help="GPU for the serve: a UUID or nvidia-smi index (as ft serve --gpu)",
+    )
     p.add_argument("--no-graph", action="store_true", help="eager decode instead of CUDA graph")
     p.add_argument(
         "--greedy",
@@ -175,15 +180,28 @@ def free_port() -> int:
 
 def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
     cmd = [
-        sys.executable, "-m", "freetoken.cli", "serve",
-        "--model", args.model,
-        "--host", "127.0.0.1", "--port", str(port),
-        "--moe-backend", backend,
-        "--max-running-requests", "1",
-        "--max-seq-len-override", str(8192 + args.decode),
-        "--memory-ratio", str(args.mem_ratio),
-        "--cuda-graph-max-bs", "0" if args.no_graph else "1",
-        "--moe-hybrid-max-fetch", str(args.hybrid_fetch),
+        sys.executable,
+        "-m",
+        "freetoken.cli",
+        "serve",
+        "--model",
+        args.model,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--moe-backend",
+        backend,
+        "--max-running-requests",
+        "1",
+        "--max-seq-len-override",
+        str(8192 + args.decode),
+        "--memory-ratio",
+        str(args.mem_ratio),
+        "--cuda-graph-max-bs",
+        "0" if args.no_graph else "1",
+        "--moe-hybrid-max-fetch",
+        str(args.hybrid_fetch),
     ]
     if args.gpu:
         cmd += ["--gpu", args.gpu]
@@ -249,8 +267,9 @@ def stop_server(proc: subprocess.Popen) -> None:
     time.sleep(3)  # let the driver reclaim VRAM before the next backend's server
 
 
-def stream_generate(origin: str, model_id: str, problem: str, sampling: dict,
-                    args: argparse.Namespace) -> dict:
+def stream_generate(
+    origin: str, model_id: str, problem: str, sampling: dict, args: argparse.Namespace
+) -> dict:
     """One streamed chat completion; returns per-token arrival stamps, text, and usage."""
     body = {
         "model": model_id,
@@ -283,7 +302,7 @@ def stream_generate(origin: str, model_id: str, problem: str, sampling: dict,
             line = raw.strip()
             if not line or not line.startswith(b"data:"):
                 continue  # blank separators between events
-            payload = line[len(b"data:"):].strip()
+            payload = line[len(b"data:") :].strip()
             if payload == b"[DONE]":
                 break
             now = time.perf_counter()
@@ -343,7 +362,9 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
         sys.exit(f"[bench] need >=2 token events to measure decode, got {len(stamps)}")
     completion = usage["completion_tokens"]
     if completion != args.decode:
-        print(f"[bench] WARNING: completion_tokens={completion} != --decode {args.decode}", flush=True)
+        print(
+            f"[bench] WARNING: completion_tokens={completion} != --decode {args.decode}", flush=True
+        )
     steps = completion - 1
     decode_time = stamps[-1] - stamps[0]
     gaps = sorted((b - a) * 1e3 for a, b in zip(stamps, stamps[1:]))
@@ -367,11 +388,15 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
     }
 
     print(f"\n==== decode bs=1 [{backend}] via /v1/chat/completions ====", flush=True)
-    print(f"  decode throughput : {row['decode_tok_s']:8.2f} tok/s  ({row['ms_per_token']:.3f} ms/token)")
+    print(
+        f"  decode throughput : {row['decode_tok_s']:8.2f} tok/s  ({row['ms_per_token']:.3f} ms/token)"
+    )
     print(f"  TTFT (warm)       : {row['ttft_ms']:8.1f} ms  (prompt {row['prompt_tokens']} tok)")
-    print(f"  decode measured   : {steps} steps in {decode_time:.3f} s  "
-          f"(event p50 {row['event_ms_p50']:.3f} / p99 {row['event_ms_p99']:.3f} ms, "
-          f"{len(stamps)} events)")
+    print(
+        f"  decode measured   : {steps} steps in {decode_time:.3f} s  "
+        f"(event p50 {row['event_ms_p50']:.3f} / p99 {row['event_ms_p99']:.3f} ms, "
+        f"{len(stamps)} events)"
+    )
     print(f"  vram (server)     : {row['vram_gib']:8.2f} GiB")
     sha_note = "greedy" if args.greedy else "sampled, per-server deterministic"
     print(f"  output sha1       : {row['output_sha1']}  ({sha_note}; compare across backends)")

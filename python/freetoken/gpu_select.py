@@ -38,7 +38,7 @@ def _canonical(entry: str) -> str:
             f"{entry!r} is neither a GPU UUID (GPU-xxxx..., as `nvidia-smi -L` prints) "
             f"nor an nvidia-smi index"
         )
-    return UUID_PREFIX + entry[len(UUID_PREFIX):] if is_gpu_uuid(entry) else entry
+    return UUID_PREFIX + entry[len(UUID_PREFIX) :] if is_gpu_uuid(entry) else entry
 
 
 def parse_gpu_spec(value: str) -> tuple[str, ...]:
@@ -81,7 +81,12 @@ def _nvml_uuids() -> "list[str] | None":
         candidates = [
             "nvml.dll",
             os.path.join(os.environ.get("SystemRoot", r"C:\\Windows"), "System32", "nvml.dll"),
-            os.path.join(os.environ.get("ProgramFiles", r"C:\\Program Files"), "NVIDIA Corporation", "NVSMI", "nvml.dll"),
+            os.path.join(
+                os.environ.get("ProgramFiles", r"C:\\Program Files"),
+                "NVIDIA Corporation",
+                "NVSMI",
+                "nvml.dll",
+            ),
         ]
     else:
         candidates = ["libnvidia-ml.so.1"]
@@ -120,7 +125,9 @@ def _match_uuid(spec: str, uuids: "list[str]", where: str) -> str:
     """The unique full UUID that ``spec`` prefixes, else ValueError."""
     hits = [u for u in uuids if u.upper().startswith(spec.upper())]
     if len(hits) != 1:
-        raise ValueError(f"--gpu {spec}: not found or not a unique prefix {where}; run `nvidia-smi -L` to list GPUs")
+        raise ValueError(
+            f"--gpu {spec}: not found or not a unique prefix {where}; run `nvidia-smi -L` to list GPUs"
+        )
     return hits[0]
 
 
@@ -147,12 +154,16 @@ def resolve_gpu_uuids(specs: Sequence[str]) -> "tuple[str, ...] | None":
             elif int(spec) < len(uuids):
                 resolved.append(uuids[int(spec)])
             else:
-                raise ValueError(f"--gpu {spec}: only {len(uuids)} GPU(s) on this machine; run `nvidia-smi -L` to list GPUs")
+                raise ValueError(
+                    f"--gpu {spec}: only {len(uuids)} GPU(s) on this machine; run `nvidia-smi -L` to list GPUs"
+                )
         else:
             entry = _preset_entry(spec, preset, preset_raw)
             # an integer entry is read in physical order, as under CUDA_DEVICE_ORDER=PCI_BUS_ID; a negative or MIG-form entry cannot name a whole GPU
             if is_gpu_uuid(entry):
-                resolved.append(_match_uuid(entry, uuids, f"(from CUDA_VISIBLE_DEVICES={preset_raw!r})"))
+                resolved.append(
+                    _match_uuid(entry, uuids, f"(from CUDA_VISIBLE_DEVICES={preset_raw!r})")
+                )
             elif is_gpu_index(entry) and int(entry) < len(uuids):
                 resolved.append(uuids[int(entry)])
             else:
@@ -180,7 +191,11 @@ def _preset_entry(spec: str, preset: "list[str]", preset_raw: str) -> str:
             f"--gpu {spec}: CUDA_VISIBLE_DEVICES={preset_raw!r} lists GPUs by index; "
             f"give --gpu as an index into that list"
         )
-    hits = [p for p in preset if p.upper().startswith(spec.upper()) or spec.upper().startswith(p.upper())]
+    hits = [
+        p
+        for p in preset
+        if p.upper().startswith(spec.upper()) or spec.upper().startswith(p.upper())
+    ]
     if len(hits) != 1:
         raise ValueError(
             f"--gpu {spec}: not one of the GPUs visible through CUDA_VISIBLE_DEVICES={preset_raw!r}"
@@ -248,7 +263,9 @@ def bind_assigned_gpu(default: int = 0):
     import torch
 
     if _assigned_visible is None:
-        _assigned_visible = default if _assigned_physical is None else _visible_of_physical(_assigned_physical)
+        _assigned_visible = (
+            default if _assigned_physical is None else _visible_of_physical(_assigned_physical)
+        )
     if not 0 <= _assigned_visible < torch.cuda.device_count():
         raise RuntimeError(
             f"cannot use CUDA device {_assigned_visible}: only {torch.cuda.device_count()} device(s) visible "

@@ -4,15 +4,15 @@ import torch
 
 
 def gdn_prefill_chunk_fla(
-    q: torch.Tensor,        # [1, total, num_k_heads, head_k_dim] bf16 (NOT GQA-expanded)
-    k: torch.Tensor,        # [1, total, num_k_heads, head_k_dim] bf16
-    v: torch.Tensor,        # [1, total, num_v_heads, head_v_dim] bf16
-    g: torch.Tensor,        # [1, total, num_v_heads] log-decay (<=0), fp32
-    beta: torch.Tensor,     # [1, total, num_v_heads] fp32
+    q: torch.Tensor,  # [1, total, num_k_heads, head_k_dim] bf16 (NOT GQA-expanded)
+    k: torch.Tensor,  # [1, total, num_k_heads, head_k_dim] bf16
+    v: torch.Tensor,  # [1, total, num_v_heads, head_v_dim] bf16
+    g: torch.Tensor,  # [1, total, num_v_heads] log-decay (<=0), fp32
+    beta: torch.Tensor,  # [1, total, num_v_heads] fp32
     *,
     state_source: torch.Tensor,  # [num_slots, num_v_heads, head_k_dim, head_v_dim] fp32 (in place)
-    indices: torch.Tensor,       # [num_seqs] slot id per sequence
-    cu_seqlens: torch.Tensor,    # [num_seqs+1] int64
+    indices: torch.Tensor,  # [num_seqs] slot id per sequence
+    cu_seqlens: torch.Tensor,  # [num_seqs+1] int64
     scale: float,
     return_h: bool = False,
 ) -> torch.Tensor:
@@ -31,9 +31,16 @@ def gdn_prefill_chunk_fla(
     from freetoken.kernel.fla import chunk_gated_delta_rule
 
     o, _, h = chunk_gated_delta_rule(
-        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-        initial_state=state_source, initial_state_indices=indices.to(torch.int32),
-        cu_seqlens=cu_seqlens.to(torch.int64), head_first=False,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=state_source,
+        initial_state_indices=indices.to(torch.int32),
+        cu_seqlens=cu_seqlens.to(torch.int64),
+        head_first=False,
         use_qk_l2norm_in_kernel=True,
     )
     if return_h:
@@ -42,17 +49,17 @@ def gdn_prefill_chunk_fla(
 
 
 def gdn_decode_fla(
-    q: torch.Tensor,        # [1, B, num_k_heads, head_k_dim] bf16 (NOT GQA-expanded)
-    k: torch.Tensor,        # [1, B, num_k_heads, head_k_dim] bf16
-    v: torch.Tensor,        # [1, B, num_v_heads, head_v_dim] bf16
-    a: torch.Tensor,        # [B, num_v_heads] raw
-    b: torch.Tensor,        # [B, num_v_heads] raw
+    q: torch.Tensor,  # [1, B, num_k_heads, head_k_dim] bf16 (NOT GQA-expanded)
+    k: torch.Tensor,  # [1, B, num_k_heads, head_k_dim] bf16
+    v: torch.Tensor,  # [1, B, num_v_heads, head_v_dim] bf16
+    a: torch.Tensor,  # [B, num_v_heads] raw
+    b: torch.Tensor,  # [B, num_v_heads] raw
     *,
-    A_log: torch.Tensor,        # [num_v_heads]
-    dt_bias: torch.Tensor,      # [num_v_heads]
+    A_log: torch.Tensor,  # [num_v_heads]
+    dt_bias: torch.Tensor,  # [num_v_heads]
     state_source: torch.Tensor,  # [num_slots, num_v_heads, head_k_dim, head_v_dim] fp32 (in place)
-    indices: torch.Tensor,      # [B] int32 slot id per request
-    cu_seqlens: torch.Tensor,   # [B+1] query indptr (arange) from FLAMetadata
+    indices: torch.Tensor,  # [B] int32 slot id per request
+    cu_seqlens: torch.Tensor,  # [B+1] query indptr (arange) from FLAMetadata
     scale: float,
 ) -> torch.Tensor:
     """Fused sigmoid-gating gated-delta-rule decode (vendored fla triton kernel): gating +
@@ -61,12 +68,20 @@ def gdn_decode_fla(
     from freetoken.kernel.fla import fused_sigmoid_gating_delta_rule_update
 
     o = fused_sigmoid_gating_delta_rule_update(
-        A_log=A_log, a=a, dt_bias=dt_bias,  # already fp32 (stored fp32)
-        softplus_beta=1.0, softplus_threshold=20.0,
-        q=q, k=k, v=v, b=b,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,  # already fp32 (stored fp32)
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
         initial_state_source=state_source,
         initial_state_indices=indices,  # already int32 (built int32 in the scheduler)
-        scale=scale, use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
     )
     # kernel returns o = [NK, *v.shape] then squeeze(NK) -> [1, B, num_v, V].
     # o[0] -> [B, num_v, V] (all B decode tokens; o[0,0] would drop B>1).

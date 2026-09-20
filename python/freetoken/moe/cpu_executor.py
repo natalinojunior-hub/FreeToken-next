@@ -162,7 +162,10 @@ def compiled_extension_supports_format(fmt: str) -> bool:
     except ImportError:
         return False
     # The default is the highest id that predates the probe, not "unknown means allowed".
-    return fmt_id <= getattr(_cpu_moe, "max_weight_format_id", lambda: _GGUF_KQUANT_MIN_PROBED_ID - 1)()
+    return (
+        fmt_id
+        <= getattr(_cpu_moe, "max_weight_format_id", lambda: _GGUF_KQUANT_MIN_PROBED_ID - 1)()
+    )
 
 
 def physical_core_cpus() -> list[int]:
@@ -372,7 +375,9 @@ class CpuMoeExecutor:
             self._done.zero_()
             self._err.zero_()
             self._ext.start_flag_coordinator(
-                self._ready.data_ptr(), self._done.data_ptr(), self._flag_capacity,
+                self._ready.data_ptr(),
+                self._done.data_ptr(),
+                self._flag_capacity,
                 self._coord_core,
             )
             self._watchdog_stop = False
@@ -475,9 +480,17 @@ class CpuMoeExecutor:
         # nvfp4: packed e2m1 (2/byte) + fp8-e4m3 per-16 block scales + fp16 row globals.
         gup, gus, gug = banks["gate_up"], banks["gate_up_scale"], banks["gate_up_global"]
         dnp, dns, dng = banks["down"], banks["down_scale"], banks["down_global"]
-        assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (gup[0].dtype, dnp[0].dtype)
-        assert gus[0].element_size() == 1 and dns[0].element_size() == 1, "block scales must be 1 byte"
-        assert gug[0].dtype == torch.float16 and dng[0].dtype == torch.float16, (gug[0].dtype, dng[0].dtype)
+        assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (
+            gup[0].dtype,
+            dnp[0].dtype,
+        )
+        assert gus[0].element_size() == 1 and dns[0].element_size() == 1, (
+            "block scales must be 1 byte"
+        )
+        assert gug[0].dtype == torch.float16 and dng[0].dtype == torch.float16, (
+            gug[0].dtype,
+            dng[0].dtype,
+        )
         I = int(gup[0].shape[1] // 2)
         H = int(gup[0].shape[2] * 2)
         assert gup[0].shape[1] == 2 * I
@@ -505,7 +518,8 @@ class CpuMoeExecutor:
         row in place (18 bytes / 32 K) and dequantizes weights inside the K-loop."""
         gate_up, down = banks["gate_up"], banks["down"]
         assert gate_up[0].dtype == torch.uint8 and down[0].dtype == torch.uint8, (
-            gate_up[0].dtype, down[0].dtype,
+            gate_up[0].dtype,
+            down[0].dtype,
         )
         I = int(gate_up[0].shape[1] // 2)
         H = int(down[0].shape[1])
@@ -563,8 +577,7 @@ class CpuMoeExecutor:
             )
         if int(down[0].shape[2]) != want_dn:
             raise ValueError(
-                f"{fmt} down row is {int(down[0].shape[2])} bytes, expected {want_dn} "
-                f"for K={I}"
+                f"{fmt} down row is {int(down[0].shape[2])} bytes, expected {want_dn} for K={I}"
             )
         ptrs = dict(
             gate_up_ptr=self._make_table(gate_up).data_ptr(),
@@ -585,9 +598,18 @@ class CpuMoeExecutor:
         (no repack, no extra host memory). Block scales are e8m0 (1 byte / 32 K)."""
         gub, gus, gob = banks["gate_up"], banks["gate_up_scale"], banks["gate_up_bias"]
         dnb, dns, dob = banks["down"], banks["down_scale"], banks["down_bias"]
-        assert gub[0].dtype == torch.uint8 and dnb[0].dtype == torch.uint8, (gub[0].dtype, dnb[0].dtype)
-        assert gus[0].dtype == torch.uint8 and dns[0].dtype == torch.uint8, (gus[0].dtype, dns[0].dtype)
-        assert gob[0].dtype == torch.bfloat16 and dob[0].dtype == torch.bfloat16, (gob[0].dtype, dob[0].dtype)
+        assert gub[0].dtype == torch.uint8 and dnb[0].dtype == torch.uint8, (
+            gub[0].dtype,
+            dnb[0].dtype,
+        )
+        assert gus[0].dtype == torch.uint8 and dns[0].dtype == torch.uint8, (
+            gus[0].dtype,
+            dns[0].dtype,
+        )
+        assert gob[0].dtype == torch.bfloat16 and dob[0].dtype == torch.bfloat16, (
+            gob[0].dtype,
+            dob[0].dtype,
+        )
         # gate_up_blocks [E, H//2, 2I]; down_blocks [E, I//2, H]
         H = int(gub[0].shape[1] * 2)
         I = int(gub[0].shape[2] // 2)
@@ -616,8 +638,13 @@ class CpuMoeExecutor:
         activations (block 128) to match DSV4's W4A8 reference, hence the %128 dims."""
         gup, gus = banks["gate_up"], banks["gate_up_scale"]
         dnp, dns = banks["down"], banks["down_scale"]
-        assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (gup[0].dtype, dnp[0].dtype)
-        assert gus[0].element_size() == 1 and dns[0].element_size() == 1, "block scales must be 1 byte"
+        assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (
+            gup[0].dtype,
+            dnp[0].dtype,
+        )
+        assert gus[0].element_size() == 1 and dns[0].element_size() == 1, (
+            "block scales must be 1 byte"
+        )
         I = int(gup[0].shape[1] // 2)
         H = int(gup[0].shape[2] * 2)
         assert gup[0].shape[1] == 2 * I
@@ -726,7 +753,9 @@ class CpuMoeExecutor:
             # doorbell). No kernel launched; no host-func round trip.
             self._cpu_moe.memop_submit(
                 torch.cuda.current_stream().cuda_stream,
-                self._done.data_ptr(), self._ready.data_ptr(), slot,
+                self._done.data_ptr(),
+                self._ready.data_ptr(),
+                slot,
             )
         else:
             stream = torch.cuda.current_stream().cuda_stream
@@ -742,7 +771,9 @@ class CpuMoeExecutor:
             # Front-end WAIT(done[slot] >= 1): blocks this stream's later nodes without
             # occupying an SM, so GPU utilization stays truthful during the CPU window.
             self._cpu_moe.memop_sync(
-                torch.cuda.current_stream().cuda_stream, self._done.data_ptr(), slot,
+                torch.cuda.current_stream().cuda_stream,
+                self._done.data_ptr(),
+                slot,
             )
         else:
             stream = torch.cuda.current_stream().cuda_stream

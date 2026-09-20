@@ -71,12 +71,14 @@ def _nvfp4_dense_parts(reader: ShardReader, raw_base: str):
     s = reader.get_tensor(raw_base + ".weight_scale")
     g = reader.get_tensor(raw_base + ".weight_scale_2").reshape(1).to(torch.float16)
     g = g.expand(w.shape[0]).contiguous()
-    assert (
-        w.dtype is torch.uint8
-        and s.dtype is torch.float8_e4m3fn
-        and g.dtype is torch.float16
-    ), f"unexpected NVFP4 dense dtypes at {raw_base}: {w.dtype}/{s.dtype}/{g.dtype}"
-    a = reader.get_tensor(raw_base + ".input_scale").reshape(()).to(torch.float32) if reader.has(raw_base + ".input_scale") else None
+    assert w.dtype is torch.uint8 and s.dtype is torch.float8_e4m3fn and g.dtype is torch.float16, (
+        f"unexpected NVFP4 dense dtypes at {raw_base}: {w.dtype}/{s.dtype}/{g.dtype}"
+    )
+    a = (
+        reader.get_tensor(raw_base + ".input_scale").reshape(()).to(torch.float32)
+        if reader.has(raw_base + ".input_scale")
+        else None
+    )
     return w, s, g, a
 
 
@@ -120,7 +122,9 @@ def _rename_vision_key(raw_name: str) -> str | None:
     return None
 
 
-def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+def iter_vision_weights(
+    model_path: str, device: torch.device
+) -> Iterator[tuple[str, torch.Tensor]]:
     """The vision encoder alone, named as iter_weights names it."""
     for file in iter_weight_files(model_path):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
@@ -204,12 +208,12 @@ def iter_weights(
                     if raw_name.endswith(_NVFP4_DENSE_SCALE_SUFFIXES):
                         continue
 
-                    is_vision = name.startswith(("vision_tower.", "embed_vision.", "vision_embedder."))
+                    is_vision = name.startswith(
+                        ("vision_tower.", "embed_vision.", "vision_embedder.")
+                    )
                     if is_vision and not include_vision:
                         continue
-                    is_expert = (
-                        not is_vision and _PACKED_EXPERT_PATTERN.match(name) is not None
-                    )
+                    is_expert = not is_vision and _PACKED_EXPERT_PATTERN.match(name) is not None
                     if is_expert and not include_moe_experts:
                         continue
                     if not is_expert and not include_non_moe:
@@ -244,10 +248,7 @@ def iter_weights(
                     slots[rule.slot] = tensor
                     if rule.slot == "k" and k_eq_v_layers:
                         layer_match = _LAYER_INDEX_PATTERN.search(name)
-                        if (
-                            layer_match is not None
-                            and int(layer_match.group(1)) in k_eq_v_layers
-                        ):
+                        if layer_match is not None and int(layer_match.group(1)) in k_eq_v_layers:
                             slots["v"] = tensor
                     if not all(slot in slots for slot in rule.slots):
                         continue

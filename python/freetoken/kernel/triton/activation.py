@@ -52,8 +52,12 @@ def _pdl_supported() -> bool:
 def _fast_tanh(x):
     # PTX tanh.approx.f32 — single HW op, matches flashinfer math::tanh.
     return tl.inline_asm_elementwise(
-        "tanh.approx.f32 $0, $1;", "=f,f", [x],
-        dtype=tl.float32, is_pure=True, pack=1,
+        "tanh.approx.f32 $0, $1;",
+        "=f,f",
+        [x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
     )
 
 
@@ -61,8 +65,12 @@ def _fast_tanh(x):
 def _fast_ex2(x):
     # PTX ex2.approx.f32 — matches __expf fast path used by flashinfer silu.
     return tl.inline_asm_elementwise(
-        "ex2.approx.f32 $0, $1;", "=f,f", [x],
-        dtype=tl.float32, is_pure=True, pack=1,
+        "ex2.approx.f32 $0, $1;",
+        "=f,f",
+        [x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
     )
 
 
@@ -141,8 +149,17 @@ def _act_and_mul(
     block_d = min(triton.next_power_of_2(d), 1024 if M >= 4096 else 512)
     num_stages = 2 if block_d == 1024 else 3
     _act_and_mul_kernel[grid](
-        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, launch_pdl=pdl,
-        BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
+        o2,
+        x2,
+        d,
+        alpha,
+        limit,
+        ACT=kind,
+        ENABLE_PDL=pdl,
+        launch_pdl=pdl,
+        BLOCK_D=block_d,
+        num_warps=4,
+        num_stages=num_stages,
     )
     return out
 

@@ -168,8 +168,11 @@ def test_supervisor_detects_post_ready_death():
         proc._alive = False  # die right after readiness
 
     run_backend_supervisor(
-        handle, LoadProgress(), on_ready=on_ready,
-        on_failure=lambda m: seen.setdefault("failure", m), poll=0.01,
+        handle,
+        LoadProgress(),
+        on_ready=on_ready,
+        on_failure=lambda m: seen.setdefault("failure", m),
+        poll=0.01,
     )
     assert seen.get("ready") is True
     assert "scheduler" in seen["failure"]
@@ -201,11 +204,14 @@ def test_supervisor_silent_on_post_ready_death_during_shutdown():
     def on_ready() -> None:
         seen["ready"] = True
         shutting_down["v"] = True  # stop requested…
-        proc._alive = False        # …and the worker exits as part of that stop
+        proc._alive = False  # …and the worker exits as part of that stop
 
     run_backend_supervisor(
-        handle, LoadProgress(), on_ready=on_ready,
-        on_failure=lambda m: seen.setdefault("failure", m), poll=0.01,
+        handle,
+        LoadProgress(),
+        on_ready=on_ready,
+        on_failure=lambda m: seen.setdefault("failure", m),
+        poll=0.01,
         is_shutting_down=lambda: shutting_down["v"],
     )
     assert seen.get("ready") is True

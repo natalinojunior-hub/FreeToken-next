@@ -26,6 +26,7 @@ from tqdm import tqdm
 
 from .config import parse_config
 
+
 # fp8-e4m3 dynamic range for the per-row W8A16 quantization of the big MLA projections.
 class _ShardReader:
     def __init__(self, folder: str, weight_map: dict, device: torch.device):
@@ -113,7 +114,10 @@ def iter_weights(
                     reader.get(f"{m}.gate.e_score_correction_bias").to(torch.bfloat16),
                 )
                 for proj in ("gate_proj", "up_proj", "down_proj"):
-                    yield f"{m}.shared_experts.{proj}.weight", reader.get(f"{m}.shared_experts.{proj}.weight")
+                    yield (
+                        f"{m}.shared_experts.{proj}.weight",
+                        reader.get(f"{m}.shared_experts.{proj}.weight"),
+                    )
 
         yield "model.embed_tokens.weight", reader.get("model.embed_tokens.weight")
         yield "model.norm.weight", reader.get("model.norm.weight")

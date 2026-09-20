@@ -109,9 +109,7 @@ def _sparse_geometry(text_config: Any) -> dict:
         return {}
     return {
         "use_sparse_attention": True,
-        "sparse_attention_freq": [
-            1 if t == "minimax_m3_sparse" else 0 for t in layer_types
-        ],
+        "sparse_attention_freq": [1 if t == "minimax_m3_sparse" else 0 for t in layer_types],
         "sparse_num_index_heads": int(getattr(text_config, "index_n_heads", 4)),
         "sparse_index_dim": int(getattr(text_config, "index_head_dim", 128)),
         "sparse_block_size": int(getattr(text_config, "index_block_size", 128)),
@@ -190,8 +188,11 @@ def load_args(text_config: Any, num_layers: int, *, sparse_enabled: bool) -> Min
     # Plain-rope only: silently ignoring a variant checkpoint's rope_scaling would
     # mis-position every token past the scaling boundary. Newer HF configs spell
     # the key `rope_parameters`; check both so a renamed config still trips this.
-    scaling = (getattr(text_config, "rope_scaling", None)
-               or getattr(text_config, "rope_parameters", None) or {})
+    scaling = (
+        getattr(text_config, "rope_scaling", None)
+        or getattr(text_config, "rope_parameters", None)
+        or {}
+    )
     rope_type = scaling.get("rope_type", scaling.get("type", "default")) if scaling else "default"
     assert rope_type in (None, "default"), (
         f"MiniMax-M3 support implements plain rope only, got rope_scaling={scaling!r}"
@@ -236,12 +237,10 @@ def load_args(text_config: Any, num_layers: int, *, sparse_enabled: bool) -> Min
         swiglu_alpha=float(getattr(text_config, "swiglu_alpha", 1.702)),
         swiglu_limit=float(getattr(text_config, "swiglu_limit", 7.0)),
         dense_intermediate_size=int(
-            getattr(text_config, "dense_intermediate_size", 0)
-            or text_config.intermediate_size
+            getattr(text_config, "dense_intermediate_size", 0) or text_config.intermediate_size
         ),
         shared_intermediate_size=int(
-            getattr(text_config, "shared_intermediate_size", 0)
-            or text_config.intermediate_size
+            getattr(text_config, "shared_intermediate_size", 0) or text_config.intermediate_size
         ),
         index_dim=int(sparse_cfg.get("sparse_index_dim", 0)) if use_sparse else 0,
         num_index_heads=num_index_heads,

@@ -36,9 +36,19 @@ _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float
 # ======================================================================================
 @triton.jit
 def _act_quant_kernel(
-    x_ptr, y_ptr, s_ptr, M, K,
-    stride_xm, stride_xk, stride_ym, stride_yk, stride_sm, stride_sk,
-    BLOCK_M: tl.constexpr, BLOCK: tl.constexpr,
+    x_ptr,
+    y_ptr,
+    s_ptr,
+    M,
+    K,
+    stride_xm,
+    stride_xk,
+    stride_ym,
+    stride_yk,
+    stride_sm,
+    stride_sk,
+    BLOCK_M: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -47,7 +57,8 @@ def _act_quant_kernel(
     m_mask = offs_m < M
     x = tl.load(
         x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
-        mask=m_mask[:, None], other=0.0,
+        mask=m_mask[:, None],
+        other=0.0,
     ).to(tl.float32)
     amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-10)
     s = amax / 448.0  # [BLOCK_M] fp32 per-token-group scale (e4m3 finite max = 448)
@@ -56,7 +67,9 @@ def _act_quant_kernel(
         y = y.to(tl.float8e4nv)
     else:
         y = round_e4m3(y)  # e4m3-grid values into the wrapper's bf16 buffer
-    tl.store(y_ptr + offs_m[:, None] * stride_ym + offs_k[None, :] * stride_yk, y, mask=m_mask[:, None])
+    tl.store(
+        y_ptr + offs_m[:, None] * stride_ym + offs_k[None, :] * stride_yk, y, mask=m_mask[:, None]
+    )
     tl.store(s_ptr + offs_m * stride_sm + pid_k * stride_sk, s, mask=m_mask)
 
 
@@ -74,9 +87,19 @@ def per_token_group_quant_fp8(x: torch.Tensor, block: int = _BLOCK):
     BLOCK_M = 32
     grid = (triton.cdiv(M, BLOCK_M), K // block)
     _act_quant_kernel[grid](
-        x2d, y, s, M, K,
-        x2d.stride(0), x2d.stride(1), y.stride(0), y.stride(1), s.stride(0), s.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK=block,
+        x2d,
+        y,
+        s,
+        M,
+        K,
+        x2d.stride(0),
+        x2d.stride(1),
+        y.stride(0),
+        y.stride(1),
+        s.stride(0),
+        s.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK=block,
     )
     return y, s
 
@@ -86,12 +109,27 @@ def per_token_group_quant_fp8(x: torch.Tensor, block: int = _BLOCK):
 # ======================================================================================
 @triton.jit
 def _block_fp8_gemm_kernel(
-    a_ptr, w_ptr, sa_ptr, sb_ptr, c_ptr,
-    M, N, K,
-    stride_am, stride_ak, stride_wn, stride_wk,
-    stride_sam, stride_sak, stride_sbn, stride_sbk,
-    stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    w_ptr,
+    sa_ptr,
+    sb_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_wn,
+    stride_wk,
+    stride_sam,
+    stride_sak,
+    stride_sbn,
+    stride_sbk,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     compute_type: tl.constexpr,
 ):
     """``BLOCK_N == BLOCK_K == 128`` so each tile maps to exactly one weight scale block
@@ -114,7 +152,9 @@ def _block_fp8_gemm_kernel(
         else:
             # bf16 dot on the same e4m3 grid: operands exact in bf16, fp32 acc
             p = tl.dot(a, tl.trans(e4m3_u8_to_f32(w).to(tl.bfloat16)), out_dtype=tl.float32)
-        sa = tl.load(sa_ptr + offs_m * stride_sam + k * stride_sak, mask=m_mask, other=0.0).to(tl.float32)
+        sa = tl.load(sa_ptr + offs_m * stride_sam + k * stride_sak, mask=m_mask, other=0.0).to(
+            tl.float32
+        )
         sb = tl.load(sb_ptr + pid_n * stride_sbn + k * stride_sbk).to(tl.float32)
         acc += p * sa[:, None] * sb
         a_ptrs += BLOCK_K * stride_ak
@@ -124,8 +164,11 @@ def _block_fp8_gemm_kernel(
 
 
 def block_fp8_matmul(
-    a_fp8: torch.Tensor, a_scale: torch.Tensor,
-    weight: torch.Tensor, weight_scale: torch.Tensor, out_dtype: torch.dtype,
+    a_fp8: torch.Tensor,
+    a_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
 ) -> torch.Tensor:
     """``y = (a_fp8 * a_scale) @ (weight * weight_scale)^T`` over 128-K blocks.
 
@@ -143,13 +186,30 @@ def block_fp8_matmul(
     nwarps = 8 if M >= 64 else 4
     grid = (triton.cdiv(M, block_m), triton.cdiv(N, _BLOCK))
     _block_fp8_gemm_kernel[grid](
-        a_fp8, w, a_scale, weight_scale, out,
-        M, N, K,
-        a_fp8.stride(0), a_fp8.stride(1), w.stride(0), w.stride(1),
-        a_scale.stride(0), a_scale.stride(1), weight_scale.stride(0), weight_scale.stride(1),
-        out.stride(0), out.stride(1),
-        BLOCK_M=block_m, BLOCK_N=_BLOCK, BLOCK_K=_BLOCK, compute_type=_TL_DTYPE[compute],
-        num_warps=nwarps, num_stages=3,
+        a_fp8,
+        w,
+        a_scale,
+        weight_scale,
+        out,
+        M,
+        N,
+        K,
+        a_fp8.stride(0),
+        a_fp8.stride(1),
+        w.stride(0),
+        w.stride(1),
+        a_scale.stride(0),
+        a_scale.stride(1),
+        weight_scale.stride(0),
+        weight_scale.stride(1),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=_BLOCK,
+        BLOCK_K=_BLOCK,
+        compute_type=_TL_DTYPE[compute],
+        num_warps=nwarps,
+        num_stages=3,
     )
     return out
 
@@ -161,9 +221,24 @@ def block_fp8_matmul(
 # ======================================================================================
 @triton.jit
 def _block_fp8_gemv_splitk_kernel(
-    a_ptr, sa_ptr, w_ptr, sb_ptr, part_ptr, N, K, n_kb, kb_per,
-    stride_ak, stride_wn, stride_wk, stride_sbn, stride_sbk, stride_pk, stride_pn,
-    BLOCK_N: tl.constexpr, USE_A_SCALE: tl.constexpr,
+    a_ptr,
+    sa_ptr,
+    w_ptr,
+    sb_ptr,
+    part_ptr,
+    N,
+    K,
+    n_kb,
+    kb_per,
+    stride_ak,
+    stride_wn,
+    stride_wk,
+    stride_sbn,
+    stride_sbk,
+    stride_pk,
+    stride_pn,
+    BLOCK_N: tl.constexpr,
+    USE_A_SCALE: tl.constexpr,
 ):
     """Each pid_k split covers ``kb_per`` 128-K-blocks (ceil-tiled, masked to ``n_kb``), so
     K only has to be a multiple of 128 -- no power-of-two ``K//128`` / split divisibility
@@ -184,23 +259,39 @@ def _block_fp8_gemv_splitk_kernel(
             if e4m3_native_cx():
                 w = tl.load(
                     w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
-                    mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+                    mask=n_mask[:, None] & k_mask[None, :],
+                    other=0.0,
                 ).to(tl.float32)
             else:
-                w = e4m3_u8_to_f32(tl.load(
-                    w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
-                    mask=n_mask[:, None] & k_mask[None, :], other=0,
-                ))
-            scb = tl.load(sb_ptr + sn * stride_sbn + kb * stride_sbk, mask=n_mask, other=0.0).to(tl.float32)
+                w = e4m3_u8_to_f32(
+                    tl.load(
+                        w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
+                        mask=n_mask[:, None] & k_mask[None, :],
+                        other=0,
+                    )
+                )
+            scb = tl.load(sb_ptr + sn * stride_sbn + kb * stride_sbk, mask=n_mask, other=0.0).to(
+                tl.float32
+            )
             if USE_A_SCALE:
-                scb *= tl.load(sa_ptr + kb).to(tl.float32)  # W8A8: also the per-token-group act scale
+                scb *= tl.load(sa_ptr + kb).to(
+                    tl.float32
+                )  # W8A8: also the per-token-group act scale
             acc += tl.sum(w * a[None, :], axis=1) * scb
     tl.store(part_ptr + pid_k * stride_pk + offs_n * stride_pn, acc, mask=n_mask)
 
 
 @triton.jit
-def _splitk_reduce_kernel(part_ptr, out_ptr, N, SPLIT_K: tl.constexpr,
-                          stride_pk, stride_pn, BLOCK: tl.constexpr, OUT: tl.constexpr):
+def _splitk_reduce_kernel(
+    part_ptr,
+    out_ptr,
+    N,
+    SPLIT_K: tl.constexpr,
+    stride_pk,
+    stride_pn,
+    BLOCK: tl.constexpr,
+    OUT: tl.constexpr,
+):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < N
     acc = tl.zeros((BLOCK,), dtype=tl.float32)
@@ -226,21 +317,45 @@ def _block_fp8_gemv(a, weight, weight_scale, out_dtype, a_scale=None):
     part = torch.empty((split_k, N), dtype=torch.float32, device=a.device)
     w = e4m3_kernel_view(weight)
     _block_fp8_gemv_splitk_kernel[(n_tiles, split_k)](
-        a, a_scale if a_scale is not None else a, w, weight_scale, part, N, K, n_kb, kb_per,
-        a.stride(0), w.stride(0), w.stride(1),
-        weight_scale.stride(0), weight_scale.stride(1), part.stride(0), part.stride(1),
-        BLOCK_N=BLOCK_N, USE_A_SCALE=a_scale is not None, num_warps=1,
+        a,
+        a_scale if a_scale is not None else a,
+        w,
+        weight_scale,
+        part,
+        N,
+        K,
+        n_kb,
+        kb_per,
+        a.stride(0),
+        w.stride(0),
+        w.stride(1),
+        weight_scale.stride(0),
+        weight_scale.stride(1),
+        part.stride(0),
+        part.stride(1),
+        BLOCK_N=BLOCK_N,
+        USE_A_SCALE=a_scale is not None,
+        num_warps=1,
     )
     out = torch.empty(N, dtype=out_dtype, device=a.device)
     _splitk_reduce_kernel[(triton.cdiv(N, 256),)](
-        part, out, N, split_k, part.stride(0), part.stride(1),
-        BLOCK=256, OUT=_TL_DTYPE[out_dtype if out_dtype in _TL_DTYPE else torch.bfloat16], num_warps=2,
+        part,
+        out,
+        N,
+        split_k,
+        part.stride(0),
+        part.stride(1),
+        BLOCK=256,
+        OUT=_TL_DTYPE[out_dtype if out_dtype in _TL_DTYPE else torch.bfloat16],
+        num_warps=2,
     )
     return out
 
 
 def block_fp8_linear(
-    x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``y = x @ weight^T`` with block-fp8 weight. Decode (M=1) uses a W8A16 split-K GEMV
@@ -258,7 +373,9 @@ def block_fp8_linear(
     return out
 
 
-def dequant_block_fp8(weight: torch.Tensor, scale: torch.Tensor, block: int = _BLOCK) -> torch.Tensor:
+def dequant_block_fp8(
+    weight: torch.Tensor, scale: torch.Tensor, block: int = _BLOCK
+) -> torch.Tensor:
     """Dequantize a block-fp8 weight ``[N, K]`` (+ scale ``[N//block, K//block]``) to bf16.
 
     ``out[i,j] = weight_fp8[i,j] * scale[i//block, j//block]`` (used by the M1 expert

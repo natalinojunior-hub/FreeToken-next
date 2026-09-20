@@ -40,8 +40,11 @@ def _inputs(fixture: Fixture, lengths, extra: int = 0, seed: int = 11):
     generator = torch.Generator(device=fixture.device).manual_seed(seed)
     return [
         torch.randn(
-            n + extra, fixture.config.hidden_size, device=fixture.device,
-            dtype=fixture.dtype, generator=generator,
+            n + extra,
+            fixture.config.hidden_size,
+            device=fixture.device,
+            dtype=fixture.dtype,
+            generator=generator,
         )
         * 0.5
         for n in lengths
@@ -136,9 +139,7 @@ def test_flashinfer_dense_matches_the_sparse_path():
 
     dense = FlashInferBackend(config)
     fixture.ctx.attn_backend = SimpleNamespace(
-        qsa_forward=lambda q, k, v, index, layer_id, batch: dense.forward(
-            q, k, v, layer_id, batch
-        )
+        qsa_forward=lambda q, k, v, index, layer_id, batch: dense.forward(q, k, v, layer_id, batch)
     )
     batch = fixture.batch([req], "prefill")
     dense.prepare_metadata(batch)
@@ -147,7 +148,9 @@ def test_flashinfer_dense_matches_the_sparse_path():
 
 
 @requires_cuda
-@pytest.mark.parametrize("cut", [1001, 4096, 4097], ids=["unaligned", "page-boundary", "boundary+1"])
+@pytest.mark.parametrize(
+    "cut", [1001, 4096, 4097], ids=["unaligned", "page-boundary", "boundary+1"]
+)
 def test_chunked_prefill_matches_one_shot(cut: int):
     """Cut points that are not multiples of index_ratio exercise the dual-source compress."""
     config = parsed_config()
@@ -188,10 +191,18 @@ def test_decode_graph_replay_matches_eager():
         "out_loc": torch.zeros(bs, dtype=torch.int32, device=fixture.device),
     }
     capture_batch = SimpleNamespace(
-        padded_reqs=[dummy] * bs, reqs=[dummy] * bs, phase="decode", size=bs, padded_size=bs,
-        is_prefill=False, is_decode=True, positions=static["positions"],
+        padded_reqs=[dummy] * bs,
+        reqs=[dummy] * bs,
+        phase="decode",
+        size=bs,
+        padded_size=bs,
+        is_prefill=False,
+        is_decode=True,
+        positions=static["positions"],
         get_attn_positions=lambda: static["positions"],
-        out_loc=static["out_loc"], attn_metadata=None, active_table_idx=None,
+        out_loc=static["out_loc"],
+        attn_metadata=None,
+        active_table_idx=None,
     )
     fixture.backend.prepare_for_capture(capture_batch)
     attn.forward(static["x"], capture_batch)  # warmup, same metadata object as the capture

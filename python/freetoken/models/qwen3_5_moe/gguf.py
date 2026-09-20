@@ -70,23 +70,14 @@ def _kv(shim: "GgufConfigShim", key: str, default: Any = None) -> Any:
     """
     val = shim.metadata.get(f"{shim.model_type}.{key}", default)
     if val is None and default is None:
-        raise ValueError(
-            f"GGUF {shim.model_path}: missing required key {shim.model_type}.{key}"
-        )
+        raise ValueError(f"GGUF {shim.model_path}: missing required key {shim.model_type}.{key}")
     return val
 
 
-def _uniform_expert_types(model_path: str, num_layers: int) -> tuple[int, int] | None:
-    """``(gate_up, down)`` ggml types of the routed-expert banks, or None if not uniform.
-
-    The offload slot pool is one allocation per bank shared by every layer, and
-    ``moe_vec.cuh`` addresses it as ``expert * nrows * (ncols / qk)`` with no padding
-    allowance -- so a bank whose type varies by layer cannot be served. We return None
-    rather than raising here because ``parse_gguf_config`` also runs for metadata-only
-    inspection; ``expert_banks._gguf_banks`` is where the load actually fails, with the
-    offending layers named. (llama.cpp's *_M mixes hit this: Ornith IQ3_M splits
-    ffn_down_exps across Q4_K and IQ3_S, while IQ3_S / IQ3_XXS are uniform.)
-    """
+def _uniform_expert_types(
+    model_path: str, num_layers: int
+) -> tuple[int, int] | list[tuple[int, int]] | None:
+    """``(gate_up, down)`` ggml types of the routed-expert banks (or per-layer list if mixed)."""
     from .gguf_experts import gguf_expert_types
 
     try:
@@ -94,9 +85,9 @@ def _uniform_expert_types(model_path: str, num_layers: int) -> tuple[int, int] |
     except Exception:
         return None
     gate_up, down = set(types["gate_up"]), set(types["down"])
-    if len(gate_up) != 1 or len(down) != 1:
-        return None
-    return (next(iter(gate_up)), next(iter(down)))
+    if len(gate_up) == 1 and len(down) == 1:
+        return (next(iter(gate_up)), next(iter(down)))
+    return [(types["gate_up"][l], types["down"][l]) for l in range(num_layers)]
 
 
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
@@ -261,11 +252,19 @@ _LAYER_MAP: dict[str, str] = {
 # NOTE the GDN target is ``in_proj``, not ``in_proj_qkvz``/``in_proj_ba``: gdn.py only
 # splits those two out on the fp8 branch (``self._fp8``), and a GGUF checkpoint sets
 # attn_quant="gguf", so the single fused in_proj is what exists.
-_MERGED_PARTS: frozenset[str] = frozenset({
-    "attn_q.weight", "attn_k.weight", "attn_v.weight",
-    "attn_qkv.weight", "attn_gate.weight", "ssm_beta.weight", "ssm_alpha.weight",
-    "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
-})
+_MERGED_PARTS: frozenset[str] = frozenset(
+    {
+        "attn_q.weight",
+        "attn_k.weight",
+        "attn_v.weight",
+        "attn_qkv.weight",
+        "attn_gate.weight",
+        "ssm_beta.weight",
+        "ssm_alpha.weight",
+        "ffn_gate_shexp.weight",
+        "ffn_up_shexp.weight",
+    }
+)
 
 # Routed-expert stacks: [num_experts, out, in] packed blocks, handled by the offload
 # expert-bank loader rather than yielded as ordinary parameters.
@@ -355,7 +354,6 @@ def _scan_quant_types(model_path: str) -> dict[tuple[int, str], int]:
 # Raw w would centre near 0.0X; these centre near 1, i.e. already 1+w.
 
 
-
 # --------------------------------------------------------------------------------------
 # V-head order: llama.cpp writes TILED, FreeToken (like HF) wants GROUPED
 # --------------------------------------------------------------------------------------
@@ -383,7 +381,7 @@ def _ungroup_v(t: torch.Tensor, dim: int, num_k_heads: int, num_v_per_k: int, he
     shape = list(t.shape)
     if dim < 0:
         dim += len(shape)
-    view = shape[:dim] + [num_v_per_k, num_k_heads, head_dim] + shape[dim + 1:]
+    view = shape[:dim] + [num_v_per_k, num_k_heads, head_dim] + shape[dim + 1 :]
     out = t.reshape(*view)
     perm = list(range(len(view)))
     perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
@@ -497,7 +495,8 @@ def iter_gguf_weights(
             break
     # attn_qkv_size = q + k + v = num_k_heads*state_size*2 + num_v_heads*state_size
     gdn_attn_qkv_size = (
-        2 * gdn_group.num_key_heads * gdn_group.key_head_dim + gdn_group.num_value_heads * gdn_group.value_head_dim
+        2 * gdn_group.num_key_heads * gdn_group.key_head_dim
+        + gdn_group.num_value_heads * gdn_group.value_head_dim
         if gdn_group
         else 8192
     )
@@ -549,7 +548,8 @@ def iter_gguf_weights(
         # served model is ``config.num_layers`` deep and this path never speculates.
         if layer >= config.num_layers or "nextn." in name:
             warn_dropped_tensors(
-                model_path, "nextn",
+                model_path,
+                "nextn",
                 f"{name} belongs to a NextN/MTP draft block, which is not loaded "
                 f"(served model is {config.num_layers} layers); GGUF paths do not do "
                 f"speculative decoding, so the draft weights are dropped.",
@@ -647,8 +647,9 @@ def iter_gguf_weights(
                         quant_map.get((layer, "ffn_up.weight")),
                     ]
                     if len(set(types)) == 1:
-                        yield f"{base}.mlp.gate_up_proj.qweight", torch.cat(
-                            [d["gate"], d["up"]], dim=0
+                        yield (
+                            f"{base}.mlp.gate_up_proj.qweight",
+                            torch.cat([d["gate"], d["up"]], dim=0),
                         )
                     else:
                         yield f"{base}.mlp.gate_up_proj.qweight_0", d["gate"]
@@ -675,8 +676,9 @@ def iter_gguf_weights(
                     quant_map.get((layer, "ffn_up_shexp.weight")),
                 ]
                 if len(set(types)) == 1:
-                    yield f"{base}.mlp.shared_expert.gate_up_proj.qweight", torch.cat(
-                        [gu["gate"], gu["up"]], dim=0
+                    yield (
+                        f"{base}.mlp.shared_expert.gate_up_proj.qweight",
+                        torch.cat([gu["gate"], gu["up"]], dim=0),
                     )
                 else:
                     yield f"{base}.mlp.shared_expert.gate_up_proj.qweight_0", gu["gate"]
@@ -709,8 +711,9 @@ def iter_gguf_weights(
                 ]
                 if len(set(types)) == 1:
                     # Uniform quant: fuse via torch.cat along dim 0.
-                    yield f"{base}.self_attn.qkv_proj.qweight", torch.cat(
-                        [slots["q"], slots["k"], slots["v"]], dim=0
+                    yield (
+                        f"{base}.self_attn.qkv_proj.qweight",
+                        torch.cat([slots["q"], slots["k"], slots["v"]], dim=0),
                     )
                 else:
                     # Mixed quant: emit GGUFMergedLinear format.
@@ -776,14 +779,17 @@ def iter_gguf_weights(
                 ]
                 if len(set(types)) == 1:
                     # Uniform quant: fuse via torch.cat along dim 0.
-                    yield f"{base}.linear_attn.in_proj.qweight", torch.cat(
-                        [
-                            slots["qkv"],
-                            slots["gate"],
-                            slots["beta"],
-                            slots["alpha"],
-                        ],
-                        dim=0,
+                    yield (
+                        f"{base}.linear_attn.in_proj.qweight",
+                        torch.cat(
+                            [
+                                slots["qkv"],
+                                slots["gate"],
+                                slots["beta"],
+                                slots["alpha"],
+                            ],
+                            dim=0,
+                        ),
                     )
                 else:
                     # Mixed quant: emit GGUFMergedLinear format.
@@ -837,7 +843,7 @@ def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> No
     # Split widths come from the config, not constants: Ornith-1.5 is 16 q heads / 2 kv /
     # 32 v heads, Qwen3.8-27B is 24 / 4 / 48. Hardcoding either breaks the other.
     _qkv_split = [
-        config.num_qo_heads * config.head_dim * 2,   # q is gated, hence *2
+        config.num_qo_heads * config.head_dim * 2,  # q is gated, hence *2
         config.num_kv_heads * config.head_dim,
         config.num_kv_heads * config.head_dim,
     ]
@@ -944,9 +950,7 @@ def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> No
             [qt(layer_idx, "ffn_gate_shexp.weight"), qt(layer_idx, "ffn_up_shexp.weight")],
             has_bias=False,
         )
-        swap_linear(
-            layer.mlp.shared_expert, "down_proj", qt(layer_idx, "ffn_down_shexp.weight")
-        )
+        swap_linear(layer.mlp.shared_expert, "down_proj", qt(layer_idx, "ffn_down_shexp.weight"))
 
     if config.tie_word_embeddings:
         from freetoken.models.gemma4.gguf import GGUFTiedLMHead
@@ -960,7 +964,9 @@ def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> No
         head = model.lm_head
         out_features, in_features = head.weight.shape
         model.lm_head = GGUFLMHead(
-            in_features, out_features, qt(-1, "output.weight"),
+            in_features,
+            out_features,
+            qt(-1, "output.weight"),
             has_bias=head.bias is not None,
         )
 

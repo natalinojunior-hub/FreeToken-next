@@ -89,8 +89,7 @@ def _config_path(model_path: str) -> str:
         if os.path.exists(path):
             return path
     raise FileNotFoundError(
-        f"No DeepSeek-V4 ModelArgs JSON found under {model_path} "
-        f"(looked for inference/config.json)"
+        f"No DeepSeek-V4 ModelArgs JSON found under {model_path} (looked for inference/config.json)"
     )
 
 

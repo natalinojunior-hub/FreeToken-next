@@ -50,7 +50,9 @@ def _text_config(hf_config: Any) -> tuple[Any, list[str] | None, Any]:
     return hf_config, top_architectures, hf_config
 
 
-def _parse_vision_config(top_cfg: Any, text_hidden_size: int) -> VisionConfig | UnifiedVisionConfig | None:
+def _parse_vision_config(
+    top_cfg: Any, text_hidden_size: int
+) -> VisionConfig | UnifiedVisionConfig | None:
     vc = getattr(top_cfg, "vision_config", None)
     if vc is None:
         return None
@@ -205,7 +207,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
                 head_dim=sliding_head_dim,
                 rotary_config=swa_rotary_config,
                 sliding_window=cfg.sliding_window,
-                bidirectional_mm_blocks=getattr(cfg, "use_bidirectional_attention", None) == "vision",
+                bidirectional_mm_blocks=getattr(cfg, "use_bidirectional_attention", None)
+                == "vision",
             ),
         ),
     )

@@ -25,13 +25,9 @@ FLA_CI_ENV = os.getenv("FLA_CI_ENV") == "1"
 FLA_CACHE_RESULTS = os.getenv("FLA_CACHE_RESULTS", "1") == "1"
 
 
-SUPPORTS_AUTOTUNE_CACHE = (
-    "cache_results" in inspect.signature(triton.autotune).parameters
-)
+SUPPORTS_AUTOTUNE_CACHE = "cache_results" in inspect.signature(triton.autotune).parameters
 
-autotune_cache_kwargs = (
-    {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
-)
+autotune_cache_kwargs = {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
 
 
 @lru_cache(maxsize=1)
@@ -127,9 +123,7 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
                     k in last_kwargs and v is last_kwargs[k] for k, v in kwargs.items()
                 ):
                     cache_entries = (
-                        cache_entries[:i]
-                        + cache_entries[i + 1 :]
-                        + [(args, kwargs, last_result)]
+                        cache_entries[:i] + cache_entries[i + 1 :] + [(args, kwargs, last_result)]
                     )
                     return last_result
 
@@ -150,12 +144,9 @@ def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        contiguous_args = (
-            i if not isinstance(i, torch.Tensor) else i.contiguous() for i in args
-        )
+        contiguous_args = (i if not isinstance(i, torch.Tensor) else i.contiguous() for i in args)
         contiguous_kwargs = {
-            k: (v if not isinstance(v, torch.Tensor) else v.contiguous())
-            for k, v in kwargs.items()
+            k: (v if not isinstance(v, torch.Tensor) else v.contiguous()) for k, v in kwargs.items()
         }
 
         tensor = None
@@ -196,10 +187,7 @@ def require_version(version, hint):
             require_version(version, hint)
             return fn(
                 ctx,
-                *(
-                    i if not isinstance(i, torch.Tensor) else i.contiguous()
-                    for i in args
-                ),
+                *(i if not isinstance(i, torch.Tensor) else i.contiguous() for i in args),
                 **{
                     k: (v if not isinstance(v, torch.Tensor) else v.contiguous())
                     for k, v in kwargs.items()
@@ -221,9 +209,7 @@ def checkpoint(fn):
 def _cpu_device_warning():
     import warnings
 
-    warnings.warn(
-        ("Triton is not supported on current platform, roll back to CPU."), stacklevel=1
-    )
+    warnings.warn(("Triton is not supported on current platform, roll back to CPU."), stacklevel=1)
 
 
 @lru_cache(maxsize=None)
@@ -298,9 +284,7 @@ is_tma_supported = (
 def get_all_max_shared_mem():
     try:
         return [
-            triton.runtime.driver.active.utils.get_device_properties(i)[
-                "max_shared_mem"
-            ]
+            triton.runtime.driver.active.utils.get_device_properties(i)["max_shared_mem"]
             for i in range(device_torch_lib.device_count())
         ]
     except BaseException:
@@ -343,9 +327,7 @@ if torch_release >= (2, 4):
         return device_torch_lib.device(index)
 
 else:
-    assert (
-        device == "cuda"
-    ), "Only cuda device is supported for PyTorch version < 2.4.0."
+    assert device == "cuda", "Only cuda device is supported for PyTorch version < 2.4.0."
     autocast_custom_fwd = device_torch_lib.amp.custom_fwd
     autocast_custom_bwd = device_torch_lib.amp.custom_bwd
 

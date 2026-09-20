@@ -1,6 +1,7 @@
 """CacheManager.free_spec_reject: return a rejected speculative window's unused whole pages,
 without touching the prefix cache (a rejected window was never committed). CPU, real
 CacheManager, no engine."""
+
 from __future__ import annotations
 
 import torch
@@ -23,9 +24,15 @@ def _make(page_size, num_pages=8):
 def _req(table_idx, prompt_len):
     from types import SimpleNamespace
 
-    req = Req(input_ids=torch.tensor(PROMPT[:prompt_len], dtype=torch.int32),
-              table_idx=table_idx, cached_len=0, output_len=4, uid=table_idx,
-              sampling_params=SamplingParams(), cache_handle=SimpleNamespace(cached_len=0))
+    req = Req(
+        input_ids=torch.tensor(PROMPT[:prompt_len], dtype=torch.int32),
+        table_idx=table_idx,
+        cached_len=0,
+        output_len=4,
+        uid=table_idx,
+        sampling_params=SamplingParams(),
+        cache_handle=SimpleNamespace(cached_len=0),
+    )
     return req
 
 
@@ -239,9 +246,7 @@ def test_free_req_resources_clears_qsa_pool_and_snapshots():
     stub = SimpleNamespace(
         cache_manager=cm,
         table_manager=tm,
-        engine=SimpleNamespace(
-            kv_cache=SimpleNamespace(free_req=freed_qsa_tables.append)
-        ),
+        engine=SimpleNamespace(kv_cache=SimpleNamespace(free_req=freed_qsa_tables.append)),
         _spec_snapshot_slots={},
         _spec_qsa_snapshots={0: (torch.zeros(1), torch.zeros(1))},
     )

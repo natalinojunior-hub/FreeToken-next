@@ -38,8 +38,11 @@ class Qwen3_5Attention(BaseOP):
         # output gate. Split sizes: [num_q*head_dim*2, num_kv*head_dim, num_kv*head_dim].
         self._qkv_split = [self.num_q * head_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
         self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkv_split, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
+            config.hidden_size,
+            self._qkv_split,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.qkv_proj",
         )
         # Qwen3.5 uses Gemma-style (1+weight) RMSNorm; the weight loader bakes the +1
         # into the stored weight (GemmaRMSNorm scales by the raw weight).
@@ -63,8 +66,11 @@ class Qwen3_5Attention(BaseOP):
             mrope_layout=config.rotary_config.mrope_layout,
         )
         self.o_proj = LinearReplicated(
-            self.qo_attn_dim, config.hidden_size, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.o_proj",
+            self.qo_attn_dim,
+            config.hidden_size,
+            has_bias=False,
+            quant_config=config.quant,
+            prefix=f"{prefix}.o_proj",
         )
 
     def _project(self, x: torch.Tensor):

@@ -31,19 +31,32 @@ def _ctx(pool):
 
 def _stack(num_pages=32, max_seq_len=8192):
     args = DeepseekV4Args(
-        max_batch_size=MRR + 1, dim=256, n_layers=len(RATIOS), n_heads=4, q_lora_rank=64,
-        o_lora_rank=64, o_groups=2, moe_inter_dim=64, n_routed_experts=4,
-        n_activated_experts=2, vocab_size=64, index_n_heads=2, index_topk=8,
-        compress_ratios=RATIOS, max_seq_len=max_seq_len,
-        head_dim=512, index_head_dim=128, window_size=P,
+        max_batch_size=MRR + 1,
+        dim=256,
+        n_layers=len(RATIOS),
+        n_heads=4,
+        q_lora_rank=64,
+        o_lora_rank=64,
+        o_groups=2,
+        moe_inter_dim=64,
+        n_routed_experts=4,
+        n_activated_experts=2,
+        vocab_size=64,
+        index_n_heads=2,
+        index_topk=8,
+        compress_ratios=RATIOS,
+        max_seq_len=max_seq_len,
+        head_dim=512,
+        index_head_dim=128,
+        window_size=P,
     )
     sizes = dsv4_pool_sizes(num_pages=num_pages + 1, args=args, swa_ratio=1.0, P=P)
     pool = DSV4PagedKVCache(sizes=sizes, args=args, device=DEVICE, P=P, n_scratch=MRR + 1)
     pool._init_paged_state(MRR, True)
     pt = torch.zeros(MRR + 1, max_seq_len, dtype=torch.int32)
-    pt[MRR].fill_(num_pages * P)          # engine's dummy-row convention
+    pt[MRR].fill_(num_pages * P)  # engine's dummy-row convention
     pt[2, :300] = torch.arange(300, dtype=torch.int32)
-    for page in range(3):                 # bind row 2's window pages (positions 0..383)
+    for page in range(3):  # bind row 2's window pages (positions 0..383)
         pool.bind_window_pages(page * P, page * P)
     pool.full_loc_map = pt
     _ctx(pool)
@@ -58,8 +71,15 @@ def _stack(num_pages=32, max_seq_len=8192):
 
 def _decode_batch(rows, positions):
     reqs = [
-        Req(input_ids=torch.zeros(1, dtype=torch.int32), table_idx=int(t), cached_len=0,
-            output_len=1, uid=i, sampling_params=SamplingParams(), cache_handle=None)
+        Req(
+            input_ids=torch.zeros(1, dtype=torch.int32),
+            table_idx=int(t),
+            cached_len=0,
+            output_len=1,
+            uid=i,
+            sampling_params=SamplingParams(),
+            cache_handle=None,
+        )
         for i, t in enumerate(rows)
     ]
     batch = Batch(reqs=reqs, phase="decode")
@@ -77,21 +97,30 @@ def test_eager_decode_snapshots_the_live_rows():
     backend, pool, pt = _stack()
     batch = _decode_batch([2, MRR], [259, 0])
     backend.prepare_metadata(batch)
-    assert batch.attn_metadata.full_snap is None          # deferred, not taken yet
+    assert batch.attn_metadata.full_snap is None  # deferred, not taken yet
     with get_global_ctx().forward_batch(batch):
         snap = backend.snapshot()
-        assert backend.snapshot() is snap                 # materialized once, then cached
+        assert backend.snapshot() is snap  # materialized once, then cached
     assert snap is not None and snap.dtype == torch.int64
     assert torch.equal(snap[0, :300], pt[2, :300].to(torch.int64))
-    assert int(snap[1, 0]) == 32 * P               # dummy row -> the reserved tail page
-    pt[2, :300] = -7                                # a later allocate mutating the live table
+    assert int(snap[1, 0]) == 32 * P  # dummy row -> the reserved tail page
+    pt[2, :300] = -7  # a later allocate mutating the live table
     assert torch.equal(snap[0, :300], torch.arange(300, dtype=torch.int64))
 
 
 def test_prefill_metadata_has_no_snapshot():
     backend, _, _ = _stack()
-    reqs = [Req(input_ids=torch.zeros(5, dtype=torch.int32), table_idx=1, cached_len=0,
-                output_len=1, uid=0, sampling_params=SamplingParams(), cache_handle=None)]
+    reqs = [
+        Req(
+            input_ids=torch.zeros(5, dtype=torch.int32),
+            table_idx=1,
+            cached_len=0,
+            output_len=1,
+            uid=0,
+            sampling_params=SamplingParams(),
+            cache_handle=None,
+        )
+    ]
     batch = Batch(reqs=reqs, phase="prefill")
     batch.padded_reqs = reqs
     backend.prepare_metadata(batch)
@@ -105,10 +134,24 @@ def test_prefill_metadata_carries_segments():
     Cold (cached_len == 0) and radix-hit (cached_len > 0) segments mix freely."""
     backend, _, _ = _stack()
     reqs = [
-        Req(input_ids=torch.zeros(300, dtype=torch.int32), table_idx=2, cached_len=256,
-            output_len=1, uid=0, sampling_params=SamplingParams(), cache_handle=None),
-        Req(input_ids=torch.zeros(5, dtype=torch.int32), table_idx=1, cached_len=0,
-            output_len=1, uid=1, sampling_params=SamplingParams(), cache_handle=None),
+        Req(
+            input_ids=torch.zeros(300, dtype=torch.int32),
+            table_idx=2,
+            cached_len=256,
+            output_len=1,
+            uid=0,
+            sampling_params=SamplingParams(),
+            cache_handle=None,
+        ),
+        Req(
+            input_ids=torch.zeros(5, dtype=torch.int32),
+            table_idx=1,
+            cached_len=0,
+            output_len=1,
+            uid=1,
+            sampling_params=SamplingParams(),
+            cache_handle=None,
+        ),
     ]
     batch = Batch(reqs=reqs, phase="prefill")
     batch.padded_reqs = reqs
@@ -192,11 +235,11 @@ def test_recapture_reallocates_a_clean_buffer_at_the_new_ceiling():
     backend.init_capture_graph(max_seq_len=2048, bs_list=[2])
     wide = _decode_batch([2, MRR], [259, 0])
     backend.prepare_for_replay(wide)
-    assert int(wide.attn_metadata.full_snap[0, 200]) == 200      # wide-era column written
+    assert int(wide.attn_metadata.full_snap[0, 200]) == 200  # wide-era column written
 
-    backend.reset_capture()                                       # engine's rebuild teardown
+    backend.reset_capture()  # engine's rebuild teardown
     assert backend.capture is None and backend.capture_bs == []
-    backend.init_capture_graph(max_seq_len=512, bs_list=[2])      # re-arm at a narrower ceiling
+    backend.init_capture_graph(max_seq_len=512, bs_list=[2])  # re-arm at a narrower ceiling
     # A brand-new -1 buffer, so no column can carry a wide-era loc into the narrower geometry
     assert backend.capture.full_snap.shape == (2, 512)
     assert (backend.capture.full_snap == -1).all()

@@ -53,7 +53,9 @@ class BlockWeightStreamer:
         self.device = device
         self._layouts = [_slots(b) for b in blocks]
         row_bytes = self._layouts[0][1]
-        assert all(nbytes == row_bytes for _, nbytes in self._layouts), "streamed blocks must share one layout"
+        assert all(nbytes == row_bytes for _, nbytes in self._layouts), (
+            "streamed blocks must share one layout"
+        )
         self.bank = torch.empty((len(blocks), row_bytes), dtype=torch.uint8, pin_memory=True)
         self.staging = torch.empty((2, row_bytes), dtype=torch.uint8, device=device)
         for b, (slots, _) in enumerate(self._layouts):

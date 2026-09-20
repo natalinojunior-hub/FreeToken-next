@@ -29,9 +29,7 @@ else:
 )
 @triton.autotune(
     configs=[
-        triton.Config({"BK": BK}, num_warps=num_warps)
-        for BK in [32, 64]
-        for num_warps in [1, 2, 4]
+        triton.Config({"BK": BK}, num_warps=num_warps) for BK in [32, 64] for num_warps in [1, 2, 4]
     ],
     key=["H", "Hg", "K", "BC"],
     **autotune_cache_kwargs,
@@ -71,12 +69,14 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-            chunk_indices + i_t * 2 + 1
-        ).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int32)
+        i_n, i_t = (
+            tl.load(chunk_indices + i_t * 2).to(tl.int32),
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+        )
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
@@ -139,17 +139,13 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     b_A32 = tl.zeros([BC, BC], dtype=tl.float32)
 
     for i_k in range(tl.cdiv(K, BK)):
-        p_k0 = tl.make_block_ptr(
-            k, (T, K), (Hg * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0)
-        )
+        p_k0 = tl.make_block_ptr(k, (T, K), (Hg * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0))
         b_k0 = tl.load(p_k0, boundary_check=(0, 1))
         # diagonal block 0
         b_A00 += tl.dot(b_k0, tl.trans(b_k0))
 
         if i_tc1 < T:
-            p_k1 = tl.make_block_ptr(
-                k, (T, K), (Hg * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0)
-            )
+            p_k1 = tl.make_block_ptr(k, (T, K), (Hg * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0))
             b_k1 = tl.load(p_k1, boundary_check=(0, 1))
             # diagonal block 1
             b_A11 += tl.dot(b_k1, tl.trans(b_k1))
@@ -203,18 +199,10 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     m_I = o_i[:, None] == o_i[None, :]
 
     # diagonal blocks: strictly lower triangular within sub-chunk, scaled by beta
-    b_A00 = (
-        tl.where(m_d & (m_tc0[:, None] & m_tc0[None, :]), b_A00, 0.0) * b_b0[:, None]
-    )
-    b_A11 = (
-        tl.where(m_d & (m_tc1[:, None] & m_tc1[None, :]), b_A11, 0.0) * b_b1[:, None]
-    )
-    b_A22 = (
-        tl.where(m_d & (m_tc2[:, None] & m_tc2[None, :]), b_A22, 0.0) * b_b2[:, None]
-    )
-    b_A33 = (
-        tl.where(m_d & (m_tc3[:, None] & m_tc3[None, :]), b_A33, 0.0) * b_b3[:, None]
-    )
+    b_A00 = tl.where(m_d & (m_tc0[:, None] & m_tc0[None, :]), b_A00, 0.0) * b_b0[:, None]
+    b_A11 = tl.where(m_d & (m_tc1[:, None] & m_tc1[None, :]), b_A11, 0.0) * b_b1[:, None]
+    b_A22 = tl.where(m_d & (m_tc2[:, None] & m_tc2[None, :]), b_A22, 0.0) * b_b2[:, None]
+    b_A33 = tl.where(m_d & (m_tc3[:, None] & m_tc3[None, :]), b_A33, 0.0) * b_b3[:, None]
 
     # off-diagonal blocks: full block, scaled by beta
     b_A10 = b_A10 * b_b1[:, None]
@@ -312,17 +300,11 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     p_A11 = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_tc1, BC), (BC, BC), (1, 0))
     p_A20 = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_tc2, 0), (BC, BC), (1, 0))
     p_A21 = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_tc2, BC), (BC, BC), (1, 0))
-    p_A22 = tl.make_block_ptr(
-        A, (T, BT), (H * BT, 1), (i_tc2, 2 * BC), (BC, BC), (1, 0)
-    )
+    p_A22 = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_tc2, 2 * BC), (BC, BC), (1, 0))
     p_A30 = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_tc3, 0), (BC, BC), (1, 0))
     p_A31 = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_tc3, BC), (BC, BC), (1, 0))
-    p_A32 = tl.make_block_ptr(
-        A, (T, BT), (H * BT, 1), (i_tc3, 2 * BC), (BC, BC), (1, 0)
-    )
-    p_A33 = tl.make_block_ptr(
-        A, (T, BT), (H * BT, 1), (i_tc3, 3 * BC), (BC, BC), (1, 0)
-    )
+    p_A32 = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_tc3, 2 * BC), (BC, BC), (1, 0))
+    p_A33 = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_tc3, 3 * BC), (BC, BC), (1, 0))
 
     tl.store(p_A00, b_Ai00.to(A.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_A10, b_Ai10.to(A.dtype.element_ty), boundary_check=(0, 1))

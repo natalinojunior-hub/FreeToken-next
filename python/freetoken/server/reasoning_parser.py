@@ -136,10 +136,7 @@ class BaseReasoningParser:
         if self.think_end_token not in processed_text:
             # No closing </think>. If a tool block starts, reasoning ends there
             # and the block stays in normal_text for the tool-call parser.
-            if (
-                self.tool_start_token is not None
-                and self.tool_start_token in processed_text
-            ):
+            if self.tool_start_token is not None and self.tool_start_token in processed_text:
                 tool_idx = processed_text.find(self.tool_start_token)
                 return ReasoningParseResult(
                     reasoning_text=processed_text[:tool_idx].strip(),
@@ -149,9 +146,7 @@ class BaseReasoningParser:
             return ReasoningParseResult(reasoning_text=processed_text)
 
         reasoning_text, normal_text = processed_text.split(self.think_end_token, 1)
-        return ReasoningParseResult(
-            reasoning_text=reasoning_text, normal_text=normal_text.strip()
-        )
+        return ReasoningParseResult(reasoning_text=reasoning_text, normal_text=normal_text.strip())
 
     def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
         """Incremental parse.
@@ -261,9 +256,7 @@ class DeepSeekV32ReasoningParser(BaseReasoningParser):
     ``｜DSML｜`` protocol). ``force_reasoning`` defaults to True because these
     checkpoints start their output inside the reasoning block."""
 
-    def __init__(
-        self, force_reasoning: bool = True, stream_reasoning: bool = True
-    ) -> None:
+    def __init__(self, force_reasoning: bool = True, stream_reasoning: bool = True) -> None:
         super().__init__(
             think_start_token=THINK_START_TOKEN,
             think_end_token=THINK_END_TOKEN,
@@ -300,9 +293,7 @@ class GptOssHarmonyReasoningParser(BaseReasoningParser):
         if HARMONY_CHANNEL not in text:
             return ReasoningParseResult(normal_text=text)
         reasoning, content = self._scan(text, hold_partial=False)
-        return ReasoningParseResult(
-            reasoning_text=reasoning.strip(), normal_text=content.strip()
-        )
+        return ReasoningParseResult(reasoning_text=reasoning.strip(), normal_text=content.strip())
 
     def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
         self._buffer += new_text
@@ -465,9 +456,7 @@ class MiniMaxM3ReasoningParser(BaseReasoningParser):
             # ends reasoning there (dsv4 precedent); else truncated reasoning.
             if self.tool_start_token is not None and self.tool_start_token in text:
                 t = text.find(self.tool_start_token)
-                return ReasoningParseResult(
-                    reasoning_text=text[:t], normal_text=text[t:]
-                )
+                return ReasoningParseResult(reasoning_text=text[:t], normal_text=text[t:])
             return ReasoningParseResult(reasoning_text=text)
         # adaptive: a leading bare closer is "thinking off for this turn"
         # (whitespace-tolerant head, same as streaming).
@@ -481,14 +470,10 @@ class MiniMaxM3ReasoningParser(BaseReasoningParser):
         body = text[start + len(self.think_start_token) :]
         reasoning, sep, rest = body.partition(end)
         if sep:
-            return ReasoningParseResult(
-                reasoning_text=reasoning, normal_text=before + rest
-            )
+            return ReasoningParseResult(reasoning_text=reasoning, normal_text=before + rest)
         if self.tool_start_token is not None and self.tool_start_token in body:
             t = body.find(self.tool_start_token)
-            return ReasoningParseResult(
-                reasoning_text=body[:t], normal_text=before + body[t:]
-            )
+            return ReasoningParseResult(reasoning_text=body[:t], normal_text=before + body[t:])
         return ReasoningParseResult(reasoning_text=body)
 
     def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
@@ -503,11 +488,7 @@ class MiniMaxM3ReasoningParser(BaseReasoningParser):
                 self._head_buffer = ""
                 self._in_reasoning = False
                 rest = head[len(self.think_end_token) :]
-                return (
-                    super().parse_streaming_increment(rest)
-                    if rest
-                    else ReasoningParseResult()
-                )
+                return super().parse_streaming_increment(rest) if rest else ReasoningParseResult()
             if not head or self.think_end_token.startswith(head):
                 return ReasoningParseResult()  # still a (whitespace+) prefix: hold
             # Diverged: not a leading closer -- replay the held head as normal
@@ -760,8 +741,8 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                 m = ATEM_INLINE_HEADER_RE.search(buf)
                 if m is not None and (s == -1 or m.start() < s):
                     emit_seek(buf[: m.start()])
-                    self._buffer = buf[m.end():]
-                    begin_body(m.group(1), buf[m.start(): m.end()])
+                    self._buffer = buf[m.end() :]
+                    begin_body(m.group(1), buf[m.start() : m.end()])
                     continue
                 if s != -1:
                     # While the header-open seed is unconsumed it is the leftmost
@@ -770,9 +751,7 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                     # dropped, never delivered (the model did not emit it).
                     synthetic = self._synthetic_open
                     msg = buf.find(ATEM_MESSAGE, s + len(ATEM_START))
-                    if atem_marker_inside(
-                        buf, s + len(ATEM_START), msg if msg != -1 else len(buf)
-                    ):
+                    if atem_marker_inside(buf, s + len(ATEM_START), msg if msg != -1 else len(buf)):
                         # A control token inside the candidate: headers never
                         # contain markers, so this <|start|> is literal content
                         # (and a synthetic seed is simply dropped). Decides
@@ -781,7 +760,7 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                         if not synthetic:
                             out_content.append(ATEM_START)
                         self._synthetic_open = False
-                        self._buffer = buf[s + len(ATEM_START):]
+                        self._buffer = buf[s + len(ATEM_START) :]
                         continue
                     if msg != -1 and msg - s - len(ATEM_START) > ATEM_HEADER_SPAN:
                         # The found <|message|> is too far away to belong to THIS
@@ -793,11 +772,11 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                         if not synthetic:
                             out_content.append(ATEM_START)
                         self._synthetic_open = False
-                        self._buffer = buf[s + len(ATEM_START):]
+                        self._buffer = buf[s + len(ATEM_START) :]
                         continue
                     if msg != -1:
                         emit_seek(buf[:s])
-                        header = buf[s + len(ATEM_START): msg]
+                        header = buf[s + len(ATEM_START) : msg]
                         rm = ATEM_RECIPIENT_RE.search(header)
                         body_start = msg + len(ATEM_MESSAGE)
                         self._buffer = buf[body_start:]
@@ -817,7 +796,7 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                         if not synthetic:
                             out_content.append(ATEM_START)  # verbatim: deliver, don't drop
                         self._synthetic_open = False
-                        self._buffer = self._buffer[len(ATEM_START):]
+                        self._buffer = self._buffer[len(ATEM_START) :]
                         continue
                     if final:
                         # At end of stream a candidate that never received its
@@ -825,7 +804,7 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                         # the marker. (A capped discard here kept a drop window
                         # whose edge moved between layers; removing it makes the
                         # detector's agreement trivial -- both deliver.)
-                        emit_seek(self._buffer[len(ATEM_START):])
+                        emit_seek(self._buffer[len(ATEM_START) :])
                         self._synthetic_open = False
                         self._buffer = ""
                     break
@@ -837,7 +816,7 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                 hold = 0 if final else atem_hold_len(buf)
                 piece = buf[: len(buf) - hold] if hold else buf
                 emit_seek(piece)
-                self._buffer = buf[len(piece):]
+                self._buffer = buf[len(piece) :]
                 break
 
             # self._mode == "body"
@@ -847,7 +826,7 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                 hold = 0 if final else atem_hold_len(buf)
                 piece = buf[: len(buf) - hold] if hold else buf
                 emit(recipient, piece)
-                self._buffer = buf[len(piece):]
+                self._buffer = buf[len(piece) :]
                 break
             body = buf[:end]
             if recipient not in ("self", "user"):
@@ -857,14 +836,14 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
                 body += payload if kind == "closer" else "<|eom|>"
             emit(recipient, body)
             if kind == "closer":
-                self._buffer = buf[end + len(payload):]
+                self._buffer = buf[end + len(payload) :]
                 self._mode = "seek"
             elif kind == "start":
                 self._buffer = buf[end:]
                 self._mode = "seek"
             else:  # headerless switch: the next segment is fully known
-                self._buffer = buf[payload.end():]
-                begin_body(payload.group(1), buf[end: payload.end()])
+                self._buffer = buf[payload.end() :]
+                begin_body(payload.group(1), buf[end : payload.end()])
         return ReasoningParseResult(
             reasoning_text="".join(out_reasoning), normal_text="".join(out_content)
         )

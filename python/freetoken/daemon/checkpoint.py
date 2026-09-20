@@ -103,7 +103,10 @@ class CheckpointManager:
             if tailer is not None:
                 tailer.start()
         threading.Thread(
-            target=self._monitor, args=(child, job_id), name=f"ft-daemon-ckpt-{child.pid}", daemon=True
+            target=self._monitor,
+            args=(child, job_id),
+            name=f"ft-daemon-ckpt-{child.pid}",
+            daemon=True,
         ).start()
         self._emit(f"checkpoint started (id={job_id} pid={child.pid})")
         return {"jobId": job_id, "pid": child.pid, "idempotent": False}

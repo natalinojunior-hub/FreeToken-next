@@ -14,7 +14,9 @@ SECTION = (11, 11, 10)
 # independent expectations for SECTION under each layout (half = 32 slots)
 REFERENCE_TABLES = {
     "contiguous": [0] * 11 + [1] * 11 + [2] * 10,
-    "interleaved": [1 if i % 3 == 1 and i < 33 else 2 if i % 3 == 2 and i < 30 else 0 for i in range(32)],
+    "interleaved": [
+        1 if i % 3 == 1 and i < 33 else 2 if i % 3 == 2 and i < 30 else 0 for i in range(32)
+    ],
     "interleaved_glm": [0, 1, 2] * 10 + [0, 1],
 }
 
@@ -25,7 +27,16 @@ def test_section_tables():
     for layout, expected in REFERENCE_TABLES.items():
         assert build_section_table(SECTION, layout).tolist() == expected, layout
     # GLM-V's [8,12,12]: T runs out first and H/W fill the tail
-    assert build_section_table((8, 12, 12), "interleaved_glm").tolist() == [0, 1, 2] * 8 + [1, 1, 2, 1, 1, 2, 2, 2]
+    assert build_section_table((8, 12, 12), "interleaved_glm").tolist() == [0, 1, 2] * 8 + [
+        1,
+        1,
+        2,
+        1,
+        1,
+        2,
+        2,
+        2,
+    ]
     with pytest.raises(ValueError, match="not representable"):
         build_section_table((8, 12, 12), "interleaved")
     with pytest.raises(ValueError, match="unknown mrope layout"):
@@ -38,8 +49,12 @@ def _make(mrope: bool, layout: str = "interleaved"):
     # the engine builds rope layers inside a cuda device context
     with torch.device("cuda"):
         return get_rope(
-            head_dim=HEAD, rotary_dim=ROT, max_position=4096, base=1e7,
-            mrope_section=SECTION if mrope else None, mrope_layout=layout,
+            head_dim=HEAD,
+            rotary_dim=ROT,
+            max_position=4096,
+            base=1e7,
+            mrope_section=SECTION if mrope else None,
+            mrope_layout=layout,
         )
 
 
@@ -69,8 +84,8 @@ def _torch_reference(pos3, q, k, table):
     half = ROT // 2
     inv = 1.0 / (1e7 ** (torch.arange(0, ROT, 2, dtype=torch.float32, device="cuda") / ROT))
     sec = torch.tensor(table, dtype=torch.long, device="cuda")
-    pos = pos3[sec, :].transpose(0, 1).float()          # [n, half]
-    freqs = pos * inv.unsqueeze(0)                       # [n, half]
+    pos = pos3[sec, :].transpose(0, 1).float()  # [n, half]
+    freqs = pos * inv.unsqueeze(0)  # [n, half]
     cos, sin = freqs.cos().unsqueeze(1), freqs.sin().unsqueeze(1)
     for t in (q, k):
         v = t.view(t.shape[0], -1, HEAD)

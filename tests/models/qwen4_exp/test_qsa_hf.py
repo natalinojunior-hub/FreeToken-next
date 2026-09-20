@@ -37,8 +37,7 @@ def _plus_one_rmsnorm(x, weight, eps):
 def _hf_rope(x, positions, rotary_dim, base):
     """HF apply_rotary_pos_emb on [T, H, D], rotating only the first rotary_dim dims."""
     inv = 1.0 / (
-        base
-        ** (torch.arange(0, rotary_dim, 2, device=x.device, dtype=torch.float32) / rotary_dim)
+        base ** (torch.arange(0, rotary_dim, 2, device=x.device, dtype=torch.float32) / rotary_dim)
     )
     freqs = positions.float().unsqueeze(-1) * inv
     cos = torch.cat([freqs.cos(), freqs.cos()], dim=-1).unsqueeze(1)
@@ -123,7 +122,10 @@ def test_single_layer_matches_hf_reference(monkeypatch):
     generator = torch.Generator(device=fixture.device).manual_seed(13)
     x = (
         torch.randn(
-            LENGTH, config.hidden_size, device=fixture.device, dtype=fixture.dtype,
+            LENGTH,
+            config.hidden_size,
+            device=fixture.device,
+            dtype=fixture.dtype,
             generator=generator,
         )
         * 0.5
@@ -146,7 +148,7 @@ def test_single_layer_matches_hf_reference(monkeypatch):
     torch.testing.assert_close(got.float(), reference, rtol=2e-2, atol=2e-2)
 
 
-_HF_DRIVER = '''
+_HF_DRIVER = """
 import sys, torch
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextAttention
@@ -184,7 +186,7 @@ mask.masked_fill_(causal[None, :] > causal[:, None], torch.finfo(torch.float32).
 out, _ = attn(x, (cos, sin), mask)
 selected = attn.indexer(x, (cos, sin), mask, None)[0, 0] == 0
 torch.save({"out": out[0].cpu(), "selected": selected.cpu()}, sys.argv[2])
-'''
+"""
 
 
 @requires_cuda
@@ -199,7 +201,10 @@ def test_single_layer_matches_upstream_hf(tmp_path, monkeypatch):
     generator = torch.Generator(device=fixture.device).manual_seed(13)
     x = (
         torch.randn(
-            LENGTH, config.hidden_size, device=fixture.device, dtype=fixture.dtype,
+            LENGTH,
+            config.hidden_size,
+            device=fixture.device,
+            dtype=fixture.dtype,
             generator=generator,
         )
         * 0.5
@@ -232,11 +237,17 @@ def test_single_layer_matches_upstream_hf(tmp_path, monkeypatch):
             "x": x.cpu(),
             "positions": batch.positions.cpu(),
             "meta": {
-                "hidden_size": config.hidden_size, "num_q": attn.num_q, "num_kv": attn.num_kv,
-                "head_dim": attn.head_dim, "eps": config.rms_norm_eps,
-                "max_position": rotary.max_position, "base": rotary.base,
-                "rotary_dim": rotary.rotary_dim, "index_heads": args.index_n_heads,
-                "index_dim": args.index_head_dim, "budget": args.index_budget,
+                "hidden_size": config.hidden_size,
+                "num_q": attn.num_q,
+                "num_kv": attn.num_kv,
+                "head_dim": attn.head_dim,
+                "eps": config.rms_norm_eps,
+                "max_position": rotary.max_position,
+                "base": rotary.base,
+                "rotary_dim": rotary.rotary_dim,
+                "index_heads": args.index_n_heads,
+                "index_dim": args.index_head_dim,
+                "budget": args.index_budget,
                 "ratio": args.index_ratio,
             },
         },
@@ -244,7 +255,9 @@ def test_single_layer_matches_upstream_hf(tmp_path, monkeypatch):
     )
     subprocess.run(
         [os.environ["FREETOKEN_QWEN4_HF_PYTHON"], str(driver), str(payload), str(result)],
-        check=True, stdout=sys.stderr, timeout=1800,
+        check=True,
+        stdout=sys.stderr,
+        timeout=1800,
     )
     upstream = torch.load(result, map_location=fixture.device, weights_only=False)
     selection = [row.nonzero().flatten() for row in upstream["selected"].to(fixture.device)]

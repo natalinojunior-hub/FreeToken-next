@@ -27,8 +27,12 @@ MRR = 4
 
 def _args():
     return DeepseekV4Args(
-        n_layers=8, compress_ratios=RATIOS, max_seq_len=8192,
-        head_dim=512, index_head_dim=128, window_size=P,
+        n_layers=8,
+        compress_ratios=RATIOS,
+        max_seq_len=8192,
+        head_dim=512,
+        index_head_dim=128,
+        window_size=P,
     )
 
 
@@ -40,17 +44,30 @@ def _stack(num_pages=32, swa_ratio=1.0, cache_type="swa_radix"):
     pool = DSV4PagedKVCache(sizes=sizes, args=args, device=DEVICE, P=P, n_scratch=MRR + 1)
     pool._init_paged_state(MRR, cache_type != "naive")
     pt = torch.zeros(MRR + 1, args.max_seq_len, dtype=torch.int32)
-    pt[MRR].fill_(num_pages * P)                       # engine.py:218 dummy convention
-    pool.full_loc_map = pt                             # attach_page_table
-    cm = CacheManager(num_pages=num_pages, page_size=P, page_table=pt, type=cache_type,
-                      swa_pool=pool, sliding_window_size=P)
+    pt[MRR].fill_(num_pages * P)  # engine.py:218 dummy convention
+    pool.full_loc_map = pt  # attach_page_table
+    cm = CacheManager(
+        num_pages=num_pages,
+        page_size=P,
+        page_table=pt,
+        type=cache_type,
+        swa_pool=pool,
+        sliding_window_size=P,
+    )
     assert cm.swa_paged
     return cm, pool, pt
 
 
 def _req(ti, ids, n_decode=4):
-    r = Req(input_ids=ids.to(torch.int32), table_idx=ti, cached_len=0, output_len=n_decode,
-            uid=ti, sampling_params=SamplingParams(), cache_handle=None)
+    r = Req(
+        input_ids=ids.to(torch.int32),
+        table_idx=ti,
+        cached_len=0,
+        output_len=n_decode,
+        uid=ti,
+        sampling_params=SamplingParams(),
+        cache_handle=None,
+    )
     r.input_len = len(ids)
     return r
 
@@ -61,8 +78,7 @@ def _lifecycle(cm, req, total_len, finished=True):
     req.cached_len = h.cached_len
     cm.lock(h)
     if h.cached_len > 0:  # prefill.py:57: the matched full locs enter the page table
-        cm.page_table[req.table_idx, : h.cached_len].copy_(
-            h.get_matched_indices().to(torch.int32))
+        cm.page_table[req.table_idx, : h.cached_len].copy_(h.get_matched_indices().to(torch.int32))
     cm.free_swa_out_of_window_extend([req])
     cm.allocate_paged([req])
     req.complete_one()
@@ -101,21 +117,26 @@ def test_crash_a_residue_class_conserves(cache_type):
     # The crash-A signature: total length a multiple of P must not strand a page in EITHER tier.
     for total in (3 * P, 3 * P + 1, 3 * P + P - 1, 4 * P):
         cm, _, _ = _stack(cache_type=cache_type)
-        _lifecycle(cm, _req(0, torch.arange(1, total - 3, dtype=torch.int32), n_decode=total),
-                   total_len=total)
+        _lifecycle(
+            cm,
+            _req(0, torch.arange(1, total - 3, dtype=torch.int32), n_decode=total),
+            total_len=total,
+        )
         cm.check_integrity()
 
 
 def test_long_decode_recycles_window_pages():
     # Decode far past the window: the out-of-window driver must keep the row's live window
     # footprint bounded (~window + margin), returning pages to the pool as it slides.
-    cm, pool, pt = _stack(num_pages=48, swa_ratio=0.25)   # small window tier
+    cm, pool, pt = _stack(num_pages=48, swa_ratio=0.25)  # small window tier
     import freetoken.scheduler.cache as C
+
     old = C._SWA_EVICTION_INTERVAL
-    C._SWA_EVICTION_INTERVAL = 1                          # evict every forward (test cadence)
+    C._SWA_EVICTION_INTERVAL = 1  # evict every forward (test cadence)
     try:
-        _lifecycle(cm, _req(0, torch.arange(1, 200, dtype=torch.int32), n_decode=14 * P),
-                   total_len=14 * P)
+        _lifecycle(
+            cm, _req(0, torch.arange(1, 200, dtype=torch.int32), n_decode=14 * P), total_len=14 * P
+        )
     finally:
         C._SWA_EVICTION_INTERVAL = old
     cm.check_integrity()
@@ -167,8 +188,11 @@ def test_chunk_boundaries_stay_page_aligned_under_unaligned_budget():
         return cm, tm, PrefillManager(cm, tm, DecodeManager(page_size=P))
 
     def _pending(uid, n):
-        return PendingReq(uid=uid, input_ids=(torch.arange(n, dtype=torch.int32) % 131) + 1,
-                          sampling_params=SamplingParams(max_tokens=1))
+        return PendingReq(
+            uid=uid,
+            input_ids=(torch.arange(n, dtype=torch.int32) % 131) + 1,
+            sampling_params=SamplingParams(max_tokens=1),
+        )
 
     # 300-token cold prompt leaves an unaligned 724-token leftover; the 2000-token prompt's
     # chunk must round down to 640 (a page multiple), not 724.
@@ -186,8 +210,8 @@ def test_chunk_boundaries_stay_page_aligned_under_unaligned_budget():
     free_tables = tm.available_size
     batch = pm.schedule_next_batch(400)
     assert [r.uid for r in batch.reqs] == [1]
-    assert tm.available_size == free_tables - 1          # only req 1 holds a row
-    assert any(p.uid == 2 for p in pm.pending_list)      # retried next pass
+    assert tm.available_size == free_tables - 1  # only req 1 holds a row
+    assert any(p.uid == 2 for p in pm.pending_list)  # retried next pass
     cm.check_integrity()
 
 
@@ -200,10 +224,12 @@ def test_abort_anywhere_fuzz_conserves_and_isolates():
     rng = random.Random(20260722)
     cm, pool, pt = _stack(num_pages=40, swa_ratio=0.5)
     bank = [
-        torch.cat([
-            torch.tensor([9000 + i] * 3, dtype=torch.int32),
-            (torch.arange(240 + 17 * i, dtype=torch.int32) % 131) + 1,
-        ])
+        torch.cat(
+            [
+                torch.tensor([9000 + i] * 3, dtype=torch.int32),
+                (torch.arange(240 + 17 * i, dtype=torch.int32) % 131) + 1,
+            ]
+        )
         for i in range(5)
     ]
     live: dict[int, Req] = {}
@@ -212,19 +238,25 @@ def test_abort_anywhere_fuzz_conserves_and_isolates():
         op = rng.random()
         free_tis = [ti for ti in range(MRR) if ti not in live]
         if op < 0.45 and free_tis:
-            prompt = (rng.choice(bank).clone() if rng.random() < 0.6 else torch.cat([
-                torch.tensor([rng.randint(20000, 60000)] * 3, dtype=torch.int32),
-                torch.randint(1, 200, (rng.randint(200, 360),), dtype=torch.int32),
-            ]))
+            prompt = (
+                rng.choice(bank).clone()
+                if rng.random() < 0.6
+                else torch.cat(
+                    [
+                        torch.tensor([rng.randint(20000, 60000)] * 3, dtype=torch.int32),
+                        torch.randint(1, 200, (rng.randint(200, 360),), dtype=torch.int32),
+                    ]
+                )
+            )
             if cm.available_size < len(prompt) + 8:
-                continue                          # scheduler defers when the full tier is short
+                continue  # scheduler defers when the full tier is short
             ti = rng.choice(free_tis)
             req = _req(ti, prompt, n_decode=64)
             h = cm.match_req(req).cuda_handle
             req.cache_handle = h
             req.cached_len = h.cached_len
             need_swa = min(max(req.input_len - h.cached_len, 1), P) + 1
-            if cm.swa_available_size < ((need_swa + P - 1) // P) * P:   # PrefillAdder swa gate
+            if cm.swa_available_size < ((need_swa + P - 1) // P) * P:  # PrefillAdder swa gate
                 continue
             cm.lock(h)
             if h.cached_len > 0:
@@ -233,7 +265,7 @@ def test_abort_anywhere_fuzz_conserves_and_isolates():
             cm.allocate_paged([req])
             req.complete_one()
             live[ti] = req
-        elif op < 0.75 and live:                  # decode a random live request
+        elif op < 0.75 and live:  # decode a random live request
             ti = rng.choice(list(live))
             req = live[ti]
             if cm.available_size < 2 or cm.swa_available_size < 2 * P:
@@ -243,12 +275,12 @@ def test_abort_anywhere_fuzz_conserves_and_isolates():
             cm.maybe_free_swa_out_of_window([req], forward_iter=it)
             cm.allocate_paged([req])
             req.complete_one()
-        elif live:                                # finish / ABORT at whatever state it is in
+        elif live:  # finish / ABORT at whatever state it is in
             ti = rng.choice(list(live))
             cm.cache_req(live.pop(ti), finished=True)
-            assert (pt[ti] >= 0).all()            # no negative locs ever enter the shared table
+            assert (pt[ti] >= 0).all()  # no negative locs ever enter the shared table
         it += 1
-        if not live:                              # idle points: exact conservation, both tiers
+        if not live:  # idle points: exact conservation, both tiers
             cm.check_integrity()
     for ti in list(live):
         cm.cache_req(live.pop(ti), finished=True)

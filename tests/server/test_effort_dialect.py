@@ -5,6 +5,7 @@ validation and DeepSeek ``thinking`` toggle in ``handle_chat_completion``, the
 pre-stream render validation, and the probed vocabulary on ``/v1/models``.
 The quantization itself is covered in tests/tokenizer/test_effort.py.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -114,9 +115,7 @@ def test_unknown_reasoning_effort_is_a_400():
 
 def test_unknown_thinking_type_is_a_400():
     response = run(
-        handle_chat_completion(
-            chat_request(thinking={"type": "sideways"}), None, FakeState(), {}
-        )
+        handle_chat_completion(chat_request(thinking={"type": "sideways"}), None, FakeState(), {})
     )
     assert isinstance(response, JSONResponse)
     assert response.status_code == 400
@@ -125,9 +124,7 @@ def test_unknown_thinking_type_is_a_400():
 def test_thinking_disabled_reaches_the_tokenizer_as_enable_thinking_false():
     state = FakeState(reasoning_parser="qwen3")
     response = run(
-        handle_chat_completion(
-            chat_request(thinking={"type": "disabled"}), None, state, {}
-        )
+        handle_chat_completion(chat_request(thinking={"type": "disabled"}), None, state, {})
     )
     assert not isinstance(response, JSONResponse)  # plain successful completion
     assert state.sent is not None
@@ -152,9 +149,7 @@ def test_off_and_mixed_case_efforts_stay_accepted():
 
 def test_empty_effort_is_treated_as_absent():
     state = FakeState(reasoning_parser="qwen3")
-    response = run(
-        handle_chat_completion(chat_request(reasoning_effort=""), None, state, {})
-    )
+    response = run(handle_chat_completion(chat_request(reasoning_effort=""), None, state, {}))
     assert not isinstance(response, JSONResponse)
     assert state.sent.chat_template_kwargs == {}
 
@@ -164,9 +159,7 @@ def test_foreign_thinking_shapes_stay_ignored():
     # a bare string, a bool, or a typeless dict must keep working unchanged.
     for shape in ("enabled", True, {}, {"budget_tokens": 1024}):
         state = FakeState(reasoning_parser="qwen3")
-        response = run(
-            handle_chat_completion(chat_request(thinking=shape), None, state, {})
-        )
+        response = run(handle_chat_completion(chat_request(thinking=shape), None, state, {}))
         assert not isinstance(response, JSONResponse), shape
         assert state.sent.chat_template_kwargs == {}, shape
 

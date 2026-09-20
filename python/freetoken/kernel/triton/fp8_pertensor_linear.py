@@ -64,8 +64,11 @@ def rowwise_scaled_mm_ok() -> bool:
             a = torch.zeros(16, 32, dtype=FP8, device=dev)
             b = torch.zeros(32, 32, dtype=FP8, device=dev)
             torch._scaled_mm(
-                a, b.t(), scale_a=torch.ones(16, 1, device=dev),
-                scale_b=torch.ones(1, 32, device=dev), out_dtype=torch.bfloat16,
+                a,
+                b.t(),
+                scale_a=torch.ones(16, 1, device=dev),
+                scale_b=torch.ones(1, 32, device=dev),
+                out_dtype=torch.bfloat16,
             )
             torch.cuda.synchronize(dev)
     except RuntimeError:
@@ -96,9 +99,20 @@ def _segments_w8a8_ok(segments: list[tuple[int, int]]) -> bool:
 # ======================================================================================
 @triton.jit
 def _gemv_splitk_kernel(
-    a_ptr, w_ptr, part_ptr, N, K, n_kb, kb_per,
-    stride_ak, stride_wn, stride_wk, stride_pk, stride_pn,
-    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    w_ptr,
+    part_ptr,
+    N,
+    K,
+    n_kb,
+    kb_per,
+    stride_ak,
+    stride_wn,
+    stride_wk,
+    stride_pk,
+    stride_pn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
     """Each (pid_n, pid_k) computes the partial sum over ``kb_per`` BLOCK_K chunks for a
     BLOCK_N slice of outputs. ``kb_per`` ceil-tiles K so K only needs to be a multiple of
@@ -118,21 +132,32 @@ def _gemv_splitk_kernel(
             if e4m3_native_cx():
                 w = tl.load(
                     w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
-                    mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+                    mask=n_mask[:, None] & k_mask[None, :],
+                    other=0.0,
                 ).to(tl.float32)
             else:
-                w = e4m3_u8_to_f32(tl.load(
-                    w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
-                    mask=n_mask[:, None] & k_mask[None, :], other=0,
-                ))
+                w = e4m3_u8_to_f32(
+                    tl.load(
+                        w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
+                        mask=n_mask[:, None] & k_mask[None, :],
+                        other=0,
+                    )
+                )
             acc += tl.sum(w * a[None, :], axis=1)
     tl.store(part_ptr + pid_k * stride_pk + offs_n * stride_pn, acc, mask=n_mask)
 
 
 @triton.jit
 def _splitk_reduce_kernel(
-    part_ptr, scale_ptr, out_ptr, N, SPLIT_K: tl.constexpr,
-    stride_pk, stride_pn, BLOCK: tl.constexpr, OUT: tl.constexpr,
+    part_ptr,
+    scale_ptr,
+    out_ptr,
+    N,
+    SPLIT_K: tl.constexpr,
+    stride_pk,
+    stride_pn,
+    BLOCK: tl.constexpr,
+    OUT: tl.constexpr,
 ):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < N
@@ -143,8 +168,9 @@ def _splitk_reduce_kernel(
     tl.store(out_ptr + offs, (acc * scale).to(OUT), mask=mask)
 
 
-def _gemv(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
-          out_dtype: torch.dtype) -> torch.Tensor:
+def _gemv(
+    a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
     """M==1 split-K GEMV. ``a`` [K] bf16; ``weight`` [N, K] fp8; ``weight_scale`` [N] fp32."""
     N, K = weight.shape
     BLOCK_K = 128
@@ -156,14 +182,33 @@ def _gemv(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     kb_per = triton.cdiv(n_kb, split_k)
     part = torch.empty((split_k, N), dtype=torch.float32, device=a.device)
     _gemv_splitk_kernel[(n_tiles, split_k)](
-        a, weight, part, N, K, n_kb, kb_per,
-        a.stride(0), weight.stride(0), weight.stride(1), part.stride(0), part.stride(1),
-        BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=1,
+        a,
+        weight,
+        part,
+        N,
+        K,
+        n_kb,
+        kb_per,
+        a.stride(0),
+        weight.stride(0),
+        weight.stride(1),
+        part.stride(0),
+        part.stride(1),
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=1,
     )
     out = torch.empty(N, dtype=out_dtype, device=a.device)
     _splitk_reduce_kernel[(triton.cdiv(N, 256),)](
-        part, weight_scale, out, N, split_k, part.stride(0), part.stride(1),
-        BLOCK=256, OUT=_TL_DTYPE[out_dtype if out_dtype in _TL_DTYPE else torch.bfloat16],
+        part,
+        weight_scale,
+        out,
+        N,
+        split_k,
+        part.stride(0),
+        part.stride(1),
+        BLOCK=256,
+        OUT=_TL_DTYPE[out_dtype if out_dtype in _TL_DTYPE else torch.bfloat16],
         num_warps=2,
     )
     return out
@@ -175,9 +220,22 @@ def _gemv(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
 # ======================================================================================
 @triton.jit
 def _gemm_kernel(
-    a_ptr, w_ptr, scale_ptr, c_ptr, M, N, K,
-    stride_am, stride_ak, stride_wn, stride_wk, stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    w_ptr,
+    scale_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_wn,
+    stride_wk,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     compute_type: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -207,8 +265,9 @@ def _gemm_kernel(
     tl.store(c_ptrs, acc.to(compute_type), mask=m_mask[:, None] & n_mask[None, :])
 
 
-def _gemm(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
-          out_dtype: torch.dtype) -> torch.Tensor:
+def _gemm(
+    a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
     """M>1 W8A16 GEMM. ``a`` [M, K] bf16; ``weight`` [N, K] fp8; ``weight_scale`` [N] fp32."""
     M, K = a.shape
     N = weight.shape[0]
@@ -218,10 +277,25 @@ def _gemm(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     BLOCK_N, BLOCK_K = 128, 64
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     _gemm_kernel[grid](
-        a, weight, weight_scale, out, M, N, K,
-        a.stride(0), a.stride(1), weight.stride(0), weight.stride(1), out.stride(0), out.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, compute_type=_TL_DTYPE[compute],
-        num_warps=8 if M >= 64 else 4, num_stages=3,
+        a,
+        weight,
+        weight_scale,
+        out,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        compute_type=_TL_DTYPE[compute],
+        num_warps=8 if M >= 64 else 4,
+        num_stages=3,
     )
     return out
 
@@ -263,14 +337,23 @@ def _static_quant(a: torch.Tensor, input_scale: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(a, dtype=FP8)
     BLOCK = 1024
     _static_quant_kernel[(triton.cdiv(n, BLOCK),)](
-        a, out, input_scale, n, BLOCK=BLOCK, num_warps=4,
+        a,
+        out,
+        input_scale,
+        n,
+        BLOCK=BLOCK,
+        num_warps=4,
     )
     return out
 
 
 def _scaled_mm(
-    a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
-    input_scale: torch.Tensor, uniform_scale: bool, out_dtype: torch.dtype,
+    a: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: torch.Tensor,
+    uniform_scale: bool,
+    out_dtype: torch.dtype,
     scale_segments: list[tuple[int, int]] | None = None,
 ) -> torch.Tensor:
     """``a @ (weight_fp8 * weight_scale)^T`` as a W8A8 cuBLASLt GEMM.
@@ -293,18 +376,29 @@ def _scaled_mm(
     sa = input_scale.reshape(())
     if uniform_scale:
         return torch._scaled_mm(
-            qa, wt, scale_a=sa, scale_b=weight_scale[0].reshape(()), out_dtype=out_dtype,
+            qa,
+            wt,
+            scale_a=sa,
+            scale_b=weight_scale[0].reshape(()),
+            out_dtype=out_dtype,
         )
     if scale_segments is not None:
-        return torch.cat([
-            torch._scaled_mm(
-                qa, weight[s:e].t(), scale_a=sa, scale_b=weight_scale[s].reshape(()),
-                out_dtype=out_dtype,
-            )
-            for s, e in scale_segments
-        ], dim=1)
+        return torch.cat(
+            [
+                torch._scaled_mm(
+                    qa,
+                    weight[s:e].t(),
+                    scale_a=sa,
+                    scale_b=weight_scale[s].reshape(()),
+                    out_dtype=out_dtype,
+                )
+                for s, e in scale_segments
+            ],
+            dim=1,
+        )
     return torch._scaled_mm(
-        qa, wt,
+        qa,
+        wt,
         scale_a=input_scale.reshape(1, 1).expand(a.shape[0], 1).contiguous(),
         scale_b=weight_scale.reshape(1, -1),
         out_dtype=out_dtype,
@@ -312,7 +406,9 @@ def _scaled_mm(
 
 
 def fp8_pertensor_linear(
-    x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
     bias: torch.Tensor | None = None,
     input_scale: torch.Tensor | None = None,
     uniform_scale: bool = False,
@@ -333,19 +429,29 @@ def fp8_pertensor_linear(
     w8a8 = input_scale is not None and e4m3_native()
     segments = None
     if w8a8 and not uniform_scale and not rowwise_scaled_mm_ok():
-        segments = scale_segments if scale_segments is not None else weight_scale_segments(weight_scale)
+        segments = (
+            scale_segments if scale_segments is not None else weight_scale_segments(weight_scale)
+        )
         if not _segments_w8a8_ok(segments):
             w8a8 = False  # W8A16 below is exact for any per-row scale and never calls _scaled_mm
     if w8a8:
         out = _scaled_mm(
-            x.reshape(-1, K), weight, weight_scale, input_scale, uniform_scale, x.dtype,
+            x.reshape(-1, K),
+            weight,
+            weight_scale,
+            input_scale,
+            uniform_scale,
+            x.dtype,
             scale_segments=segments,
         ).reshape(*lead, N)
     elif x.numel() // K == 1:
         out = _gemv(x.reshape(K), e4m3_kernel_view(weight), weight_scale, x.dtype).reshape(*lead, N)
     else:
         out = _gemm(
-            x.reshape(-1, K), e4m3_kernel_view(weight), weight_scale, x.dtype,
+            x.reshape(-1, K),
+            e4m3_kernel_view(weight),
+            weight_scale,
+            x.dtype,
         ).reshape(*lead, N)
     if bias is not None:
         out = out + bias.to(out.dtype)

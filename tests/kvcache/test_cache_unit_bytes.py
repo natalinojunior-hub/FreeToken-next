@@ -30,8 +30,13 @@ def _mha_engine(layers=4, pages=100, page_size=16, kv_heads=2, head_dim=64, dtyp
     _init_tp()
     eng = SimpleNamespace(
         kv_cache=MHAKVCache(
-            num_kv_heads=kv_heads, num_layers=layers, head_dim=head_dim, num_pages=pages,
-            page_size=page_size, dtype=dtype, device=torch.device("cpu"),
+            num_kv_heads=kv_heads,
+            num_layers=layers,
+            head_dim=head_dim,
+            num_pages=pages,
+            page_size=page_size,
+            dtype=dtype,
+            device=torch.device("cpu"),
         ),
         moe_offload_cache=None,
         linear_state_pool=None,
@@ -60,13 +65,27 @@ def test_kv_and_swa_bytes_per_token_from_hybrid_pools():
     kv_heads, head_dim = 4, 32
     pool = HybridSWAKVCache(
         groups=[
-            KVCacheGroupSpec(name="full", layer_ids=(0, 2), num_kv_heads=kv_heads,
-                             head_dim=head_dim, sliding_window=None),
-            KVCacheGroupSpec(name="swa", layer_ids=(1,), num_kv_heads=kv_heads,
-                             head_dim=head_dim, sliding_window=128),
+            KVCacheGroupSpec(
+                name="full",
+                layer_ids=(0, 2),
+                num_kv_heads=kv_heads,
+                head_dim=head_dim,
+                sliding_window=None,
+            ),
+            KVCacheGroupSpec(
+                name="swa",
+                layer_ids=(1,),
+                num_kv_heads=kv_heads,
+                head_dim=head_dim,
+                sliding_window=128,
+            ),
         ],
-        num_layers=3, num_full_pages=50, page_size=16, num_swa_tokens=512,
-        dtype=torch.bfloat16, device=torch.device("cpu"),
+        num_layers=3,
+        num_full_pages=50,
+        page_size=16,
+        num_swa_tokens=512,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
     )
     eng = SimpleNamespace(
         kv_cache=pool, moe_offload_cache=None, linear_state_pool=None, config=None
@@ -129,9 +148,7 @@ def test_never_raises_on_bad_pool():
         def bytes_per_slot(self):
             raise RuntimeError("boom")
 
-    eng = SimpleNamespace(
-        kv_cache=object(), moe_offload_cache=object(), linear_state_pool=Boom()
-    )
+    eng = SimpleNamespace(kv_cache=object(), moe_offload_cache=object(), linear_state_pool=Boom())
     ub = compute_cache_unit_bytes(eng)
     assert ub == {
         "kv_bytes_per_token": 0,
@@ -178,7 +195,9 @@ def test_floors_hybrid_moe_model():
 def test_floors_naive_gdn_and_dense():
     # naive (non-hybrid_radix) GDN pool: physical floor mr+1 -> mr usable.
     eng = SimpleNamespace(
-        config=_config(cache_type="naive"), moe_offload_cache=None, linear_state_pool=object(),
+        config=_config(cache_type="naive"),
+        moe_offload_cache=None,
+        linear_state_pool=object(),
         kv_cache=None,
     )
     assert compute_cache_floors(eng)["mamba_slots"] == 4
@@ -243,9 +262,9 @@ def test_status_meta_reports_post_weights_baseline():
     # The budget is the value Engine.__init__ recorded, verbatim -- not a query-time reading.
     eng = _mha_engine()
     eng.config = _config()
-    eng._post_weights_free = 6 * 2 ** 30
+    eng._post_weights_free = 6 * 2**30
     meta = compute_cache_status_meta(eng)
-    assert meta["free_vram_bytes"] == 6 * 2 ** 30
+    assert meta["free_vram_bytes"] == 6 * 2**30
 
 
 def test_compute_cache_pools_reads_load_time_allocations():

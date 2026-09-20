@@ -33,7 +33,11 @@ _EXPERT_KEY_RE = (
     r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>{kinds})$"
 )
 # role -> the expert bank reader's canonical (ModelOpt) tensor kind
-_BANK_KINDS = {"weight": "weight", "weight_scale": "weight_scale", "weight_global": "weight_scale_2"}
+_BANK_KINDS = {
+    "weight": "weight",
+    "weight_scale": "weight_scale",
+    "weight_global": "weight_scale_2",
+}
 
 # Gemma-style (1+weight) RMSNorm weights; the GDN gated norm (linear_attn.norm) is a plain weight*x norm
 _GEMMA_NORM_SUFFIXES = (
@@ -43,10 +47,25 @@ _GEMMA_NORM_SUFFIXES = (
     ".self_attn.k_norm.weight",
 )
 # leaves the model builds as Linear layers: only their tensors are read under the QuantConfig, the rest passes through as stored
-_LINEAR_LEAVES = frozenset({
-    "q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
-    "gate_proj", "up_proj", "down_proj", "gate", "shared_expert_gate", "lm_head",
-})
+_LINEAR_LEAVES = frozenset(
+    {
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "in_proj_qkv",
+        "in_proj_z",
+        "in_proj_b",
+        "in_proj_a",
+        "out_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "gate",
+        "shared_expert_gate",
+        "lm_head",
+    }
+)
 # activation scales of modules whose scheme carries no input_scale role
 _DROPPED_SUFFIXES = frozenset({"input_scale", "input_global_scale"})
 _ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn, "e2m1": torch.uint8}
@@ -80,15 +99,22 @@ def _per_row_scale(scale: torch.Tensor, rows: int) -> torch.Tensor:
     return flat.contiguous()
 
 
-def _dequant_nvfp4(weight: torch.Tensor, weight_scale: torch.Tensor, weight_global: torch.Tensor) -> torch.Tensor:
+def _dequant_nvfp4(
+    weight: torch.Tensor, weight_scale: torch.Tensor, weight_global: torch.Tensor
+) -> torch.Tensor:
     """Packed NVFP4 -> bf16 on CUDA (the kernel is GPU-only, the converter reads on CPU), returned on the caller's device."""
     device = weight.device
     if device.type != "cuda":
-        weight, weight_scale, weight_global = (t.to("cuda") for t in (weight, weight_scale, weight_global))
+        weight, weight_scale, weight_global = (
+            t.to("cuda") for t in (weight, weight_scale, weight_global)
+        )
     slots = torch.zeros(1, dtype=torch.int32, device=weight.device)
     out = dequant_nvfp4(
-        weight.unsqueeze(0).contiguous(), weight_scale.unsqueeze(0).contiguous(), weight_global.unsqueeze(0),
-        slots, dtype=torch.bfloat16,
+        weight.unsqueeze(0).contiguous(),
+        weight_scale.unsqueeze(0).contiguous(),
+        weight_global.unsqueeze(0),
+        slots,
+        dtype=torch.bfloat16,
     )[0]
     return out.to(device)
 
@@ -112,13 +138,18 @@ class _DenseReader:
 
     def __init__(self, quant: QuantConfig | None, spec: ModelSpec) -> None:
         self.quant = quant
-        self.groups = {fused: parts for fused, parts in spec.packed_modules_mapping if fused != "experts"}
+        self.groups = {
+            fused: parts for fused, parts in spec.packed_modules_mapping if fused != "experts"
+        }
         self.by_part: dict[str, list[tuple[str, int]]] = {}
         for fused, parts in self.groups.items():
             for idx, part in enumerate(parts):
                 self.by_part.setdefault(part, []).append((fused, idx))
         # target module -> (part count, {part: {role: tensor}}, {part: the roles its module stores})
-        self.pending: dict[str, tuple[int, dict[int, dict[str, torch.Tensor]], dict[int, set[str]], QuantScheme | None]] = {}
+        self.pending: dict[
+            str,
+            tuple[int, dict[int, dict[str, torch.Tensor]], dict[int, set[str]], QuantScheme | None],
+        ] = {}
 
     def scheme(self, module: str) -> QuantScheme | None:
         return None if self.quant is None else self.quant.scheme_for(module)
@@ -149,7 +180,11 @@ class _DenseReader:
         if module.rpartition(".")[2] not in _LINEAR_LEAVES:
             return None
         stored = self.stored(module)
-        roles = {"weight": "weight"} if stored is None else {e.name: r for r, e in self.quant.storage(stored).items()}
+        roles = (
+            {"weight": "weight"}
+            if stored is None
+            else {e.name: r for r, e in self.quant.storage(stored).items()}
+        )
         role = roles.get(suffix)
         if role is None:
             if suffix in _DROPPED_SUFFIXES:
@@ -158,9 +193,17 @@ class _DenseReader:
                 f"{name}: the checkpoint's quant config declares {module} {stored or 'unquantized'}, stored as {sorted(roles)}"
             )
         if stored is None and tensor.dtype in _QUANT_DTYPES:
-            raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} unquantized")
-        if stored is not None and role == "weight" and tensor.dtype is not _ELEM_DTYPES[stored.weight.elem]:
-            raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} {stored}")
+            raise ValueError(
+                f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} unquantized"
+            )
+        if (
+            stored is not None
+            and role == "weight"
+            and tensor.dtype is not _ELEM_DTYPES[stored.weight.elem]
+        ):
+            raise ValueError(
+                f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} {stored}"
+            )
         target, idx, count = self.target(module)
         _, parts, expected, _ = self.pending.setdefault(target, (count, {}, {}, stored))
         parts.setdefault(idx, {})[role] = tensor
@@ -177,7 +220,11 @@ class _DenseReader:
             lacking = sorted(set().union(*(expected[i] - set(parts[i]) for i in parts)))
             note = ""
             if lacking == ["input_scale"]:
-                fix = "declares W4A16_NVFP4 or sets with_input_scale false" if stored is not None and stored.kind is QuantKind.NVFP4 else "sets with_input_scale false"
+                fix = (
+                    "declares W4A16_NVFP4 or sets with_input_scale false"
+                    if stored is not None and stored.kind is QuantKind.NVFP4
+                    else "sets with_input_scale false"
+                )
                 note = f" (an export without activation scales {fix})"
             if len(parts) < count:
                 lacking.append(f"{count - len(parts)} of {count} fused parts")
@@ -200,15 +247,21 @@ class _DenseReader:
             out.append((f"{target}.{role}", value))
         return out
 
-    def _check(self, target: str, scheme: QuantScheme, part: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def _check(
+        self, target: str, scheme: QuantScheme, part: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
         """Validate one part against ``scheme`` and put its scales in the layer's form."""
         part = {
-            role: 1.0 / tensor.to(torch.float32) if self.quant.storage(scheme)[role].reciprocal else tensor
+            role: 1.0 / tensor.to(torch.float32)
+            if self.quant.storage(scheme)[role].reciprocal
+            else tensor
             for role, tensor in part.items()
         }
         weight = part["weight"]
         if weight.dtype is not _ELEM_DTYPES[scheme.weight.elem]:
-            raise ValueError(f"{target}: weight is {weight.dtype} but the checkpoint's quant config declares {scheme}")
+            raise ValueError(
+                f"{target}: weight is {weight.dtype} but the checkpoint's quant config declares {scheme}"
+            )
         rows, cols = weight.shape[0], weight.shape[1] * (2 if scheme.weight.elem == "e2m1" else 1)
         block_rows, block_cols = scheme.weight.group or (1, 1)
         scale_role = "weight_scale_inv" if "weight_scale_inv" in part else "weight_scale"
@@ -217,16 +270,24 @@ class _DenseReader:
             out[scale_role] = _per_row_scale(part[scale_role], rows)
         else:
             if rows % block_rows or cols % block_cols:
-                raise ValueError(f"{target}: {rows}x{cols} weight is not a multiple of the {block_rows}x{block_cols} scale block of {scheme}")
+                raise ValueError(
+                    f"{target}: {rows}x{cols} weight is not a multiple of the {block_rows}x{block_cols} scale block of {scheme}"
+                )
             expected = (rows // block_rows, cols // block_cols)
             if tuple(part[scale_role].shape) != expected:
-                raise ValueError(f"{target}: {scale_role} is {tuple(part[scale_role].shape)}, expected {expected} for {scheme}")
+                raise ValueError(
+                    f"{target}: {scale_role} is {tuple(part[scale_role].shape)}, expected {expected} for {scheme}"
+                )
             if scheme.weight.scale == "e4m3" and part[scale_role].dtype is not torch.float8_e4m3fn:
-                raise ValueError(f"{target}: {scale_role} is {part[scale_role].dtype} but {scheme} stores e4m3 scales")
+                raise ValueError(
+                    f"{target}: {scale_role} is {part[scale_role].dtype} but {scheme} stores e4m3 scales"
+                )
         if "weight_global" in part:
             g = part["weight_global"].reshape(-1).to(torch.float32)
             if g.numel() != 1:
-                raise ValueError(f"{target}: weight_global has {g.numel()} elements, expected one per-tensor scale")
+                raise ValueError(
+                    f"{target}: weight_global has {g.numel()} elements, expected one per-tensor scale"
+                )
             out["weight_global"] = g.to(torch.float16).expand(rows).contiguous()
         if "input_scale" in part:
             out["input_scale"] = part["input_scale"].reshape(()).to(torch.float32)
@@ -251,14 +312,31 @@ def iter_weights(
     config = parse_config(hf_config)
     stacked = include_moe_experts and config.is_moe and config.expert_quant == "none"
     if include_non_moe or stacked:
-        reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0])) if include_non_moe else None
-        yield from _iter_shards(model_path, device, reader, stacked=stacked, include_vision=include_vision)
+        reader = (
+            _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0]))
+            if include_non_moe
+            else None
+        )
+        yield from _iter_shards(
+            model_path, device, reader, stacked=stacked, include_vision=include_vision
+        )
     if include_moe_experts and config.is_moe and config.expert_quant == "fp8_block":
         yield from _resident_fp8_experts(model_path, config)
 
 
-def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | None, *, stacked: bool, include_vision: bool):
-    for file in tqdm(iter_weight_files(model_path), desc="Loading weights", disable=not get_tp_info().is_primary()):
+def _iter_shards(
+    model_path: str,
+    device: torch.device,
+    reader: _DenseReader | None,
+    *,
+    stacked: bool,
+    include_vision: bool,
+):
+    for file in tqdm(
+        iter_weight_files(model_path),
+        desc="Loading weights",
+        disable=not get_tp_info().is_primary(),
+    ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
                 name = _rename(raw_name)
@@ -282,11 +360,17 @@ def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | N
                     yield name, tensor
     if reader is not None and reader.pending:
         lines = reader.missing()
-        shown = "\n  ".join(lines[:8]) + (f"\n  ... {len(lines) - 8} more" if len(lines) > 8 else "")
-        raise ValueError(f"checkpoint is missing tensors the quant config declares for {len(lines)} modules:\n  {shown}")
+        shown = "\n  ".join(lines[:8]) + (
+            f"\n  ... {len(lines) - 8} more" if len(lines) > 8 else ""
+        )
+        raise ValueError(
+            f"checkpoint is missing tensors the quant config declares for {len(lines)} modules:\n  {shown}"
+        )
 
 
-def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+def iter_vision_weights(
+    model_path: str, device: torch.device
+) -> Iterator[tuple[str, torch.Tensor]]:
     """The vision tower alone, named as iter_weights names it."""
     for file in iter_weight_files(model_path):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
@@ -351,8 +435,12 @@ def _resident_fp8_experts(model_path, config):
     }
     layers: dict[int, dict[str, torch.Tensor]] = {}
     placed = [0] * L
-    for li, e0, e1, piece in iter_expert_pieces(model_path, config, QuantKind.FP8_BLOCK, parallel=None):
-        stack = layers.setdefault(li, {n: torch.empty(shape, dtype=dt) for n, (shape, dt) in shapes.items()})
+    for li, e0, e1, piece in iter_expert_pieces(
+        model_path, config, QuantKind.FP8_BLOCK, parallel=None
+    ):
+        stack = layers.setdefault(
+            li, {n: torch.empty(shape, dtype=dt) for n, (shape, dt) in shapes.items()}
+        )
         stack["gate_up_proj"][e0:e1, :I] = piece["gate"]
         stack["gate_up_proj"][e0:e1, I:] = piece["up"]
         stack["gate_up_scale_inv"][e0:e1, : I // B] = piece["gate_scale"]
@@ -370,12 +458,23 @@ def _resident_fp8_experts(model_path, config):
 def _moe_dims(model_config):
     L = model_config.num_moe_layers
     return (
-        L, model_config.num_experts, model_config.hidden_size,
-        model_config.moe_intermediate_size, model_config.num_layers - L,  # dense prefix
+        L,
+        model_config.num_experts,
+        model_config.hidden_size,
+        model_config.moe_intermediate_size,
+        model_config.num_layers - L,  # dense prefix
     )
 
 
-def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
+def iter_expert_pieces(
+    model_path,
+    config,
+    kind: QuantKind,
+    *,
+    parallel: bool | None = False,
+    workers: int = 8,
+    chunk: int = 8 << 20,
+):
     """Block-fp8 routed experts, one piece per expert: ``{gate, up, down}`` fp8 codes and their
     ``_scale`` (block scale) companions, named as the checkpoint's dialect stores them. Other expert kinds use the generic readers."""
     if kind is not QuantKind.FP8_BLOCK:
@@ -410,7 +509,11 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
     def _serial():
         reader = ShardReader(model_path, torch.device("cpu"))
         try:
-            for li in tqdm(range(L), desc="Loading fp8 experts (serial)", disable=not get_tp_info().is_primary()):
+            for li in tqdm(
+                range(L),
+                desc="Loading fp8 experts (serial)",
+                disable=not get_tp_info().is_primary(),
+            ):
                 for e in range(E):
                     base = f"model.language_model.layers.{dense + li}.mlp.experts.{e}"
                     for proj in ("gate", "up", "down"):

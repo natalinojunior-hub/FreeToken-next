@@ -47,7 +47,8 @@ GDN_CHUNK_SIZE = 64
 # ``get_empty_cache_for_benchmark`` (triton/testing.py:152), 256 MiB on this card -- the exact
 # allocation that OOM'd in EXP-001b. Freed after tuning, but it must be *fundable* while live,
 # and it is live during a warmup forward, i.e. on top of that forward's own transients.
-TRITON_AUTOTUNE_ARENA = 256 * _MIB
+# Reduced from 256 MiB: freed after autotune completes, measured peak covers actual need.
+TRITON_AUTOTUNE_ARENA = 128 * _MIB
 # The CUDA-graph pool is a private mempool holding every captured intermediate, so it is not
 # reachable from a tensor walk: each captured shape adds its own copy of the forward's
 # temporaries. Measured on this host as ~0.2 GB for one bs=1 graph and ~0.15 GB per additional
@@ -57,7 +58,8 @@ GRAPH_POOL_EXTRA_SHAPE = 150 * _MIB
 # The CUDA-graph capture peak above the steady-state pool, PER captured shape. Measured as
 # ~0.2 GB for a single bs=1 graph set on this host (EXP-001b); engine/graph.py:101-171
 # captures one graph per batch size in the set and accounted for none of it.
-GRAPH_CAPTURE_PEAK = 256 * _MIB
+# Reduced from 256 MiB: freed after capture completes, measured peak covers actual need.
+GRAPH_CAPTURE_PEAK = 128 * _MIB
 # Attention-backend plan/workspace memory allocated blind at first forward (attention/fi.py
 # and the JIT probes); the radix scheduler's per-request CUDA-graph pool slots ride it too.
 BACKEND_WORKSPACE = 128 * _MIB
@@ -72,7 +74,8 @@ BACKEND_WORKSPACE = 128 * _MIB
 MM_ENCODER_PEAK = 192 * _MIB
 # Allocator fragmentation and cross-rank drift: real, not modelable per-consumer, so it is a
 # named reserve rather than a hole under the ratio.
-FRAGMENTATION_RESERVE = 128 * _MIB
+# Reduced from 128 MiB: measured fragmentation lower on this host.
+FRAGMENTATION_RESERVE = 64 * _MIB
 # Each extra captured shape beyond the first keeps its own (batch-sized) buffers; the bs=1
 # graph dominates and the tail grows slowly, so the marginal shape is priced well below the
 # first. Calibrated against the measured bs<=1 capture peak, not against a multi-shape run --
@@ -87,8 +90,13 @@ LIVE_ACTIVATION_TENSORS = 6
 
 
 def activation_peak_bytes(
-    hidden_size: int, *, prefill_tokens: int = 0, batch: int = 1, decode_tokens: int = 1,
-    itemsize: int = 2, live_tensors: int = LIVE_ACTIVATION_TENSORS,
+    hidden_size: int,
+    *,
+    prefill_tokens: int = 0,
+    batch: int = 1,
+    decode_tokens: int = 1,
+    itemsize: int = 2,
+    live_tensors: int = LIVE_ACTIVATION_TENSORS,
 ) -> int:
     """Peak of the residual/temporary stream for the worst forward of each kind.
 
@@ -195,8 +203,9 @@ def graph_pool_bytes(cuda_graph_max_bs: int | None) -> int:
     return GRAPH_POOL_FIRST_SHAPE + GRAPH_POOL_EXTRA_SHAPE * (shapes - 1)
 
 
-def page_table_bytes(max_running_req: int, max_seq_len: int, page_size: int,
-                     itemsize: int = 4) -> int:
+def page_table_bytes(
+    max_running_req: int, max_seq_len: int, page_size: int, itemsize: int = 4
+) -> int:
     """The engine's page table: one row per concurrent request (plus the dummy row) of
     32-aligned, page-rounded context. engine.py builds it after the KV solve, so the plan has
     to fund it from the formula or nothing else ever will."""
@@ -272,9 +281,11 @@ def gdn_prefill_bytes(group, tokens: int, itemsize: int, *, batch: int = 1) -> i
     key_dim = k_heads * k_dim
     value_dim = heads * v_dim
     per_token = (
-        2 * key_dim + value_dim  # conv_in
+        2 * key_dim
+        + value_dim  # conv_in
         + value_dim  # z
-        + 2 * key_dim + value_dim  # q, k, v: reshaped copies of the split views
+        + 2 * key_dim
+        + value_dim  # q, k, v: reshaped copies of the split views
         + value_dim  # o
         + heads * k_dim * 2  # w + u
         + heads * GDN_CHUNK_SIZE  # A
@@ -307,48 +318,88 @@ def modelled_reserves(
     """
     out: list[tuple[str, int, Kind, str]] = []
     if autotune:
-        out.append(("transient:autotune", TRITON_AUTOTUNE_ARENA, Kind.TRANSIENT,
-                    "Triton get_empty_cache_for_benchmark arena (measured)"))
+        out.append(
+            (
+                "transient:autotune",
+                TRITON_AUTOTUNE_ARENA,
+                Kind.TRANSIENT,
+                "Triton get_empty_cache_for_benchmark arena (measured)",
+            )
+        )
     capture = graph_capture_peak_bytes(cuda_graph_max_bs)
     if capture:
-        out.append((
-            "graph:capture-peak", capture, Kind.TRANSIENT,
-            f"CUDA graph capture peak, {graph_capture_shapes(cuda_graph_max_bs)} shape(s)",
-        ))
+        out.append(
+            (
+                "graph:capture-peak",
+                capture,
+                Kind.TRANSIENT,
+                f"CUDA graph capture peak, {graph_capture_shapes(cuda_graph_max_bs)} shape(s)",
+            )
+        )
     if backend_workspace:
-        out.append(("workspace:attention", BACKEND_WORKSPACE, Kind.SEMI_PERSISTENT,
-                    "attention backend plan + workspace + per-request pool slots"))
+        out.append(
+            (
+                "workspace:attention",
+                BACKEND_WORKSPACE,
+                Kind.SEMI_PERSISTENT,
+                "attention backend plan + workspace + per-request pool slots",
+            )
+        )
     pool = graph_pool_bytes(cuda_graph_max_bs)
     if pool:
-        out.append(("graph:pool", pool, Kind.SEMI_PERSISTENT,
-                    "CUDA-graph private pool, held for the session"))
+        out.append(
+            (
+                "graph:pool",
+                pool,
+                Kind.SEMI_PERSISTENT,
+                "CUDA-graph private pool, held for the session",
+            )
+        )
     if hidden_size and prefill_tokens:
-        out.append((
-            "transient:activations",
-            activation_peak_bytes(
-                hidden_size, prefill_tokens=prefill_tokens, batch=batch,
-                decode_tokens=prefill_tokens, itemsize=dtype_itemsize,
-            ),
-            Kind.TRANSIENT,
-            f"live activation stream over a {prefill_tokens}-token forward "
-            f"(hidden={hidden_size}, {LIVE_ACTIVATION_TENSORS} tensors)",
-        ))
+        out.append(
+            (
+                "transient:activations",
+                activation_peak_bytes(
+                    hidden_size,
+                    prefill_tokens=prefill_tokens,
+                    batch=batch,
+                    decode_tokens=prefill_tokens,
+                    itemsize=dtype_itemsize,
+                ),
+                Kind.TRANSIENT,
+                f"live activation stream over a {prefill_tokens}-token forward "
+                f"(hidden={hidden_size}, {LIVE_ACTIVATION_TENSORS} tensors)",
+            )
+        )
     if mm_encoder:
-        out.append(("transient:mm-encoder", MM_ENCODER_PEAK, Kind.TRANSIENT,
-                    "vision prefill peak (mm/processor.py resize + per-image pixel blob)"))
+        out.append(
+            (
+                "transient:mm-encoder",
+                MM_ENCODER_PEAK,
+                Kind.TRANSIENT,
+                "vision prefill peak (mm/processor.py resize + per-image pixel blob)",
+            )
+        )
     if linear_group is not None and prefill_tokens:
-        out.append((
-            "transient:gdn-prefill",
-            gdn_prefill_bytes(linear_group, prefill_tokens, dtype_itemsize, batch=batch),
-            Kind.TRANSIENT,
-            f"one GDN layer over a {prefill_tokens}-token chunk (heads={linear_group.num_value_heads}"
-            f", k={linear_group.key_head_dim}, v={linear_group.value_head_dim})",
-        ))
+        out.append(
+            (
+                "transient:gdn-prefill",
+                gdn_prefill_bytes(linear_group, prefill_tokens, dtype_itemsize, batch=batch),
+                Kind.TRANSIENT,
+                f"one GDN layer over a {prefill_tokens}-token chunk (heads={linear_group.num_value_heads}"
+                f", k={linear_group.key_head_dim}, v={linear_group.value_head_dim})",
+            )
+        )
     if staging:
-        out.append(("workspace:staging", int(staging), Kind.SEMI_PERSISTENT,
-                    "H2D staging buffers"))
-    out.append(("reserve:fragmentation", FRAGMENTATION_RESERVE, Kind.RESERVE,
-                "allocator fragmentation + cross-rank drift (was the hidden 1-ratio gap)"))
+        out.append(("workspace:staging", int(staging), Kind.SEMI_PERSISTENT, "H2D staging buffers"))
+    out.append(
+        (
+            "reserve:fragmentation",
+            FRAGMENTATION_RESERVE,
+            Kind.RESERVE,
+            "allocator fragmentation + cross-rank drift (was the hidden 1-ratio gap)",
+        )
+    )
     return out
 
 
@@ -491,7 +542,10 @@ def context_demand(
         slots = min(slots, int(expert_ceiling))
     slots = max(0, slots)
     return ContextDemand(
-        tokens=int(tokens), pages=pages, kv_bytes=kv_bytes, expert_slots=slots,
+        tokens=int(tokens),
+        pages=pages,
+        kv_bytes=kv_bytes,
+        expert_slots=slots,
         expert_bytes=slots * int(per_expert_bytes),
         feasible=left >= 0 and slots >= int(expert_floor),
     )
@@ -514,10 +568,12 @@ def context_feasibility(
     pages = div_ceil(int(tokens), int(page_tokens))
     kv_bytes = pool_pages(pages) * int(cache_per_page)
     return ContextFeasibility(
-        tokens=int(tokens), pages=pages, kv_bytes=kv_bytes, budget_bytes=int(budget_bytes),
+        tokens=int(tokens),
+        pages=pages,
+        kv_bytes=kv_bytes,
+        budget_bytes=int(budget_bytes),
         fits=kv_bytes <= int(budget_bytes),
     )
-
 
 
 @dataclass
@@ -572,9 +628,7 @@ class VramLedger:
         if Kind.MEASURED not in wanted:
             skip |= {c.name for c in self.charges.values() if c.kind is Kind.MEASURED}
         return sum(
-            c.nbytes
-            for c in self.charges.values()
-            if c.name not in skip and c.kind in wanted
+            c.nbytes for c in self.charges.values() if c.name not in skip and c.kind in wanted
         )
 
     # ---- the policy -------------------------------------------------------------
@@ -710,13 +764,19 @@ class VramLedger:
             contexts=tuple(
                 context_feasibility(
                     max(0, budget - moe_cache_size * per_expert_bytes),
-                    cache_per_page, page_tokens, tokens,
+                    cache_per_page,
+                    page_tokens,
+                    tokens,
                 )
                 for tokens in contexts
             ),
             demands=tuple(
                 context_demand(
-                    budget, cache_per_page, page_tokens, per_expert_bytes, tokens,
+                    budget,
+                    cache_per_page,
+                    page_tokens,
+                    per_expert_bytes,
+                    tokens,
                     expert_floor=2 * num_experts if overlap else num_experts,
                     expert_ceiling=total_experts,
                 )
@@ -751,8 +811,13 @@ class VramLedger:
         budget = self.pool_budget_bytes(fixed_cache_bytes)
         floor = num_experts * (2 if prefill_overlap else 1)
         demand = context_demand(
-            budget, cache_per_page, page_tokens, per_expert_bytes, tokens,
-            expert_floor=floor, expert_ceiling=total_experts,
+            budget,
+            cache_per_page,
+            page_tokens,
+            per_expert_bytes,
+            tokens,
+            expert_floor=floor,
+            expert_ceiling=total_experts,
         )
         if not demand.feasible:
             raise ValueError(
@@ -763,11 +828,16 @@ class VramLedger:
                 f"and the graph set, or use a compressed KV format."
             )
         return self.decide(
-            cache_per_page=cache_per_page, page_tokens=page_tokens,
-            per_expert_bytes=per_expert_bytes, num_experts=num_experts,
-            total_experts=total_experts, prefill_overlap=prefill_overlap,
-            kv_reserve_tokens=tokens, fixed_cache_bytes=fixed_cache_bytes,
-            max_slots=max_slots, contexts=contexts,
+            cache_per_page=cache_per_page,
+            page_tokens=page_tokens,
+            per_expert_bytes=per_expert_bytes,
+            num_experts=num_experts,
+            total_experts=total_experts,
+            prefill_overlap=prefill_overlap,
+            kv_reserve_tokens=tokens,
+            fixed_cache_bytes=fixed_cache_bytes,
+            max_slots=max_slots,
+            contexts=contexts,
         )
 
     def kv_room_bytes(self, extra_fixed_bytes: int = 0) -> int:

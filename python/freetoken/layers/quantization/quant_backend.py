@@ -48,10 +48,14 @@ class QuantBackend:
             name = name.strip().lower()
             if not sep or not name or table is None:
                 layers = [l.value for l in LayerKind]
-                raise ValueError(f"bad --quant-backend item {item!r}; expected layer[.kind]=name with layer in {layers}")
+                raise ValueError(
+                    f"bad --quant-backend item {item!r}; expected layer[.kind]=name with layer in {layers}"
+                )
             known = _kernel_names(*table)
             if name not in known:
-                raise ValueError(f"--quant-backend {key}: no kernel {name!r}; known: {sorted(known)}")
+                raise ValueError(
+                    f"--quant-backend {key}: no kernel {name!r}; known: {sorted(known)}"
+                )
             items[table] = name
         return cls(tuple(sorted(items.items(), key=lambda kv: _table_text(kv[0]))))
 

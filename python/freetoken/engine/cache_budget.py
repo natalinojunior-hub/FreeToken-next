@@ -20,12 +20,26 @@ def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
     Each bank source is per-layer ``[num_experts, *row_shape]`` tensors and is
     already TP-sharded upstream, so the per-row byte count is the per-rank slot
     size.
+
+    Supports mixed/non-uniform geometry across layers (Phase 7): for banks with
+    varying layer shapes/dtypes, each distinct geometry allocates its own GPU slot
+    cache of shape ``(cache_size, *shape[1:])``, so all distinct geometries must
+    be summed to reflect actual VRAM occupancy per slot.
     """
     # marlin/b12x gate_up/down alpha scales are fixed [L*E] residency (do not scale
     # with cache_size), so they are intentionally excluded from the per-slot growth term.
     # tensor[0].numel() is the per-row element count (one expert slot); see the matching
     # slot-byte idiom in kvcache/linear_state_pool.py and kvcache/dsv4_paged_pool.py.
-    return sum(t[0][0].numel() * t[0].element_size() for t in sources.values())
+    total = 0
+    for per_layer in sources.values():
+        if not per_layer:
+            continue
+        unique_geoms = {
+            (tuple(layer_t.shape[1:]), layer_t.dtype): layer_t[0].numel() * layer_t.element_size()
+            for layer_t in per_layer
+        }
+        total += sum(unique_geoms.values())
+    return total
 
 
 def ceiling_bytes(baseline_free: int, memory_ratio: float, reserve_bytes: int = 0) -> int:
@@ -56,7 +70,9 @@ def net_cache_budget_bytes(
     (non-paged) cache. Single source of truth for startup auto-sizing and the runtime-rebuild
     fit check; ``reserve_bytes`` is the ledger's modelled peak, 0 for callers that have no
     ledger (and therefore keep the pre-ledger formula exactly)."""
-    return ceiling_bytes(baseline_free, memory_ratio, reserve_bytes) - weights_bytes - fixed_cache_size
+    return (
+        ceiling_bytes(baseline_free, memory_ratio, reserve_bytes) - weights_bytes - fixed_cache_size
+    )
 
 
 # Every KV pool allocates one page past the usable ones for padded / dummy rows to write

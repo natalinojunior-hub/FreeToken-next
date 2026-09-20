@@ -64,7 +64,9 @@ class MHAKVCache(BaseKVCachePool):
         existing buffer; only the page count changes. Views and ``_storage_shape`` are
         refreshed. Object identity is preserved so cached backend references stay valid.
         """
-        _, num_storage_layers, _old_pages, page_size, local_kv_heads, head_dim = self._kv_buffer.shape
+        _, num_storage_layers, _old_pages, page_size, local_kv_heads, head_dim = (
+            self._kv_buffer.shape
+        )
         dtype = self._kv_buffer.dtype
         device = self._device
         self._k_buffer = None

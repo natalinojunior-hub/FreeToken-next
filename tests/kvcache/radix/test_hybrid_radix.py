@@ -18,6 +18,7 @@ token keying); the truncation test sweeps the page-size matrix.
 Expectations come from the page-keyed reference model in ``model.py``; ``Session.do_*`` compares
 every public result against it and ``Session.check()`` runs the invariant battery.
 """
+
 from __future__ import annotations
 
 from typing import Sequence, Tuple
@@ -88,8 +89,9 @@ def two_node_tree(s: Session) -> Tuple[Sequence[int], int, int]:
 
 
 # --------------------------------------------------------------------------- constructor
-@pytest.mark.parametrize("page_size, ok", [(1, True), (4, True), (64, True),
-                                           (3, False), (48, False), (128, False)])
+@pytest.mark.parametrize(
+    "page_size, ok", [(1, True), (4, True), (64, True), (3, False), (48, False), (128, False)]
+)
 def test_page_size_must_divide_chunk_size(page_size, ok):
     """Snapshots land on x CHUNK_SIZE boundaries, so a page must not straddle one."""
     from freetoken.kernel.fla.chunk import CHUNK_SIZE
@@ -97,8 +99,9 @@ def test_page_size_must_divide_chunk_size(page_size, ok):
 
     assert (CHUNK_SIZE % page_size == 0) is ok, "the parameter table assumed CHUNK_SIZE == 64"
     if not ok:
-        with pytest.raises(AssertionError,
-                           match=rf"CHUNK_SIZE\({CHUNK_SIZE}\) % page_size\({page_size}\)"):
+        with pytest.raises(
+            AssertionError, match=rf"CHUNK_SIZE\({CHUNK_SIZE}\) % page_size\({page_size}\)"
+        ):
             HybridRadixCache(torch.device("cpu"), page_size=page_size)
         return
     c = HybridRadixCache(torch.device("cpu"), page_size=page_size)
@@ -129,11 +132,11 @@ def test_deepest_snapshot_wins_and_unmatched_suffix_is_dropped(hyb):
     assert mx != my
 
     m, _ = hyb.do_match(chain)
-    assert (m.cached_len, m.second) == (4 * PAGE, my)          # the deeper snapshot supersedes
+    assert (m.cached_len, m.second) == (4 * PAGE, my)  # the deeper snapshot supersedes
     # a query running past the end of the tree still resumes from the deepest snapshot
     m, _ = hyb.do_match(chain + ids(5))
     assert (m.cached_len, m.second) == (4 * PAGE, my)
-    assert events(hyb)["match.snapshot_truncation"] == 0        # nothing was truncated: 4P is the end
+    assert events(hyb)["match.snapshot_truncation"] == 0  # nothing was truncated: 4P is the end
     hyb.check()
 
 
@@ -142,16 +145,16 @@ def test_split_leaves_the_snapshot_on_the_suffix_half(hyb):
     snapshot and a match that ends there falls back to the nearest ancestor that does."""
     chain, mx, my = two_node_tree(hyb)
 
-    m, _ = hyb.do_match(ids(1, 2, 3, 5))       # diverges inside Y -> Y splits into [3] + [4]
+    m, _ = hyb.do_match(ids(1, 2, 3, 5))  # diverges inside Y -> Y splits into [3] + [4]
     assert events(hyb)["node.split"] == 1
     assert events(hyb)["match.snapshot_truncation"] == 1
-    assert (m.cached_len, m.second) == (2 * PAGE, mx)           # truncated back to X's snapshot
+    assert (m.cached_len, m.second) == (2 * PAGE, mx)  # truncated back to X's snapshot
     hyb.check()
 
-    m, _ = hyb.do_match(chain)                 # the suffix half kept my, so the deep hit survives
+    m, _ = hyb.do_match(chain)  # the suffix half kept my, so the deep hit survives
     assert (m.cached_len, m.second) == (4 * PAGE, my)
     assert live_snapshots(hyb) == 2
-    assert full_size(hyb) == 4 * PAGE                          # a split moves no KV
+    assert full_size(hyb) == 4 * PAGE  # a split moves no KV
 
 
 def test_prefix_of_a_snapshot_node_is_not_reusable(hyb):
@@ -162,12 +165,12 @@ def test_prefix_of_a_snapshot_node_is_not_reusable(hyb):
     ms = donated(hyb)
     hyb.check()
 
-    m, _ = hyb.do_match(ids(1, 2))             # splits the node; the [1,2] half owns no snapshot
+    m, _ = hyb.do_match(ids(1, 2))  # splits the node; the [1,2] half owns no snapshot
     assert (m.cached_len, m.indices, m.second) == (0, [], None)
     assert events(hyb)["node.split"] == 1
     assert events(hyb)["match.no_snapshot"] == 1
 
-    m, _ = hyb.do_match(ids(1, 2, 3, 4))       # ... while the full prefix is still a hit
+    m, _ = hyb.do_match(ids(1, 2, 3, 4))  # ... while the full prefix is still a hit
     assert (m.cached_len, m.indices, m.second) == (4 * PAGE, slots, ms)
     assert full_size(hyb) == 4 * PAGE
     hyb.check()
@@ -178,16 +181,16 @@ def test_insert_dedups_and_the_caller_frees_the_donated_slot(hyb):
     mx = donated(hyb)
 
     slots = hyb.kv.take(2 * PAGE)
-    got, exp = hyb.do_insert(ids(1, 2), slots=slots)            # same boundary, second donation
+    got, exp = hyb.do_insert(ids(1, 2), slots=slots)  # same boundary, second donation
     assert (got.matched_len, got.second_exists) == (2 * PAGE, True)
-    assert exp.dups == slots and exp.adopted == []               # caller keeps every duplicate page
+    assert exp.dups == slots and exp.adopted == []  # caller keeps every duplicate page
     assert events(hyb)["insert.snapshot_dedup"] == 1
-    assert live_snapshots(hyb) == 1                              # still exactly one snapshot
+    assert live_snapshots(hyb) == 1  # still exactly one snapshot
     hyb.check()
 
     m, _ = hyb.do_match(ids(1, 2))
-    assert m.second == mx                                        # the original snapshot is kept
-    assert donated(hyb) in hyb.second.free                       # the loser was handed back
+    assert m.second == mx  # the original snapshot is kept
+    assert donated(hyb) in hyb.second.free  # the loser was handed back
 
 
 @pytest.mark.parametrize("P", [1, 4, 64], ids=["p1", "p4", "p64"])
@@ -195,7 +198,7 @@ def test_insert_stores_whole_pages_only(P):
     """``align_down`` governs both ends: fewer tokens than a page reaches the root (which cannot
     hold a snapshot, hence ``exists=True``), and a ragged tail is left with the caller."""
     s = Session(CacheSpec("hybrid", P))
-    stub = page_ids(P, 1)[: P - 1]                               # () at P == 1
+    stub = page_ids(P, 1)[: P - 1]  # () at P == 1
     got, _ = s.do_insert(stub)
     assert (got.matched_len, got.second_exists) == (0, True)
     assert full_size(s) == 0 and live_snapshots(s) == 0
@@ -204,7 +207,7 @@ def test_insert_stores_whole_pages_only(P):
     slots = s.kv.take(2 * P + (P - 1))
     got, exp = s.do_insert(page_ids(P, 1, 2) + page_ids(P, 3)[: P - 1], slots=slots)
     assert (got.matched_len, got.second_exists) == (0, False)
-    assert exp.adopted == slots[: 2 * P]                         # the tail was never adopted
+    assert exp.adopted == slots[: 2 * P]  # the tail was never adopted
     s.check()
 
     m, _ = s.do_match(page_ids(P, 1, 2))
@@ -216,27 +219,27 @@ def test_insert_stores_whole_pages_only(P):
 def test_evict_mamba_tombstones_an_internal_node_and_keeps_its_kv(hyb):
     chain, mx, my = two_node_tree(hyb)
 
-    hyb.do_evict_second(1)                     # X is the LRU snapshot and is internal
+    hyb.do_evict_second(1)  # X is the LRU snapshot and is internal
     assert events(hyb)["evict_mamba.tombstone_in_place"] == 1
-    assert mx in hyb.second.free and hyb.kv.free == set()        # no KV was reclaimed
+    assert mx in hyb.second.free and hyb.kv.free == set()  # no KV was reclaimed
     assert full_size(hyb) == 4 * PAGE and live_snapshots(hyb) == 1
     hyb.check()
 
-    m, _ = hyb.do_match(ids(1, 2))             # the tombstoned boundary is no longer resumable
+    m, _ = hyb.do_match(ids(1, 2))  # the tombstoned boundary is no longer resumable
     assert (m.cached_len, m.second) == (0, None)
-    m, _ = hyb.do_match(chain)                 # the descendant snapshot is untouched
+    m, _ = hyb.do_match(chain)  # the descendant snapshot is untouched
     assert (m.cached_len, m.second) == (4 * PAGE, my)
 
 
 def test_insert_refills_a_tombstoned_node(hyb):
     two_node_tree(hyb)
-    hyb.do_evict_second(1)                     # tombstone X (KV kept, snapshot gone)
+    hyb.do_evict_second(1)  # tombstone X (KV kept, snapshot gone)
     hyb.check()
 
     slots = hyb.kv.take(2 * PAGE)
     got, exp = hyb.do_insert(ids(1, 2), slots=slots)
-    assert (got.matched_len, got.second_exists) == (2 * PAGE, False)   # attaches, does not dedup
-    assert exp.dups == slots                                          # KV stays canonical
+    assert (got.matched_len, got.second_exists) == (2 * PAGE, False)  # attaches, does not dedup
+    assert exp.dups == slots  # KV stays canonical
     assert events(hyb)["insert.snapshot_attach"] == 3
     hyb.check()
 
@@ -247,10 +250,10 @@ def test_insert_refills_a_tombstoned_node(hyb):
 
 def test_evict_mamba_on_a_leaf_frees_kv_and_cascades_through_tombstones(hyb):
     chain, _mx, _my = two_node_tree(hyb)
-    hyb.do_evict_second(1)                     # X -> KV-only tombstone
-    hyb.do_evict_second(1)                     # Y is now the only snapshot node, and a leaf
+    hyb.do_evict_second(1)  # X -> KV-only tombstone
+    hyb.do_evict_second(1)  # Y is now the only snapshot node, and a leaf
     assert events(hyb)["evict_mamba.leaf_free"] == 1
-    assert events(hyb)["evict_mamba.cascade"] == 1                    # X reclaimed in the same call
+    assert events(hyb)["evict_mamba.cascade"] == 1  # X reclaimed in the same call
     hyb.check()
 
     assert full_size(hyb) == 0 and live_snapshots(hyb) == 0
@@ -269,9 +272,9 @@ def test_evict_mamba_counts_snapshots_not_tokens(hyb):
     assert live_snapshots(hyb) == 3 and full_size(hyb) == 3 * PAGE
 
     hyb.do_evict_second(2)
-    assert len(hyb.second.free) == 2                                  # exactly two snapshots
-    assert events(hyb)["evict_mamba.tombstone_in_place"] == 2         # both were internal
-    assert hyb.kv.free == set() and full_size(hyb) == 3 * PAGE        # no KV touched
+    assert len(hyb.second.free) == 2  # exactly two snapshots
+    assert events(hyb)["evict_mamba.tombstone_in_place"] == 2  # both were internal
+    assert hyb.kv.free == set() and full_size(hyb) == 3 * PAGE  # no KV touched
     assert live_snapshots(hyb) == 1
     hyb.check()
 
@@ -304,13 +307,13 @@ def test_snapshot_slots_are_conserved_across_eviction_waves(hyb):
 def test_evict_full_takes_the_leaf_snapshot_and_leaves_the_ancestor_usable(hyb):
     chain, mx, my = two_node_tree(hyb)
 
-    hyb.do_evict_full(2 * PAGE)                # the only unlocked leaf is Y
+    hyb.do_evict_full(2 * PAGE)  # the only unlocked leaf is Y
     assert my in hyb.second.free and mx not in hyb.second.free
-    assert events(hyb)["evict_full.cascade"] == 0   # X still owns a snapshot, so it is not reclaimed
+    assert events(hyb)["evict_full.cascade"] == 0  # X still owns a snapshot, so it is not reclaimed
     assert full_size(hyb) == 2 * PAGE and live_snapshots(hyb) == 1
     hyb.check()
 
-    m, _ = hyb.do_match(chain)                 # the request re-hits at the surviving boundary
+    m, _ = hyb.do_match(chain)  # the request re-hits at the surviving boundary
     assert (m.cached_len, m.second) == (2 * PAGE, mx)
 
 
@@ -318,8 +321,8 @@ def test_evict_full_cascades_through_an_exposed_tombstone_leaf(hyb):
     """A KV-only tombstone leaf is reclaimed eagerly in the same ``evict_full`` that exposes it,
     so ``evict_full(2*PAGE)`` returns twice that many tokens."""
     two_node_tree(hyb)
-    hyb.do_evict_second(1)                     # X -> tombstone
-    hyb.do_evict_full(2 * PAGE)                # evicting Y exposes X and reclaims it too
+    hyb.do_evict_second(1)  # X -> tombstone
+    hyb.do_evict_full(2 * PAGE)  # evicting Y exposes X and reclaims it too
     assert events(hyb)["evict_full.cascade"] == 1
     hyb.check()
 
@@ -336,18 +339,18 @@ def test_lock_pins_the_snapshot_and_the_whole_kv_path(hyb):
     assert held is not None
     hyb.check()
 
-    hyb.do_evict_full(4 * PAGE)                # Y is locked, X is internal -> nothing is evictable
-    assert hyb.kv.free == set() and full_size(hyb) == 0        # all 4 pages are protected now
+    hyb.do_evict_full(4 * PAGE)  # Y is locked, X is internal -> nothing is evictable
+    assert hyb.kv.free == set() and full_size(hyb) == 0  # all 4 pages are protected now
 
-    hyb.do_evict_second(1)                     # X's snapshot is unprotected -> tombstoned in place
+    hyb.do_evict_second(1)  # X's snapshot is unprotected -> tombstoned in place
     assert hyb.second.free == {mx}
-    hyb.do_evict_second(1)                     # Y's snapshot is pinned by the lock
+    hyb.do_evict_second(1)  # Y's snapshot is pinned by the lock
     assert hyb.second.free == {mx}
     hyb.check()
 
     hyb.do_unlock(held)
     assert full_size(hyb) == 4 * PAGE
-    hyb.do_evict_full(2 * PAGE)                # Y is evictable again; X cascades behind it
+    hyb.do_evict_full(2 * PAGE)  # Y is evictable again; X cascades behind it
     assert events(hyb)["evict_full.cascade"] == 1
     assert hyb.kv.in_use() == set() and hyb.second.in_use() == set()
     hyb.check()

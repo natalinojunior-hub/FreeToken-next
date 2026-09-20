@@ -19,7 +19,16 @@ class Compressor(BaseOP):
     """Learned gated pooling of KV over ``compress_ratio`` tokens (CSA overlap when
     ratio==4). Stateful across decode steps. KV / state buffers are bound from the pool."""
 
-    def __init__(self, args: DeepseekV4Args, compress_ratio: int, head_dim: int, rotate: bool = False, *, quant_config=None, prefix: str = ""):
+    def __init__(
+        self,
+        args: DeepseekV4Args,
+        compress_ratio: int,
+        head_dim: int,
+        rotate: bool = False,
+        *,
+        quant_config=None,
+        prefix: str = "",
+    ):
         self.dim = args.dim
         self.head_dim = head_dim
         self.rope_head_dim = args.rope_head_dim
@@ -31,8 +40,20 @@ class Compressor(BaseOP):
 
         self.ape = torch.empty(compress_ratio, coff * self.head_dim, dtype=torch.float32)
         # checkpoint stores these bf16; matmul upcasts on-chip (halves footprint + read).
-        self.wkv = LinearReplicated(self.dim, coff * self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wkv")
-        self.wgate = LinearReplicated(self.dim, coff * self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wgate")
+        self.wkv = LinearReplicated(
+            self.dim,
+            coff * self.head_dim,
+            has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wkv",
+        )
+        self.wgate = LinearReplicated(
+            self.dim,
+            coff * self.head_dim,
+            has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wgate",
+        )
         self.norm = RMSNorm(self.head_dim, args.norm_eps)
         # Paged-KV binding (set on first forward). All addressing -- the compressed-KV pool view,
         # the per-window-page compress-state ring, the decode snapshot -- is reached through the
@@ -42,7 +63,7 @@ class Compressor(BaseOP):
         self.layer_id: int | None = None
         self.ring_size = coff * compress_ratio  # state rows per window page
         self.coff = coff
-        self.item_size = coff * self.head_dim   # the ring row's kv|score split point
+        self.item_size = coff * self.head_dim  # the ring row's kv|score split point
         self.P: int = 128  # window-page size (set in bind)
         self._freqs_cis: torch.Tensor | None = None
         # Rolling state register held in fp32 (the carry); seeded by prefill, advanced by
@@ -76,7 +97,9 @@ class Compressor(BaseOP):
         )
         self._score_state = torch.full(
             (1, coff * self.compress_ratio, coff * self.head_dim),
-            float("-inf"), dtype=torch.float32, device=device,
+            float("-inf"),
+            dtype=torch.float32,
+            device=device,
         )
 
     def reset(self) -> None:
@@ -89,7 +112,10 @@ class Compressor(BaseOP):
         # window page's block, for cross-request / radix carry-by-value. ADDITIVE: the register stays
         # the compute source, so this write does not touch parity. cat: kv half = ks, score = ss.
         self.attn.write_carry(
-            self.layer_id, self.tier, window_slot, self.ring_size,
+            self.layer_id,
+            self.tier,
+            window_slot,
+            self.ring_size,
             torch.cat([self._kv_state[0], self._score_state[0]], dim=-1),
         )
 
@@ -111,9 +137,17 @@ class Compressor(BaseOP):
 
     def _write_boundary_carries_range(self, kv, score, lo: int, hi: int, window_slots) -> None:
         self.attn.write_boundary_carries(
-            layer_id=self.layer_id, tier=self.tier, ratio=self.compress_ratio,
-            overlap=self.overlap, ring_size=self.ring_size, ape=self.ape,
-            kv=kv, score=score, lo=lo, hi=hi, window_slots=window_slots,
+            layer_id=self.layer_id,
+            tier=self.tier,
+            ratio=self.compress_ratio,
+            overlap=self.overlap,
+            ring_size=self.ring_size,
+            ape=self.ape,
+            kv=kv,
+            score=score,
+            lo=lo,
+            hi=hi,
+            window_slots=window_slots,
         )
 
     def overlap_transform(self, tensor: torch.Tensor, value=0):
@@ -124,7 +158,9 @@ class Compressor(BaseOP):
         new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
         return new_tensor
 
-    def forward(self, x, start_pos: int, window_slots: torch.Tensor, tail_window_slot=None, ti: int = 0):
+    def forward(
+        self, x, start_pos: int, window_slots: torch.Tensor, tail_window_slot=None, ti: int = 0
+    ):
         # Prefill (single-request, start_pos==0) or carry-aware re-prefill (start_pos>0, radix hit).
         # ``window_slots`` is translate(full_loc_map[ti, start_pos:start_pos+seqlen]) (the NEW
         # tokens' page-tail slots). ``tail_window_slot`` (start_pos>0 only) is the matched tail
@@ -147,11 +183,11 @@ class Compressor(BaseOP):
         cutoff = seqlen - remainder
         offset = ratio if overlap else 0
         if overlap and cutoff >= ratio:
-            ks[:bsz, :ratio] = kv[:, cutoff - ratio: cutoff]
-            ss[:bsz, :ratio] = score[:, cutoff - ratio: cutoff] + self.ape
+            ks[:bsz, :ratio] = kv[:, cutoff - ratio : cutoff]
+            ss[:bsz, :ratio] = score[:, cutoff - ratio : cutoff] + self.ape
         if remainder > 0:
-            kv, ks[:bsz, offset: offset + remainder] = kv.split([cutoff, remainder], dim=1)
-            ss[:bsz, offset: offset + remainder] = score[:, cutoff:] + self.ape[:remainder]
+            kv, ks[:bsz, offset : offset + remainder] = kv.split([cutoff, remainder], dim=1)
+            ss[:bsz, offset : offset + remainder] = score[:, cutoff:] + self.ape[:remainder]
             score = score[:, :cutoff]
         kv = kv.unflatten(1, (-1, ratio))
         score = score.unflatten(1, (-1, ratio)) + self.ape
@@ -181,12 +217,16 @@ class Compressor(BaseOP):
         # full_loc(b*ratio) // ratio (arithmetic; block b starts at abs position b*ratio).
         block_starts = torch.arange(0, cutoff, ratio, device=self._device)
         self.attn.scatter_compressed(
-            self.layer_id, self.tier,
-            self.attn.compress_rows_of(ti, block_starts, self.compress_ratio), kv[0],
+            self.layer_id,
+            self.tier,
+            self.attn.compress_rows_of(ti, block_starts, self.compress_ratio),
+            kv[0],
         )
         return kv
 
-    def extend(self, x, start_pos: int, window_slots: torch.Tensor, tail_window_slot: int, ti: int = 0):
+    def extend(
+        self, x, start_pos: int, window_slots: torch.Tensor, tail_window_slot: int, ti: int = 0
+    ):
         """Carry-aware compressor extend for new tokens [start_pos, start_pos+seqlen).
 
         ``start_pos`` is 128-aligned (== the radix match boundary, divisible by both ratios).
@@ -225,17 +265,17 @@ class Compressor(BaseOP):
         if overlap:
             # Build [n_new_blocks, ratio, 2d] for new tokens, then prepend the carry block so
             # overlap_transform feeds block-(-1)'s first-half into block-0's overlap slots.
-            kv_blocks = kv[:, :cutoff].unflatten(1, (-1, ratio))      # [1, nb, ratio, 2d]
+            kv_blocks = kv[:, :cutoff].unflatten(1, (-1, ratio))  # [1, nb, ratio, 2d]
             score_blocks = score[:, :cutoff].unflatten(1, (-1, ratio)) + self.ape
-            carry_kv = ks[:bsz, :ratio].unsqueeze(1)                  # [1, 1, ratio, 2d]
-            carry_ss = ss[:bsz, :ratio].unsqueeze(1)                  # already +ape at write time
-            kv_blocks = torch.cat([carry_kv, kv_blocks], dim=1)       # [1, nb+1, ratio, 2d]
+            carry_kv = ks[:bsz, :ratio].unsqueeze(1)  # [1, 1, ratio, 2d]
+            carry_ss = ss[:bsz, :ratio].unsqueeze(1)  # already +ape at write time
+            kv_blocks = torch.cat([carry_kv, kv_blocks], dim=1)  # [1, nb+1, ratio, 2d]
             score_blocks = torch.cat([carry_ss, score_blocks], dim=1)
             kv_t = self.overlap_transform(kv_blocks, 0)
             score_t = self.overlap_transform(score_blocks, float("-inf"))
-            kv_t = kv_t[:, 1:]      # drop the synthetic carry block (no valid output)
+            kv_t = kv_t[:, 1:]  # drop the synthetic carry block (no valid output)
             score_t = score_t[:, 1:]
-            reduced = (kv_t * score_t.softmax(dim=2)).sum(dim=2)      # [1, nb, 2d]
+            reduced = (kv_t * score_t.softmax(dim=2)).sum(dim=2)  # [1, nb, 2d]
         else:
             # ratio-128 (non-overlap): no cross-block overlap; the boundary is block-aligned so
             # the first new block starts clean. Reduce the new tokens' full blocks directly.
@@ -250,15 +290,17 @@ class Compressor(BaseOP):
         # would drop the next block's overlap source, and _write_through_carry below would then
         # persist the damaged register into the tail page's ring.
         if overlap and cutoff >= ratio:
-            ks[:bsz, :ratio] = kv[:, cutoff - ratio: cutoff]
-            ss[:bsz, :ratio] = score[:, cutoff - ratio: cutoff] + self.ape
+            ks[:bsz, :ratio] = kv[:, cutoff - ratio : cutoff]
+            ss[:bsz, :ratio] = score[:, cutoff - ratio : cutoff] + self.ape
         if overlap:
-            ks[:bsz, ratio:].zero_(); ss[:bsz, ratio:].fill_(float("-inf"))
+            ks[:bsz, ratio:].zero_()
+            ss[:bsz, ratio:].fill_(float("-inf"))
         else:
-            ks[:bsz].zero_(); ss[:bsz].fill_(float("-inf"))
+            ks[:bsz].zero_()
+            ss[:bsz].fill_(float("-inf"))
         if remainder > 0:
-            ks[:bsz, offset: offset + remainder] = kv[:, cutoff:]
-            ss[:bsz, offset: offset + remainder] = score[:, cutoff:] + self.ape[:remainder]
+            ks[:bsz, offset : offset + remainder] = kv[:, cutoff:]
+            ss[:bsz, offset : offset + remainder] = score[:, cutoff:] + self.ape[:remainder]
         # Page-boundary carries across [start_pos, start_pos+seqlen); plus tail if unaligned.
         end = start_pos + seqlen
         self._write_boundary_carries_range(kv_full, score_full, start_pos, end, window_slots)
@@ -272,7 +314,7 @@ class Compressor(BaseOP):
         # the block-aligned `cutoff` end (NOT start_pos+seqlen): a stepped slice over an unaligned
         # span ceils to one extra element when seqlen % ratio != 0 (mirrors the from-scratch
         # prefill's freqs_cis[:cutoff:ratio]).
-        freqs_cis = self._freqs_cis[start_pos:start_pos + cutoff:ratio]
+        freqs_cis = self._freqs_cis[start_pos : start_pos + cutoff : ratio]
         assert freqs_cis.size(0) == reduced.size(1), f"{freqs_cis.shape=} {reduced.shape=}"
         apply_rotary_emb(reduced[..., -rd:], freqs_cis)
         if self.rotate:
@@ -284,14 +326,20 @@ class Compressor(BaseOP):
         # arithmetic rows full_loc(b*ratio) // ratio.
         block_starts = torch.arange(start_pos, start_pos + cutoff, ratio, device=self._device)
         self.attn.scatter_compressed(
-            self.layer_id, self.tier,
-            self.attn.compress_rows_of(ti, block_starts, self.compress_ratio), reduced[0],
+            self.layer_id,
+            self.tier,
+            self.attn.compress_rows_of(ti, block_starts, self.compress_ratio),
+            reduced[0],
         )
         return reduced
 
     def decode_step(
-        self, x: torch.Tensor, pos: torch.Tensor, prev_window_slots: torch.Tensor,
-        window_slots: torch.Tensor, rows: torch.Tensor,
+        self,
+        x: torch.Tensor,
+        pos: torch.Tensor,
+        prev_window_slots: torch.Tensor,
+        window_slots: torch.Tensor,
+        rows: torch.Tensor,
     ) -> None:
         """Batched single-token compressor update (EAGER/graph; ``pos``/``prev_window_slots``/
         ``window_slots`` are GPU int tensors ``[B]``; ``rows`` is the LOCAL row index [B] into the
@@ -364,18 +412,39 @@ class Compressor(BaseOP):
 class Indexer(BaseOP):
     """Lightning Indexer: scores compressed KV and returns top-k positions to attend."""
 
-    def __init__(self, args: DeepseekV4Args, compress_ratio: int, *, quant_config=None, prefix: str = ""):
+    def __init__(
+        self, args: DeepseekV4Args, compress_ratio: int, *, quant_config=None, prefix: str = ""
+    ):
         self.dim = args.dim
         self.n_heads = args.index_n_heads
         self.head_dim = args.index_head_dim
         self.rope_head_dim = args.rope_head_dim
         self.index_topk = args.index_topk
         self.q_lora_rank = args.q_lora_rank
-        self.wq_b = LinearReplicated(self.q_lora_rank, self.n_heads * self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_b")
-        self.weights_proj = LinearReplicated(self.dim, self.n_heads, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.weights_proj")
-        self.softmax_scale = self.head_dim ** -0.5
+        self.wq_b = LinearReplicated(
+            self.q_lora_rank,
+            self.n_heads * self.head_dim,
+            has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wq_b",
+        )
+        self.weights_proj = LinearReplicated(
+            self.dim,
+            self.n_heads,
+            has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.weights_proj",
+        )
+        self.softmax_scale = self.head_dim**-0.5
         self.compress_ratio = compress_ratio
-        self.compressor = Compressor(args, compress_ratio, self.head_dim, rotate=True, quant_config=quant_config, prefix=f"{prefix}.compressor")
+        self.compressor = Compressor(
+            args,
+            compress_ratio,
+            self.head_dim,
+            rotate=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.compressor",
+        )
         # The indexer's own compressor writes its compressed keys into the idx tier; scoring
         # gathers them by block index. Both go through the LIVE backend (self.attn ->
         # ctx.attn_backend) per access, so a runtime rebuild needs no model unbind.
@@ -402,9 +471,17 @@ class Indexer(BaseOP):
     def reset(self) -> None:
         self.compressor.reset()
 
-    def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int, window_slots: torch.Tensor, ti: int = 0):
+    def forward(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        start_pos: int,
+        offset: int,
+        window_slots: torch.Tensor,
+        ti: int = 0,
+    ):
         bsz, seqlen, _ = x.size()
-        freqs_cis = self._freqs_cis[start_pos:start_pos + seqlen]
+        freqs_cis = self._freqs_cis[start_pos : start_pos + seqlen]
         ratio = self.compress_ratio
         rd = self.rope_head_dim
         end_pos = start_pos + seqlen
@@ -413,13 +490,19 @@ class Indexer(BaseOP):
         apply_rotary_emb(q[..., -rd:], freqs_cis)
         q = hadamard_transform(q)
         fp4_act_quant_inplace(q, 32)
-        self.compressor.forward(x, start_pos, window_slots, ti=ti)  # scatters indexer keys to idx_pool
-        weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads ** -0.5)
+        self.compressor.forward(
+            x, start_pos, window_slots, ti=ti
+        )  # scatters indexer keys to idx_pool
+        weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads**-0.5)
         keys = self.attn.indexer_keys(ti, end_pos // ratio, ratio, self.layer_id, bsz)
         scores = self.attn.indexer_prefill_logits(q, keys, weights)
         return self.attn.indexer_select_prefill(
-            scores, start_pos=start_pos, seqlen=seqlen, ratio=ratio,
-            topk=self.index_topk, offset=offset,
+            scores,
+            start_pos=start_pos,
+            seqlen=seqlen,
+            ratio=ratio,
+            topk=self.index_topk,
+            offset=offset,
         )
 
     def extend(self, x, qr, start_pos, offset, window_slots, tail_window_slot, ti: int = 0):
@@ -434,18 +517,30 @@ class Indexer(BaseOP):
         apply_rotary_emb(q[..., -rd:], freqs_cis)
         q = hadamard_transform(q)
         fp4_act_quant_inplace(q, 32)
-        self.compressor.forward(x, start_pos, window_slots, tail_window_slot=tail_window_slot, ti=ti)  # writes idx_pool
-        weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads ** -0.5)
+        self.compressor.forward(
+            x, start_pos, window_slots, tail_window_slot=tail_window_slot, ti=ti
+        )  # writes idx_pool
+        weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads**-0.5)
         keys = self.attn.indexer_keys(ti, end // ratio, ratio, self.layer_id, bsz)
         scores = self.attn.indexer_prefill_logits(q, keys, weights)
         return self.attn.indexer_select_prefill(
-            scores, start_pos=start_pos, seqlen=seqlen, ratio=ratio,
-            topk=self.index_topk, offset=offset,
+            scores,
+            start_pos=start_pos,
+            seqlen=seqlen,
+            ratio=ratio,
+            topk=self.index_topk,
+            offset=offset,
         )
 
     def decode_step(
-        self, x: torch.Tensor, qr: torch.Tensor, pos: torch.Tensor, offset: int,
-        prev_window_slots: torch.Tensor, window_slots: torch.Tensor, rows: torch.Tensor,
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        pos: torch.Tensor,
+        offset: int,
+        prev_window_slots: torch.Tensor,
+        window_slots: torch.Tensor,
+        rows: torch.Tensor,
         n_stage: int,
     ) -> torch.Tensor:
         """Batched single-token indexer (EAGER/graph). Scores the first ``n_stage`` compressed
@@ -463,7 +558,7 @@ class Indexer(BaseOP):
         fp4_act_quant_inplace(q, 32)
         # Advance the indexer's own compressor (writes this token's idx key to idx_pool per row).
         self.compressor.decode_step(x, pos, prev_window_slots, window_slots, rows)
-        weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads ** -0.5)
+        weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads**-0.5)
         valid = (pos + 1) // ratio  # [B] per-row valid block count
         # Head-reduced scores in one pass: the kernel gathers each block's key off the full-loc
         # SNAPSHOT (not the live map -> overlap-safe replay) and reads its column bound from
@@ -472,7 +567,10 @@ class Indexer(BaseOP):
         index_score = self.attn.indexer_decode_scores(
             q.reshape(B, self.n_heads, self.head_dim),
             weights.reshape(B, self.n_heads),
-            valid, n_stage, ratio, self.layer_id,
+            valid,
+            n_stage,
+            ratio,
+            self.layer_id,
         ).view(B, 1, n_stage)
         return self.attn.indexer_select_decode(
             index_score, valid=valid, topk=self.index_topk, offset=offset

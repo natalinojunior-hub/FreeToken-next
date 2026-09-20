@@ -124,9 +124,7 @@ def load_args(hf_config: Any) -> Glm5NextArgs:
     if not layer_types:
         raise ValueError("glm5_next config is missing layer_types")
     if len(layer_types) != num_layers:
-        raise ValueError(
-            f"layer_types has {len(layer_types)} entries for {num_layers} layers"
-        )
+        raise ValueError(f"layer_types has {len(layer_types)} entries for {num_layers} layers")
     unknown = sorted(set(layer_types) - {KDA_LAYER, DSA_LAYER})
     if unknown:
         raise ValueError(f"unsupported layer_types entries: {unknown}")
@@ -135,16 +133,12 @@ def load_args(hf_config: Any) -> Glm5NextArgs:
     if not mlp_layer_types:
         # Older-schema fallback (mirrors vLLM): derive from first_k_dense_replace.
         first_dense = int(_get(text, "first_k_dense_replace", 0) or 0)
-        mlp_layer_types = ("dense",) * first_dense + ("sparse",) * (
-            num_layers - first_dense
-        )
+        mlp_layer_types = ("dense",) * first_dense + ("sparse",) * (num_layers - first_dense)
 
     # Checkpoint alias folding (transformers 5.16 spellings first).
     mla_nope = _get(text, "mla_use_nope", _get(text, "mla_nope", False))
     hc_mult = _get(text, "hc_mult", _get(text, "mhc_num_residual_streams", 4))
-    hc_sinkhorn = _get(
-        text, "hc_sinkhorn_iters", _get(text, "mhc_sinkhorn_iterations", 20)
-    )
+    hc_sinkhorn = _get(text, "hc_sinkhorn_iters", _get(text, "mhc_sinkhorn_iterations", 20))
 
     # KDA head geometry ships as the nested ``linear_attn_config`` dict; a future
     # flattened schema would carry vLLM-style ``linear_*`` top-level fields.
@@ -161,14 +155,10 @@ def load_args(hf_config: Any) -> Glm5NextArgs:
             if hasattr(linear_cfg, k)
         }
     linear_cfg = linear_cfg or {}
-    linear_num_heads = int(
-        linear_cfg.get("num_heads", _get(text, "linear_num_heads", 0))
-    )
+    linear_num_heads = int(linear_cfg.get("num_heads", _get(text, "linear_num_heads", 0)))
     linear_head_dim = int(linear_cfg.get("head_dim", _get(text, "linear_head_dim", 0)))
     linear_conv = int(
-        linear_cfg.get(
-            "short_conv_kernel_size", _get(text, "linear_conv_kernel_dim", 4)
-        )
+        linear_cfg.get("short_conv_kernel_size", _get(text, "linear_conv_kernel_dim", 4))
     )
     linear_lower_bound = float(
         linear_cfg.get("gate_lower_bound", _get(text, "linear_lower_bound", -5.0))
@@ -201,9 +191,7 @@ def load_args(hf_config: Any) -> Glm5NextArgs:
         indexer_rope_interleave=bool(_get(text, "indexer_rope_interleave", False)),
         index_kpool=int(_get(text, "index_kpool", 1) or 1),
         index_kpool_compress=bool(_get(text, "index_kpool_compress", False)),
-        index_kpool_always_select_tail=bool(
-            _get(text, "index_kpool_always_select_tail", False)
-        ),
+        index_kpool_always_select_tail=bool(_get(text, "index_kpool_always_select_tail", False)),
         linear_num_heads=linear_num_heads,
         linear_head_dim=linear_head_dim,
         linear_conv_kernel_dim=linear_conv,

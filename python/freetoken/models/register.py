@@ -46,15 +46,21 @@ _DENSE_PACKED = (
     ("gate_up_proj", ("gate_proj", "up_proj")),
 )
 # per-expert checkpoints: probe the first expert's projections for the experts container
-_EXPERTS_PACKED = (("experts", ("experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj")),)
+_EXPERTS_PACKED = (
+    ("experts", ("experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj")),
+)
 _EXPERTS_W123_PACKED = (("experts", ("experts.0.w1", "experts.0.w2", "experts.0.w3")),)
 # pre-stacked expert checkpoints (Qwen3-VL-MoE): the container's own two tensors are the probe
 _STACKED_EXPERTS_PACKED = (("experts", ("experts.gate_up_proj", "experts.down_proj")),)
-_QWEN3_5_PACKED = _DENSE_PACKED + (
-    ("in_proj_qkvz", ("in_proj_qkv", "in_proj_z")),
-    ("in_proj_ba", ("in_proj_b", "in_proj_a")),
-    ("in_proj", ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")),
-) + _EXPERTS_PACKED
+_QWEN3_5_PACKED = (
+    _DENSE_PACKED
+    + (
+        ("in_proj_qkvz", ("in_proj_qkv", "in_proj_z")),
+        ("in_proj_ba", ("in_proj_b", "in_proj_a")),
+        ("in_proj", ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")),
+    )
+    + _EXPERTS_PACKED
+)
 # routers the family builds without a quant config (qwen3_5_moe/moe.py), so a checkpoint that quantized them is dequantized at load
 _QWEN3_5_UNQUANTIZED = ("*.mlp.gate", "*.mlp.shared_expert_gate")
 # Qwen3.8's per-layer hyper-connections fuse the down projection with the block-inject rows.
@@ -79,9 +85,9 @@ _GEMMA4_UNIFIED_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4UnifiedMMProce
 _GEMMA4_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 _MUSE_GLIMMER_PROCESSOR = "freetoken.mm.processors.muse_glimmer:MuseGlimmerMMProcessor"
 _MUSE_GLIMMER_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
-_MINIMAX_M3_PACKED = _DENSE_PACKED + (
-    ("index_qk_proj", ("index_q_proj", "index_k_proj")),
-) + _EXPERTS_W123_PACKED
+_MINIMAX_M3_PACKED = (
+    _DENSE_PACKED + (("index_qk_proj", ("index_q_proj", "index_k_proj")),) + _EXPERTS_W123_PACKED
+)
 _MINIMAX_M3_PROCESSOR = "freetoken.mm.processors.minimax_m3:MiniMaxM3MMProcessor"
 _MINIMAX_M3_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 
@@ -154,7 +160,12 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         checkpoint_roots=(("model.layers", "layers"), ("model.head", "head")),
         packed_modules_mapping=_EXPERTS_W123_PACKED,
         # the head, the KV compressors and the indexer's scorer ship bf16; the fp8 config has no modules_to_not_convert
-        unquantized_modules=("head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.weights_proj"),
+        unquantized_modules=(
+            "head",
+            "*.compressor.wkv",
+            "*.compressor.wgate",
+            "*.indexer.weights_proj",
+        ),
     ),
     "Qwen3_5MoeForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_5_moe",
@@ -273,6 +284,13 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
     ),
+    # GGUF qwen4exp (Qwen3.8-Flash-Next UD-IQ4_XS): hybrid GDN + QSA + PLE + MTP.
+    "Qwen4ExpGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen4_exp",
+        "Qwen4ExpForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
     # Dense qwen35 GGUF (Qwen3.8-27B): same package and classes, moe_enabled==False.
     "Qwen35GGUFForCausalLM": ModelSpec(
         "freetoken.models.qwen3_5_moe",
@@ -354,7 +372,11 @@ def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
         return None
     return QuantConfig.from_hf(
         hf_config,
-        name_map=NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping),
+        name_map=NameMap(
+            roots=spec.checkpoint_roots,
+            segments=spec.checkpoint_segments,
+            packed=spec.packed_modules_mapping,
+        ),
         unquantized=spec.unquantized_modules,
     )
 

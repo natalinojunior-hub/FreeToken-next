@@ -9,7 +9,9 @@ import torch.nn.functional as F
 def get_window_topk_idxs(window_size, bsz, seqlen, start_pos):
     if start_pos >= window_size - 1:
         start_pos %= window_size
-        matrix = torch.cat([torch.arange(start_pos + 1, window_size), torch.arange(0, start_pos + 1)], dim=0)
+        matrix = torch.cat(
+            [torch.arange(start_pos + 1, window_size), torch.arange(0, start_pos + 1)], dim=0
+        )
     elif start_pos > 0:
         matrix = F.pad(torch.arange(start_pos + 1), (0, window_size - start_pos - 1), value=-1)
     else:

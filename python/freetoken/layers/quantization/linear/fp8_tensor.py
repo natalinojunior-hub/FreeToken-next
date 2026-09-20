@@ -33,7 +33,10 @@ class TorchFp8TensorLinearKernel(LinearKernel):
         return None
 
     def finalize(self, layer: Any) -> None:
-        from freetoken.kernel.triton.fp8_pertensor_linear import rowwise_scaled_mm_ok, weight_scale_segments
+        from freetoken.kernel.triton.fp8_pertensor_linear import (
+            rowwise_scaled_mm_ok,
+            weight_scale_segments,
+        )
 
         # a fused projection carries one scalar per part; decide the GEMM shape once, not under graph capture
         scale = layer.weight_scale
@@ -47,8 +50,13 @@ class TorchFp8TensorLinearKernel(LinearKernel):
         from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
 
         return fp8_pertensor_linear(
-            x, layer.weight, layer.weight_scale, layer.bias,
-            layer.input_scale, layer._fp8_uniform_scale, scale_segments=layer._fp8_scale_segments,
+            x,
+            layer.weight,
+            layer.weight_scale,
+            layer.bias,
+            layer.input_scale,
+            layer._fp8_uniform_scale,
+            scale_segments=layer._fp8_scale_segments,
         )
 
 
@@ -75,10 +83,16 @@ class EmulationFp8TensorLinearKernel(LinearKernel):
 
 @register_method(QuantKind.FP8_TENSOR, LayerKind.LINEAR)
 class Fp8TensorLinearMethod(LinearMethod):
-    candidates = (TorchFp8TensorLinearKernel, TritonFp8TensorLinearKernel, EmulationFp8TensorLinearKernel)
+    candidates = (
+        TorchFp8TensorLinearKernel,
+        TritonFp8TensorLinearKernel,
+        EmulationFp8TensorLinearKernel,
+    )
 
     def create_weights(self, layer: Any) -> None:
         g = self.cfg
         layer.weight = torch.empty(g.out_features, g.in_features, dtype=FP8)
         layer.weight_scale = torch.empty(g.out_features, dtype=torch.float32)
-        layer.input_scale = torch.empty((), dtype=torch.float32) if self.scheme.has("input_scale") else None
+        layer.input_scale = (
+            torch.empty((), dtype=torch.float32) if self.scheme.has("input_scale") else None
+        )
