@@ -12,6 +12,10 @@
 
 - **Triton `fp4_quantization_120f` não compila com nvcc 13.3** -> `quantization.cu:488` alignment error -> **workaround:** test skip isolado; não bloqueia suite principal.
 
+- **CUDA graph capture crash `cudaErrorStreamCaptureInvalidated` em `qsa_sparse.py` (turbo4/qsa_sparse backend)** -> `valid = indices[indices >= 0]` é boolean-mask com shape dinâmica, operação inválida dentro de `torch.cuda.graph()` capture -> **fix:** guarda `capturing = torch.cuda.is_current_stream_capturing()`, pula seleção de páginas (`selected_pages=None`, decompress cai para todas as páginas) quando `capturing=True`. Commitado em `ba7f976`. Não confirmado se elimina 100% do hang de replay() já documentado abaixo — precisa reteste isolado.
+
+- **Comparação de TG entre versões usando números de boots "smoke" não certificados** -> stats.json de smoke test pode ter prompt de poucas dezenas de tokens mesmo citando `kv_reserve_tokens` alto (isso é reserva de VRAM, não profundidade real usada) -> **fix:** antes de comparar tok/s entre rodadas, sempre conferir `prompt_tokens_total`/`completion_tokens_total` no stats.json real, não assumir a partir de flags de configuração (`--max-seq-len-override`, `kv_reserve_tokens`).
+
 ---
 
 ## Processos / Monitoramento / Higiene
