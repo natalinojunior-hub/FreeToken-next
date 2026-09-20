@@ -16,6 +16,11 @@ from typing import TYPE_CHECKING, List
 import torch
 from freetoken.core import Batch, Req
 from freetoken.engine.spec import accept_drafts, spec_rollback_lengths
+from freetoken.scheduler.adaptive_mtp import (
+    AdaptiveMTPController,
+    AdaptiveMTPConfig,
+    resolve_adaptive_k,
+)
 from freetoken.message import DetokenizeMsg
 from freetoken.utils import init_logger
 
@@ -82,7 +87,8 @@ class SchedulerSpecMixin:
                 wb.mrope_positions = _spec_mrope_positions(req, start_pos, d, self.device)
             wb.out_loc = self.engine.page_table[req.table_idx, start_pos:d]
             wb.input_ids = tok_window
-            wb.spec_logits_indices = torch.tensor([win_len - 1], device=self.device)
+            # Do NOT set spec_logits_indices: we want full prefill attention to populate
+            # the draft head's QSA slot for ALL prefill positions, not just the last token.
             self.engine.attn_backend.prepare_metadata(wb)
             with self.engine.ctx.forward_batch(wb):
                 mtp.forward(r_window, tok_window, wb)
@@ -276,7 +282,34 @@ class SchedulerSpecMixin:
         r_prev = model.model._last_residual[-1:].clone()
         tok_prev = self.token_pool[req.table_idx, d - 1 : d]
         drafts: List[int] = []
-        for i in range(k):
+
+        # Confidence gating: run first draft step, check top-1 prob, skip if low confidence
+        db = Batch(reqs=[req], phase="prefill")
+        db.padded_reqs = [req]
+        db.positions = torch.tensor([d - 1], dtype=torch.int32, device=self.device)
+        if self._model_is_mrope:
+            db.mrope_positions = _spec_mrope_positions(req, d - 1, d, self.device)
+        db.out_loc = self.engine.page_table[req.table_idx, d - 1 : d]
+        db.input_ids = tok_prev
+        db.spec_logits_indices = torch.arange(1, device=self.device)
+        self.engine.attn_backend.prepare_metadata(db)
+        with self.engine.ctx.forward_batch(db):
+            r_prev = mtp.forward(r_prev, tok_prev, db)
+            logits = model.lm_head.forward(mtp.to_head(r_prev))
+        probs = torch.softmax(logits, dim=-1)
+        top1_prob = probs.max().item()
+
+        controller = getattr(self, "_adaptive_mtp_controller", None)
+        if controller is not None and top1_prob < controller.config.min_draft_prob:
+            # Low confidence: skip speculation, fall back to normal decode
+            return False
+
+        tok_prev = torch.argmax(logits, dim=-1)
+        drafts.append(int(tok_prev.item()))
+        self.token_pool[req.table_idx, d] = tok_prev
+
+        # Continue draft chain for remaining k-1 steps
+        for i in range(1, k):
             # prepare_metadata (e.g. qsa_sparse) reads req.cached_len/device_len for
             # seqlens_k/extend_len; at i >= 1 the draft's own query must see its own prior
             # draft-step KV, which needs these advanced per step, not left at the entry value.
@@ -342,6 +375,12 @@ class SchedulerSpecMixin:
             self.free_spec_snapshot_slot(req)
             self.decode_manager.filter_reqs([req])
             return True
+
+        # Update _last_residual to last committed token for next draft chain
+        # (verify_forward overwrites it; we need the residual of the last accepted token)
+        last_res = getattr(model.model, "_last_residual", None)
+        if last_res is not None and last_res.shape[0] >= committed:
+            model.model._last_residual = last_res[committed - 1 : committed].clone()
 
         if committed <= k:
             checkpoints = getattr(vb, "gdn_checkpoints", None)

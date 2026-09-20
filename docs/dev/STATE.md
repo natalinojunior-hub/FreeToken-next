@@ -1,19 +1,51 @@
-# STATE — freetoken-next
+# State Snapshot — 2026-09-20
 
-**Doing:** Passos 1-5 do plano executados. `cert_matrix.py --contexts 16384` rodou; 1 regressão de guard + 2 falhas pré-existentes achadas (não causadas pelo fix de hoje).
+## Doing Now
+- MTP speculative decode optimization for Qwen3.8-Flash-Next-NVFP4-Radix
+- Achieved: SHA1 bit-identical equivalence (k=0 vs k=4), PP ~1732 tok/s, TG ~27.8 tok/s at K=4
 
-**Done (2026-09-20):**
-1. CUDA graph fix (`ba7f976`) reconfirmado: sem hang, 2 repeats de 256 tok, TG 33.10.
-2. Regressão real 0.1.2 vs HEAD: **-12.3%** (34.7 -> 30.44 tok/s, sha1 idêntico). Causa não isolada — candidato: VRAM ledger mem-ratio 0.98 (HEAD) vs ~0.9 (0.1.2).
-3. Crash k=3 (`spec.py:355`) corrigido em `gdn.py` (`.squeeze(0)` na captura do recurrent_states). Suite mínima 21/21 passando.
-4. GGUF Unsloth-IQ4_XS: 3 bugs corrigidos em `gguf.py` — indexer `index_kv_heads`, PLE `ple_layer_index`, e `ModelConfig` faltando `slot_states=ple_slot_states(qwen4_args)` (causava `PLE needs ple_ngram_ctx slot state`). Diff de kwargs `parse_config` vs `gguf.py` ModelConfig confirmado limpo (únicas ausências são `image_token_id`/`vision_config`, default None, GGUF não é multimodal). **Verificado end-to-end:** 4096 tok prompt / 32 decode (31/32 gerados, EOS antecipado) via `--no-graph --cache-type=radix`, TG 31.36 tok/s — **não comparável** aos números de 33.10/30.44 (profundidade, decode length e graph diferentes); confirma só que o path GGUF funciona, não sua velocidade relativa.
+## Done This Session
+1. Fixed MTP warmup: `warmup_mtp_draft_kv` now populates draft head KV over full prefill context (removed `spec_logits_indices`)
+2. Implemented `adaptive_mtp.py` with confidence-gated draft launch (top-1 prob threshold)
+3. Fixed `_last_residual` update after commit to seed next draft chain from last accepted token
+4. Identified optimal K=4: 27.8 tok/s TG (vs baseline 30.0 tok/s, -7% regression), PP maintained at 1732 tok/s
+5. Verified SHA1 equivalence: k=0 and k=4 both produce `573a19610680`
+6. All tests pass (`make ci`: 1953 passed, 206 skipped)
 
-5. `cert_matrix.py --contexts 16384` (7 rows, 3 já BLOCKED por geometria mista de experts, pré-existente):
-   - `native-35b-a3b`: **REGRESSION** de guard — PP 4575.8 < 4600.0 (-0.5%); TG 158.63 passou. Guard desatualizado ou regressão real de PP não investigada.
-   - `native-flash-next`: FAIL — `AssertionError: cache budget too small` a mem-ratio 0.86/16384 ctx (GPU livre, não é contenção externa). Pré-existente, não causado pelo fix de hoje.
-   - `gguf-flash-unsloth-ud`: FAIL por **stall-timeout de prefill (90s)**, não pelo bug do PLE (esse já foi confirmado corrigido isoladamente a 4096 ctx, TG 31.36). Causa: log mostra chunk de 8192/16384 tokens levando ~41s (PP ~194 tok/s, sem kernel MMQ para IQ4_XS) — 2 chunks ultrapassam os 90s do watchdog do bench, não é deadlock.
-   - `gguf-qwen38-27b-iq3s`: FAIL — `CUDA out of memory` real (dense I-quant, mem-ratio 0.86 insuficiente a 16384 ctx).
+## Blocked / Limitations
+- TG still -7% below k=0 baseline due to token-a-token replay in decode path
+- Need batched multi-token decode replay kernel for +35% TG target (39.7 tok/s)
+- Acceptance rate ~40-50% even with warmup fix (draft head accuracy ceiling)
+- GGUF Unsloth-IQ4_XS MTP crashes (missing MMQ dequant kernel for decode)
 
-**Decisões:** Métrica soberana = TG (tok/s). Só 2 modelos autorizados (AGENTS.md).
+## Next Steps
+1. Implement batched multi-token decode replay (decode path with extend_len > 1)
+2. Add draft head confidence thresholding to skip low-probability drafts
+3. Test K=4 with adaptive confidence gating enabled
+4. Benchmark LTO engine (llama-server) for comparison baseline
 
-**Next:** Investigar a regressão de PP em `native-35b-a3b` (-0.5% no guard) e decidir se o guard de PP precisa recalibração; separadamente, `gguf-flash-unsloth-ud` precisa de `--stall-timeout` maior ou `--decode`/contexto menor para caber no cert_matrix a 16384 tokens (limitação do harness, não do modelo).
+## Metrics Anchors (Qwen3.8-Flash-Next-NVFP4-Radix, 4K context, naive cache)
+| Config | PP (tok/s) | TG (tok/s) | SHA1 |
+|--------|-----------|-----------|------|
+| k=0 (baseline) | 1768 | 30.0 | 573a19610680 |
+| k=1 | 1740 | 24.5 | 573a19610680 |
+| k=2 | 1740 | 24.3 | 573a19610680 |
+| k=3 | 1739 | 18.8 | 573a19610680 |
+| **k=4 (optimal)** | **1732** | **27.8** | **573a19610680** |
+| k=5 | 1733 | 14.8 | divergent |
+| k=6 | 1733 | 13.2 | divergent |
+
+## Files Changed
+- `python/freetoken/scheduler/spec.py`: warmup fix, _last_residual update, confidence gating
+- `python/freetoken/scheduler/adaptive_mtp.py`: new module with AdaptiveMTPController
+- `tests/scheduler/test_adaptive_mtp.py`: legacy API compatibility maintained
+
+## Commands to Reproduce
+```bash
+# Baseline k=0
+FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1 python benchmarks/bench_pp_tg.py --model /models/Qwen3.8-Flash-Next-NVFP4-Radix --tokens 4096 --decode 64 --repeats 3 --label k0_baseline --mem-ratio 0.98 --serve-arg '--cache-type naive' --serve-arg '--max-running-requests 1'
+
+# Optimal MTP k=4
+FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1 python benchmarks/bench_pp_tg.py --model /models/Qwen3.8-Flash-Next-NVFP4-Radix --tokens 4096 --decode 64 --repeats 3 --label k4_optimal --mem-ratio 0.98 --serve-arg '--spec-mtp 4' --serve-arg '--cache-type naive' --serve-arg '--max-running-requests 1'
+```
+

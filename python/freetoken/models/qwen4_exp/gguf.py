@@ -6,6 +6,7 @@ and translates GGUF tensor names/layouts into FreeToken's qwen4_exp weight map.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Iterator
 
 import torch
@@ -37,6 +38,50 @@ def _kv(shim: "GgufConfigShim", suffix: str, default=None):
     if default is not None:
         return default
     raise KeyError(f"GGUF metadata missing key {key!r} (and {key_gen!r})")
+
+
+def _find_mtp_gguf_path(model_path: str) -> str | None:
+    """Find the MTP GGUF directory relative to the main model path."""
+    from freetoken.models.gguf.reader import resolve_gguf_path
+
+    main_path = resolve_gguf_path(model_path)
+    if main_path is None:
+        return None
+    main_dir = os.path.dirname(main_path)
+    # Check current dir, parent dir, and sibling MTP dirs
+    candidates = [
+        os.path.join(main_dir, "MTP"),
+        os.path.join(os.path.dirname(main_dir), "MTP"),
+    ]
+    for mtp_dir in candidates:
+        if os.path.isdir(mtp_dir):
+            for f in sorted(os.listdir(mtp_dir)):
+                if f.endswith(".gguf") and not f.startswith("."):
+                    return os.path.join(mtp_dir, f)
+    return None
+
+
+def _parse_mtp_config_from_gguf(model_path: str) -> Qwen4ExpMTPConfig:
+    """Parse MTP config from MTP GGUF metadata."""
+    mtp_path = _find_mtp_gguf_path(model_path)
+    if mtp_path is None:
+        return Qwen4ExpMTPConfig()
+    from freetoken.models.gguf.config import build_gguf_shim
+
+    shim = build_gguf_shim(mtp_path)
+    enabled = shim.metadata.get("qwen4exp.nextn_predict_layers", 0) > 0
+    hybrid = True
+    num_hidden_layers = shim.metadata.get("qwen4exp.nextn_predict_layers", 0)
+    layer_types = ("full_attention",)
+    shared = shim.metadata.get("qwen4exp.nextn_shared_target_tensors", False)
+    return Qwen4ExpMTPConfig(
+        enabled=enabled,
+        hybrid=hybrid,
+        num_hidden_layers=num_hidden_layers,
+        layer_types=layer_types,
+        use_hidden_state_from_layer=None,
+        rope_theta=None,
+    )
 
 
 def is_gguf_model(config: ModelConfig) -> bool:
@@ -174,6 +219,8 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
                 ple_dim = t.shape[1]
                 break
 
+    mtp_config = _parse_mtp_config_from_gguf(model_path) if model_path else Qwen4ExpMTPConfig()
+
     qwen4_args = Qwen4ExpArgs(
         hidden_size=hidden_size,
         hc_count=hc_count,
@@ -193,6 +240,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         index_budget=int(_kv(shim, "attention.indexer.top_k", 2048)),
         index_ratio=int(_kv(shim, "attention.compress_ratios", [4])[interval - 1] or 4),
         image_token_id=img_id,
+        mtp=mtp_config,
     )
 
     model_path = getattr(shim, "model_path", None)
@@ -676,3 +724,194 @@ def load_ple_table_from_gguf(
                     embed_dim=qwen4_args.ngram_head_dim,
                 )
     raise ValueError(f"per_layer_token_embd.weight not found in GGUF shards for {model_path}")
+
+
+def iter_gguf_mtp_weights(
+    model_path: str,
+    device: torch.device,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield MTP weights from GGUF for qwen4_exp."""
+    mtp_path = _find_mtp_gguf_path(model_path)
+    if mtp_path is None:
+        return
+
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    quant_map = _scan_quant_types(mtp_path)
+    qkv_buf: dict[int, dict[str, torch.Tensor]] = {}
+    index_buf: dict[int, dict[str, torch.Tensor]] = {}
+    gate_up_buf: dict[int, dict[str, torch.Tensor]] = {}
+    hc_attn_down_buf: dict[int, dict[str, torch.Tensor]] = {}
+    hc_ffn_down_buf: dict[int, dict[str, torch.Tensor]] = {}
+
+    for t in iter_gguf_tensors(mtp_path):
+        name = t.name
+        if (
+            ".mlp.experts." in name
+            or "ffn_gate_exps" in name
+            or "ffn_down_exps" in name
+            or "ffn_up_exps" in name
+        ):
+            continue
+
+        if not name.startswith("blk."):
+            continue
+
+        parts = name.split(".", 2)
+        layer = int(parts[1])
+        suffix = parts[2]
+        base = "mtp.layers.0"
+
+        # Handle nextn prefix tensors
+        if suffix.startswith("nextn."):
+            nextn_suffix = suffix[len("nextn.") :]
+            if nextn_suffix == "eh_proj.weight":
+                raw = _to_bf16(t, device=device)
+                hidden_dim = raw.shape[0]
+                yield "mtp.fc_embedding.weight", raw[:, :hidden_dim]
+                yield "mtp.fc_hidden.weight", raw[:, hidden_dim:]
+                continue
+            if nextn_suffix == "enorm.weight":
+                yield "mtp.pre_fc_norm_embedding.weight", _to_bf16(t, device=device)
+                continue
+            if nextn_suffix == "hnorm.weight":
+                yield "mtp.pre_fc_norm_hidden.weight", _to_bf16(t, device=device)
+                continue
+            if nextn_suffix == "hc_head_norm.weight":
+                yield "mtp.hyper_connection_mixer.hc_norm.weight", _to_bf16(t, device=device)
+                continue
+            if nextn_suffix == "hc_head_up.weight":
+                yield (
+                    "mtp.hyper_connection_mixer.input_mix_weight_up.weight",
+                    _to_bf16(t, device=device),
+                )
+                continue
+            if nextn_suffix == "hc_head_down.weight":
+                yield (
+                    "mtp.hyper_connection_mixer.input_mix_weight_down.weight",
+                    _to_bf16(t, device=device),
+                )
+                continue
+
+        # HC norm & up projections
+        if suffix == "hc_attn_norm.weight":
+            yield f"{base}.attn_hyper_connection.hc_norm.weight", _to_bf16(t, device=device)
+            continue
+        if suffix == "hc_ffn_norm.weight":
+            yield f"{base}.mlp_hyper_connection.hc_norm.weight", _to_bf16(t, device=device)
+            continue
+        if suffix == "hc_attn_up.weight":
+            yield (
+                f"{base}.attn_hyper_connection.input_mix_weight_up.weight",
+                _to_bf16(t, device=device),
+            )
+            continue
+        if suffix == "hc_ffn_up.weight":
+            yield (
+                f"{base}.mlp_hyper_connection.input_mix_weight_up.weight",
+                _to_bf16(t, device=device),
+            )
+            continue
+
+        # HC down + inject fusion
+        if suffix == "hc_attn_down.weight":
+            hc_attn_down_buf.setdefault(layer, {})["down"] = _to_bf16(t, device=device)
+        elif suffix == "hc_attn_inject.weight":
+            hc_attn_down_buf.setdefault(layer, {})["inject"] = _to_bf16(t, device=device)
+        if (
+            layer in hc_attn_down_buf
+            and "down" in hc_attn_down_buf[layer]
+            and "inject" in hc_attn_down_buf[layer]
+        ):
+            d = hc_attn_down_buf[layer]["down"].to(device)
+            inj = hc_attn_down_buf[layer]["inject"].to(device)
+            pad = torch.zeros(12, d.shape[1], dtype=d.dtype, device=device)
+            yield (
+                f"{base}.attn_hyper_connection.input_mix_weight_down_block_inject.weight",
+                torch.cat([d, inj, pad], dim=0),
+            )
+            del hc_attn_down_buf[layer]
+            continue
+
+        if suffix == "hc_ffn_down.weight":
+            hc_ffn_down_buf.setdefault(layer, {})["down"] = _to_bf16(t, device=device)
+        elif suffix == "hc_ffn_inject.weight":
+            hc_ffn_down_buf.setdefault(layer, {})["inject"] = _to_bf16(t, device=device)
+        if (
+            layer in hc_ffn_down_buf
+            and "down" in hc_ffn_down_buf[layer]
+            and "inject" in hc_ffn_down_buf[layer]
+        ):
+            d = hc_ffn_down_buf[layer]["down"].to(device)
+            inj = hc_ffn_down_buf[layer]["inject"].to(device)
+            pad = torch.zeros(12, d.shape[1], dtype=d.dtype, device=device)
+            yield (
+                f"{base}.mlp_hyper_connection.input_mix_weight_down_block_inject.weight",
+                torch.cat([d, inj, pad], dim=0),
+            )
+            del hc_ffn_down_buf[layer]
+            continue
+
+        # MoE router & shared expert
+        if suffix == "ffn_gate_inp.weight":
+            yield f"{base}.mlp.gate.weight", _to_bf16(t, device=device)
+            continue
+        if suffix == "ffn_gate_inp_shexp.weight":
+            yield f"{base}.mlp.shared_expert_gate.weight", _to_bf16(t, device=device).reshape(1, -1)
+            continue
+        if suffix == "ffn_down_shexp.weight":
+            yield f"{base}.mlp.shared_expert.down_proj.weight", _to_bf16(t, device=device)
+            continue
+        if suffix == "ffn_gate_shexp.weight":
+            gate_up_buf.setdefault(layer, {})["gate"] = _to_bf16(t, device=device)
+        elif suffix == "ffn_up_shexp.weight":
+            gate_up_buf.setdefault(layer, {})["up"] = _to_bf16(t, device=device)
+        if layer in gate_up_buf and "gate" in gate_up_buf[layer] and "up" in gate_up_buf[layer]:
+            gu = gate_up_buf[layer]
+            yield (
+                f"{base}.mlp.shared_expert.gate_up_proj.weight",
+                torch.cat([gu["gate"], gu["up"]], dim=0),
+            )
+            del gate_up_buf[layer]
+            continue
+
+        # QSA layers
+        if suffix == "attn_output.weight":
+            yield f"{base}.self_attn.o_proj.weight", _to_bf16(t, device=device)
+            continue
+        if suffix == "attn_q_norm.weight":
+            yield f"{base}.self_attn.q_norm.weight", _to_bf16(t, device=device)
+            continue
+        if suffix == "attn_k_norm.weight":
+            yield f"{base}.self_attn.k_norm.weight", _to_bf16(t, device=device)
+            continue
+        if suffix in ("attn_q.weight", "attn_k.weight", "attn_v.weight"):
+            k = suffix.split(".")[0].replace("attn_", "")
+            qkv_buf.setdefault(layer, {})[k] = _to_bf16(t, device=device)
+            if len(qkv_buf[layer]) == 3:
+                slots = qkv_buf[layer]
+                yield (
+                    f"{base}.self_attn.qkv_proj.weight",
+                    torch.cat([slots["q"], slots["k"], slots["v"]], dim=0),
+                )
+                del qkv_buf[layer]
+            continue
+
+        # QSA indexer
+        if suffix == "indexer.q_norm.weight":
+            yield f"{base}.self_attn.indexer.q_layernorm.weight", _to_bf16(t, device=device)
+            continue
+        if suffix == "indexer.k_norm.weight":
+            yield f"{base}.self_attn.indexer.k_layernorm.weight", _to_bf16(t, device=device)
+            continue
+        if suffix in ("indexer.q_proj.weight", "indexer.k_proj.weight"):
+            k = suffix.split(".")[1].replace("_proj", "")
+            index_buf.setdefault(layer, {})[k] = _to_bf16(t, device=device)
+            if len(index_buf[layer]) == 2:
+                slots = index_buf[layer]
+                yield (
+                    f"{base}.self_attn.indexer.index_qk_proj.weight",
+                    torch.cat([slots["q"], slots["k"]], dim=0),
+                )
+                del index_buf[layer]
+            continue
