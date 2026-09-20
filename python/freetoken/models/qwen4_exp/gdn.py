@@ -226,8 +226,8 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
 
             # Checkpoint: clone recurrent + conv state after this step
             if batch is not None and getattr(batch, "gdn_checkpoints", None) is not None:
-                rec_state = pool.recurrent_states[li, fla.cache_indices].clone()
-                conv_state = pool.conv_states[li, fla.cache_indices].clone()
+                rec_state = pool.recurrent_states[li, fla.cache_indices].clone().squeeze(0)
+                conv_state = pool.conv_states[li, fla.cache_indices].clone().squeeze(0)
                 batch.gdn_checkpoints.setdefault(t, {})[li] = (rec_state, conv_state)
 
         core_out = torch.cat(core_outs, dim=0)  # [total, num_v, V]

@@ -139,6 +139,34 @@ Números que existem, nenhum comparável 1:1 entre si (contexto/quant/config dif
 
 ---
 
+## Reteste do fix de CUDA graph capture (`ba7f976`) e regressão real 0.1.2 vs HEAD — 2026-09-20
+
+**Reteste do fix:** com o fix de `qsa_sparse.py` (guarda `is_current_stream_capturing()`) já commitado em `ba7f976`, decode via CUDA graph (`--cuda-graph-max-bs 1`, default) completou normalmente em HEAD, sem hang em `replay()`: 512 tok prompt / 256 tok decode, 2 repeats, TG 33.10 tok/s estável, GPU util 98%. O hang documentado anteriormente no WIP tree (não commitado) não se manifesta em HEAD com o fix presente — não descartado que o WIP tree tivesse uma causa adicional não isolada, mas o caminho de graph em si voltou a funcionar.
+
+**Comparação real (isolando profundidade de KV, kv-format, cache-type e caminho graph/eager entre 0.1.2 e HEAD):** ambos rodados com prompt 22 tokens, decode 31, `--kv-format bf16`, `--cache-type radix`, CUDA graph ligado (default).
+- 0.1.2+gaf71ba432: **34.7 tok/s** (reproduzido, estável).
+- HEAD (mem-ratio 0.98, `--kv-reserve-tokens 1024` — necessário para caber no orçamento de VRAM do ledger atual): **30.44 tok/s**, 3 repeats idênticos (sha1 `c80887695bb9`).
+
+**Regressão real medida: -12.3%** (34.7 → 30.44 tok/s), não os ~31% da comparação anterior invalidada. Causa ainda não isolada — candidatos: mudanças no VRAM ledger/cache_budget (exigem mem-ratio 0.98 vs provável 0.9 do 0.1.2 só para caber o plano mínimo), ou custo adicional no caminho de decode entre as versões. Próximo passo natural seria bisect entre 0.1.2 e HEAD nessas condições fixas, mas não solicitado nesta rodada.
+
+---
+
+## GGUF Unsloth-IQ4_XS: fix do `PLE_NGRAM_STATE` e `cert_matrix.py --contexts 16384` — 2026-09-20
+
+**Fix:** `ModelConfig(...)` em `gguf.py` não passava `slot_states=ple_slot_states(qwen4_args)` (só `parse_config`, path safetensors, fazia isso), então o pool nunca registrava `ple_ngram_ctx`/`ple_conv`. Verificado end-to-end após o fix: 4096 tok prompt / 32 decode, `--no-graph --cache-type=radix`, TG 31.36 tok/s (31/32 tokens, EOS antecipado) — número não comparável às medições de 16K acima (profundidade, decode length e graph diferentes).
+
+**`cert_matrix.py --contexts 16384` (7 rows declaradas, 3 BLOCKED pré-existentes por geometria mista de experts):**
+| row | resultado |
+|---|---|
+| `native-35b-a3b` | REGRESSION de guard: PP 4575.8 < 4600.0 (-0.5%); TG 158.63 >= 158.0 passou |
+| `native-flash-next` | FAIL — `cache budget too small` a mem-ratio 0.86/16384 ctx (GPU livre no momento, não é contenção externa); pré-existente |
+| `gguf-flash-unsloth-ud` | FAIL — stall-timeout de prefill (90s) do harness, **não** o bug do PLE (já corrigido, ver acima). Log mostra chunk de 8192/16384 tokens levando ~41s (PP ~194 tok/s, IQ4_XS sem kernel MMQ dequantiza no prefill); 2 chunks passam dos 90s fixos do `bench_pp_tg.py` |
+| `gguf-qwen38-27b-iq3s` | FAIL — `CUDA out of memory` real (dense I-quant, mem-ratio 0.86 insuficiente a 16384 ctx) |
+
+Nenhuma das 3 falhas acima foi causada pelo fix do PLE; são pré-existentes e não investigadas nesta sessão (guard de PP possivelmente desatualizado; mem-ratio insuficiente para os dois rows de OOM; `bench_pp_tg.py` precisa de `--stall-timeout` maior para IQ4_XS a 16K).
+
+---
+
 ## Referência Completa
 
 `old/docs/freetoken-next/PERFORMANCE.md` — Tabelas detalhadas por config/modelo, EXP-001 a EXP-045, metodologia, variáveis de controle.

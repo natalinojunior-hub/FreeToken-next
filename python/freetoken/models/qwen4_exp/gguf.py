@@ -20,7 +20,7 @@ from freetoken.models.qwen3_5_moe.gguf_experts import (
     gguf_expert_types,
     load_gguf_expert_sources,
 )
-from freetoken.models.qwen4_exp.config import Qwen4ExpArgs, Qwen4ExpMTPConfig
+from freetoken.models.qwen4_exp.config import Qwen4ExpArgs, Qwen4ExpMTPConfig, ple_slot_states
 
 if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
@@ -188,7 +188,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         split_ngram_parts=1,
         ngram_boundary_token_id=eos_id,
         index_n_heads=int(_kv(shim, "attention.indexer.head_count", 4)),
-        index_kv_heads=num_kv_heads,
+        index_kv_heads=int(_kv(shim, "attention.indexer.head_count_kv", 1)),
         index_head_dim=int(_kv(shim, "attention.indexer.key_length", 128)),
         index_budget=int(_kv(shim, "attention.indexer.top_k", 2048)),
         index_ratio=int(_kv(shim, "attention.compress_ratios", [4])[interval - 1] or 4),
@@ -222,6 +222,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         expert_quant="gguf" if moe_enabled else "none",
         gguf_expert_types=(gguf_expert_types(model_path, num_layers) if model_path else None),
         gguf_model_path=model_path,
+        slot_states=ple_slot_states(qwen4_args),
         attn_quant="gguf",
         dense_quant="gguf",
         lm_head_quant="gguf",
@@ -631,13 +632,13 @@ def iter_gguf_weights(
     if qwen4_args is not None:
         from .ple import derive_ngram_hash_constants
 
-        for ple_layer_id in qwen4_args.ple_layer_ids:
+        for ple_index, ple_layer_id in enumerate(qwen4_args.ple_layer_ids):
             mult, sizes, offsets = derive_ngram_hash_constants(
                 vocab_size=config.vocab_size,
                 ngram_size=qwen4_args.ngram_size,
                 num_ngram_heads=qwen4_args.num_ngram_heads,
                 ngram_vocab_size_base=qwen4_args.ngram_vocab_size_base,
-                ple_layer_index=ple_layer_id,  # ple_layer_ids are already the layer indices
+                ple_layer_index=ple_index,  # position among PLE layers, matching Qwen4ExpPLE.ple_index
             )
             yield (
                 f"model.layers.{ple_layer_id}.ple.ple_embedding.layer_multipliers",

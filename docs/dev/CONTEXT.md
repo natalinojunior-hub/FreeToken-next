@@ -43,15 +43,13 @@
   - $k=0$ (Greedy baseline): **TG 27.73 tok/s**, PP 1681 tok/s, VRAM 13.75 GiB, sha1 `c0e2b6c30ac9`
   - $k=1$ (MTP Speculative): **TG 24.39 tok/s**, PP 1670 tok/s, VRAM 14.49 GiB, sha1 `17f277f43565`, 100% accept (1/1)
   - $k=2$ (MTP Multi-Token): **TG 25.09 tok/s** (best MTP TG), PP 1687 tok/s, VRAM 14.49 GiB, sha1 `17f277f43565`, 100% accept (2/2)
-  - $k=3$: **CRASH** — shape mismatch GDN layer [48,128,128] vs [1,48,128,128] durante verify forward
+  - $k=3$: **CRASH corrigido (2026-09-20)** — shape mismatch GDN layer [48,128,128] vs [1,48,128,128] durante verify forward; fix `.squeeze(0)` na captura em `gdn.py`. Não retestado o TG de k=3 após o fix.
   - $k=4,5,6$: Não testados (k=3 falhou)
   - **Conclusão:** Para NVFP4 + naive cache + Radix backend em 16K context, MTP overhead excede benefício — melhor TG em k=0 (27.73 tok/s). MTP k=2 é melhor entre configs MTP (25.09 tok/s) mas ainda 9.5% abaixo do baseline.
-- **GGUF Adapter qwen4_exp — ARQUITETURA INCOMPATÍVEL:**
-  - Checkpoint `Qwen3.8-Flash-Next-Unsloth-IQ4_XS/UD-IQ4_XS` tem geometrias divergentes:
-    - PLE key_proj: GGUF tem [10240, 2560] (in=hidden_size), modelo espera [10240, 160] (in=ple_embed_dim)
-    - Indexer k_proj: GGUF tem 1 head (128), modelo espera 2 heads (256)
-  - Fixes parciais aplicados (detecção automática ple_embed_dim via tensor shape), mas mismatches estruturais impedem load completo.
-  - **Bloqueado** até realinhamento de arquitetura ou conversão do checkpoint.
+- **GGUF Adapter qwen4_exp — RESOLVIDO (2026-09-20):**
+  - Checkpoint `Qwen3.8-Flash-Next-Unsloth-IQ4_XS/UD-IQ4_XS` carrega e serve end-to-end.
+  - Bugs corrigidos em `gguf.py`: indexer `index_kv_heads` (usava GQA kv_heads em vez do 1 fixo do indexer), PLE `ple_layer_index` (índice absoluto vs local divergente entre init e geração de pesos), `ModelConfig` sem `slot_states=ple_slot_states(qwen4_args)` (causava `PLE needs ple_ngram_ctx slot state`).
+  - Verificado com `benchmarks/bench_pp_tg.py` (4096 tok / 32 decode, TG 31.36 tok/s) e `cert_matrix.py` a 16384 tokens (falha residual é stall-timeout de harness por lentidão real de prefill IQ4_XS sem MMQ, não bug de carregamento). Ver `PERFORMANCE.md`.
 - **Documentação Atualizada:** `docs/dev/PERFORMANCE.md` (anchors NVFP4 k=0,1,2,3), `docs/dev/STATE.md` (status atual)
 
 ### ⏳ PENDENTE — Roadmap Lines 12-18
@@ -139,7 +137,8 @@ export TMPDIR=/models/desenvolvimento/tmp
 
 ## Próximos Passos Imediatos (Prioridade)
 
-1. Investigar crash k=3 (GDN shape mismatch) — possível fix em `scheduler/spec.py` verify forward path
-2. Resolver mismatches arquiteturais GGUF Unsloth-IQ4_XS (PLE dims, indexer heads)
-3. Executar `benchmarks/cert_matrix.py` para matriz completa de certificação
-4. Testes 512K/1M diferidos (requerem flag `--allow-rope-extend`)
+1. ~~Investigar crash k=3 (GDN shape mismatch)~~ — corrigido em `gdn.py` (`.squeeze(0)` na captura), suite mínima 21/21 passando (2026-09-20).
+2. ~~Resolver mismatches arquiteturais GGUF Unsloth-IQ4_XS (PLE dims, indexer heads)~~ — 3 bugs corrigidos em `gguf.py` (indexer `index_kv_heads`, PLE `ple_layer_index`, `ModelConfig` sem `slot_states`); verificado end-to-end (2026-09-20). Ver `PERFORMANCE.md`.
+3. ~~Executar `benchmarks/cert_matrix.py` para matriz completa de certificação~~ — rodado a 16384 ctx (2026-09-20): 1 regressão de guard (PP em `native-35b-a3b`) + 2 falhas de VRAM/OOM pré-existentes não investigadas. Ver `PERFORMANCE.md` e `STATE.md`.
+4. Investigar regressão de guard PP em `native-35b-a3b` (-0.5%, `cert_matrix.py`) e falhas de VRAM em `native-flash-next`/`gguf-qwen38-27b-iq3s` a 16384 ctx.
+5. Testes 512K/1M diferidos (requerem flag `--allow-rope-extend`)

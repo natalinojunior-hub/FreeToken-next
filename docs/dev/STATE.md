@@ -1,20 +1,19 @@
 # STATE — freetoken-next
 
-**Doing:** Investigação de regressão de TG entre FreeToken 0.1.2 e HEAD — pausada. Premissa de comparação FreeToken vs LTO já estava invalidada (LTO é GGUF-only). Agora também invalidada a comparação intra-FreeToken 0.1.2 vs atual (ver Achados).
+**Doing:** Passos 1-5 do plano executados. `cert_matrix.py --contexts 16384` rodou; 1 regressão de guard + 2 falhas pré-existentes achadas (não causadas pelo fix de hoje).
 
-**Done:**
-- Baseline eager válido: **TG 23.21 tok/s** @ 16384 ctx, `--no-graph`, mem-ratio 0.85, 1089 slots de expert cache.
-- Varredura MTP NVFP4 k=0..6: k=0 TG 27.73, k=1 TG 24.39, k=2 TG 25.09, k=3 crash (GDN shape mismatch). GGUF Unsloth-IQ4_XS bloqueado (PLE/indexer dims incompatíveis).
-- Causa raiz de um crash de captura de CUDA graph identificada e corrigida (commit `ba7f976`): `qsa_sparse.py` fazia `indices[indices >= 0]` (boolean-mask, shape dinâmica) dentro do stream de captura -> `cudaErrorStreamCaptureInvalidated`. Fix: guarda `torch.cuda.is_current_stream_capturing()` pulando a seleção de páginas durante captura. Não confirmado se resolve 100% do hang em replay() já documentado — precisa reteste.
-- Snapshot de segurança commitado: `ba7f976` (470 arquivos, todo o WIP de MoE offload + docs).
+**Done (2026-09-20):**
+1. CUDA graph fix (`ba7f976`) reconfirmado: sem hang, 2 repeats de 256 tok, TG 33.10.
+2. Regressão real 0.1.2 vs HEAD: **-12.3%** (34.7 -> 30.44 tok/s, sha1 idêntico). Causa não isolada — candidato: VRAM ledger mem-ratio 0.98 (HEAD) vs ~0.9 (0.1.2).
+3. Crash k=3 (`spec.py:355`) corrigido em `gdn.py` (`.squeeze(0)` na captura do recurrent_states). Suite mínima 21/21 passando.
+4. GGUF Unsloth-IQ4_XS: 3 bugs corrigidos em `gguf.py` — indexer `index_kv_heads`, PLE `ple_layer_index`, e `ModelConfig` faltando `slot_states=ple_slot_states(qwen4_args)` (causava `PLE needs ple_ngram_ctx slot state`). Diff de kwargs `parse_config` vs `gguf.py` ModelConfig confirmado limpo (únicas ausências são `image_token_id`/`vision_config`, default None, GGUF não é multimodal). **Verificado end-to-end:** 4096 tok prompt / 32 decode (31/32 gerados, EOS antecipado) via `--no-graph --cache-type=radix`, TG 31.36 tok/s — **não comparável** aos números de 33.10/30.44 (profundidade, decode length e graph diferentes); confirma só que o path GGUF funciona, não sua velocidade relativa.
 
-**Achados desta sessão (correção de achado anterior):** a suposta "regressão de ~31%" (0.1.2 34.7 tok/s vs atual 23.94 tok/s, ambos @ "ctx=8192") **não é uma comparação válida**. Releitura do `stats.json`/`ServerArgs` do boot 0.1.2 mostrou: `max_seq_len_override=4096`, prompt de 22 tokens, 31 completions — decode com KV quase vazio, não "8192 preenchido" (`kv_reserve_tokens=8192` é reserva de VRAM, não profundidade usada). 0.1.2 também não tem campo kv-format/turbo4 (KV puro, `cache_type='radix'`) e rodou com CUDA graph ligado; a rodada atual usada na comparação foi `--no-graph` e possivelmente turbo4. Reproduzi o boot 0.1.2 exatamente (mesma venv pinada em 0.1.2+gaf71ba432) e bati o número: **34.7 tok/s de novo, idêntico** — confirma que o número antigo é real e reprodutível *para aquela condição*, mas não é comparável ao número atual. Nenhuma regressão foi de fato medida ainda. Ver PERFORMANCE.md.
+5. `cert_matrix.py --contexts 16384` (7 rows, 3 já BLOCKED por geometria mista de experts, pré-existente):
+   - `native-35b-a3b`: **REGRESSION** de guard — PP 4575.8 < 4600.0 (-0.5%); TG 158.63 passou. Guard desatualizado ou regressão real de PP não investigada.
+   - `native-flash-next`: FAIL — `AssertionError: cache budget too small` a mem-ratio 0.86/16384 ctx (GPU livre, não é contenção externa). Pré-existente, não causado pelo fix de hoje.
+   - `gguf-flash-unsloth-ud`: FAIL por **stall-timeout de prefill (90s)**, não pelo bug do PLE (esse já foi confirmado corrigido isoladamente a 4096 ctx, TG 31.36). Causa: log mostra chunk de 8192/16384 tokens levando ~41s (PP ~194 tok/s, sem kernel MMQ para IQ4_XS) — 2 chunks ultrapassam os 90s do watchdog do bench, não é deadlock.
+   - `gguf-qwen38-27b-iq3s`: FAIL — `CUDA out of memory` real (dense I-quant, mem-ratio 0.86 insuficiente a 16384 ctx).
 
-**Decisões:** Métrica soberana = TG (tok/s), não taxa de aceitação. Só 2 modelos autorizados (ver AGENTS.md).
+**Decisões:** Métrica soberana = TG (tok/s). Só 2 modelos autorizados (AGENTS.md).
 
-**Next:**
-1. Reteste do caminho CUDA graph com o fix de `qsa_sparse.py` já commitado — confirmar se o hang em replay() sumiu ou se há causa adicional.
-2. Só depois disso, medir uma regressão real: mesmo commit, mesma profundidade de KV preenchida, mesmo kv-format, mesmo caminho graph/eager entre 0.1.2 e HEAD. Bisect só faz sentido com esse baseline válido em mãos.
-3. Investigar crash k=3 (GDN shape mismatch) em `scheduler/spec.py` verify forward.
-4. Resolver mismatches GGUF Unsloth-IQ4_XS (PLE dims, indexer heads).
-5. Rodar `benchmarks/cert_matrix.py`.
+**Next:** Investigar a regressão de PP em `native-35b-a3b` (-0.5% no guard) e decidir se o guard de PP precisa recalibração; separadamente, `gguf-flash-unsloth-ud` precisa de `--stall-timeout` maior ou `--decode`/contexto menor para caber no cert_matrix a 16384 tokens (limitação do harness, não do modelo).
