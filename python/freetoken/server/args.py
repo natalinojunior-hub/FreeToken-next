@@ -712,11 +712,8 @@ def parse_args(
         action="store_true",
         default=ServerArgs.kv_reserve_context,
         help=(
-            "Treat the serving context as a requirement rather than a floor: fund"
-            " --max-seq-len-override (or the model's own context) in KV first and size the"
-            " expert cache from what the VRAM ledger has left, refusing to start if even a"
-            " minimal expert cache would not fit. Buys long context out of the expert cache"
-            " without hand-computing --kv-reserve-tokens."
+            "Deprecated: context-aware VRAM planning is automatic. The engine funds the"
+            " serving context in the selected KV format before sizing the expert cache."
         ),
     )
 

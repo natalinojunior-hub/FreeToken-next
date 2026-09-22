@@ -106,6 +106,7 @@ class EngineConfig:
     # and scheduler expose the matching draft/verify/rollback path.
     spec_mtp: int = 0
     max_seq_len_override: int | None = None
+    max_extend_tokens: int = 8192
     num_page_override: int | None = None  # if not None, will override the number of pages
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.

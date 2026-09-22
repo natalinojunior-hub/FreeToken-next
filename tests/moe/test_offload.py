@@ -8,6 +8,24 @@ from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.layers.quantization import QuantKind
 
 
+def test_gguf_lazy_bank_materializes_only_requested_layer():
+    from freetoken.models.qwen3_5_moe.gguf_experts import _LazyGGUFBank
+
+    gate = [
+        torch.arange(16, dtype=torch.uint8).reshape(2, 2, 4),
+        torch.ones(2, 2, 4, dtype=torch.uint8),
+    ]
+    up = [torch.full((2, 2, 4), 2, dtype=torch.uint8), torch.full((2, 2, 4), 3, dtype=torch.uint8)]
+    source = _LazyGGUFBank(list(zip(gate, up)), [(2, 4, 4)] * 2, "gate_up")
+
+    assert source._cache == {}
+    assert source[1].tolist() == [
+        [[1, 1, 1, 1], [1, 1, 1, 1], [3, 3, 3, 3], [3, 3, 3, 3]],
+        [[1, 1, 1, 1], [1, 1, 1, 1], [3, 3, 3, 3], [3, 3, 3, 3]],
+    ]
+    assert list(source._cache) == [1]
+
+
 def test_conversion_host_banks_use_discardable_private_mmaps(monkeypatch):
     from freetoken.moe import host_banks
 

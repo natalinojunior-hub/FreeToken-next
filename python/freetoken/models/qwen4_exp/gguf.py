@@ -55,9 +55,14 @@ def _find_mtp_gguf_path(model_path: str) -> str | None:
     ]
     for mtp_dir in candidates:
         if os.path.isdir(mtp_dir):
-            for f in sorted(os.listdir(mtp_dir)):
-                if f.endswith(".gguf") and not f.startswith("."):
-                    return os.path.join(mtp_dir, f)
+            files = sorted(
+                f for f in os.listdir(mtp_dir) if f.endswith(".gguf") and not f.startswith(".")
+            )
+            preferred = [f for f in files if "shared-Q8_0" in f]
+            if preferred:
+                return os.path.join(mtp_dir, preferred[0])
+            if files:
+                return os.path.join(mtp_dir, files[0])
     return None
 
 
@@ -92,7 +97,7 @@ def _scan_quant_types(model_path: str) -> dict[tuple[int, str], int]:
     from freetoken.models.gguf.reader import iter_gguf_tensors
 
     quant_types = {}
-    for t in iter_gguf_tensors(model_path):
+    for t in iter_gguf_tensors(model_path, skip_names={"per_layer_token_embd.weight"}):
         if not t.name.startswith("blk."):
             quant_types[(-1, t.name)] = t.ggml_type
             continue
@@ -213,7 +218,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     if model_path is not None:
         from freetoken.models.gguf.reader import iter_gguf_tensors
 
-        for t in iter_gguf_tensors(model_path):
+        for t in iter_gguf_tensors(model_path, skip_names={"per_layer_token_embd.weight"}):
             if t.name.endswith(".ple_key.weight"):
                 # ple_key.weight shape is [out_features, in_features] = [width, ple_embed_dim]
                 ple_dim = t.shape[1]

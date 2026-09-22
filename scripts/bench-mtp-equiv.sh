@@ -19,7 +19,7 @@ MODEL=""
 MTP_K=1
 TOKENS=16384
 DECODE=16
-MEM_RATIO=0.9
+MEM_RATIO=0.98
 LABEL_PREFIX="mtpeq"
 EXTRA_SERVE_ARGS=()
 NO_GRAPH=""
@@ -61,35 +61,22 @@ run_arm() {
     local pid
     local -a serve_arg_flags=()
     for a in "${EXTRA_SERVE_ARGS[@]}"; do
-        serve_arg_flags+=(--serve-arg "$a")
+        serve_arg_flags+=("--serve-arg=$a")
     done
     TMPDIR=/models/desenvolvimento/tmp FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1 \
-        setsid nohup .venv/bin/python benchmarks/bench_pp_tg.py \
+        .venv/bin/python benchmarks/bench_pp_tg.py \
         --model "$MODEL" --tokens "$TOKENS" --decode "$DECODE" \
         --repeats 1 --warmups 0 --label "$label" --mem-ratio "$MEM_RATIO" $NO_GRAPH \
-        --serve-arg "--spec-mtp $k" "${serve_arg_flags[@]}" \
+        --serve-arg="--spec-mtp $k" "${serve_arg_flags[@]}" \
         --json "$json" > "$log" 2>&1 < /dev/null &
     pid=$!
-    disown
 
-    # Own the process lifetime: bail out if the backend worker dies, do not
-    # rely solely on bench_pp_tg.py's internal watchdog.
-    while kill -0 "$pid" 2>/dev/null; do
-        if grep -q "output sha1" "$log" 2>/dev/null; then
-            wait "$pid" 2>/dev/null || true
-            return 0
-        fi
-        if grep -qE "Backend worker is gone|Traceback \(most recent call last\)" "$log" 2>/dev/null; then
-            sleep 2  # give it a moment to self-exit before force-killing
-            if kill -0 "$pid" 2>/dev/null; then
-                echo "[bench-mtp-equiv] backend died, killing stuck bench PID $pid"
-                kill -9 "$pid" 2>/dev/null || true
-            fi
-            return 1
-        fi
-        sleep 1
-    done
-    grep -q "output sha1" "$log" 2>/dev/null
+    wait "$pid" || true
+    if [[ ! -s "$json" ]]; then
+        return 1
+    fi
+    python3 -c 'import json,sys; from pathlib import Path; rows=[json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]; raise SystemExit(0 if rows and rows[-1].get("output_sha1") else 1)' "$json" || return 1
+    return 0
 }
 
 echo "[bench-mtp-equiv] arm k=0 (baseline)..."
@@ -104,10 +91,8 @@ if ! run_arm "$MTP_K" "${LABEL_PREFIX}_k${MTP_K}" "$SCRATCH/k${MTP_K}.jsonl" "$S
     exit 1
 fi
 
-SHA_K0=$(python3 -c "import json;print([json.loads(l) for l in open('$SCRATCH/k0.jsonl') if l.strip()][-1]['output_sha1'])")
-SHA_KN=$(python3 -c "import json;print([json.loads(l) for l in open('$SCRATCH/k${MTP_K}.jsonl') if l.strip()][-1]['output_sha1'])")
-TG_K0=$(python3 -c "import json;print([json.loads(l) for l in open('$SCRATCH/k0.jsonl') if l.strip()][-1]['TG_mean'])")
-TG_KN=$(python3 -c "import json;print([json.loads(l) for l in open('$SCRATCH/k${MTP_K}.jsonl') if l.strip()][-1]['TG_mean'])")
+VALUES=$(python3 -c 'import json,sys; from pathlib import Path; rows=[json.loads(Path(name).read_text().splitlines()[-1]) for name in sys.argv[1:]]; print(rows[0]["output_sha1"], rows[0]["TG_mean"], rows[1]["output_sha1"], rows[1]["TG_mean"])' "$SCRATCH/k0.jsonl" "$SCRATCH/k${MTP_K}.jsonl")
+read -r SHA_K0 TG_K0 SHA_KN TG_KN <<< "$VALUES"
 
 echo "[bench-mtp-equiv] k=0 sha1=$SHA_K0 TG=$TG_K0"
 echo "[bench-mtp-equiv] k=$MTP_K sha1=$SHA_KN TG=$TG_KN"

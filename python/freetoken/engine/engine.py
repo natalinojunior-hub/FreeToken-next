@@ -31,6 +31,7 @@ from freetoken.utils import (
 )
 
 from .config import EngineConfig
+from .memory_planner import create_memory_planner, MemoryPlanner
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from .cache_budget import ceiling_bytes, pool_pages
@@ -996,21 +997,37 @@ class Engine:
         except Exception:
             pass
         if config.moe_cache_auto:
-            size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method)
-            object.__setattr__(config, "moe_cache_size", size)
-            object.__setattr__(config, "moe_prefill_overlap", overlap)
+            # Use new multi-stage memory planner
+            logger.info_rank0("--moe-cache-auto: invoking multi-stage VRAM planner")
+            planner = create_memory_planner(
+                config=config,
+                device=self.device,
+                model_config=config.model_config,
+                dtype=self.dtype,
+                pool_cls=self._pool_cls,
+                banks=banks,
+                method=method,
+            )
+            plan = planner.plan(
+                config=config,
+                model=self.model,
+                num_experts=config.model_config.num_experts,
+                num_moe_layers=config.model_config.num_moe_layers,
+                prefill_overlap=config.moe_prefill_overlap,
+                method_slot_limit=method.slot_limit() if method is not None else None,
+                max_running_req=config.max_running_req,
+                max_seq_len=config.max_seq_len,
+                page_size=config.page_size,
+                weights_bytes=self._weights_bytes,
+            )
+            object.__setattr__(config, "moe_cache_size", plan.expert_slots)
+            object.__setattr__(config, "moe_prefill_overlap", plan.prefill_overlap)
             if config.num_page_override is None:
-                # Honor the plan's KV half too: MoE slots and KV pages were solved
-                # against ONE budget (ratio x baseline - weights), so both must come
-                # from it. Re-solving pages later from a fresh free-memory reading
-                # double-counts everything allocated since the weights measurement
-                # (this expert cache, the CPU-executor GPU buffers, allocator
-                # slack) and goes negative whenever the expert fill is exact --
-                # a greedy fill leaves no headroom for the measurement delta.
-                object.__setattr__(config, "num_page_override", pages)
+                object.__setattr__(config, "num_page_override", plan.kv_pages)
             logger.info_rank0(
-                f"--moe-cache-auto resolved moe_cache_size={size} "
-                f"num_pages={pages} (prefill_overlap={overlap})"
+                f"--moe-cache-auto resolved moe_cache_size={plan.expert_slots} "
+                f"num_pages={plan.kv_pages} (prefill_overlap={plan.prefill_overlap}, "
+                f"prefill_chunk={plan.prefill_chunk})"
             )
         _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
         layout = max_slots = None

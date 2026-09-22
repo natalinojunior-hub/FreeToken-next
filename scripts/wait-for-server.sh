@@ -3,7 +3,7 @@
 
 PORT=${1:-8081}
 PID=${2:-}
-TIMEOUT=60
+TIMEOUT=${3:-60}
 START=$(date +%s)
 
 echo "Aguardando servidor na porta $PORT..."

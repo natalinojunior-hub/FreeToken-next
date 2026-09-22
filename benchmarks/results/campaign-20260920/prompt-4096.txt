@@ -1,0 +1,209 @@
+Task coding-01: parse a CSV stream
+Context:
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])
+The cache policy is cold for every request; state assumptions before selecting a safe change.
+csv row id=17 status=queued owner=ops; preserve ordering and explain malformed fields.
+agent evidence ticket-04 is open while service-04 reports degraded; record the next action.
+def merge_intervals(items): return sorted(items, key=lambda item: item[0])

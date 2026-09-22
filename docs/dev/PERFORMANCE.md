@@ -169,6 +169,43 @@ Nenhuma das 3 falhas acima foi causada pelo fix do PLE; são pré-existentes e n
 
 ---
 
+## `--moe-strategy hybrid` no Flash-Next NVFP4-Radix: teste do gargalo PCIe — 2026-09-20
+
+**Motivação:** investigar se streaming de experts via PCIe é o gargalo de TG no Flash-Next. `--moe-strategy hybrid` (CPU+GPU co-compute, fração auto-tunada por PCIe/CPU bandwidth) já existia em `moe/offload_cache.py`/`engine.py:1620` mas nunca tinha sido testado — nenhuma menção em nenhum doc vivo antes desta sessão. Formato `nvfp4` e ativação `silu` já suportados pelo executor CPU (`cpu_executor.py:72`, `_CPU_MOE_ACTS`), sem bloqueio de gate.
+
+**Par isomórfico (único comparável entre si — mesmo prompt 4096/64dec, eager `--no-graph`, `cache-type naive`, mem-ratio 0.98, `max-running-requests 1`):**
+
+| Config | PP (tok/s) | TG (tok/s) | GPU util | RSS | SHA1 |
+|---|---|---|---|---|---|
+| `gpu` (default, controle) | 1771.5 | **29.61** | 98% | 70.0 GiB | `573a19610680` |
+| `hybrid` (auto: 48.7% PCIe / 51.3% CPU) | 1775.9 | **30.51** | 90% | 70.5 GiB | `573a19610680` |
+
+**Resultado:** +3% TG, bit-idêntico (mesmo SHA1 do baseline k=0). Correto, mas pequeno. **Conclusão:** hybrid moveu 51.3% dos misses de expert para fora do PCIe e TG só mudou 3% — isso limita o custo de PCIe expert-streaming a uma fração baixa (poucos %) do tempo do passo de decode no Flash-Next. GPU util fica saturado nos dois casos (98% gpu-path / 90% hybrid) — decode é **GPU-compute-bound**, não PCIe-bound nem host-bound. O gap vs 35B-A3B (6.3ms/token vs 33ms/token, mesma GPU) **não é primariamente residência de experts em VRAM** — se fosse, hybrid teria mudado TG substancialmente ao tirar carga do caminho de transferência. É mais provável que 35B-A3B tenha um forward pass por token estruturalmente mais barato (roteamento mais denso/simples, sem a pilha híbrida GDN/QSA attention do Flash-Next, menor compute por token). Não investigado a fundo — próximo passo é instrumentar `torch.cuda.Event` por região (GDN, QSA/TurboKV attention, MoE grouped GEMV) para achar o kernel dominante; `nsys`/`ncu` estão quebrados nesta máquina (Nsight não instalado para CUDA 13.3).
+
+**Não comparar** estas duas linhas com os anchors de 34.7/30.44/23.21 tok/s de sessões anteriores — diferem em cuda-graph vs eager, kv-reserve-tokens e mem-ratio.
+
+**Ação:** `--moe-strategy hybrid` é gratuito (sem custo de correção, +3% TG) — candidato a default para Flash-Next. Próxima hipótese a descartar antes de qualquer trabalho de kernel: `--ple-backend pinned` (tabela PLE hoje é lida de disco por token) — **testado e falhou**: processo morto durante load (RSS já ~70 GiB no path `disk`, pinned exige mais RAM residente que a máquina tem livre no mem-ratio atual). Não investigado se cabe em mem-ratio menor.
+
+**`ft bench bw --dtype nvfp4` (mecanismo oficial de auto-resolução, 2026-09-20):** ceilings CPU STREAM read 70.4 GB/s, PCIe linear H2D 57.9 / D2H 57.3 GB/s. Real kernels nvfp4: CPU-MoE 63.0 GB/s vs PCIe-gather 53.2 GB/s = **1.19x** — abaixo do limiar padrão (2.0x) para recomendar hybrid, então `auto` resolve para `offload` nesta GPU. Overlapped (CPU+PCIe concorrentes): 40.0/38.0 GB/s → fetch split 48.7% (bate com o 48.7% medido em runtime acima). **Decisão do operador (2026-09-20): manter `offload`/`auto` como está — não baixar o limiar, não forçar `hybrid` como default.** Motivo: o +3% medido foi com 1 requisição e CPU ociosa; o limiar de 2x existe para proteger o cenário multi-requisição (CPU disputada entre GEMV, tokenização e scheduler), não medido nesta sessão. Não reabrir sem medir multi-request.
+
+**Diagnóstico `FREETOKEN_DEBUG_SPEC_TIMING=1` no MTP k=4 (2026-09-20):** confirma que o replay batched já funciona corretamente — `gdn_replay` (fallback caro, forward extra) **nunca disparou** em 30 spec steps; `zero_replay_gdn` (sem custo de forward extra, restaura de checkpoint) cobriu 100% dos casos que precisaram de restore. Custo real por step: `draft_chain` ~11ms (4 forwards sequenciais do draft, inerente à especulação) + `verify_forward` ~140ms (cobre k+1=5 posições, ~28ms/token — em linha com o custo normal de decode ~33ms/token, não é anomalia). Com aceitação ~40-50%, ~2-3 tokens entregues por ~151ms de step vs ~33ms/token do baseline greedy — abaixo do break-even, o que explica a regressão de -7% em k=4 sem precisar de nenhum bug adicional. **Não há bug de replay a corrigir; MTP está no seu comportamento esperado dado o algoritmo.**
+
+## Instrumentação `FREETOKEN_DEBUG_LAYER_TIMING` (mixer vs MoE por camada) e teste de kernel NVFP4 alternativo — 2026-09-20
+
+**Instrumentação:** `torch.cuda.Event` opt-in (`FREETOKEN_DEBUG_LAYER_TIMING=1`, custo zero quando desligada — fast path idêntico ao original) em `Qwen4ExpDecoderLayer.forward` (`models/qwen4_exp/model.py`), medindo tempo de GPU do mixer (GDN/QSA attention) vs MoE por camada, print a cada 256 chamadas.
+
+**Resultado (4096 tok prefill + 64 decode, eager, naive):** acumulado ~2476ms mixer / ~6257ms MoE em 6144 chamadas de layer → **MoE domina o custo por camada em ~2.5x sobre o mixer de atenção** (0.40ms vs 1.02ms por chamada, média mista prefill+decode). Confirma que o gargalo de compute do Flash-Next está no grouped-GEMV/dequant NVFP4 do MoE, não na atenção GDN/QSA.
+
+**Teste de kernel alternativo:** 3 backends NVFP4 existem (`triton` nativo, `nvfp4_marlin`, `nvfp4_b12x`/flashinfer SM12x). Ambos os alternativos descartados:
+- `nvfp4_marlin`: documentado como sm_80-99 only — esta GPU é sm_120 (Blackwell), incompatível por design.
+- `nvfp4_b12x` (`--quant-backend moe.nvfp4=b12x`): **crash** — `ValueError: force_tile_config fc2 tile (tile_k=32, tile_n=512) does not fit problem N/K=2560/640 at moe_block_size=8` (bug de tabela de tile config do flashinfer para esta geometria específica do Flash-Next, não corrigível do nosso lado sem patch upstream).
+
+**Conclusão:** o kernel `triton` nativo (default/`auto`) é o único backend NVFP4 viável para a geometria deste checkpoint nesta GPU. Sem ganho disponível por troca de kernel MoE sem trabalho de correção upstream no flashinfer. Instrumentação de timing mantida no código (opt-in, custo zero por padrão) para uso em sessões futuras.
+
+**Controle pós-instrumentação (flag desligada):** TG 29.60 tok/s (3 repeats), idêntico ao controle anterior (29.61) — confirma zero regressão de PP/TG pela mudança de código.
+
+---
+
 ## Referência Completa
 
 `old/docs/freetoken-next/PERFORMANCE.md` — Tabelas detalhadas por config/modelo, EXP-001 a EXP-045, metodologia, variáveis de controle.

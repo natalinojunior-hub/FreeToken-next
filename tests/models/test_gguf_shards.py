@@ -202,3 +202,13 @@ class TestDeclaredCountMismatch:
         first = tmp / "m-00001-of-00002.gguf"
         with pytest.raises(Exception):
             list(iter_gguf_tensors(str(first)))
+
+    def test_skip_names_avoids_large_tensor_materialization(self, tmp_path: Path):
+        paths = _make_split(
+            tmp_path, "m", [["per_layer_token_embd.weight", "a.weight"], ["b.weight"]]
+        )
+        names = [
+            t.name
+            for t in iter_gguf_tensors(str(paths[0]), skip_names={"per_layer_token_embd.weight"})
+        ]
+        assert names == ["a.weight", "b.weight"]

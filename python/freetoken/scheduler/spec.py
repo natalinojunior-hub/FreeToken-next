@@ -156,6 +156,26 @@ class SchedulerSpecMixin:
         scratch_base = getattr(kv, "_cmp_scratch_base", 0)
         kv._cmp_k_buffer[:, scratch_base + req.table_idx].copy_(snap_scratch)
 
+    def _snapshot_ple_state(self, req: Req) -> torch.Tensor | None:
+        pool = getattr(self.engine, "linear_state_pool", None)
+        if pool is None or not pool.has_slot_state("ple_ngram_ctx"):
+            return None
+        state = pool.slot_state("ple_ngram_ctx")[self._linear_slot(req)]
+        if not hasattr(self, "_spec_ple_snapshots"):
+            self._spec_ple_snapshots: dict[int, torch.Tensor] = {}
+        snapshot = state.clone()
+        self._spec_ple_snapshots[req.uid] = snapshot
+        return snapshot
+
+    def _restore_ple_state(self, req: Req) -> None:
+        snapshots = getattr(self, "_spec_ple_snapshots", None)
+        snapshot = snapshots.get(req.uid) if snapshots is not None else None
+        if snapshot is None:
+            return
+        pool = getattr(self.engine, "linear_state_pool", None)
+        if pool is not None and pool.has_slot_state("ple_ngram_ctx"):
+            pool.slot_state("ple_ngram_ctx")[self._linear_slot(req)].copy_(snapshot)
+
     @staticmethod
     def _linear_slot(req: Req) -> int:
         """GDN/PLE state slot: the hybrid-radix live slot when allocated, else table_idx
@@ -277,6 +297,15 @@ class SchedulerSpecMixin:
 
         # Snapshot QSA pending ring and scratch cmp buffer before draft chain mutates them
         self._snapshot_qsa_state(req)
+        self._snapshot_ple_state(req)
+
+        # ---- snapshot linear state before the draft chain mutates it ----
+        pool = self.engine.linear_state_pool
+        snap_slot = None
+        if pool is not None:
+            snap_slot = self._spec_snapshot_slot(req)
+            pool.copy_from(self._linear_slot(req), snap_slot)
+        residual_snapshot = model.model._last_residual[-1:].clone()
 
         # ---- draft chain: k autoregressive steps through the draft head's own QSA slot ----
         r_prev = model.model._last_residual[-1:].clone()
@@ -332,12 +361,12 @@ class SchedulerSpecMixin:
         req.cached_len, req.device_len = d - 1, d
         mark("draft_chain")
 
-        # ---- snapshot linear state (GDN conv+recurrent+PLE ctx) before verify mutates it ----
-        pool = self.engine.linear_state_pool
-        snap_slot = None
-        if pool is not None:
-            snap_slot = self._spec_snapshot_slot(req)
-            pool.copy_from(self._linear_slot(req), snap_slot)
+        # ---- restore state before target verification ----
+        if snap_slot is not None:
+            pool.copy_from(snap_slot, self._linear_slot(req))
+        model.model._last_residual = residual_snapshot
+        self._restore_qsa_state(req)
+        self._restore_ple_state(req)
         mark("snapshot")
 
         # ---- verify: one prefill-phase Batch over [d-1, d+k) ----
@@ -383,7 +412,7 @@ class SchedulerSpecMixin:
             model.model._last_residual = last_res[committed - 1 : committed].clone()
 
         if committed <= k:
-            checkpoints = getattr(vb, "gdn_checkpoints", None)
+            checkpoints = None
             target_step = committed - 1
             if checkpoints is not None and target_step in checkpoints and pool is not None:
                 # Phase 10 Pillar 2 Zero-Replay GDN: restore recurrent + conv states from verify checkpoint

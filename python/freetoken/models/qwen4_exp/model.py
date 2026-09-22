@@ -44,6 +44,13 @@ if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
 
+_LAYER_TIMING_ENV = "FREETOKEN_DEBUG_LAYER_TIMING"
+_layer_timing_enabled = os.getenv(_LAYER_TIMING_ENV, "0").strip().lower() not in {"0", "false", ""}
+# accumulated ms per component; not touched unless FREETOKEN_DEBUG_LAYER_TIMING is set, so it
+# costs nothing on a normal run
+_layer_timing_totals: dict[str, float] = {"mixer": 0.0, "moe": 0.0, "calls": 0.0}
+
+
 def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseOP:
     """GDN mixer of a linear_attention layer (Qwen3.5's GDN with a configurable output gate)."""
     from .gdn import Qwen4ExpGatedDeltaNet
@@ -100,13 +107,41 @@ class Qwen4ExpDecoderLayer(BaseOP):
         if self.ple is not None:
             hidden = hidden + self.ple.forward(hidden, batch)
         block_input, inject = self.attn_hyper_connection.mix(hidden)
+        if not _layer_timing_enabled:
+            if self._is_linear:
+                block_output = self.linear_attn.forward(block_input)
+            else:
+                block_output = self.self_attn.forward(block_input, batch)
+            hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
+            block_input, inject = self.mlp_hyper_connection.mix(hidden)
+            return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
+
+        mixer_start, mixer_end = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        moe_start, moe_end = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        mixer_start.record()
         if self._is_linear:
             block_output = self.linear_attn.forward(block_input)
         else:
             block_output = self.self_attn.forward(block_input, batch)
+        mixer_end.record()
         hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
         block_input, inject = self.mlp_hyper_connection.mix(hidden)
-        return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
+        moe_start.record()
+        moe_out = self.mlp.forward(block_input)
+        moe_end.record()
+        torch.cuda.current_stream().synchronize()
+        _layer_timing_totals["mixer"] += mixer_start.elapsed_time(mixer_end)
+        _layer_timing_totals["moe"] += moe_start.elapsed_time(moe_end)
+        _layer_timing_totals["calls"] += 1
+        if int(_layer_timing_totals["calls"]) % 256 == 0:
+            print(f"[layer-timing] totals_ms={_layer_timing_totals}", flush=True)
+        return self.mlp_hyper_connection.combine(hidden, moe_out, inject)
 
 
 class _MTPQuantConfig(QuantConfig):

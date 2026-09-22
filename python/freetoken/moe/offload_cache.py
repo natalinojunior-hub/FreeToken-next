@@ -347,8 +347,15 @@ class OffloadMoeCache:
                 f"MoE pool key mismatch: expected (bank, role, type)"
             )
         bank_idx, role_name, qt = key
-        weight = self.bank_sources[role_name][bank_idx]
+        source = self.bank_sources[role_name]
+        weight = source[bank_idx]
         return ExpertBank(weight=weight, quant_type=qt, shape=tuple(weight.shape))
+
+    def _materialize_sources(self, layer_id: int) -> None:
+        for source in self.bank_sources.values():
+            materialize = getattr(source, "materialize", None)
+            if materialize is not None:
+                materialize(layer_id)
 
     def put_expert(
         self,
@@ -415,11 +422,37 @@ class OffloadMoeCache:
                 )
         self._unpinned_layers = unpinned
         self.layer_residency = list(residency)
+        if any(hasattr(sources[name], "materialize") for name in self.bank_schema):
+            if not all(hasattr(sources[name], "materialize") for name in self.bank_schema):
+                raise ValueError("lazy GGUF sources must cover every bank")
+            self.expert_geometry = {}
+            for name in self.bank_schema:
+                source = sources[name]
+                geometries = {}
+                for layer_id in range(self.num_layers):
+                    shape = source.shape_at(layer_id)
+                    geometry = (tuple(shape[1:]), source.dtype)
+                    if geometry not in geometries:
+                        geometries[geometry] = torch.empty(
+                            (self.cache_size, *shape[1:]),
+                            dtype=source.dtype,
+                            device=self.device,
+                        )
+                    qt = self._get_layer_quant_type(layer_id, name)
+                    self.expert_geometry[(layer_id, name, qt)] = (shape, source.dtype)
+                    self.bank_caches[(layer_id, name, qt)] = geometries[geometry]
+                self.bank_sources[name] = source
+                self.bank_caches[name] = next(iter(geometries.values()))
+            self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
+            self._copy_fused_ok = False
+            self.prefill_overlap = False
+            self.prefill_bank_buffers = []
+            return
         self.expert_geometry = {}
         for name in self.bank_schema:
             per_layer = sources[name]
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
-            head = per_layer[0]
+            head = per_layer.shape_at(0) if hasattr(per_layer, "shape_at") else per_layer[0]
             if self.layout is not None:
                 spec = self.layout[name]
                 if tuple(head.shape[1:]) != tuple(spec.shape) or head.dtype != spec.dtype:
@@ -502,6 +535,8 @@ class OffloadMoeCache:
         self._gather_bank_ids: list[int] = []
         self._gather_dst_ptrs: torch.Tensor | None = None
         self._gather_feat_bytes: torch.Tensor | None = None
+        if any(hasattr(per_layer, "materialize") for per_layer, _ in self.banks):
+            return
         if not _FUSED_COPY or self.device.type != "cuda" or not self.banks:
             return
         from freetoken.kernel.pinned import device_ptr
@@ -1172,6 +1207,7 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        self._materialize_sources(layer_id)
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 raise RuntimeError(
@@ -1205,11 +1241,21 @@ class OffloadMoeCache:
             per_layer = self.bank_sources[name]
             qt = self._get_layer_quant_type(layer_id, name)
             key = (layer_id, name, qt)
-            cache = self.bank_caches.get(key, self.bank_caches[name])
+            source_layer = per_layer[layer_id]
+            cache = self.bank_caches.get(key)
+            if cache is None:
+                for candidate in self.bank_caches.values():
+                    if isinstance(candidate, torch.Tensor) and tuple(candidate.shape[1:]) == tuple(
+                        source_layer.shape[1:]
+                    ):
+                        cache = candidate
+                        break
+            if cache is None:
+                raise KeyError(f"missing GPU cache geometry for {key!r}")
             fast_index_copy_jit(
                 cache,
                 self.evict_slots,
-                per_layer[layer_id],
+                source_layer,
                 self.src_indices,
                 self.num_indices,
             )

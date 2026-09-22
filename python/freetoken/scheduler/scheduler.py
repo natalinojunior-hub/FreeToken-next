@@ -439,8 +439,6 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
                     # rather than re-read the freed page-table row (and on hybrid, deref the
                     # None'd GDN ping-pong slots).
                     self.cache_manager.cache_req(req, finished=False)
-                    if self.spec_mtp > 0:
-                        self.warmup_mtp_draft_kv(req)
 
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell

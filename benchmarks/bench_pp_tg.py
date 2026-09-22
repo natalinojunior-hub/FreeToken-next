@@ -61,7 +61,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--prompt-offset", type=int, default=0, help="token offset into the corpus slice"
     )
-    p.add_argument("--mem-ratio", type=float, default=0.9)
     p.add_argument("--gpu", default=None, help="UUID or nvidia-smi index, as ft serve --gpu")
     p.add_argument("--no-graph", action="store_true", help="eager decode instead of CUDA graph")
     p.add_argument(
@@ -160,8 +159,6 @@ def serve_cmd(args: argparse.Namespace, port: int) -> list[str]:
         "1",
         "--max-seq-len-override",
         str(args.tokens + args.decode + 64),
-        "--memory-ratio",
-        str(args.mem_ratio),
         "--cuda-graph-max-bs",
         "0" if args.no_graph else "1",
     ]
@@ -299,6 +296,14 @@ def stream_completion(
                     print(
                         f"\n[bench] server process died with exitcode {proc.returncode}", flush=True
                     )
+                    os._exit(1)
+                try:
+                    health = get_json(f"{origin}/health", timeout=1)
+                except (OSError, ValueError):
+                    health = None
+                if isinstance(health, dict) and health.get("status") == "error":
+                    print(f"\n[bench] server reported failure: {health}", flush=True)
+                    os.killpg(proc.pid, signal.SIGTERM)
                     os._exit(1)
 
                 if in_prefill[0]:
@@ -470,18 +475,26 @@ def pump_output(src, log_f) -> None:
         sys.stdout.flush()
 
 
+def wait_process_exit(proc) -> None:
+    try:
+        fd = os.pidfd_open(proc.pid)
+    except ProcessLookupError:
+        return
+    try:
+        import select
+
+        select.select([fd], [], [])
+    finally:
+        os.close(fd)
+    proc.wait()
+
+
 def stop_server(proc) -> None:
-    for sig, wait_s in ((signal.SIGTERM, 90), (signal.SIGKILL, 30)):
-        try:
-            os.killpg(proc.pid, sig)
-        except ProcessLookupError:
-            pass
-        try:
-            proc.wait(timeout=wait_s)
-            break
-        except subprocess.TimeoutExpired:
-            continue
-    time.sleep(3)
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    wait_process_exit(proc)
 
 
 def main(argv: list[str] | None = None) -> int:

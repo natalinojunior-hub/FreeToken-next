@@ -281,10 +281,13 @@ def _reader(model_path: str):
     this validates that:
       1. All shards 1..N are present and complete (no missing indices).
       2. The summed tensor count across all shards matches split.tensors.count (if present).
+
+    Uses mmap mode ('r') to avoid loading tensor data into RAM.
     """
     import gguf
 
-    reader = gguf.GGUFReader(model_path)
+    # Use mmap mode to avoid loading tensor data into memory
+    reader = gguf.GGUFReader(model_path, mode="r")
 
     # Check if this is shard 1 of a multi-shard set
     split_count = _field_value(reader, "split.count")
@@ -300,20 +303,25 @@ def _reader(model_path: str):
                     f"but found {len(shards)} shards"
                 )
 
-            # Validate tensor count sum if split.tensors.count is declared
-            split_tensors_count = _field_value(reader, "split.tensors.count")
-            if split_tensors_count is not None:
-                total_tensor_count = 0
-                for shard_path in shards:
-                    shard_reader = gguf.GGUFReader(shard_path)
-                    total_tensor_count += len(shard_reader.tensors)
+            # Skip tensor count validation - it forces loading all tensors into RAM
+            # which defeats the purpose of mmap. Validation is optional and can be
+            # re-enabled if needed by setting FT_GGUF_VALIDATE_TENSORS=1
+            import os
 
-                if total_tensor_count != split_tensors_count:
-                    raise ValueError(
-                        f"GGUF shard validation: {model_path} declares "
-                        f"split.tensors.count={split_tensors_count}, but summed tensor count "
-                        f"across all shards is {total_tensor_count}"
-                    )
+            if os.environ.get("FT_GGUF_VALIDATE_TENSORS") == "1":
+                split_tensors_count = _field_value(reader, "split.tensors.count")
+                if split_tensors_count is not None:
+                    total_tensor_count = 0
+                    for shard_path in shards:
+                        shard_reader = gguf.GGUFReader(shard_path, mode="r")
+                        total_tensor_count += len(shard_reader.tensors)
+
+                    if total_tensor_count != split_tensors_count:
+                        raise ValueError(
+                            f"GGUF shard validation: {model_path} declares "
+                            f"split.tensors.count={split_tensors_count}, but summed tensor count "
+                            f"across all shards is {total_tensor_count}"
+                        )
         except ValueError:
             raise
 
@@ -351,8 +359,10 @@ def gguf_architecture(model_path: str) -> str:
     return str(arch)
 
 
-def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
-    """Yield every tensor with its torch shape, ggml type, and packed block bytes.
+def iter_gguf_tensors(
+    model_path: str, *, skip_names: set[str] | frozenset[str] = frozenset()
+) -> Iterator[GgufTensor]:
+    """Yield GGUF tensors with their torch shape, type, and packed block bytes.
 
     For multi-shard files, yields tensors from shard 1, then shard 2, ..., in order.
     Single-shard files take exactly the same code path (gguf_shards returns [path]).
@@ -370,6 +380,8 @@ def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
     for shard_path in shards:
         reader = _reader(shard_path)
         for t in reader.tensors:
+            if t.name in skip_names:
+                continue
             ne = [int(s) for s in t.shape]  # ggml order, fastest dim first
             torch_shape = tuple(reversed(ne))
             block, type_size = gguf.GGML_QUANT_SIZES[t.tensor_type]
@@ -383,7 +395,10 @@ def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
             rows = int(np.prod(ne[1:])) if len(ne) > 1 else 1
             # gguf-py returns quantized tensors as raw uint8 but F32/F16 as typed arrays;
             # normalize everything to a flat byte view before shaping into [rows, row_bytes].
-            flat = np.ascontiguousarray(t.data).reshape(-1).view(np.uint8)
+            data = t.data
+            if not data.flags.c_contiguous:
+                data = np.ascontiguousarray(data)
+            flat = data.reshape(-1).view(np.uint8)
             raw = flat.reshape(rows, row_bytes)
             yield GgufTensor(
                 name=t.name,

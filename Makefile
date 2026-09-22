@@ -1,4 +1,4 @@
-.PHONY: help install test bench format lint typecheck ci clean preflight profile crossref
+.PHONY: help install test test-safe bench format lint typecheck ci clean preflight profile crossref
 
 export CUDA_HOME ?= /models/outros/cuda-13.3
 export CUDA_PATH ?= $(CUDA_HOME)
@@ -19,6 +19,7 @@ export CFLAGS ?= -O3 -march=native
 export CXXFLAGS ?= -O3 -march=native
 export CUDAFLAGS ?= -O3 --use_fast_math -Xfatbin=-compress-all
 export TMPDIR ?= /models/desenvolvimento/tmp
+TIMEOUT ?= 60
 
 # Default target
 help:
@@ -54,6 +55,9 @@ rebuild:
 
 test:
 	TMPDIR=/models/desenvolvimento/tmp uv run --no-sync pytest tests -m "not slow" -q --basetemp=/models/desenvolvimento/tmp
+
+test-safe:
+	TMPDIR=/models/desenvolvimento/tmp uv run --no-sync python scripts/test-runner.py --timeout $(TIMEOUT) -- uv run --no-sync pytest tests -m "not slow" -q --basetemp=/models/desenvolvimento/tmp
 
 test-all:
 	TMPDIR=/models/desenvolvimento/tmp uv run --no-sync pytest tests -q --basetemp=/models/desenvolvimento/tmp

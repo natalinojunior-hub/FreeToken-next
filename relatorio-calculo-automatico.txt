@@ -1,0 +1,462 @@
+RELATÓRIO DO CÁLCULO AUTOMÁTICO DE VRAM
+========================================
+
+Data: 2026-09-21
+Projeto: FreeToken
+Repositório: /models/desenvolvimento/freetoken-next
+Hardware usado nas evidências: GPU com aproximadamente 15,18 GiB livres no início e 15,51 GiB totais observados nos logs.
+
+1. ESCOPO E CONCLUSÃO EXECUTIVA
+--------------------------------
+
+Este relatório descreve o funcionamento atual do cálculo automático de VRAM, conforme o código presente e os logs registrados. Ele separa o que está implementado do que ainda é hipótese ou pendência.
+
+O sistema atual calcula um orçamento global de VRAM, reserva consumidores conhecidos, divide o saldo entre cache de experts MoE e cache KV, cria os pools e depois compara o ledger com a memória CUDA observada.
+
+O planejamento já considera, em graus diferentes:
+
+- pesos residentes;
+- estados GDN/atenção linear;
+- custo do formato KV escolhido;
+- páginas KV e página dummy;
+- cache de experts;
+- tabelas auxiliares de quantização;
+- tabela de páginas;
+- workspaces e pools de backend;
+- gráficos CUDA;
+- uma estimativa de temporários de prefill;
+- fragmentação e diferenças entre ranks.
+
+O comportamento, porém, ainda não pode ser considerado totalmente automático e comprovado para o caso de 16K. Existem três fatos importantes:
+
+1. O cálculo automático consegue produzir um plano consistente matematicamente, mas o caso real de 15.800 tokens ainda não foi concluído com JSON válido e geração completa.
+2. O ledger ainda contém constantes e estimativas de memória transitória. Elas não são flags do usuário, mas são hipóteses internas do modelo de custo.
+3. O mecanismo de calibração atual mede a memória durante a inicialização e imprime divergências, mas não existe ainda um perfil persistente de calibração por hardware/modelo/formato KV validado em produção.
+
+Portanto, a situação atual é: planejamento automático parcialmente implementado, cobertura de testes forte para aritmética, validação real de 16K ainda pendente.
+
+2. ENTRADA DO PLANEJADOR
+------------------------
+
+O planejamento recebe informações de quatro grupos.
+
+2.1 Hardware
+
+O engine mede a memória livre antes de carregar o modelo usando CUDA. O valor é sincronizado entre ranks e o menor valor entre os ranks é usado como baseline seguro.
+
+Fluxo principal:
+
+- mede memória livre inicial;
+- carrega pesos e inicializa o modelo;
+- mede novamente a memória livre;
+- calcula os bytes consumidos pelos pesos como:
+
+  pesos = memória_livre_inicial - memória_livre_pós_pesos
+
+- obtém a memória total da GPU;
+- abre o VramLedger com esses valores.
+
+O código também verifica desequilíbrio de memória entre ranks. Se a diferença entre a maior e a menor memória livre excede aproximadamente 2 GiB, o engine aborta para não planejar com um rank que tenha menos memória.
+
+2.2 Modelo e quantização
+
+O modelo fornece:
+
+- número de camadas MoE;
+- número de experts por camada;
+- dimensões das matrizes dos experts;
+- dtype e tamanho dos elementos;
+- grupo de atenção linear/GDN;
+- dimensões de heads, key e value;
+- configuração de MTP, quando presente;
+- formato e método de quantização dos experts.
+
+A função expert_bytes_per_slot() calcula o custo de um slot de expert. Ela percorre os bancos de experts e soma as geometrias distintas. Para cada geometria, calcula os bytes de uma linha de expert a partir de shape e dtype.
+
+Geometrias iguais dentro de um banco não devem ser somadas repetidamente. Esse ponto foi corrigido no caminho lazy GGUF.
+
+2.3 Cache KV
+
+O pool KV informa sua geometria por meio de kv_cost(config), incluindo:
+
+- bytes por página;
+- bytes fixos do pool;
+- tokens por página;
+- reserva mínima do backend.
+
+Para Turbo3 e Turbo4, o backend selecionado é o caminho de KV codificado, com page size observado de 64 tokens nos logs.
+
+O custo de páginas é:
+
+  páginas_necessárias = ceil(tokens_solicitados / tokens_por_página)
+
+O pool efetivamente aloca uma página dummy adicional:
+
+  páginas_alocadas = páginas_úteis + 1
+
+O custo KV é:
+
+  bytes_KV = páginas_alocadas × bytes_por_página
+
+A página dummy é incluída no cálculo do ledger para evitar que o plano consuma todo o orçamento e depois ultrapasse o limite durante a criação real do pool.
+
+2.4 Contexto
+
+EngineConfig.max_seq_len retorna max_seq_len_override quando fornecido; caso contrário, retorna a capacidade máxima do modelo.
+
+O padrão atual de kv_reserve_context foi alterado para True. Além disso, max_seq_len_override também força o caminho de planejamento por contexto.
+
+Nesse caminho, o contexto de serviço é tratado como requisito. O plano chama plan_for_context(config.max_seq_len, geometry), em vez de reservar apenas o piso padrão kv_reserve_tokens.
+
+3. VRAM LEDGER
+--------------
+
+O VramLedger mantém charges nomeados. Cada charge possui:
+
+- nome;
+- bytes;
+- tipo;
+- descrição.
+
+Os tipos são:
+
+- IMMUTABLE: memória residente, como pesos;
+- PERSISTENT: pools mantidos durante a sessão;
+- SEMI_PERSISTENT: estruturas que permanecem depois da inicialização;
+- TRANSIENT: picos temporários esperados;
+- RESERVE: espaço que deve permanecer vazio;
+- MEASURED: leituras de diagnóstico, não consumidores adicionais.
+
+Os consumidores negociáveis são:
+
+- cache:expert;
+- cache:kv.
+
+Os outros consumidores devem ser cobrados antes da divisão entre experts e KV.
+
+3.1 Teto
+
+O código ainda mantém a fórmula histórica:
+
+  cap = memory_ratio × baseline_free
+  reserva_implícita = baseline_free - cap
+  teto = cap - max(0, reserva_modelada - reserva_implícita)
+
+Com memory_ratio=1.0, o cap deixa de retirar 10% da memória antes do cálculo. O engine também força memory_ratio=1.0 ao abrir o ledger e ao calcular o plano automático em alguns caminhos.
+
+Importante: a flag memory-ratio ainda existe em partes da configuração e do CLI. O padrão foi alterado para 1.0, mas a remoção completa da dependência conceitual ainda não foi concluída.
+
+3.2 Reserva modelada
+
+modelled_reserves() cria charges para consumidores que não são diretamente negociados no plano:
+
+- arena de autotune Triton;
+- pico de captura de CUDA Graph;
+- workspace de atenção;
+- graph pool;
+- ativações gerais;
+- pico de encoder multimodal, quando aplicável;
+- workspace de prefill GDN;
+- staging, quando informado;
+- reserva de fragmentação.
+
+Os valores de GDN e ativações são calculados por fórmulas baseadas em dimensões e tokens, mas alguns workspaces, arena e fragmentação ainda são constantes ou estimativas internas.
+
+3.3 Pico GDN
+
+gdn_prefill_bytes() estima o pico de uma camada GDN para um chunk de prefill. O cálculo inclui termos relativos a:
+
+- projeção convolucional;
+- tensor z;
+- cópias q/k/v;
+- w e u;
+- A;
+- h;
+- v_new;
+- saída o;
+- gate e beta em fp32.
+
+A função calcula bytes por token e multiplica por tokens do chunk, batch e itemsize.
+
+Nos logs, um chunk de 8.192 tokens foi precificado como aproximadamente 0,835 GiB de workspace GDN.
+
+O log do caso de 16K mostrou uma tentativa real de alocação adicional de aproximadamente 192 MiB durante o prefill, com aproximadamente 171 MiB livres. Isso demonstra que a estimativa modelada e os demais consumidores não estavam suficientemente reconciliados para garantir o forward.
+
+4. DIVISÃO ENTRE EXPERTS E KV
+-----------------------------
+
+4.1 Caminho automático MoE
+
+Quando moe_cache_auto está ativo:
+
+1. o engine obtém a geometria do pool KV;
+2. calcula bytes por slot de expert;
+3. calcula num_experts;
+4. calcula total_experts como num_moe_layers × num_experts;
+5. inclui se o overlap de prefill está ativo;
+6. inclui cache fixo e limite de slots do método;
+7. chama plan_for_context() quando o contexto é requisito;
+8. caso contrário, chama decide() usando kv_reserve_tokens e overrides de páginas;
+9. grava o plano em self.memory_plan;
+10. grava moe_cache_size e num_page_override no config;
+11. cria o cache de experts;
+12. cria o pool KV com as páginas determinadas pelo plano.
+
+4.2 plan_for_context()
+
+Este caminho prioriza o contexto. Ele calcula quantas páginas são necessárias para o contexto escolhido e tenta financiar essas páginas antes de preencher o restante com experts.
+
+Se o contexto não couber respeitando o piso mínimo de experts, o planejador deve falhar com ValueError de contexto não financiável, em vez de iniciar com capacidade menor silenciosamente.
+
+4.3 decide()
+
+Este caminho começa com um piso KV, normalmente kv_reserve_tokens. O saldo restante é entregue ao cache de experts. Essa política é MoE-first e foi a causa do comportamento anterior de reservar apenas aproximadamente 8K tokens quando o usuário precisava de 16K.
+
+Com contexto explícito, o caminho desejado é plan_for_context(), não decide() com o piso padrão.
+
+5. ORDEM DE INICIALIZAÇÃO ATUAL
+--------------------------------
+
+A ordem observada é:
+
+1. mede memória livre inicial;
+2. cria o modelo em meta;
+3. carrega state_dict;
+4. finaliza quantização;
+5. posiciona componentes multimodais, se houver;
+6. mede memória livre pós-pesos;
+7. carrega tabelas host/PLE;
+8. abre o VramLedger;
+9. inicializa o cache MoE offload;
+10. resolve cache automático, quando ativo;
+11. cria o OffloadMoeCache;
+12. associa bancos host ao cache GPU;
+13. associa escalas alpha;
+14. anexa o cache aos módulos MoE;
+15. inicializa executor CPU/hybrid, quando aplicável;
+16. cria o pool KV com num_pages;
+17. cria tabela de páginas;
+18. inicializa backend de atenção;
+19. cria sampler;
+20. cria GraphRunner;
+21. aquece o prefill/autotune;
+22. mede buffers do graph runner;
+23. executa calibração do ledger.
+
+A consequência importante é que o plano do cache MoE precisa ser decidido antes da criação do OffloadMoeCache. Portanto, qualquer memória fixa que só seja criada dentro do cache precisa ser conhecida por fórmula ou medida antes da alocação. Medir depois não pode corrigir uma decisão que já consumiu todo o saldo.
+
+6. TABELAS AUXILIARES E CACHE LAZY
+-----------------------------------
+
+O cache MoE possui:
+
+- bank_sources host;
+- bank_caches GPU;
+- bookkeeping de slots;
+- índices de uso;
+- buffers de cópia;
+- estruturas de overlap;
+- escalas alpha em alguns formatos;
+- geometrias por camada, banco e tipo de quantização.
+
+Foram encontrados e corrigidos dois defeitos no caminho lazy:
+
+1. A geometria não era registrada corretamente durante a contagem preliminar. Isso podia somar o custo de uma geometria repetida mais de uma vez por camada.
+2. dict.setdefault() recebia torch.empty() como argumento. Em Python, o argumento é avaliado antes da chamada, portanto um tensor novo podia ser alocado mesmo quando a chave já existia.
+
+Também foi removido um segundo limitador que subtraía uma reserva fixa de 1 GiB diretamente do free_bytes no cache lazy. Esse valor não vinha do ledger e criava uma política paralela.
+
+O dimensionamento lazy independente foi removido. A intenção atual é que o ledger forneça o único plano de tamanho do cache.
+
+7. ESCALAS AUXILIARES NVFP4
+----------------------------
+
+Em alguns formatos, bancos de experts possuem escalas auxiliares GPU, como gate_up_alpha e down_alpha.
+
+O engine agora calcula os bytes dessas escalas antes de resolver o cache automático e cobra uma linha persistent chamada cache:expert-auxiliary.
+
+Na medição posterior do cache, esses bytes são subtraídos do total medido antes de calcular cache:expert, para evitar cobrança dupla.
+
+Esse ajuste é importante porque as escalas não crescem com cache_size, mas precisam estar presentes no orçamento fixo antes da divisão entre KV e slots.
+
+8. CALIBRAÇÃO ATUAL
+-------------------
+
+Depois da criação dos pools e do graph runner, _calibrate_vram_ledger():
+
+- lê torch.cuda.memory_allocated();
+- grava measured:allocator-held como diagnóstico;
+- compara max_memory_allocated menos a base do probe;
+- grava measured:transient-peak;
+- imprime o relatório do ledger;
+- calcula diferença entre memória segurada pelo allocator e memória explicada pelo ledger;
+- emite warning se a diferença superar CALIBRATION_TOLERANCE.
+
+As linhas MEASURED não entram normalmente no total de consumidores para evitar contagem dupla. O pico medido pode, contudo, elevar reserve_bytes para decisões posteriores dentro do mesmo processo.
+
+O que ainda não existe:
+
+- arquivo persistente por GPU UUID;
+- chave por modelo e variante de quantização;
+- chave por Turbo3/Turbo4;
+- chave por contexto/chunk/batch;
+- validade e expiração de uma calibração;
+- prova de que um perfil calibrado em uma configuração é seguro em outra;
+- comando automático que faça uma única calibração de memória e reutilize o resultado de forma validada.
+
+O perfil benchbw existente é voltado a bandwidth e escolha de backend MoE híbrido. Ele não é, por si só, um perfil completo de pico de VRAM para este planner.
+
+9. EVIDÊNCIAS DOS LOGS
+----------------------
+
+9.1 Caso automático com contexto explícito
+
+Arquivo: benchmarks/results/campaign-20260920/auto-context-16k-k0.log
+
+Valores registrados:
+
+- memória livre inicial: 15,18 GiB;
+- plano: pool budget 3,369 GiB;
+- experts: 1.262 slots, 3,259 GiB;
+- KV: 259 páginas úteis, 16.576 tokens;
+- KV: 0,110 GiB;
+- GDN prefill modelado: 0,835 GiB para chunk de 8.192;
+- memória livre após inicialização: 1,24 GiB;
+- committed reportado: 15,179 GiB;
+- ceiling reportado: 13,922 GiB;
+- headroom próximo de zero.
+
+Durante o prefill, houve tentativa de alocar aproximadamente 192 MiB com aproximadamente 171 MiB livres. O backend caiu por OOM antes de produzir resultado JSON válido.
+
+9.2 Caso 4K com cache lazy
+
+Arquivo: benchmarks/results/campaign-20260920/freetoken-lazy-cache512.log
+
+- memória livre inicial: 15,18 GiB;
+- memória livre após inicialização: 2,31 GiB;
+- KV: 4.311 páginas úteis;
+- KV: 6,514 GiB;
+- experts: 81 slots;
+- experts: 0,438 GiB;
+- GDN modelado: 0,835 GiB;
+- committed: 15,166 GiB;
+- ceiling: 13,485 GiB com ratio histórico 0,9;
+- headroom reportado: aproximadamente 0,013 GiB.
+
+Esse log mostra que o plano consegue ser aritmeticamente próximo do limite, mas também mostra que o conceito histórico de ratio ainda aparece em artefatos antigos.
+
+9.3 Caso lazy com grande KV
+
+Arquivo: benchmarks/results/campaign-20260920/freetoken-lazy-boot-fixed3.log
+
+- pool budget: 6,961 GiB;
+- experts: 24.576 slots, 0,136 GiB;
+- KV: 4.516 páginas úteis;
+- KV: 289.024 tokens;
+- memória livre após inicialização: 2,00 GiB.
+
+Esse resultado não certifica contexto de 256K; ele apenas registra que a inicialização chegou a produzir esse plano em uma configuração lazy específica.
+
+10. STATUS DE mem-ratio
+------------------------
+
+O estado atual não é uma remoção completa de mem-ratio.
+
+Implementado:
+
+- default de EngineConfig.memory_ratio alterado para 1.0;
+- abertura do ledger em alguns caminhos usa memory_ratio=1.0;
+- benchmark bench_pp_tg.py deixou de injetar automaticamente --memory-ratio;
+- o contexto explícito passou a usar plan_for_context;
+- o cálculo principal não depende mais do usuário escolher 0,8, 0,9 ou 0,99 para o caso padrão.
+
+Ainda presente:
+
+- campo memory_ratio na EngineConfig;
+- opção --memory-ratio no CLI;
+- funções ceiling_bytes e net_cache_budget_bytes que aceitam ratio;
+- documentação e mensagens internas que mencionam ratio;
+- testes históricos parametrizados por ratio;
+- função _startup_kv_budget ainda existente;
+- cálculo de ceiling que ainda conceitualmente usa ratio.
+
+Conclusão: o usuário não deveria precisar caçar essa flag no fluxo automático atual, mas a arquitetura ainda carrega compatibilidade e dependência histórica.
+
+11. MTP
+-------
+
+A equivalência MTP foi obtida em uma configuração de 4K usando replay completo dos tokens aceitos.
+
+Resultado registrado:
+
+- SHA1 comum: 2263f0aae97e;
+- k=1 a k=6 coincidiram com o baseline nesse teste;
+- baseline aproximadamente 25,3–25,5 tokens/s;
+- k=1 aproximadamente 11,05;
+- k=2 aproximadamente 8,44;
+- k=3 aproximadamente 7,54;
+- k=4 aproximadamente 7,00;
+- k=5 aproximadamente 6,48;
+- k=6 aproximadamente 5,79.
+
+Isso demonstra equivalência nesse cenário, mas não demonstra que o caminho zero-replay está correto nem que o desempenho está resolvido.
+
+12. TESTES E VALIDAÇÃO
+----------------------
+
+Última CI completa registrada após as mudanças recentes:
+
+- 1.957 testes aprovados;
+- 206 ignorados;
+- 15 deselecionados;
+- aproximadamente 140 segundos;
+- lint passou;
+- mypy passou;
+- ruff passou.
+
+Suites específicas do ledger/cache/offload também passaram, totalizando 80 testes na rodada focada.
+
+O benchmark GPU de 16K ainda não tem resultado final válido. As últimas tentativas não produziram JSON e deixaram o processo do servidor vivo até serem encerradas. O harness recebeu melhorias de espera por PID/pidfd, mas a execução ainda precisa ser repetida e concluída corretamente.
+
+13. PROBLEMAS AINDA ABERTOS
+----------------------------
+
+1. O planner pode preencher o orçamento com experts até deixar margem quase zero antes de um prefill real.
+2. O pico GDN é estimado, não medido previamente para cada hardware e configuração.
+3. Arena de autotune, workspace, graph capture e fragmentação ainda possuem componentes fixos/estimados.
+4. O contexto total e o chunk de prefill ainda são conceitos diferentes, mas não existe um solver completo que determine o maior chunk seguro a partir do orçamento físico restante.
+5. O ledger é atualizado depois que alguns consumidores já foram alocados, portanto calibração posterior não desfaz uma decisão inicial excessivamente agressiva.
+6. Não existe calibração persistente validada por hardware, modelo, formato KV e contexto.
+7. O benchmark ainda precisa detectar e propagar corretamente todos os modos de queda do backend sem deixar processos órfãos.
+8. Turbo3 e Turbo4 ainda não foram validados de forma completa no contexto 16K com o novo caminho.
+9. MTP k=1–6 só foi validado no cenário 4K com replay completo, não no cenário final 16K automático.
+10. O caminho GGUF lazy possui alterações extensas que ainda precisam de auditoria e certificação independente.
+
+14. O QUE SERIA UMA CORREÇÃO COMPLETA
+--------------------------------------
+
+Uma correção completa deve:
+
+- remover o ratio como entrada operacional do solver;
+- medir a memória física disponível e os consumidores residentes;
+- materializar ou calcular exatamente todas as estruturas fixas antes da divisão;
+- obter o custo do KV diretamente do backend Turbo3/Turbo4 selecionado;
+- reservar o contexto solicitado antes de escolher experts;
+- resolver o chunk de prefill a partir do maior pico financiável, sem reduzir o contexto total;
+- usar o mesmo plano para cache MoE e pool KV;
+- rejeitar o plano se não houver saldo para os mínimos reais do backend;
+- calibrar temporários com um probe controlado por hardware;
+- persistir calibração com chave composta por GPU, modelo, quantização, backend KV e batch;
+- invalidar o perfil quando driver, arquitetura, dtype ou backend mudarem;
+- registrar no log o plano, as premissas e a margem física restante;
+- validar o plano com baseline 16K, Turbo3, Turbo4 e MTP k=1–6;
+- só então habilitar certificações maiores.
+
+15. CONCLUSÃO
+--------------
+
+O sistema atual já possui um ledger central, cálculo por bytes, suporte a contexto prioritário e integração com o formato KV. Também foram corrigidos defeitos concretos de geometria lazy, alocação duplicada e cobrança antecipada de escalas auxiliares.
+
+Entretanto, a execução automática ainda não está comprovada para o objetivo final de 16K. O principal risco restante é a diferença entre reservas estimadas pelo ledger e picos temporários reais do forward GDN/backend, combinada com o preenchimento agressivo do saldo por cache de experts.
+
+O estado correto é: a base do cálculo automático existe e os testes unitários/CI passam, mas ainda falta concluir o solver físico/calibrado e validar o caminho real de 16K sem OOM.
