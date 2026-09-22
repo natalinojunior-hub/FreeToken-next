@@ -161,11 +161,18 @@ class GGUFLMHead(GGUFLinear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from freetoken.core import get_global_ctx
 
-        batch = get_global_ctx().batch
-        if batch.is_prefill:
-            indices = batch.attn_metadata.get_last_indices(batch.size)
-            x = x[indices].contiguous()
-        return super().forward(x)
+        return super().forward(select_head_rows(x, get_global_ctx().batch))
+
+
+def select_head_rows(x: torch.Tensor, batch) -> torch.Tensor:
+    """Rows an LM head must score on prefill: each request's last row, or every drafted
+    position of a spec-decode verify (``spec_logits_indices``) -- as ``ParallelLMHead``."""
+    if not batch.is_prefill:
+        return x
+    indices = batch.spec_logits_indices
+    if indices is None:
+        indices = batch.attn_metadata.get_last_indices(batch.size)
+    return x[indices].contiguous()
 
 
 class GGUFMergedLinear(BaseOP):

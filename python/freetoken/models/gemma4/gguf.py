@@ -330,12 +330,9 @@ class GGUFTiedLMHead:
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from freetoken.core import get_global_ctx
-        from freetoken.layers.gguf import fused_mul_mat_gguf
+        from freetoken.layers.gguf import fused_mul_mat_gguf, select_head_rows
 
-        batch = get_global_ctx().batch
-        if batch.is_prefill:
-            indices = batch.attn_metadata.get_last_indices(batch.size)
-            x = x[indices].contiguous()
+        x = select_head_rows(x, get_global_ctx().batch)
         return fused_mul_mat_gguf(x, self._embedding.qweight, self._quant_type)
 
 

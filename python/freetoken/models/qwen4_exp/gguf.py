@@ -21,6 +21,7 @@ from freetoken.models.qwen3_5_moe.gguf_experts import (
     gguf_expert_types,
     load_gguf_expert_sources,
 )
+from freetoken.models.qwen3_5_moe.gguf import _ungroup_packed_rows, _ungroup_v
 from freetoken.models.qwen4_exp.config import Qwen4ExpArgs, Qwen4ExpMTPConfig, ple_slot_states
 
 if TYPE_CHECKING:
@@ -144,6 +145,37 @@ def _to_f32(t, device=None) -> torch.Tensor:
     return _dense(t, torch.float32, device=device)
 
 
+def _plus_one_norm(t, device=None) -> torch.Tensor:
+    """A (1+w) RMSNorm weight, back to the checkpoint's zero-centered ``w``.
+
+    llama.cpp's converter folds the +1 into every Qwen4ExpTextRMSNorm tensor it writes
+    (measured: GGUF - HF == +1.0000 exactly, std 0, for hc/ple/q/k/indexer/MTP norms),
+    while GroupedPlusOneRMSNorm / GemmaPlusOneRMSNorm apply (1+w) at runtime -- loading the
+    GGUF value raw scales every norm by 2+w. ``ssm_norm`` (GatedRMSNorm, plain w) is not shifted.
+    """
+    return (_to_f32(t, device=device) - 1.0).to(torch.bfloat16)
+
+
+def _ungroup_packed_cols(t, num_k_heads: int, num_v_per_k: int, head_dim: int) -> torch.Tensor:
+    """Un-tile the V-head COLUMNS of a packed ``ssm_out`` without dequantizing.
+
+    qwen3_5_moe's loader densifies this tensor because a 128-wide head straddles 256-element
+    k-quant blocks; a head that is a whole number of blocks permutes as raw bytes instead.
+    """
+    from freetoken.models.gguf.dequant import BLOCK_SHAPE
+
+    block, type_size = BLOCK_SHAPE[int(t.ggml_type)]
+    if head_dim % block:
+        raise NotImplementedError(
+            f"{t.name}: V head of {head_dim} columns straddles {block}-element "
+            f"ggml type {t.ggml_type} blocks; un-tiling it needs a dense out_proj"
+        )
+    head_bytes = head_dim // block * type_size
+    packed = t.packed()
+    rows = packed.reshape(t.rows, -1)
+    return _ungroup_v(rows, 1, num_k_heads, num_v_per_k, head_bytes).reshape(packed.shape)
+
+
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     """Parse qwen4exp GGUF metadata into ModelConfig."""
     num_layers = int(_kv(shim, "block_count"))
@@ -198,7 +230,8 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
             key_head_dim=state_size,
             value_head_dim=state_size,
             conv_kernel_dim=conv_kernel,
-            output_gate="silu",
+            # HF config.json output_gate_type is "sigmoid"; the GGUF carries no such key
+            output_gate=str(_kv(shim, "ssm.output_gate_type", "sigmoid")),
         ),
     )
 
@@ -440,6 +473,13 @@ def iter_gguf_weights(
     shim = build_gguf_shim(shard1_path)
     config = parse_gguf_config(shim)
     qwen4_args = config.qwen4_args
+    # llama.cpp stores GDN V heads TILED when K heads < V heads; FreeToken wants them grouped
+    # (see qwen3_5_moe/gguf.py _ungroup_v). Every tensor indexing the V-head axis is un-tiled.
+    gdn = next(g for g in config.attention_groups if isinstance(g, LinearGatedDeltaGroupConfig))
+    vK, vD = gdn.num_key_heads, gdn.value_head_dim
+    vR = gdn.num_value_heads // vK
+    untile = vK != gdn.num_value_heads
+    qk_rows = 2 * vK * gdn.key_head_dim
 
     qkv_buf: dict[int, dict[str, torch.Tensor]] = {}
     index_buf: dict[int, dict[str, torch.Tensor]] = {}
@@ -466,7 +506,7 @@ def iter_gguf_weights(
             elif name == "output.weight":
                 yield "lm_head.qweight", t.packed()
             elif name == "output_hc_norm.weight":
-                yield "model.hyper_connection_mixer.hc_norm.weight", _to_bf16(t)
+                yield "model.hyper_connection_mixer.hc_norm.weight", _plus_one_norm(t)
             elif name == "output_hc_up.weight":
                 yield "model.hyper_connection_mixer.input_mix_weight_up.qweight", t.packed()
             elif name == "output_hc_down.weight":
@@ -480,10 +520,10 @@ def iter_gguf_weights(
 
         # HC norm & up projections
         if suffix == "hc_attn_norm.weight":
-            yield f"{base}.attn_hyper_connection.hc_norm.weight", _to_bf16(t)
+            yield f"{base}.attn_hyper_connection.hc_norm.weight", _plus_one_norm(t)
             continue
         if suffix == "hc_ffn_norm.weight":
-            yield f"{base}.mlp_hyper_connection.hc_norm.weight", _to_bf16(t)
+            yield f"{base}.mlp_hyper_connection.hc_norm.weight", _plus_one_norm(t)
             continue
         if suffix == "hc_attn_up.weight":
             yield f"{base}.attn_hyper_connection.input_mix_weight_up.qweight", t.packed()
@@ -565,13 +605,13 @@ def iter_gguf_weights(
             yield f"{base}.ple.conv1d.weight", _to_bf16(t, device=device).view(-1, 1, t.shape[-1])
             continue
         if suffix == "ple_norm_conv.weight":
-            yield f"{base}.ple.norm_conv.weight", _to_bf16(t, device=device)
+            yield f"{base}.ple.norm_conv.weight", _plus_one_norm(t, device=device)
             continue
         if suffix == "ple_norm_key.weight":
-            yield f"{base}.ple.norm_key.weight", _to_bf16(t, device=device)
+            yield f"{base}.ple.norm_key.weight", _plus_one_norm(t, device=device)
             continue
         if suffix == "ple_norm_query.weight":
-            yield f"{base}.ple.norm_query.weight", _to_bf16(t, device=device)
+            yield f"{base}.ple.norm_query.weight", _plus_one_norm(t, device=device)
             continue
         if suffix == "ple_key.weight":
             yield f"{base}.ple.key_proj.qweight", t.packed()
@@ -582,27 +622,39 @@ def iter_gguf_weights(
 
         # GDN layers
         if suffix == "ssm_conv1d.weight":
-            yield (
-                f"{base}.linear_attn.conv1d.weight",
-                _to_bf16(t, device=device).view(-1, 1, t.shape[-1]),
-            )
+            w = _to_bf16(t, device=device)
+            if untile:
+                # channels are [q | k | v]; only the V block is tiled
+                w = torch.cat([w[:qk_rows], _ungroup_v(w[qk_rows:], 0, vK, vR, vD)], dim=0)
+            yield f"{base}.linear_attn.conv1d.weight", w.view(-1, 1, t.shape[-1])
             continue
         if suffix == "ssm_norm.weight":
             yield f"{base}.linear_attn.norm.weight", _to_bf16(t)
             continue
         if suffix == "ssm_out.weight":
-            yield f"{base}.linear_attn.out_proj.qweight", t.packed()
+            w = _ungroup_packed_cols(t, vK, vR, vD) if untile else t.packed()
+            yield f"{base}.linear_attn.out_proj.qweight", w
             continue
         if suffix == "ssm_a":
             a = _to_f32(t)
+            if untile:
+                a = _ungroup_v(a, 0, vK, vR, 1)
             yield f"{base}.linear_attn.A_log", torch.log(-a) if bool((a < 0).all()) else a
             continue
         if suffix == "ssm_dt.bias":
-            yield f"{base}.linear_attn.dt_bias", _to_f32(t)
+            dt = _to_f32(t)
+            yield f"{base}.linear_attn.dt_bias", _ungroup_v(dt, 0, vK, vR, 1) if untile else dt
             continue
         if suffix in ("attn_qkv.weight", "attn_gate.weight", "ssm_beta.weight", "ssm_alpha.weight"):
             key = suffix.split(".")[0].replace("attn_", "").replace("ssm_", "")
-            in_proj_buf.setdefault(layer, {})[key] = t.packed()
+            w = t.packed()
+            if untile:
+                # whole rows permute safely on packed data (each row is its own block run)
+                if key == "qkv":
+                    w = torch.cat([w[:qk_rows], _ungroup_packed_rows(w[qk_rows:], vK, vR, vD)])
+                else:
+                    w = _ungroup_packed_rows(w, vK, vR, vD if key == "gate" else 1)
+            in_proj_buf.setdefault(layer, {})[key] = w
             slots = in_proj_buf[layer]
             if len(slots) == 4:
                 types = [
@@ -631,10 +683,10 @@ def iter_gguf_weights(
             yield f"{base}.self_attn.o_proj.qweight", t.packed()
             continue
         if suffix == "attn_q_norm.weight":
-            yield f"{base}.self_attn.q_norm.weight", _to_bf16(t)
+            yield f"{base}.self_attn.q_norm.weight", _plus_one_norm(t)
             continue
         if suffix == "attn_k_norm.weight":
-            yield f"{base}.self_attn.k_norm.weight", _to_bf16(t)
+            yield f"{base}.self_attn.k_norm.weight", _plus_one_norm(t)
             continue
         if suffix in ("attn_q.weight", "attn_k.weight", "attn_v.weight"):
             k = suffix.split(".")[0].replace("attn_", "")
@@ -660,10 +712,10 @@ def iter_gguf_weights(
 
         # QSA indexer
         if suffix == "indexer.q_norm.weight":
-            yield f"{base}.self_attn.indexer.q_layernorm.weight", _to_bf16(t)
+            yield f"{base}.self_attn.indexer.q_layernorm.weight", _plus_one_norm(t)
             continue
         if suffix == "indexer.k_norm.weight":
-            yield f"{base}.self_attn.indexer.k_layernorm.weight", _to_bf16(t)
+            yield f"{base}.self_attn.indexer.k_layernorm.weight", _plus_one_norm(t)
             continue
         if suffix in ("indexer.q_proj.weight", "indexer.k_proj.weight"):
             k = suffix.split(".")[1].replace("_proj", "")
@@ -781,13 +833,13 @@ def iter_gguf_mtp_weights(
                 yield "mtp.fc_hidden.weight", raw[:, hidden_dim:]
                 continue
             if nextn_suffix == "enorm.weight":
-                yield "mtp.pre_fc_norm_embedding.weight", _to_bf16(t, device=device)
+                yield "mtp.pre_fc_norm_embedding.weight", _plus_one_norm(t, device=device)
                 continue
             if nextn_suffix == "hnorm.weight":
-                yield "mtp.pre_fc_norm_hidden.weight", _to_bf16(t, device=device)
+                yield "mtp.pre_fc_norm_hidden.weight", _plus_one_norm(t, device=device)
                 continue
             if nextn_suffix == "hc_head_norm.weight":
-                yield "mtp.hyper_connection_mixer.hc_norm.weight", _to_bf16(t, device=device)
+                yield "mtp.hyper_connection_mixer.hc_norm.weight", _plus_one_norm(t, device=device)
                 continue
             if nextn_suffix == "hc_head_up.weight":
                 yield (
@@ -804,10 +856,10 @@ def iter_gguf_mtp_weights(
 
         # HC norm & up projections
         if suffix == "hc_attn_norm.weight":
-            yield f"{base}.attn_hyper_connection.hc_norm.weight", _to_bf16(t, device=device)
+            yield f"{base}.attn_hyper_connection.hc_norm.weight", _plus_one_norm(t, device=device)
             continue
         if suffix == "hc_ffn_norm.weight":
-            yield f"{base}.mlp_hyper_connection.hc_norm.weight", _to_bf16(t, device=device)
+            yield f"{base}.mlp_hyper_connection.hc_norm.weight", _plus_one_norm(t, device=device)
             continue
         if suffix == "hc_attn_up.weight":
             yield (
@@ -889,10 +941,10 @@ def iter_gguf_mtp_weights(
             yield f"{base}.self_attn.o_proj.weight", _to_bf16(t, device=device)
             continue
         if suffix == "attn_q_norm.weight":
-            yield f"{base}.self_attn.q_norm.weight", _to_bf16(t, device=device)
+            yield f"{base}.self_attn.q_norm.weight", _plus_one_norm(t, device=device)
             continue
         if suffix == "attn_k_norm.weight":
-            yield f"{base}.self_attn.k_norm.weight", _to_bf16(t, device=device)
+            yield f"{base}.self_attn.k_norm.weight", _plus_one_norm(t, device=device)
             continue
         if suffix in ("attn_q.weight", "attn_k.weight", "attn_v.weight"):
             k = suffix.split(".")[0].replace("attn_", "")
@@ -908,10 +960,10 @@ def iter_gguf_mtp_weights(
 
         # QSA indexer
         if suffix == "indexer.q_norm.weight":
-            yield f"{base}.self_attn.indexer.q_layernorm.weight", _to_bf16(t, device=device)
+            yield f"{base}.self_attn.indexer.q_layernorm.weight", _plus_one_norm(t, device=device)
             continue
         if suffix == "indexer.k_norm.weight":
-            yield f"{base}.self_attn.indexer.k_layernorm.weight", _to_bf16(t, device=device)
+            yield f"{base}.self_attn.indexer.k_layernorm.weight", _plus_one_norm(t, device=device)
             continue
         if suffix in ("indexer.q_proj.weight", "indexer.k_proj.weight"):
             k = suffix.split(".")[1].replace("_proj", "")
