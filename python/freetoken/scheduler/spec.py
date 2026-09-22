@@ -109,6 +109,9 @@ class SchedulerSpecMixin:
     def _spec_snapshot_slot(self, req: Req) -> int:
         slot = self._spec_snapshot_slots.get(req.uid)
         if slot is None:
+            if self.cache_manager.is_hybrid:
+                # Shares the free list with radix snapshots, which may have drained it.
+                self.cache_manager.ensure_mamba_slots(1)
             slot = self.engine.linear_state_pool.alloc(1)[0]
             self._spec_snapshot_slots[req.uid] = slot
         return slot
@@ -249,6 +252,19 @@ class SchedulerSpecMixin:
                     self.cache_manager.free_spec_reject(
                         req, keep_len=keep_device, alloc_len=spec_alloc_len
                     )
+                # cache_req(finished=True) (via _free_req_resources) uses req.cached_len as the
+                # "KV already written" boundary, same as normal decode's complete_one lag -- but
+                # that lag is only real for the k+1'th (bonus/correction) token, which is a fresh
+                # sample never fed through the verify forward. Every other committed token WAS
+                # fed as the verify batch's own input (drafts at positions [d, d+k)) and already
+                # has written KV. Finishing on one of those (committed <= k) with cached_len left
+                # at keep_cached excludes that token's own page from both insert_prefix and the
+                # tail-free -- and free_spec_reject starts its range one page later -- so a page
+                # landing exactly on that boundary is neither freed nor retained: orphaned. This
+                # produced the live 'free_pages + cache_pages != num_pages' idle-check crash.
+                k = spec_alloc_len - start_pos
+                req.cached_len = start_pos + min(committed, k)
+                req.device_len = req.cached_len + 1
                 self.decode_manager.remove_req(req)
                 self._free_req_resources(req)
                 self.finished_reqs.add(req)
@@ -325,13 +341,11 @@ class SchedulerSpecMixin:
         with self.engine.ctx.forward_batch(db):
             r_prev = mtp.forward(r_prev, tok_prev, db)
             logits = model.lm_head.forward(mtp.to_head(r_prev))
-        probs = torch.softmax(logits, dim=-1)
-        top1_prob = probs.max().item()
-
         controller = getattr(self, "_adaptive_mtp_controller", None)
-        if controller is not None and top1_prob < controller.config.min_draft_prob:
-            # Low confidence: skip speculation, fall back to normal decode
-            return False
+        if controller is not None:
+            top1_prob = torch.softmax(logits, dim=-1).max().item()
+            if top1_prob < controller.config.min_draft_prob:
+                return False
 
         tok_prev = torch.argmax(logits, dim=-1)
         drafts.append(int(tok_prev.item()))

@@ -68,6 +68,12 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # Page-table ownership high-water mark (page index, not token position): the request may
+    # legitimately own pages beyond what `div_ceil(cached_len, page_size)` implies, e.g. a
+    # speculative-decode rollback that lands cached_len exactly on a page boundary after a
+    # page was already allocated for a since-rejected draft one token into that page.
+    # allocate_paged/free_spec_reject keep this in sync; see CacheManager.allocate_paged.
+    alloc_page_bound: int = 0
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

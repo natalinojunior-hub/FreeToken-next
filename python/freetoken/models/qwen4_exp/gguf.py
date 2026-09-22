@@ -322,6 +322,10 @@ def convert_qwen4exp_to_gguf(model, config: ModelConfig, *, model_path: str) -> 
         embedding_dim=config.hidden_size,
         quant_type=qt(-1, "token_embd.weight"),
     )
+    # The MTP head shares the token embedding by reference; re-point it at the
+    # GGUF module, else it keeps the replaced (never-loaded, meta) embedding.
+    if getattr(model, "mtp", None) is not None:
+        model.mtp._embed_ref = inner.embed_tokens
     if not config.tie_word_embeddings and hasattr(model, "lm_head"):
         from freetoken.layers.gguf import GGUFLMHead
 

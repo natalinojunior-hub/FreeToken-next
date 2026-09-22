@@ -14,6 +14,7 @@ multi-stage solver that:
 from __future__ import annotations
 
 import gc
+import dataclasses
 import math
 import os
 from dataclasses import dataclass, field
@@ -40,7 +41,6 @@ from .vram_ledger import (
     CALIBRATION_TOLERANCE,
     Kind,
     Charge,
-    gdn_prefill_bytes,
     modelled_reserves,
     open_ledger,
     page_table_bytes,
@@ -51,6 +51,23 @@ logger = init_logger(__name__)
 
 _MIB = 1 << 20
 _GIB = 1 << 30
+_MIN_CHUNK = 256
+_MAX_PROBE_CHUNK = 8192
+_CHUNK_LADDER = (256, 512, 1024, 2048, 4096, 8192)
+
+
+class _AllocMeter:
+    """Attribute allocator growth to consecutive constructors."""
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.mark = torch.cuda.memory_allocated(device)
+        self.actual: Dict[str, int] = {}
+
+    def took(self, owner: str) -> None:
+        now = torch.cuda.memory_allocated(self.device)
+        self.actual[owner] = now - self.mark
+        self.mark = now
 
 
 @dataclass(frozen=True)
@@ -103,6 +120,18 @@ def take_physical_snapshot(
     )
 
 
+def log_reconciliation(stage: str, planned: Dict[str, int], actual: Dict[str, int]) -> None:
+    """Log PLANNED | ACTUAL | DELTA per memory owner; warn on unexplained > 128 MiB."""
+    logger.info_rank0(f"  [{stage}] owner | PLANNED | ACTUAL | DELTA")
+    for owner in planned.keys() | actual.keys():
+        p, a = planned.get(owner, 0), actual.get(owner, 0)
+        line = f"  [{stage}] {owner} | {p / _MIB:.1f} MiB | {a / _MIB:.1f} MiB | {(a - p) / _MIB:+.1f} MiB"
+        if abs(a - p) > 128 * _MIB:
+            logger.warning_rank0(line)
+        else:
+            logger.info_rank0(line)
+
+
 @dataclass(frozen=True)
 class StaticCostModel:
     """Exactly calculable memory costs before any allocation."""
@@ -139,14 +168,19 @@ class StaticCostModel:
         return self.gdn_state_bytes_per_slot * self.gdn_num_slots
 
     def fixed_overhead_bytes(self) -> int:
-        """All non-negotiable fixed costs EXCEPT model weights.
+        """All non-negotiable fixed costs EXCEPT model weights and KV.
 
-        Weights are already accounted for in the physical budget (post-mandatory snapshot).
+        KV's fixed cost and dummy page are priced by every `kv_bytes`
+        computation (`kv_bytes_for_context` and its inline equivalents at
+        each solver call site) -- including them here too double-charged the
+        same bytes against the budget (confirmed: the joint-solver invariant
+        tripped once the transient reserve below became accurate enough that
+        this double-charge was the binding constraint, not slack it hid
+        inside before). Weights are already accounted for in the physical
+        budget (post-mandatory snapshot).
         """
         return (
-            self.kv_fixed_bytes
-            + self.dummy_page_bytes
-            + self.gdn_state_total_bytes()
+            self.gdn_state_total_bytes()
             + self.page_table_bytes
             + self.expert_auxiliary_bytes
             + self.quantization_side_tables
@@ -157,28 +191,25 @@ class StaticCostModel:
 
 @dataclass(frozen=True)
 class RuntimeCalibration:
-    """Measured runtime-dependent memory costs."""
+    """Measured runtime-dependent memory costs (Phase D)."""
 
-    triton_autotune_peak: int
-    backend_workspace_peak: int
+    chunk_lo: int
+    transient_lo: int
+    chunk_hi: int
+    transient_hi: int
+    lazy_persistent: int
     graph_capture_peak: int
     graph_pool_size: int
-    gdn_prefill_peak: int
-    activation_peak: int
-    allocator_fragmentation: int
-    non_pytorch_overhead: int
+    non_pytorch_growth: int
 
-    def total_transient_peak(self) -> int:
-        return (
-            self.triton_autotune_peak
-            + self.backend_workspace_peak
-            + self.graph_capture_peak
-            + self.gdn_prefill_peak
-            + self.activation_peak
-        )
-
-    def total_semi_persistent(self) -> int:
-        return self.graph_pool_size + self.backend_workspace_peak
+    def transient_at(self, chunk: int) -> int:
+        """Prefill transient at ``chunk`` (<= chunk_hi): linear between the two
+        measured points; below chunk_lo the smaller measurement bounds it."""
+        assert chunk <= self.chunk_hi, (chunk, self.chunk_hi)
+        if chunk <= self.chunk_lo:
+            return self.transient_lo
+        slope = max(0, self.transient_hi - self.transient_lo) / (self.chunk_hi - self.chunk_lo)
+        return self.transient_lo + math.ceil(slope * (chunk - self.chunk_lo))
 
 
 @dataclass(frozen=True)
@@ -252,6 +283,8 @@ class MemoryPlanner:
         self._probe_linear_pool = None
         self._probe_attn_backend = None
         self._probe_graph_runner = None
+        self._orig_linear_state_pool = None
+        self._orig_attn_backend = None
 
     # ======================= Phase A: Hardware Baseline =======================
 
@@ -338,22 +371,25 @@ class MemoryPlanner:
         kv_per_page, kv_fixed, page_tokens, min_reserve = self.pool_cls.kv_cost(self.config)
         dummy_page_bytes = kv_per_page  # +1 dummy page
 
-        # GDN state pool - use minimum slots for fixed overhead (max is for decode cache)
-        gdn_slots = _linear_pool_min_slots(self.config)
+        # GDN state pool: fixed_overhead must match what phase_h_construct_final_pools
+        # actually builds (_linear_pool_num_slots, includes the cross-request snapshot
+        # cache), not the bare non-evictable floor (_linear_pool_min_slots). The final
+        # pool is always constructed at num_slots with no smaller fallback, so budgeting
+        # at min_slots under-reserved every plan by (num_slots - min_slots) GDN slots --
+        # a plan the solver approved as fitting could still OOM at final construction.
+        gdn_slots = _linear_pool_num_slots(self.config)
         gdn_bytes_per_slot = state_pool_bytes(self.config, 1)
         gdn_total = gdn_bytes_per_slot * gdn_slots
 
         # Page table
         pt_bytes = page_table_bytes(max_running_req, max_seq_len, page_size)
 
-        # Attention backend fixed cost (ledger constants, but we'll measure later)
-        attn_fixed = 128 * _MIB  # BACKEND_WORKSPACE - will be calibrated
+        # Attention backend construction cost has no closed form: Phase C
+        # measures it; nothing is guessed before that.
+        attn_fixed = 0
 
         # Min/max expert slots
         min_slots = num_experts * (2 if prefill_overlap else 1)
-        if physical_budget_hint := getattr(self, "_physical_budget_hint", None):
-            if min_slots * per_expert + 256 * _MIB > physical_budget_hint:
-                min_slots = num_experts
         max_slots = num_moe_layers * num_experts
         if per_expert == 0:
             raise RuntimeError("Unable to determine expert slot geometry for automatic planning")
@@ -409,7 +445,12 @@ class MemoryPlanner:
         required_pages = self.static_model.kv_pages_for_context(config.max_seq_len)
 
         # Create minimal KV pool
+        logger.info_rank0(
+            f"  Phase C: required_pages={required_pages} for max_seq_len={config.max_seq_len}"
+        )
+        meter = _AllocMeter(self.device)
         kv_pool = create_kv_pool(config, required_pages, device=self.device, dtype=self.dtype)
+        meter.took("kv")
 
         # Create minimal expert cache
         method = self.method
@@ -434,6 +475,7 @@ class MemoryPlanner:
             getattr(self.banks_sources, "down_alpha", None),
         )
         attach_offload_moe_cache(model, expert_cache)
+        meter.took("experts")
 
         # Create linear state pool
         linear_group = config.model_config.linear_attention_group()
@@ -450,6 +492,7 @@ class MemoryPlanner:
             )
         else:
             linear_pool = None
+        meter.took("gdn")
 
         # Create attention backend - need to set probe KV pool on global context
         from freetoken.core import get_global_ctx
@@ -465,12 +508,36 @@ class MemoryPlanner:
                 global_ctx.kv_cache = original_kv_cache
             else:
                 delattr(global_ctx, "kv_cache")
+        meter.took("attn_backend")
+
+        # Reconcile the static model against what these constructors really
+        # allocated. The attention backend's construction-time buffers have no
+        # closed form, so the measurement replaces the placeholder term.
+        sm = self.static_model
+        planned = {
+            "kv": sm.kv_bytes_for_context(config.max_seq_len),
+            "experts": sm.expert_bytes_for_slots(min_experts),
+            "gdn": state_pool_bytes(config, 1) * _linear_pool_min_slots(config)
+            if linear_group is not None
+            else 0,
+            "attn_backend": sm.attention_backend_fixed,
+        }
+        log_reconciliation("Phase C", planned, meter.actual)
+        self.static_model = dataclasses.replace(
+            sm, attention_backend_fixed=meter.actual["attn_backend"]
+        )
 
         self._probe_kv_pool = kv_pool
         self._probe_expert_cache = expert_cache
         self._probe_linear_pool = linear_pool
         self._probe_attn_backend = attn_backend
         self._probe_model = model
+        # Engine.__init__ already built production linear_state_pool/attn_backend
+        # on global_ctx before invoking the planner; save them so cleanup can put
+        # them back instead of leaving the engine permanently pointed at a probe
+        # object or None.
+        self._orig_linear_state_pool = getattr(global_ctx, "linear_state_pool", None)
+        self._orig_attn_backend = getattr(global_ctx, "attn_backend", None)
         global_ctx.linear_state_pool = linear_pool
         global_ctx.attn_backend = attn_backend
 
@@ -480,133 +547,91 @@ class MemoryPlanner:
 
     # ======================= Phase D: Runtime Calibration/Probe =======================
 
-    def phase_d_runtime_calibration(
-        self,
-        config: EngineConfig,
-        model,
-        prefill_chunk: int,
-    ) -> RuntimeCalibration:
-        """Run controlled probe to measure runtime-dependent costs."""
-        logger.info_rank0(f"Phase D: Runtime calibration with chunk={prefill_chunk}...")
+    def _measure_prefill_transient(self, model, config: EngineConfig, chunk: int) -> int:
+        """Bytes the caching allocator must obtain from the driver, on top of
+        everything already resident, to run the worst prefill step at ``chunk``
+        (first chunk + context-final chunk, see _run_validation_prefill).
 
-        # Reset peaks before probe
+        Measured in reserved (not allocated) bytes: reserved is what the driver
+        actually hands out, so allocator rounding/fragmentation is included
+        instead of guessed. Lazily-created persistent tensors are excluded
+        (they are priced once as ``lazy_persistent``)."""
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
-
-        pre_probe = take_physical_snapshot(self.device, reset_peaks=False)
-
-        # Run a representative prefill through the model
-        self._run_probe_prefill(model, prefill_chunk, config)
-
-        post_probe = take_physical_snapshot(self.device, reset_peaks=False)
-
-        # Measure allocator deltas
-        alloc_delta = post_probe.allocator_allocated - pre_probe.allocator_allocated
-        reserved_delta = post_probe.allocator_reserved - pre_probe.allocator_reserved
-        peak_alloc_delta = post_probe.allocator_peak_allocated - pre_probe.allocator_allocated
-        peak_reserved_delta = post_probe.allocator_peak_reserved - pre_probe.allocator_reserved
-
-        # Driver delta
-        driver_delta = pre_probe.driver_free - post_probe.driver_free
-
-        # Non-PyTorch overhead
-        non_pytorch = driver_delta - reserved_delta
-
+        pre_reserved = torch.cuda.memory_reserved(self.device)
+        pre_alloc = torch.cuda.memory_allocated(self.device)
+        self._run_validation_prefill(model, config, chunk, self._probe_kv_pool)
+        torch.cuda.synchronize(self.device)
+        kept = torch.cuda.memory_allocated(self.device) - pre_alloc
+        transient = torch.cuda.max_memory_reserved(self.device) - pre_reserved - kept
         logger.info_rank0(
-            f"  Probe deltas: alloc={mem_GB(alloc_delta)}, "
-            f"reserved={mem_GB(reserved_delta)}, peak_alloc={mem_GB(peak_alloc_delta)}, "
-            f"driver={mem_GB(driver_delta)}, non_pytorch={mem_GB(non_pytorch)}"
+            f"  Prefill transient at chunk={chunk}: {mem_GB(transient)} (kept={mem_GB(kept)})"
+        )
+        return max(0, transient)
+
+    def phase_d_runtime_calibration(self, config: EngineConfig, model) -> RuntimeCalibration:
+        """Measure runtime costs no closed form prices.
+
+        A warm-up forward first creates every lazily-built persistent tensor
+        (autotune caches, backend workspaces). Then the worst prefill transient
+        is measured at two chunk sizes, giving the per-token slope so the solver
+        prices any chunk up to the largest one measured instead of
+        extrapolating a single point.
+        """
+        c_hi = min(config.max_extend_tokens, config.max_seq_len, _MAX_PROBE_CHUNK)
+        logger.info_rank0(f"Phase D: Runtime calibration up to chunk={c_hi}...")
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+        pre_alloc = torch.cuda.memory_allocated(self.device)
+        pre_free = torch.cuda.mem_get_info(self.device)[0]
+        pre_reserved = torch.cuda.memory_reserved(self.device)
+        while True:
+            c_lo = max(_MIN_CHUNK, c_hi // 2)
+            try:
+                self._run_validation_prefill(model, config, c_lo, self._probe_kv_pool)
+                lazy_persistent = torch.cuda.memory_allocated(self.device) - pre_alloc
+                t_lo = self._measure_prefill_transient(model, config, c_lo)
+                t_hi = (
+                    t_lo if c_hi == c_lo else self._measure_prefill_transient(model, config, c_hi)
+                )
+                break
+            except torch.cuda.OutOfMemoryError:
+                # Even the minimal pools leave no room for this chunk: halve it.
+                # A genuine search step, bounded below by _MIN_CHUNK.
+                gc.collect()
+                torch.cuda.empty_cache()
+                if c_hi <= _MIN_CHUNK:
+                    raise
+                logger.warning_rank0(f"  Probe OOM at chunk={c_hi}; halving")
+                c_hi //= 2
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+        non_pytorch = (pre_free - torch.cuda.mem_get_info(self.device)[0]) - (
+            torch.cuda.memory_reserved(self.device) - pre_reserved
         )
 
-        # The peak alloc delta during probe is our measured transient
-        # We need to subtract the static model's known transient estimate
-        # to isolate the truly runtime-dependent portion
-        modelled_transient = self.static_model.fixed_overhead_bytes()  # placeholder
-        # Actually, we want to measure the GDN prefill peak specifically
-        # The modelled GDN prefill is in modelled_reserves
-
-        # For now, use the measured peak alloc as the transient reserve
-        # and decompose it in Phase E
-        measured_transient = peak_alloc_delta
-
-        # Graph capture is separate - measure if enabled
-        graph_peak = 0
-        graph_pool = 0
-        if config.cuda_graph_max_bs and config.cuda_graph_max_bs > 0:
-            graph_peak, graph_pool = self._measure_graph_capture(config, model)
+        graph_peak, graph_pool = self._measure_graph_capture(config, model)
 
         self.runtime_calibration = RuntimeCalibration(
-            triton_autotune_peak=128 * _MIB,  # Will be refined
-            backend_workspace_peak=128 * _MIB,  # Will be refined
+            chunk_lo=c_lo,
+            transient_lo=t_lo,
+            chunk_hi=c_hi,
+            transient_hi=t_hi,
+            lazy_persistent=lazy_persistent,
             graph_capture_peak=graph_peak,
             graph_pool_size=graph_pool,
-            gdn_prefill_peak=measured_transient,  # Will be refined in Phase E
-            activation_peak=0,  # Included in gdn_prefill_peak
-            allocator_fragmentation=64 * _MIB,
-            non_pytorch_overhead=max(0, non_pytorch),
+            non_pytorch_growth=non_pytorch,
         )
-
         logger.info_rank0(f"  Calibration: {self.runtime_calibration}")
         return self.runtime_calibration
-
-    def _run_probe_prefill(self, model, chunk_size: int, config: EngineConfig):
-        """Run a single prefill chunk through the model."""
-        from freetoken.core import Batch, Req, Context
-        from freetoken.attention.linear import build_fla_metadata
-
-        # Create dummy batch with chunk_size tokens
-        dummy_req = Req(
-            input_ids=torch.zeros(chunk_size, dtype=torch.int32, device="cpu"),
-            table_idx=config.max_running_req,
-            cached_len=0,
-            output_len=1,
-            uid=-1,
-            sampling_params=None,
-            cache_handle=None,
-        )
-        batch = Batch(reqs=[dummy_req], phase="prefill")
-        batch.padded_reqs = batch.reqs
-        batch.input_ids = torch.zeros(chunk_size, dtype=torch.int32, device=self.device)
-        batch.positions = torch.arange(chunk_size, dtype=torch.int32, device=self.device)
-        batch.out_loc = torch.arange(chunk_size, dtype=torch.int32, device=self.device)
-
-        # Create page_table for probe and set on global context
-        from freetoken.core import get_global_ctx
-
-        global_ctx = get_global_ctx()
-        aligned_max_seq_len = (
-            (config.max_seq_len + config.page_size - 1) // config.page_size * config.page_size
-        )
-        probe_page_table = torch.zeros(
-            config.max_running_req + 1, aligned_max_seq_len, dtype=torch.int32, device=self.device
-        )
-        global_ctx.page_table = probe_page_table
-
-        # Build attention metadata
-        if hasattr(global_ctx, "attn_backend") and global_ctx.attn_backend is not None:
-            global_ctx.attn_backend.prepare_metadata(batch)
-        fla = build_fla_metadata(batch, self.device)
-        batch.fla_metadata = fla
-        if hasattr(self._probe_kv_pool, "attach_page_table"):
-            self._probe_kv_pool.attach_page_table(probe_page_table)
-        dummy_page = self._probe_required_pages * config.page_size - config.page_size
-        probe_page_table[dummy_req.table_idx].fill_(dummy_page)
-
-        # Run forward
-        with torch.inference_mode(), global_ctx.forward_batch(batch):
-            try:
-                model.forward()
-            except torch.cuda.OutOfMemoryError as e:
-                logger.warning_rank0(f"Probe OOM at chunk {chunk_size}: {e}")
-                raise
-
-        torch.cuda.synchronize(self.device)
 
     def _measure_graph_capture(self, config: EngineConfig, model) -> Tuple[int, int]:
         """Measure CUDA graph capture memory cost."""
         if not config.cuda_graph_max_bs or config.cuda_graph_max_bs <= 0:
             return 0, 0
+
+        from freetoken.core import Req
 
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
@@ -651,229 +676,94 @@ class MemoryPlanner:
 
         return peak, pool_size
 
-    # ======================= Phase E: Exact GDN/FLA Runtime Sizing =======================
+    # ======================= Phase F/G: Canonical Ledger Solve =======================
 
-    def phase_e_gdn_sizing(
-        self,
-        config: EngineConfig,
-        chunk_size: int,
-    ) -> int:
-        """Determine exact GDN prefill allocation for a given chunk size."""
-        logger.info_rank0(f"Phase E: Exact GDN sizing for chunk={chunk_size}...")
+    def ledger(
+        self, config: EngineConfig, chunk: int, expert_slots: int, kv_pages: int
+    ) -> Dict[str, int]:
+        """The canonical VRAM ledger: every byte the plan commits beyond the
+        measured budget, one term per owner.
 
-        linear_group = config.model_config.linear_attention_group()
-        if linear_group is None:
-            return 0
-
-        # The failing allocation: h = k.new_empty(B, NT, H, V, K)
-        # B=1 (batch), NT=ceil(chunk_size/64), H=num_v_heads, V=value_head_dim, K=key_head_dim
-        BT = 64  # FLA chunk size
-        NT = div_ceil(chunk_size, BT)
-        B = 1
-        H = linear_group.num_value_heads
-        V = linear_group.value_head_dim
-        K = linear_group.key_head_dim
-        dtype = self.dtype
-
-        # Exact bytes for h tensor
-        h_bytes = B * NT * H * V * K * dtype.itemsize
-
-        # But we need the SIMULTANEOUSLY live tensors at the peak
-        # The estimator in gdn_prefill_bytes includes:
-        # - conv_in (2*key_dim + value_dim)
-        # - z (value_dim)
-        # - q,k,v copies (2*key_dim + value_dim)
-        # - w,u (2*heads*key_dim)
-        # - A (heads * 64)
-        # - h (v_dim * k_dim / 64) -> this is PER CHUNK, so NT * (V*K/64) = NT*V*K/64
-        #   Wait, the estimator has v_dim * k_dim // GDN_CHUNK_SIZE which is per token?
-        #   Let me re-read: per_token includes v_dim * k_dim // GDN_CHUNK_SIZE
-        #   So for T tokens: T * V*K/64 = (T/64) * V*K = NT * V*K
-        #   This matches h = B * NT * H * V * K for B=1, H=num_v_heads
-
-        # The estimator's h term: tokens * (v_dim * k_dim // 64) * itemsize * batch
-        # = chunk_size * (V*K/64) * itemsize * 1
-        # = (chunk_size/64) * V*K * itemsize
-        # = NT * V*K * itemsize
-        # But the actual allocation is B * NT * H * V * K * itemsize
-        # For H=num_v_heads, these differ by factor of H!
-
-        # The estimator is WRONG - it's missing the H (num_v_heads) factor in the h term
-        # Let's verify: v_dim = H * V, k_dim = K (per head)
-        # Estimator: v_dim * k_dim // 64 = (H*V) * K // 64
-        # Actual h: B * NT * H * V * K
-        # Per token: (B * NT * H * V * K) / chunk_size = (B * H * V * K) / 64
-        # = H * V * K / 64 = v_dim * k_dim / 64
-        # So the estimator IS correct per token!
-
-        # But wait - the estimator multiplies by batch * tokens * itemsize
-        # batch=1, tokens=chunk_size, so: chunk_size * (H*V*K/64) * itemsize
-        # = (chunk_size/64) * H*V*K * itemsize = NT * H*V*K * itemsize
-        # This matches! The estimator is correct.
-
-        # However, the estimator assumes all terms are simultaneously live
-        # We need to verify the actual peak by measuring
-
-        # For now, use the estimator but with exact runtime params
-        exact_gdn = gdn_prefill_bytes(linear_group, chunk_size, dtype.itemsize, batch=1)
-
-        logger.info_rank0(
-            f"  GDN exact: chunk={chunk_size}, NT={NT}, "
-            f"h_shape=({B},{NT},{H},{V},{K}), h_bytes={mem_GB(h_bytes)}, "
-            f"estimator_total={mem_GB(exact_gdn)}"
-        )
-
-        return exact_gdn
-
-    # ======================= Phase F: Prefill Chunk Solver =======================
-
-    def phase_f_solve_prefill_chunk(
-        self,
-        config: EngineConfig,
-        physical_budget: int,
-    ) -> Tuple[int, int]:
-        """Find the largest prefill chunk that fits in physical budget.
-
-        Returns: (prefill_chunk, gdn_peak_bytes)
+        The budget (driver free after weights, CUDA context and probe cleanup)
+        already excludes weights, CUDA context/modules and non-PyTorch runtime
+        growth, so none of those appear here -- subtracting them again would
+        double-count. ``transient`` is the larger of the prefill peak and the
+        graph-capture peak: capture runs once at startup, never during a
+        prefill, so the two never coexist and are not summed.
         """
-        logger.info_rank0("Phase F: Solving prefill chunk size...")
+        sm, rc = self.static_model, self.runtime_calibration
+        return {
+            "gdn_state": sm.gdn_state_total_bytes(),
+            "page_table": sm.page_table_bytes,
+            "expert_aux": sm.expert_auxiliary_bytes,
+            "quant_tables": sm.quantization_side_tables,
+            "staging": sm.staging_buffers,
+            "attn_backend": sm.attention_backend_fixed,
+            "experts": sm.expert_bytes_for_slots(expert_slots),
+            "kv": pool_pages(kv_pages) * sm.kv_bytes_per_page + sm.kv_fixed_bytes,
+            "lazy_persistent": rc.lazy_persistent if rc else 0,
+            "graph_pool": rc.graph_pool_size if rc else 0,
+            "transient": max(rc.transient_at(chunk), rc.graph_capture_peak) if rc else 0,
+        }
 
-        # The chunk size is bounded by:
-        # 1. Scheduler's max_extend_tokens (config.max_extend_tokens)
-        # 2. Physical memory available for transient peak
-        # 3. Must be at least 1 token
+    def infeasible(self, config: EngineConfig, budget: int, ledger: Dict[str, int]) -> RuntimeError:
+        required = sum(ledger.values())
+        owners = ", ".join(
+            f"{k}={mem_GB(v)}" for k, v in sorted(ledger.items(), key=lambda kv: -kv[1])[:5]
+        )
+        return RuntimeError(
+            f"VRAM plan infeasible for max_seq_len={config.max_seq_len}: "
+            f"required={required} bytes ({mem_GB(required)}), available={budget} bytes "
+            f"({mem_GB(budget)}), shortfall={required - budget} bytes "
+            f"({mem_GB(required - budget)}); largest owners: {owners}. "
+            f"Use a compressed --kv-format (turbo3/turbo4), lower "
+            f"--max-running-requests, or free VRAM."
+        )
 
-        max_chunk = config.max_extend_tokens
-        min_chunk = 256  # Minimum viable chunk
+    def phase_fg_solve_chunk_and_experts(
+        self, config: EngineConfig, budget: int
+    ) -> Tuple[int, int, int]:
+        """Solve once against the measured budget.
 
-        # Binary search for largest chunk that fits
-        # We need: fixed_overhead + expert_bytes + kv_bytes + gdn_peak(chunk) <= physical_budget
-        # But expert_bytes and kv_bytes are also variables...
-        # Actually, Phase F solves chunk FIRST assuming minimum expert cache
-        # Then Phase G solves expert cache from residual
+        Priority: the requested context is a hard floor (its KV pages are always
+        funded), then the largest measured-safe prefill chunk that still funds
+        the expert floor, then as many expert slots as fit; the sub-slot
+        remainder becomes extra KV pages. Returns (chunk, expert_slots, kv_pages).
+        """
+        logger.info_rank0("Phase F/G: Solving canonical ledger...")
+        sm, rc = self.static_model, self.runtime_calibration
+        required_pages = sm.kv_pages_for_context(config.max_seq_len)
+        min_bytes = sm.expert_bytes_for_slots(sm.min_expert_slots)
 
-        # For chunk solving, the budget is measured after the minimal probe pools exist.
-        available_transient = physical_budget
+        def residual(chunk: int) -> int:
+            return budget - sum(self.ledger(config, chunk, 0, required_pages).values())
 
-        if available_transient <= 0:
-            raise RuntimeError(
-                f"Insufficient memory for prefill transient: budget={mem_GB(physical_budget)}"
+        candidates = sorted(
+            {c for c in (*_CHUNK_LADDER, rc.chunk_lo, rc.chunk_hi) if c <= rc.chunk_hi},
+            reverse=True,
+        )
+        chunk = next((c for c in candidates if residual(c) >= min_bytes), None)
+        if chunk is None:
+            raise self.infeasible(
+                config,
+                budget,
+                self.ledger(config, candidates[-1], sm.min_expert_slots, required_pages),
             )
-
-        # Binary search for max chunk
-        lo, hi = min_chunk, max_chunk
-        best_chunk = min_chunk
-        best_gdn = 0
-
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            gdn_peak = self.phase_e_gdn_sizing(config, mid)
-
-            # Total transient includes GDN + other measured transients
-            other_transient = (
-                self.runtime_calibration.triton_autotune_peak
-                + self.runtime_calibration.backend_workspace_peak
-                + self.runtime_calibration.graph_capture_peak
-                + self.runtime_calibration.activation_peak
-            )
-            total_transient = gdn_peak + other_transient
-
-            if total_transient <= available_transient:
-                best_chunk = mid
-                best_gdn = gdn_peak
-                lo = mid + 1
-            else:
-                hi = mid - 1
-
+        left = residual(chunk)
+        expert_slots = min(sm.max_expert_slots, left // sm.expert_bytes_per_slot)
+        kv_pages = (
+            required_pages
+            + (left - sm.expert_bytes_for_slots(expert_slots)) // sm.kv_bytes_per_page
+        )
+        ledger = self.ledger(config, chunk, expert_slots, kv_pages)
+        assert sum(ledger.values()) <= budget, (ledger, budget)
         logger.info_rank0(
-            f"  Chunk solver: max_chunk={best_chunk}, gdn_peak={mem_GB(best_gdn)}, "
-            f"available_transient={mem_GB(available_transient)}"
+            f"  chunk={chunk}, expert_slots={expert_slots}, kv_pages={kv_pages}, "
+            f"committed={mem_GB(sum(ledger.values()))} of budget={mem_GB(budget)}"
         )
-        return best_chunk, best_gdn
-
-    # ======================= Phase G: Expert Cache Solver =======================
-
-    def phase_g_solve_expert_cache(
-        self,
-        config: EngineConfig,
-        physical_budget: int,
-        chosen_chunk: int,
-        gdn_peak: int,
-    ) -> Tuple[int, int]:
-        """Solve for expert slots and KV pages from residual budget."""
-        logger.info_rank0("Phase G: Solving expert cache and KV pages...")
-
-        fixed_overhead = self.static_model.fixed_overhead_bytes()
-        required_kv_pages = self.static_model.kv_pages_for_context(config.max_seq_len)
-        required_kv_bytes = self.static_model.kv_bytes_for_context(config.max_seq_len)
-
-        # Other transients
-        other_transient = (
-            self.runtime_calibration.triton_autotune_peak
-            + self.runtime_calibration.backend_workspace_peak
-            + self.runtime_calibration.graph_capture_peak
-            + self.runtime_calibration.activation_peak
-        )
-        total_transient = gdn_peak + other_transient
-
-        # Semi-persistent (graph pool + backend workspace)
-        semi_persistent = (
-            self.runtime_calibration.graph_pool_size
-            + self.runtime_calibration.backend_workspace_peak
-        )
-
-        # Residual after fixed + required KV + transients + semi-persistent
-        residual = (
-            physical_budget - fixed_overhead - required_kv_bytes - total_transient - semi_persistent
-        )
-
-        if residual < 0:
-            raise RuntimeError(
-                f"Residual budget negative after required allocations: "
-                f"budget={mem_GB(physical_budget)}, "
-                f"fixed={mem_GB(fixed_overhead)}, "
-                f"required_kv={mem_GB(required_kv_bytes)}, "
-                f"transient={mem_GB(total_transient)}, "
-                f"semi_persistent={mem_GB(semi_persistent)}, "
-                f"residual={mem_GB(residual)}"
-            )
-
-        # How many expert slots can we afford?
-        per_expert = self.static_model.expert_bytes_per_slot
-        max_affordable_slots = residual // per_expert
-
-        # Clamp to [min, max]
-        expert_slots = max(
-            self.static_model.min_expert_slots,
-            min(max_affordable_slots, self.static_model.max_expert_slots),
-        )
-
-        # Recalculate KV pages with chosen expert slots
-        expert_bytes = expert_slots * per_expert
-        remaining_after_experts = (
-            physical_budget - fixed_overhead - expert_bytes - total_transient - semi_persistent
-        )
-        kv_pages = max(
-            remaining_after_experts // self.static_model.kv_bytes_per_page - 1, required_kv_pages
-        )
-        kv_bytes = (
-            pool_pages(kv_pages) * self.static_model.kv_bytes_per_page
-            + self.static_model.kv_fixed_bytes
-        )
-        kv_tokens = kv_pages * self.static_model.page_tokens
-
-        # Verify total fits
-        total_committed = fixed_overhead + expert_bytes + kv_bytes + semi_persistent
-        # Note: transient is not committed, it's peak headroom
-
-        logger.info_rank0(
-            f"  Expert solver: expert_slots={expert_slots} ({mem_GB(expert_bytes)}), "
-            f"kv_pages={kv_pages} ({kv_tokens} tokens, {mem_GB(kv_bytes)}), "
-            f"total_committed={mem_GB(total_committed)}, "
-            f"transient_reserve={mem_GB(total_transient)}"
-        )
-
-        return expert_slots, kv_pages
+        for owner, nbytes in ledger.items():
+            logger.info_rank0(f"    ledger {owner}: {nbytes / _MIB:.1f} MiB")
+        return chunk, expert_slots, kv_pages
 
     # ======================= Phase H: Final Pool Construction =======================
 
@@ -885,24 +775,16 @@ class MemoryPlanner:
         kv_pages: int,
         prefill_overlap: bool,
     ) -> Tuple[BaseKVCachePool, OffloadMoeCache, Any]:
-        """Construct final pools with validated sizes."""
+        """Build the solved pools exactly as sized (validation-only; engine.py
+        builds the permanent ones with the same geometry) and reconcile each
+        owner against the ledger."""
         logger.info_rank0(
             f"Phase H: Constructing final pools (experts={expert_slots}, kv_pages={kv_pages})..."
         )
-
-        # Destroy probe pools first
-        self._cleanup_probe_artifacts()
-
-        # Verify memory is reclaimed
-        torch.cuda.synchronize(self.device)
-        torch.cuda.empty_cache()
-        post_cleanup = take_physical_snapshot(self.device)
-        logger.info_rank0(f"  Post-cleanup: {post_cleanup}")
-
-        # Build final KV pool
+        meter = _AllocMeter(self.device)
         kv_pool = create_kv_pool(config, kv_pages, device=self.device, dtype=self.dtype)
+        meter.took("kv")
 
-        # Build final expert cache
         method = self.method
         method_slot_limit = method.slot_limit() if method is not None else None
         expert_cache = OffloadMoeCache(
@@ -925,8 +807,8 @@ class MemoryPlanner:
             getattr(self.banks_sources, "down_alpha", None),
         )
         attach_offload_moe_cache(model, expert_cache)
+        meter.took("experts")
 
-        # Build linear state pool
         linear_group = config.model_config.linear_attention_group()
         if linear_group is not None:
             from freetoken.kvcache.linear_state_pool import LinearStatePool
@@ -941,16 +823,37 @@ class MemoryPlanner:
             )
         else:
             linear_pool = None
+        meter.took("gdn_state")
 
-        # Verify final allocation
-        torch.cuda.synchronize(self.device)
-        final_snapshot = take_physical_snapshot(self.device)
-        logger.info_rank0(f"  Final allocation: {final_snapshot}")
-
+        ledger = self.ledger(config, 0, expert_slots, kv_pages)
+        log_reconciliation(
+            "Phase H", {k: ledger[k] for k in ("kv", "experts", "gdn_state")}, meter.actual
+        )
         return kv_pool, expert_cache, linear_pool
 
     def _cleanup_probe_artifacts(self):
-        """Destroy probe artifacts and verify memory reclamation."""
+        """Destroy probe artifacts and verify memory reclamation.
+
+        phase_c_build_minimal_config wires the probe pools into places that
+        outlive the planner's own `_probe_*` attributes: the real model's MoE
+        layers hold `layer.offload_cache` (via attach_offload_moe_cache), and
+        the global context holds `linear_state_pool`/`attn_backend`. Deleting
+        only the planner's references left those strong references alive, so
+        the probe's ~2.6 GiB expert cache was never actually freed -- this is
+        why post-cleanup driver_free previously showed no improvement over
+        post-mandatory. Detach all of them before dropping the objects.
+        """
+        from freetoken.core import get_global_ctx
+
+        if self._probe_model is not None:
+            attach_offload_moe_cache(self._probe_model, None)
+
+        global_ctx = get_global_ctx()
+        global_ctx.linear_state_pool = self._orig_linear_state_pool
+        global_ctx.attn_backend = self._orig_attn_backend
+        self._orig_linear_state_pool = None
+        self._orig_attn_backend = None
+
         for attr in [
             "_probe_graph_runner",
             "_probe_attn_backend",
@@ -981,7 +884,11 @@ class MemoryPlanner:
         linear_pool: Any,
         prefill_chunk: int,
     ) -> Tuple[bool, str]:
-        """Run final validation with real forward pass."""
+        """Run the solved plan's worst prefill on the real final pools.
+
+        Returns (valid, message). No headroom margin: the ledger already priced
+        every owner, so an OOM here is an unpriced owner, reported, not absorbed.
+        """
         logger.info_rank0("Phase I: Final in-situ validation...")
 
         torch.cuda.synchronize(self.device)
@@ -990,59 +897,124 @@ class MemoryPlanner:
 
         pre_val = take_physical_snapshot(self.device)
 
+        # Phase H's pools are validation-only (engine.py builds the real, permanent
+        # kv_cache/linear_state_pool/attn_backend/offload cache after plan() returns),
+        # so wire them onto global_ctx only for the duration of this forward pass and
+        # restore whatever engine.py had configured there beforehand.
+        from freetoken.core import get_global_ctx
+        from freetoken.attention import create_attention_backend
+
+        global_ctx = get_global_ctx()
+        orig_linear_state_pool = getattr(global_ctx, "linear_state_pool", None)
+        orig_attn_backend = getattr(global_ctx, "attn_backend", None)
+        orig_kv_cache = getattr(global_ctx, "kv_cache", None)
+        global_ctx.linear_state_pool = linear_pool
+        global_ctx.kv_cache = kv_pool
+        global_ctx.attn_backend = create_attention_backend(
+            config.attention_backend, config.model_config
+        )
         try:
-            # Run a full prefill at the chosen chunk size
-            self._run_validation_prefill(model, config, prefill_chunk)
+            try:
+                # A single prefill can never exceed max_seq_len tokens regardless of
+                # the scheduler's chunk cap -- validating at prefill_chunk itself
+                # would overrun the KV page table when the requested context is
+                # smaller than the chunk (e.g. small-context smoke tests), which is
+                # not a real validation failure, just an oversized probe request.
+                validation_chunk = min(prefill_chunk, config.max_seq_len)
+                self._run_validation_prefill(model, config, validation_chunk, kv_pool)
 
-            post_val = take_physical_snapshot(self.device)
-            peak_alloc = post_val.allocator_peak_allocated - pre_val.allocator_allocated
-
-            logger.info_rank0(
-                f"  Validation: peak_alloc={mem_GB(peak_alloc)}, "
-                f"free_after={mem_GB(post_val.driver_free)}"
-            )
-
-            # Check if we have reasonable headroom
-            headroom = post_val.driver_free
-            min_headroom = 256 * _MIB  # 256 MiB minimum
-
-            if headroom < min_headroom:
-                return (
-                    False,
-                    f"Insufficient headroom after validation: {mem_GB(headroom)} < {mem_GB(min_headroom)}",
+                torch.cuda.synchronize(self.device)
+                transient = torch.cuda.max_memory_reserved(self.device) - pre_val.allocator_reserved
+                log_reconciliation(
+                    "Phase I",
+                    {"transient": self.runtime_calibration.transient_at(validation_chunk)},
+                    {"transient": transient},
                 )
+                return True, "Validation passed"
+            except torch.cuda.OutOfMemoryError as e:
+                return False, f"Validation OOM: {e}"
+        finally:
+            global_ctx.linear_state_pool = orig_linear_state_pool
+            global_ctx.attn_backend = orig_attn_backend
+            if orig_kv_cache is not None:
+                global_ctx.kv_cache = orig_kv_cache
+            elif hasattr(global_ctx, "kv_cache"):
+                delattr(global_ctx, "kv_cache")
 
-            return True, "Validation passed"
+    def _run_validation_prefill(
+        self, model, config: EngineConfig, chunk_size: int, kv_pool: BaseKVCachePool
+    ):
+        """Run final validation as real serving would: one prefill forward per chunk,
+        continuation chunks carrying the real GDN recurrent state forward.
 
-        except torch.cuda.OutOfMemoryError as e:
-            return False, f"Validation OOM: {e}"
-        except Exception as e:
-            return False, f"Validation error: {e}"
-
-    def _run_validation_prefill(self, model, config: EngineConfig, chunk_size: int):
-        """Run validation prefill."""
-        from freetoken.core import Batch, Req
+        A single-chunk validation never exercises the ``has_initial_state=True``
+        Triton specialization that any prompt longer than one chunk hits on its
+        second forward (see docs/dev/LESSONS.md) -- validating only the first
+        chunk can pass while that continuation path still OOMs in real serving.
+        """
+        from freetoken.core import Batch, Req, get_global_ctx
         from freetoken.attention.linear import build_fla_metadata
 
-        dummy_req = Req(
-            input_ids=torch.zeros(chunk_size, dtype=torch.int32, device="cpu"),
-            table_idx=config.max_running_req,
-            cached_len=0,
-            output_len=1,
-            uid=-1,
-            sampling_params=None,
-            cache_handle=None,
+        global_ctx = get_global_ctx()
+        aligned_max_seq_len = (
+            (config.max_seq_len + config.page_size - 1) // config.page_size * config.page_size
         )
-        batch = Batch(reqs=[dummy_req], phase="prefill")
-        batch.padded_reqs = batch.reqs
-        batch.input_ids = torch.zeros(chunk_size, dtype=torch.int32, device=self.device)
-        batch.positions = torch.arange(chunk_size, dtype=torch.int32, device=self.device)
+        validation_page_table = torch.zeros(
+            config.max_running_req + 1, aligned_max_seq_len, dtype=torch.int32, device=self.device
+        )
+        global_ctx.page_table = validation_page_table
+        if hasattr(kv_pool, "attach_page_table"):
+            kv_pool.attach_page_table(validation_page_table)
 
-        fla = build_fla_metadata(batch, self.device)
-        batch.fla_metadata = fla
+        table_idx = config.max_running_req
+        # Map the whole context to real KV slots up front so the final chunk's
+        # attention reads a full-context page table, exactly as a real prompt would.
+        validation_page_table[table_idx, : config.max_seq_len] = torch.arange(
+            config.max_seq_len, dtype=torch.int32, device=self.device
+        )
 
-        with torch.inference_mode():
-            model.forward()
+        def _run_chunk(cached_len: int, extend_len: int):
+            device_len = cached_len + extend_len
+            assert device_len <= config.max_seq_len, (
+                f"validation chunk end {device_len} exceeds requested context "
+                f"{config.max_seq_len}; kv_pool was not sized to hold it"
+            )
+            dummy_req = Req(
+                input_ids=torch.zeros(device_len, dtype=torch.int32, device="cpu"),
+                table_idx=table_idx,
+                cached_len=cached_len,
+                output_len=1,
+                uid=-1,
+                sampling_params=None,
+                cache_handle=None,
+            )
+            batch = Batch(reqs=[dummy_req], phase="prefill")
+            batch.padded_reqs = batch.reqs
+            batch.input_ids = torch.zeros(extend_len, dtype=torch.int32, device=self.device)
+            batch.positions = torch.arange(
+                cached_len, device_len, dtype=torch.int32, device=self.device
+            )
+            if config.model_config.model_is_mrope:
+                batch.mrope_positions = batch.positions.unsqueeze(0).expand(3, -1).contiguous()
+
+            batch.out_loc = validation_page_table[table_idx, cached_len:device_len].clone()
+
+            if hasattr(global_ctx, "attn_backend") and global_ctx.attn_backend is not None:
+                global_ctx.attn_backend.prepare_metadata(batch)
+            fla = build_fla_metadata(batch, self.device)
+            batch.fla_metadata = fla
+
+            with torch.inference_mode(), global_ctx.forward_batch(batch):
+                model.forward()
+
+        # First chunk: fresh GDN state (cached_len=0). Final chunk: ends at
+        # max_seq_len, carrying real GDN state (has_initial_state=True) and paying
+        # the full-context attention/indexer workspace -- the worst prefill step
+        # real serving can take, so probe and validation measure the same peak.
+        _run_chunk(cached_len=0, extend_len=chunk_size)
+        if config.max_seq_len > chunk_size:
+            tail = min(chunk_size, config.max_seq_len - chunk_size)
+            _run_chunk(cached_len=config.max_seq_len - tail, extend_len=tail)
 
         torch.cuda.synchronize(self.device)
 
@@ -1100,75 +1072,85 @@ class MemoryPlanner:
         )
 
         # Phase C: Minimal viable config
+        # Reject before any pool exists if the context floor alone cannot fit.
+        sm = self.static_model
+        floor = self.ledger(
+            config, 0, sm.min_expert_slots, sm.kv_pages_for_context(config.max_seq_len)
+        )
+        if sum(floor.values()) > baseline_free:
+            raise self.infeasible(config, baseline_free, floor)
         self.phase_c_build_minimal_config(config, model)
 
-        # Phase A continued: Post-mandatory measurement
+        # Phase A continued: post-mandatory measurement is diagnostic only (it
+        # runs after Phase C's temporary probe pools -- min-experts expert
+        # cache, minimal KV pool -- are already resident). Using its driver_free
+        # as the solve budget double-counts: the probe's own footprint gets
+        # subtracted once here, then Phase F/G would ask to fund the equivalent
+        # final cache again out of what's left, even though _cleanup_probe_artifacts()
+        # frees the probe before the final pools are ever built. The real budget
+        # for sizing the final persistent pools is the free memory that existed
+        # right after weights loaded, before any probe scaffolding was created.
         self.phase_a_post_mandatory()
-
-        # Physical budget = post-mandatory free memory
-        physical_budget = self.post_mandatory_snapshot.driver_free
-
-        # Phase D: Runtime calibration (with initial chunk guess)
-        initial_chunk = min(getattr(config, "max_extend_tokens", 8192), 4096)  # Start conservative
-        self.phase_d_runtime_calibration(config, model, initial_chunk)
-
-        # Phase E: Exact GDN sizing (will be called during chunk solving)
-        # Phase F: Solve prefill chunk
-        chosen_chunk, gdn_peak = self.phase_f_solve_prefill_chunk(config, physical_budget)
-
-        # Phase G: Solve expert cache
-        expert_slots, kv_pages = self.phase_g_solve_expert_cache(
-            config, physical_budget, chosen_chunk, gdn_peak
+        probe_overhead = (
+            self.baseline_snapshot.driver_free - self.post_mandatory_snapshot.driver_free
+        )
+        logger.info_rank0(
+            f"  Probe scaffolding overhead (reclaimed before final pools): {mem_GB(probe_overhead)}"
         )
 
-        # Phase H: Construct final pools
+        # Phase D: warm-up + two-point prefill transient + graph capture,
+        # measured against the minimal probe pools.
+        self.phase_d_runtime_calibration(config, model)
+
+        # The budget is measured ONCE, after the probe scaffolding is gone: it
+        # already reflects CUDA context, modules, lmem and every persistent
+        # byte the probe left behind, so the ledger never re-subtracts them.
+        self._cleanup_probe_artifacts()
+        budget_snapshot = take_physical_snapshot(self.device)
+        budget = budget_snapshot.driver_free
+        logger.info_rank0(f"  Solve budget (post-probe): {budget_snapshot}")
+
+        chosen_chunk, expert_slots, kv_pages = self.phase_fg_solve_chunk_and_experts(config, budget)
+
         kv_pool, expert_cache, linear_pool = self.phase_h_construct_final_pools(
             config, model, expert_slots, kv_pages, prefill_overlap
         )
-
-        # Phase I: Final validation
-        valid, msg = self.phase_i_final_validation(
-            config, model, kv_pool, expert_cache, linear_pool, chosen_chunk
-        )
-
+        try:
+            valid, msg = self.phase_i_final_validation(
+                config, model, kv_pool, expert_cache, linear_pool, chosen_chunk
+            )
+        finally:
+            # Phase H's pools only prove Phase I's forward fits; engine.py builds
+            # the permanent ones from the returned sizes. Free them first or
+            # the engine double-commits.
+            attach_offload_moe_cache(model, None)
+            del kv_pool, expert_cache, linear_pool
+            gc.collect()
+            torch.cuda.synchronize(self.device)
+            torch.cuda.empty_cache()
         if not valid:
-            # Replan with reduced chunk or experts
-            logger.warning_rank0(f"Validation failed: {msg}. Attempting replan...")
-            # For now, fail - full replan logic would go here
-            raise RuntimeError(f"Final validation failed: {msg}")
+            # The ledger promised this fits; failing means an unpriced owner.
+            raise RuntimeError(
+                f"Final validation failed against the solved ledger "
+                f"({self.ledger(config, chosen_chunk, expert_slots, kv_pages)}, "
+                f"budget={budget}): {msg}"
+            )
 
-        # Build final plan candidate
-        fixed_overhead = self.static_model.fixed_overhead_bytes()
-        expert_bytes = expert_slots * self.static_model.expert_bytes_per_slot
-        kv_bytes = (
-            pool_pages(kv_pages) * self.static_model.kv_bytes_per_page
-            + self.static_model.kv_fixed_bytes
-        )
-        other_transient = (
-            self.runtime_calibration.triton_autotune_peak
-            + self.runtime_calibration.backend_workspace_peak
-            + self.runtime_calibration.graph_capture_peak
-            + self.runtime_calibration.activation_peak
-        )
-        total_transient = gdn_peak + other_transient
-        semi_persistent = (
-            self.runtime_calibration.graph_pool_size
-            + self.runtime_calibration.backend_workspace_peak
-        )
-        total_committed = fixed_overhead + expert_bytes + kv_bytes + semi_persistent
-
+        ledger = self.ledger(config, chosen_chunk, expert_slots, kv_pages)
         final_snapshot = take_physical_snapshot(self.device)
-
         self.final_plan = PlanCandidate(
             prefill_chunk=chosen_chunk,
             expert_slots=expert_slots,
             kv_pages=kv_pages,
             kv_tokens=kv_pages * self.static_model.page_tokens,
-            expert_bytes=expert_bytes,
-            kv_bytes=kv_bytes,
-            fixed_overhead=fixed_overhead,
-            transient_reserve=total_transient,
-            total_committed=total_committed,
+            expert_bytes=ledger["experts"],
+            kv_bytes=ledger["kv"],
+            fixed_overhead=sum(ledger.values())
+            - ledger["experts"]
+            - ledger["kv"]
+            - ledger["transient"],
+            transient_reserve=ledger["transient"],
+            total_committed=sum(ledger.values()),
             physical_free_after=final_snapshot.driver_free,
             validation_passed=True,
             prefill_overlap=prefill_overlap,

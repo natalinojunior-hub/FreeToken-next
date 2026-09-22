@@ -112,6 +112,21 @@ def test_offload_cache_exact_geometry_views():
     assert views1[1].shape == (cache_size, 4, 16)
 
 
+def test_offload_cache_normalizes_per_layer_gguf_gate_up_types():
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=4,
+        cache_size=8,
+        device=torch.device("cpu"),
+        quant_format="gguf",
+        gguf_expert_types={"gate_up": [21, 23], "down": [20, 8]},
+    )
+
+    assert cache.gguf_expert_types == [(21, 20), (23, 8)]
+    assert cache._get_layer_quant_type(1, "gate_up") == "IQ4_XS"
+    assert cache._get_layer_quant_type(1, "down") == "Q8_0"
+
+
 def test_spec_warmup_no_op_when_disabled():
     from unittest.mock import MagicMock
     from freetoken.scheduler.spec import SchedulerSpecMixin

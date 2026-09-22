@@ -484,8 +484,11 @@ def pack(idx: torch.Tensor, book: str) -> torch.Tensor:
         two[:, :, :, 0] | (two[:, :, :, 1] << 2) | (two[:, :, :, 2] << 4) | (two[:, :, :, 3] << 6)
     )
     third = ((idx >> 2) & 1).reshape(rows, groups, QK_TURBO // 8, 8)
-    shifts = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=idx.device, dtype=torch.int32)
-    bits = (third * shifts).sum(-1).to(torch.uint8)
+    # Shifts, not a host-built weight tensor: this runs inside CUDA graph capture.
+    bits = third[:, :, :, 0]
+    for b in range(1, 8):
+        bits = bits | (third[:, :, :, b] << b)
+    bits = bits.to(torch.uint8)
     out = torch.cat((words.to(torch.uint8), bits), dim=-1)
     return out.reshape(rows, -1).contiguous()
 
@@ -508,7 +511,7 @@ def unpack(codes: torch.Tensor, book: str) -> torch.Tensor:
     grouped = codes.reshape(rows, groups, CODE_BYTES[book])
     words = grouped[:, :, :32].reshape(rows, groups, QK_TURBO // 4, 1)
     bits = grouped[:, :, 32:].reshape(rows, groups, QK_TURBO // 8, 1)
-    sh4 = torch.tensor([0, 2, 4, 6], device=codes.device, dtype=torch.uint8)
+    sh4 = torch.arange(0, 8, 2, device=codes.device, dtype=torch.uint8)
     low = (words >> sh4) & 0x3
     sh8 = torch.arange(8, device=codes.device, dtype=torch.uint8)
     third = (bits >> sh8) & 0x1

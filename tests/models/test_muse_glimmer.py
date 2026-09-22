@@ -392,6 +392,7 @@ def _bf16_checkpoint_tensors(hf) -> dict:
     return tensors
 
 
+@pytest.mark.slow  # ~50 s per case (full-size synthetic shards): 90% of `make ci` wall time
 @pytest.mark.parametrize("include_vision", [False, True])
 def test_iter_weights_bf16_matches_model_state_dict(tmp_path, monkeypatch, include_vision):
     """The BF16 loader must produce exactly the model's state-dict keys with the

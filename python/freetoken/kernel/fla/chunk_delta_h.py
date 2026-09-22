@@ -290,6 +290,21 @@ def chunk_gated_delta_rule_fwd_h(
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
+    if os.environ.get("FT_DEBUG_GDN_MEM"):
+        torch.cuda.synchronize()
+        free, total = torch.cuda.mem_get_info()
+        h_bytes = B * NT * H * V * K * k.element_size()
+        print(
+            f"[FT_DEBUG_GDN_MEM] B={B} NT={NT} H={H} V={V} K={K} dtype={k.dtype} "
+            f"itemsize={k.element_size()} h_bytes={h_bytes} ({h_bytes / (1 << 20):.1f} MiB) "
+            f"driver_free={free / (1 << 20):.1f}MiB driver_total={total / (1 << 20):.1f}MiB "
+            f"allocated={torch.cuda.memory_allocated() / (1 << 20):.1f}MiB "
+            f"reserved={torch.cuda.memory_reserved() / (1 << 20):.1f}MiB "
+            f"max_allocated={torch.cuda.max_memory_allocated() / (1 << 20):.1f}MiB "
+            f"max_reserved={torch.cuda.max_memory_reserved() / (1 << 20):.1f}MiB",
+            flush=True,
+        )
+
     h = k.new_empty(B, NT, H, V, K)
 
     v_new = torch.empty_like(u) if save_new_value else None

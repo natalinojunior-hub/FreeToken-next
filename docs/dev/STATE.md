@@ -1,19 +1,18 @@
-# State Snapshot — 2026-09-20
+# State Snapshot — 2026-09-22
 
 ## Doing Now
-- Investigar gargalo PCIe/heterogeneidade no Flash-Next NVFP4-Radix (decode TG)
+- VRAM audit DONE; relatorio-vram-definitivo.md being finalized. Nothing committed.
 
-## Done This Session
-1. Refutada premissa "LTO supera FreeToken": LTO só roda GGUF (não NVFP4-Radix), número 38 tok/s é IQ4_XS prompt curto com MTP n_max=3 não certificado
-2. Testado `--moe-strategy hybrid` (CPU+GPU co-compute, nunca usado antes no Flash-Next): +3% TG (29.61→30.51), bit-idêntico, auto-tune 48.7% PCIe/51.3% CPU
-3. Conclusão: PCIe expert-streaming NÃO é o gargalo dominante (~poucos % do step); 35B-A3B faz 6.3ms/token vs Flash-Next 33ms/token pela residência de experts em VRAM, não por PCIe
-4. Testado `--ple-backend pinned`: falhou por RAM insuficiente (RSS já ~70 GiB em `disk`)
-5. Docs atualizados em `docs/dev/PERFORMANCE.md`
+## Done
+1. Canonical ledger in memory_planner.py (single solve, measured budget once, 2-point transient, no margins/retries, infeasible report). Tests: tests/engine/test_memory_planner_ledger.py.
+2. Root causes fixed: GGUF lazy pageable experts (HMM 2.41 GiB), probe chunk extrapolation, double counts, PLE wait-sync graph deadlock (auto->gate), GGUF MTP meta embedding, turbo_kv host tensors in capture, MTP snapshot slot eviction.
+3. Certification 16K, CUDA graph, auto planner: GGUF/FTW x turbo3/turbo4 PASS; MTP k=1 FTW/GGUF PASS. Reconciliation: no unexplained >128 MiB.
+4. make ci PASS (CPU-only). muse_glimmer slow test marked slow.
+5. Harness benchmarks/cert_matrix.py: one boot per config, event watchdog (GPU idle 2s, death, health) + py-spy native dumps.
 
 ## Decisions
-- `--moe-strategy hybrid` candidato a default no Flash-Next (ganho grátis, sem risco de correção)
-- Meta de 60 tok/s no Flash-Next não é alcançável só por otimização de decode/PCIe — exigiria experts residentes em VRAM ou checkpoint menor
+- PLE disk sync default = launch-gating (wait-sync deadlocks graphs).
+- Never run make ci concurrently with GPU serve (earlyoom + basetemp wipes /models/desenvolvimento/tmp).
 
-## Next Steps
-1. Aguardando decisão do usuário: (a) tornar hybrid default, ou (b) investigar path GDN/QSA decode / dequant NVFP4 via profiling
-2. Regressão interna não resolvida: bisect 34.7 (v0.1.2) → 30.44 (HEAD) tok/s, mesma config isomórfica
+## Next
+1. MTP k=1 lowers TG (GGUF 28->10, FTW ~28->10-19): investigate. 2. Per-geometry expert slot pools (~2.5x waste GGUF). 3. Lazy GDN snapshot slots. 4. Certify 128K/256K. 5. Commit only when operator asks.

@@ -27,47 +27,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-
-class _LazyGGUFBank:
-    def __init__(self, layers, shapes, role):
-        self._layers = layers
-        self._shapes = shapes
-        self._role = role
-        self._cache = {}
-
-    def __len__(self):
-        return len(self._shapes)
-
-    def shape_at(self, layer_id):
-        return self._shapes[layer_id]
-
-    @property
-    def dtype(self):
-        return torch.uint8
-
-    def materialize(self, layer_id):
-        if layer_id not in self._cache:
-            tensors = self._layers[layer_id]
-            if self._role == "gate_up":
-                gate, up = tensors
-                experts, rows, row_bytes = self._shapes[layer_id]
-                value = torch.cat(
-                    [
-                        gate.reshape(experts, rows // 2, row_bytes),
-                        up.reshape(experts, rows // 2, row_bytes),
-                    ],
-                    dim=1,
-                )
-            else:
-                experts, rows, row_bytes = self._shapes[layer_id]
-                value = tensors.reshape(experts, rows, row_bytes)
-            self._cache[layer_id] = value.contiguous()
-        return self._cache[layer_id]
-
-    def __getitem__(self, layer_id):
-        return self.materialize(layer_id)
-
-
 from freetoken.models.gguf.dequant import GGML_IQ3_S, GGML_Q4_K, GGML_NAME, row_bytes
 
 if TYPE_CHECKING:
@@ -197,52 +156,6 @@ def load_gguf_expert_sources(
     from freetoken.models.gguf.reader import iter_gguf_tensors
 
     types = gguf_expert_types(model_path, config.num_layers)
-    if layer_sink is None:
-        tensors = {}
-        for t in iter_gguf_tensors(model_path):
-            if not t.name.startswith("blk."):
-                continue
-            layer = int(t.name.split(".")[1])
-            if layer >= config.num_layers:
-                continue
-            if t.name.endswith("ffn_gate_exps.weight"):
-                tensors.setdefault(layer, {})["gate"] = t.packed()
-            elif t.name.endswith("ffn_up_exps.weight"):
-                tensors.setdefault(layer, {})["up"] = t.packed()
-            elif t.name.endswith("ffn_down_exps.weight"):
-                tensors.setdefault(layer, {})["down"] = t.packed()
-        if len(tensors) != config.num_layers or any(
-            set(v) != {"gate", "up", "down"} for v in tensors.values()
-        ):
-            raise ValueError("missing GGUF expert tensors")
-        shapes = {
-            "gate_up": [
-                (
-                    config.num_experts,
-                    2 * config.moe_intermediate_size,
-                    row_bytes(config.hidden_size, types["gate_up"][i]),
-                )
-                for i in range(config.num_layers)
-            ],
-            "down": [
-                (
-                    config.num_experts,
-                    config.hidden_size,
-                    row_bytes(config.moe_intermediate_size, types["down"][i]),
-                )
-                for i in range(config.num_layers)
-            ],
-        }
-        return {
-            "gate_up": _LazyGGUFBank(
-                [(tensors[i]["gate"], tensors[i]["up"]) for i in range(config.num_layers)],
-                shapes["gate_up"],
-                "gate_up",
-            ),
-            "down": _LazyGGUFBank(
-                [tensors[i]["down"] for i in range(config.num_layers)], shapes["down"], "down"
-            ),
-        }
 
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
 

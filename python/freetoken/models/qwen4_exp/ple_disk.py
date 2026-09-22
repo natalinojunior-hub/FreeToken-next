@@ -214,7 +214,11 @@ class DiskRowTable:
     def _probe_wait_sync(self, mode: str) -> bool:
         from freetoken.kernel import _ple_store
 
-        if mode == "gate":
+        # auto -> gate: wait-sync signals the flag only after graph.replay() returns, but
+        # cuGraphLaunch itself blocks once the graph outgrows the launch queue (turbo KV
+        # decompress, GGUF MoE), so the host never signals and the GPU waits forever.
+        # Measured on RTX 5080: wait-sync hangs the first graph decode; gate decodes.
+        if mode in ("gate", "auto"):
             return False
         scratch = alloc_pinned_tensor(1, dtype=torch.int64)
         scratch.zero_()

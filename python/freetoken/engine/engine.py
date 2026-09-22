@@ -1024,10 +1024,16 @@ class Engine:
             object.__setattr__(config, "moe_prefill_overlap", plan.prefill_overlap)
             if config.num_page_override is None:
                 object.__setattr__(config, "num_page_override", plan.kv_pages)
+            # The scheduler reads max_extend_tokens directly to cap each prefill
+            # chunk (scheduler.py); the planner only sized transient memory for
+            # plan.prefill_chunk, so leaving max_extend_tokens unset would let the
+            # scheduler issue larger chunks than the plan accounted for and OOM.
+            if config.max_extend_tokens > plan.prefill_chunk:
+                object.__setattr__(config, "max_extend_tokens", plan.prefill_chunk)
             logger.info_rank0(
                 f"--moe-cache-auto resolved moe_cache_size={plan.expert_slots} "
                 f"num_pages={plan.kv_pages} (prefill_overlap={plan.prefill_overlap}, "
-                f"prefill_chunk={plan.prefill_chunk})"
+                f"prefill_chunk={plan.prefill_chunk}, max_extend_tokens={config.max_extend_tokens})"
             )
         _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
         layout = max_slots = None

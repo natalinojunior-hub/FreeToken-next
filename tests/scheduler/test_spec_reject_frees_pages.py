@@ -153,18 +153,17 @@ def test_reject_keep_len_must_be_the_post_commit_device_len_not_cached_len():
     )
 
 
-def test_allocate_paged_twice_over_the_same_range_orphans_a_page():
+def test_allocate_paged_twice_over_the_same_range_is_idempotent():
     """Live crash (RTX 5080, real serve, page_size=64, 16384-token prompt): SchedulerSpecMixin's
     GDN-state replay rewinds cached_len/device_len to an already-verified window and calls
-    _prepare_batch again to rebuild positions/attention metadata -- but _prepare_batch's
-    allocate_paged has no memory of the verify step's own earlier call over that SAME range,
-    so calling it twice on an identical (cached_len, device_len) pair that crosses a page
-    boundary allocates a SECOND, different page and overwrites the page_table row that already
+    _prepare_batch again to rebuild positions/attention metadata. allocate_paged used to have no
+    memory of its own earlier call over that SAME range: div_ceil(cached_len, page_size) alone
+    treated the already-owned page as unallocated, so a second call crossing the same page
+    boundary allocated a SECOND, different page and overwrote the page_table row that already
     held the first one -- orphaning it (never returned to free_slots, never reachable again).
-    This is what actually produced free_pages+cache_pages != num_pages: not a spec_reject
-    accounting error, but allocate_paged's own lack of idempotency across two calls for the
-    same range. The real fix is scheduler.py's `_prepare_batch(..., skip_alloc=True)` on the
-    replay call; this test pins the underlying mechanism at the CacheManager level."""
+    The fix: req.alloc_page_bound tracks the real ownership high-water mark (set by
+    allocate_paged, dropped by free_spec_reject), so a repeat call over an unchanged range is
+    now a no-op instead of a double-allocation."""
     cm, page_table = _make(page_size=4)
     req = _req(0, prompt_len=4)
     req.cached_len, req.device_len = 4, 4
@@ -174,19 +173,50 @@ def test_allocate_paged_twice_over_the_same_range_orphans_a_page():
     req.cached_len, req.device_len = 4, 5
     cm.allocate_paged([req])
     first_page_value = page_table[0, 4].item()
+    free_after_first = set(cm.free_slots.tolist())
 
     # replay rewinds to the SAME (cached_len, device_len) pair to rebuild metadata -- calling
-    # allocate_paged again must be skipped (this is what skip_alloc does); simulating the old,
-    # unguarded behaviour here to pin the failure mode:
+    # allocate_paged again must be a no-op now (alloc_page_bound already covers this range):
     cm.allocate_paged([req])
-    second_page_value = page_table[0, 4].item()
 
-    assert second_page_value != first_page_value, (
-        "demonstrates the bug: a second allocate_paged call over an unchanged range grabs a "
-        "different physical page"
+    assert page_table[0, 4].item() == first_page_value, (
+        "a repeat allocate_paged call over an unchanged range must not reassign the page"
     )
-    assert first_page_value not in set(cm.free_slots.tolist()), (
-        "the orphaned page is neither referenced by page_table nor back in free_slots -- lost"
+    assert set(cm.free_slots.tolist()) == free_after_first, "no new page should be allocated"
+
+
+def test_rollback_to_an_exact_page_boundary_after_a_speculative_page_does_not_orphan_it():
+    """Live crash trigger, stated precisely: a speculative-decode rollback lands keep_cached on
+    an EXACT multiple of page_size after a page was already allocated one token into it (for a
+    since-rejected draft). div_ceil(keep_cached, page_size) alone is then one page BELOW what
+    the request actually owns, so the next round's allocate_paged call re-derives first_page as
+    that same already-owned page, grabs a fresh physical page for it, and overwrites the
+    page_table row -- orphaning the original (never freed, never reachable again). This is
+    equivalent to keep_device == 1 (mod page_size). The fix: req.alloc_page_bound remembers the
+    real ownership ceiling across the rollback."""
+    cm, page_table = _make(page_size=4)
+    req = _req(0, prompt_len=4)
+    req.cached_len, req.device_len = 4, 4
+    cm.allocate_paged([req])  # page 0 full and page-aligned: tokens [0,4)
+
+    # round R: draft at position 4 needs a new page; draft rejected, only the correction at
+    # position 4 is committed -> keep_cached lands exactly on the page-4 boundary (4 == 1*4).
+    req.cached_len, req.device_len = 4, 5
+    cm.allocate_paged([req])  # allocates page 1 (tokens [4, 8)) for the draft
+    speculative_page_value = page_table[0, 4].item()
+    cm.free_spec_reject(req, keep_len=5, alloc_len=5)  # keep_device == alloc_len: no-op free
+    req.cached_len, req.device_len = 4, 5  # keep_cached=4 (page-aligned), keep_device=5
+
+    # round R+1: draft chain resets cached_len to device_len - 1 == 4 again, then extends
+    # device_len by k=1 to re-verify -- an allocate_paged call over the SAME range as round R's.
+    req.cached_len, req.device_len = 4, 5
+    cm.allocate_paged([req])
+
+    assert page_table[0, 4].item() == speculative_page_value, (
+        "round R+1 must not reassign the page already owned since round R"
+    )
+    assert speculative_page_value not in set(cm.free_slots.tolist()), (
+        "the page is still legitimately owned by the request, not back on the free list"
     )
 
 
@@ -282,3 +312,55 @@ def test_idle_asserts_spec_snapshot_slots_empty():
     stub._spec_snapshot_slots = {101: 3}
     with pytest.raises(AssertionError, match="leaked spec snapshot slots in idle"):
         Scheduler.run_when_idle(stub)
+
+
+def test_finish_on_verified_draft_token_at_page_boundary_does_not_leak():
+    """Live crash (RTX 5080, spec-mtp=1, Turbo4, 16K real serve): EOS lands on a token that was
+    itself one of the verify batch's OWN INPUT drafts (committed <= k, not the k+1'th bonus/
+    correction token), so its KV was already written by the single verify forward -- unlike
+    normal decode's complete_one lag, where the newest token's KV is genuinely still pending.
+    _commit_spec_tokens used to leave req.cached_len at the lag value (keep_cached) regardless,
+    which is only correct for the pending bonus token. When keep_cached lands exactly on a page
+    boundary, that already-written page is excluded from BOTH cache_req's insert/tail-free range
+    (which stops at page_ceil(keep_cached)) AND free_spec_reject's range (which starts at
+    page_ceil(keep_device) = the page AFTER it) -- orphaned forever. The fix: cached_len at
+    finish must be keep_device (not keep_cached) whenever committed <= k."""
+    cm, page_table = _make(page_size=4)
+    req = _req(0, prompt_len=4)
+    req.device_len = 4
+    cm.allocate_paged([req])  # fills page 0 exactly: tokens [0,4)
+    req.cached_len = req.device_len
+    req.cache_handle = cm.prefix_cache.match_prefix(req.input_ids[:0]).cuda_handle
+
+    # k=1 verify window: draft at position 4 (a real verify-batch input), spec_alloc_len=5
+    req.device_len = 5
+    cm.allocate_paged([req])  # allocates page 1 for the draft position
+    committed = 1  # EOS hit on the draft itself (committed <= k=1): its KV IS already written
+    start_pos, spec_alloc_len = 4, 5
+    k = spec_alloc_len - start_pos
+    keep_cached = start_pos + committed - 1  # the old (buggy) value: 4
+
+    # surplus beyond what was committed (none here: keep_device == spec_alloc_len == 5)
+    keep_device = start_pos + committed
+    if keep_device < spec_alloc_len:
+        cm.free_spec_reject(req, keep_len=keep_device, alloc_len=spec_alloc_len)
+
+    # the fix, exactly as applied in _commit_spec_tokens:
+    req.cached_len = start_pos + min(committed, k)  # == keep_device == 5, NOT keep_cached (4)
+    assert req.cached_len != keep_cached
+    cm.cache_req(req, finished=True)
+    cm.check_integrity()  # would raise RuntimeError with the old keep_cached-only assignment
+
+
+def test_spec_snapshot_slot_evicts_radix_snapshots_when_free_list_is_drained():
+    from types import SimpleNamespace
+
+    free = []
+    pool = SimpleNamespace(alloc=lambda n: [free.pop() for _ in range(n)])
+    cm = SimpleNamespace(is_hybrid=True, ensure_mamba_slots=lambda n: free.extend(range(7, 7 + n)))
+    stub = SimpleNamespace(
+        cache_manager=cm, engine=SimpleNamespace(linear_state_pool=pool), _spec_snapshot_slots={}
+    )
+    req = SimpleNamespace(uid=3)
+    assert SchedulerSpecMixin._spec_snapshot_slot(stub, req) == 7
+    assert stub._spec_snapshot_slots == {3: 7}

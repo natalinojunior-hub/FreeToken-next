@@ -59,6 +59,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--warmups", type=int, default=2, help="untimed requests at full context")
     p.add_argument("--prompt-file", default=os.environ.get("FREETOKEN_NEXT_PROMPT", DEFAULT_CORPUS))
     p.add_argument(
+        "--prompt-file-exact",
+        action="store_true",
+        help="send --prompt-file verbatim instead of deriving a fixed token slice",
+    )
+    p.add_argument(
         "--prompt-offset", type=int, default=0, help="token offset into the corpus slice"
     )
     p.add_argument("--gpu", default=None, help="UUID or nvidia-smi index, as ft serve --gpu")
@@ -85,6 +90,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=45.0,
         help="max seconds between token arrivals during decode (default: 45s)",
+    )
+    p.add_argument(
+        "--ttft-timeout",
+        type=float,
+        default=None,
+        help="max seconds before first token; default scales with prompt length",
     )
     p.add_argument("--json", dest="json_out", default=None, help="append result rows here")
     p.add_argument(
@@ -282,30 +293,73 @@ def stream_completion(
     last_event_time = [time.monotonic()]
     token_count = [0]
     in_prefill = [True]
+    failure: list[str] = []
 
-    ttft_timeout = max(90.0, (args.tokens / 1000.0) * 2.5 + 30.0)
+    ttft_timeout = args.ttft_timeout or max(90.0, (args.tokens / 1000.0) * 2.5 + 30.0)
     stall_timeout = getattr(args, "stall_timeout", 45.0)
+    gpu_idle_timeout = getattr(args, "gpu_idle_timeout", 2.0)
 
     if proc is not None:
 
+        def _fail(msg: str) -> None:
+            # Dump every server thread's stack (faulthandler on SIGUSR1, when the
+            # server registered it) before killing, then unblock the reader.
+            print(f"\n[bench] {msg}", flush=True)
+            failure.append(msg)
+            spy = Path(sys.executable).with_name("py-spy")
+            for pid in _tree_pids(proc.pid) if spy.exists() else []:
+                dump = subprocess.run(
+                    [str(spy), "dump", "--native", "--pid", str(pid)],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                print(f"[bench] py-spy {pid}:\n{dump.stdout}{dump.stderr}", flush=True)
+            for pid in _tree_pids(proc.pid):
+                try:
+                    os.kill(pid, signal.SIGUSR1)
+                except OSError:
+                    pass
+            watch_stop.wait(2.0)
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+        def _gpu_busy() -> bool:
+            try:
+                out = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                ).stdout.split()
+                return any(int(u) > 0 for u in out)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                return True  # unknown: never fail on a missing probe
+
         def _watch():
             last_heartbeat = time.monotonic()
+            last_gpu_busy = time.monotonic()
             while not watch_stop.wait(0.5):
                 now = time.monotonic()
+                # No token AND an idle GPU is a hang, whatever the phase: fail fast
+                # instead of waiting out the TTFT/stall ceilings.
+                if _gpu_busy():
+                    last_gpu_busy = now
+                elif (
+                    now - last_gpu_busy > gpu_idle_timeout
+                    and now - last_event_time[0] > gpu_idle_timeout
+                ):
+                    return _fail(f"GPU idle for {now - last_gpu_busy:.0f}s with no token: hang")
                 if proc.poll() is not None:
-                    print(
-                        f"\n[bench] server process died with exitcode {proc.returncode}", flush=True
-                    )
-                    os._exit(1)
+                    return _fail(f"server process died with exitcode {proc.returncode}")
                 try:
                     health = get_json(f"{origin}/health", timeout=1)
                 except (OSError, ValueError):
                     health = None
                 if isinstance(health, dict) and health.get("status") == "error":
-                    print(f"\n[bench] server reported failure: {health}", flush=True)
-                    os.killpg(proc.pid, signal.SIGTERM)
-                    os._exit(1)
-
+                    return _fail(f"server reported failure: {health}")
                 if in_prefill[0]:
                     elapsed_ttft = now - t0
                     if now - last_heartbeat >= 5.0:
@@ -315,13 +369,9 @@ def stream_completion(
                             flush=True,
                         )
                     if elapsed_ttft > ttft_timeout:
-                        err_msg = f"TTFT prefill timed out after {elapsed_ttft:.1f}s (max {ttft_timeout:.1f}s)! Server stalled or GPU deadlocked."
-                        print(f"\n[bench] {err_msg}", flush=True)
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except Exception:
-                            pass
-                        os._exit(1)
+                        return _fail(
+                            f"TTFT prefill timed out after {elapsed_ttft:.1f}s (max {ttft_timeout:.1f}s)! Server stalled or GPU deadlocked."
+                        )
                 else:
                     gap = now - last_event_time[0]
                     if now - last_heartbeat >= 5.0:
@@ -331,13 +381,9 @@ def stream_completion(
                             flush=True,
                         )
                     if gap > stall_timeout:
-                        err_msg = f"Token generation stalled! No token for {gap:.1f}s (stall-timeout: {stall_timeout:.1f}s) after token {token_count[0]}/{args.decode}."
-                        print(f"\n[bench] {err_msg}", flush=True)
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except Exception:
-                            pass
-                        os._exit(1)
+                        return _fail(
+                            f"Token generation stalled! No token for {gap:.1f}s (stall-timeout: {stall_timeout:.1f}s) after token {token_count[0]}/{args.decode}."
+                        )
 
         threading.Thread(target=_watch, daemon=True).start()
 
@@ -371,8 +417,13 @@ def stream_completion(
                         in_prefill[0] = False
                         token_count[0] += 1
                         last_event_time[0] = time.monotonic()
+    except OSError:
+        if not failure:
+            raise
     finally:
         watch_stop.set()
+    if failure:
+        sys.exit(f"[bench] {failure[0]}")
     if usage is None:
         sys.exit("[bench] stream ended without a usage chunk; is this a FreeToken server?")
     return {"t0": t0, "stamps": stamps, "text": "".join(pieces), "usage": usage}
@@ -499,7 +550,11 @@ def stop_server(proc) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    prompt = build_prompt_text(args.model, args.prompt_file, args.tokens, args.prompt_offset)
+    prompt = (
+        Path(args.prompt_file).read_text(errors="replace")
+        if args.prompt_file_exact
+        else build_prompt_text(args.model, args.prompt_file, args.tokens, args.prompt_offset)
+    )
     port = free_port()
     origin = f"http://127.0.0.1:{port}"
     tmp_dir = os.environ.get("TMPDIR", "/models/desenvolvimento/tmp")

@@ -281,8 +281,15 @@ class CacheManager:
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []
         for req in reqs:
-            first_page = div_ceil(req.cached_len, self.page_size)
+            # A speculative-decode rollback can land cached_len exactly on a page boundary
+            # after a page was already allocated one token into it (for a since-rejected
+            # draft) -- div_ceil(cached_len, page_size) alone would then treat that owned
+            # page as unallocated and double-allocate it, orphaning the original page (never
+            # freed, silently overwritten in the page table). alloc_page_bound is the real
+            # ownership high-water mark; take whichever of the two is higher.
+            first_page = max(div_ceil(req.cached_len, self.page_size), req.alloc_page_bound)
             last_page = div_ceil(req.device_len, self.page_size)
+            req.alloc_page_bound = last_page
             if last_page > first_page:
                 needed_pages += last_page - first_page
                 allocation_info.append((req.table_idx, first_page, last_page))
@@ -541,6 +548,10 @@ class CacheManager:
         from freetoken.engine.spec import pages_to_free
 
         first, last = pages_to_free(keep_len, alloc_len, self.page_size)
+        # The returned range no longer belongs to the request -- drop the ownership
+        # high-water mark back to its start, or a later allocate_paged call would treat
+        # those now-freed pages as still owned and never re-allocate them for this row.
+        req.alloc_page_bound = first
         if last <= first:
             return
         indices = self.page_table[req.table_idx, first * self.page_size : last * self.page_size]
