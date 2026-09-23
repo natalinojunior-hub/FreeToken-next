@@ -177,30 +177,54 @@ def test_gguf_cache_resolves_to_the_cpu_kernel(fmt):
 class TestGgufFormatResolution:
     """The bridge's refusals. Each must name what is wrong and what to use instead."""
 
-    def test_mixed_banks_refused(self):
-        """Q4_K_M stores gate_up Q4_K and down Q6_K; one weight_format cannot serve both."""
+    def test_mixed_kquant_banks_resolve_to_a_pair(self):
+        """Q4_K_M stores gate_up Q4_K and down Q6_K; both are in the mixable K-quant/
+        I-quant family (_GGUF_KQUANT_BLOCK), so this now resolves to a (gate_up, down)
+        format pair instead of being refused -- the C++ executor takes an independent
+        weight_format per bank for exactly this family (see down_weight_format in
+        cpu_moe_ext.cpp)."""
         from freetoken.moe.cpu_executor import _resolve_gguf_format
 
         c = SimpleNamespace(quant_format="gguf", gguf_expert_types=(GGML_Q4_K, GGML_Q6_K))
-        with pytest.raises(NotImplementedError, match="(?i)mixed-type"):
+        assert _resolve_gguf_format(c) == ("q4_k", "q6_k")
+
+    def test_mixed_banks_outside_kquant_family_refused(self):
+        """Q4_0 has its own W4A8 dot path (single-format only in the C++ side), so it
+        cannot pair with a K-quant/I-quant format even though both sides individually
+        have a CPU kernel."""
+        from freetoken.moe.cpu_executor import _resolve_gguf_format
+
+        c = SimpleNamespace(quant_format="gguf", gguf_expert_types=(GGML_Q4_0, GGML_Q4_K))
+        with pytest.raises(NotImplementedError, match="(?i)mixable"):
             _resolve_gguf_format(c)
 
     def test_uniform_but_unsupported_type_refused(self):
-        """IQ3_S banks are uniform but have no CPU dot kernel; offload must be named."""
+        """A ggml type with no CPU dot kernel at all (e.g. IQ2_XXS = 19) still needs
+        offload named; IQ3_S (21) now has one (this worker's AVX-512 kernel), so it no
+        longer belongs in this case -- see test_uniform_supported_types_resolve."""
         from freetoken.moe.cpu_executor import _resolve_gguf_format
 
-        c = SimpleNamespace(quant_format="gguf", gguf_expert_types=(21, 21))
+        c = SimpleNamespace(quant_format="gguf", gguf_expert_types=(19, 19))
         with pytest.raises(NotImplementedError, match="(?i)no cpu kernel"):
             _resolve_gguf_format(c)
 
     @pytest.mark.parametrize(
-        "t,want", [(GGML_Q4_0, "q4_0"), (GGML_Q4_K, "q4_k"), (GGML_Q6_K, "q6_k")]
+        "t,want",
+        [
+            (GGML_Q4_0, "q4_0"),
+            (GGML_Q4_K, "q4_k"),
+            (GGML_Q6_K, "q6_k"),
+            (21, "iq3_s"),
+            (23, "iq4_xs"),
+            (20, "iq4_nl"),
+            (8, "q8_0"),
+        ],
     )
     def test_uniform_supported_types_resolve(self, t, want):
         from freetoken.moe.cpu_executor import _resolve_gguf_format
 
         c = SimpleNamespace(quant_format="gguf", gguf_expert_types=(t, t))
-        assert _resolve_gguf_format(c) == want
+        assert _resolve_gguf_format(c) == (want, want)
 
     def test_missing_types_refused(self):
         from freetoken.moe.cpu_executor import _resolve_gguf_format

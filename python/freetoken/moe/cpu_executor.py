@@ -69,27 +69,54 @@ _ACT_IDS = {
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
-_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4, "q4_k": 5, "q6_k": 6}
+_WFMT_IDS = {
+    "bf16": 0,
+    "nvfp4": 1,
+    "mxfp4_triton": 2,
+    "ds_fp4": 3,
+    "q4_0": 4,
+    "q4_k": 5,
+    "q6_k": 6,
+    "iq3_s": 7,
+    "iq4_xs": 8,
+    "iq4_nl": 9,
+    "q8_0": 10,
+}
 
-# (elements per block, bytes per block) for the K-quant expert banks the CPU GEMV reads in
-# place. Must match ggml-common.h and the q4_gu_row_bytes arithmetic in cpu_moe_ext.cpp:
-# block_q4_K is 144 bytes and block_q6_K is 210 bytes, both over QK_K = 256 elements.
-_GGUF_KQUANT_BLOCK = {"q4_k": (256, 144), "q6_k": (256, 210)}
+# (elements per block, bytes per block) for the K-quant/i-quant expert banks the CPU GEMV
+# reads in place. Must match ggml-common.h and the q4_gu_row_bytes arithmetic in
+# cpu_moe_ext.cpp: block_q4_K is 144 bytes / block_q6_K is 210 bytes over QK_K = 256
+# elements; block_iq3_s is 110 bytes / block_iq4_xs is 136 bytes, also QK_K = 256;
+# block_iq4_nl is 18 bytes / block_q8_0 is 34 bytes, both over 32 elements.
+_GGUF_KQUANT_BLOCK = {
+    "q4_k": (256, 144),
+    "q6_k": (256, 210),
+    "iq3_s": (256, 110),
+    "iq4_xs": (256, 136),
+    "iq4_nl": (32, 18),
+    "q8_0": (32, 34),
+}
 
 # quant_format == "gguf" names a container, not a layout: the checkpoint picks a ggml type
 # per tensor, so the concrete CPU format has to be recovered from the bank types. Only
 # types with a CPU dot kernel appear here; everything else has to stay on --moe-strategy
 # offload, where the GPU dequantizes.
-_GGML_TO_CPU_FMT = {2: "q4_0", 12: "q4_k", 14: "q6_k"}
+_GGML_TO_CPU_FMT = {2: "q4_0", 8: "q8_0", 12: "q4_k", 14: "q6_k", 20: "iq4_nl", 21: "iq3_s", 23: "iq4_xs"}
 
 
-def _resolve_gguf_format(cache) -> str:
-    """Map a GGUF checkpoint's expert bank types onto one CPU weight format.
+def _resolve_gguf_format(cache) -> tuple[str, str]:
+    """Map a GGUF checkpoint's expert bank types onto (gate_up_fmt, down_fmt).
 
-    The C++ executor takes a single ``weight_format`` for both banks, so a checkpoint whose
-    gate_up and down banks use different ggml types cannot run here even when both types
-    are individually supported. That combination is common (Q4_K_M bumps ffn_down_exps to
-    Q6_K), so it gets its own message rather than being lumped in with unsupported types.
+    Uniform banks (gate_up type == down type) return the same name twice, matching every
+    caller that only ever passed one ``fmt`` string before mixed-format support existed.
+    Different types are allowed when BOTH are in the K-quant/I-quant family
+    (``_GGUF_KQUANT_BLOCK`` -- Q4_K/Q6_K/IQ3_S/IQ4_XS/IQ4_NL/Q8_0): the C++ executor takes
+    an independent ``weight_format`` per bank for exactly that family (gemm1_dot dispatches
+    on the gate_up one, gemm2_dot on the down one), which is what real checkpoints need --
+    Q4_K_M stores gate_up Q4_K / down Q6_K, and IQ3_S-heavy GGUFs commonly pair IQ3_S
+    gate_up with IQ4_NL or Q8_0 down (down projections tolerate less aggressive
+    quantization). Q4_0 sits outside that family (its own W4A8 dot path, single-format
+    only in the C++ side) and never mixes with anything, uniform or not.
     """
     types = getattr(cache, "gguf_expert_types", None)
     if not types:
@@ -104,20 +131,27 @@ def _resolve_gguf_format(cache) -> str:
 
         return GGML_NAME.get(t, f"type {t}")
 
-    if gate_up != down:
+    def unsupported(t: int) -> None:
         raise NotImplementedError(
-            f"--moe-strategy cpu/hybrid runs one weight format for both expert banks, but "
-            f"this checkpoint stores gate_up as {name(gate_up)} and down as {name(down)}. "
-            f"Mixed-type banks (Q4_K_M and the _M/_XXS mixes do this) need "
-            f"--moe-strategy offload; a --pure requantization would also make it uniform."
-        )
-    if gate_up not in _GGML_TO_CPU_FMT:
-        raise NotImplementedError(
-            f"--moe-strategy cpu/hybrid has no CPU kernel for {name(gate_up)} experts "
+            f"--moe-strategy cpu/hybrid has no CPU kernel for {name(t)} experts "
             f"(supported: {', '.join(sorted(set(_GGML_TO_CPU_FMT.values())))}); use "
             f"--moe-strategy offload, which dequantizes on the GPU and covers every type."
         )
-    return _GGML_TO_CPU_FMT[gate_up]
+
+    if gate_up not in _GGML_TO_CPU_FMT:
+        unsupported(gate_up)
+    if down not in _GGML_TO_CPU_FMT:
+        unsupported(down)
+    gu_fmt, dn_fmt = _GGML_TO_CPU_FMT[gate_up], _GGML_TO_CPU_FMT[down]
+    if gu_fmt != dn_fmt and (gu_fmt not in _GGUF_KQUANT_BLOCK or dn_fmt not in _GGUF_KQUANT_BLOCK):
+        raise NotImplementedError(
+            f"--moe-strategy cpu/hybrid runs one weight format for both expert banks, but "
+            f"this checkpoint stores gate_up as {name(gate_up)} and down as {name(down)}, "
+            f"and at least one of those isn't in the mixable K-quant/I-quant family "
+            f"({', '.join(sorted(_GGUF_KQUANT_BLOCK))}); use --moe-strategy offload, or a "
+            f"--pure requantization to make it uniform."
+        )
+    return gu_fmt, dn_fmt
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -242,27 +276,32 @@ class CpuMoeExecutor:
         from freetoken.moe.legacy_format import canonical_role
 
         fmt = fmt or cache.quant_format
-        # "gguf" is a container tag; resolve it to the concrete per-type CPU format first so
-        # everything downstream (the _WFMT_IDS gate, _resolve_banks, the C++ weight_format)
-        # sees one layout name.
+        # "gguf" is a container tag; resolve it to the concrete per-type CPU format(s) first
+        # so everything downstream (the _WFMT_IDS gate, _resolve_banks, the C++
+        # weight_format/down_weight_format) sees plain layout names. down_fmt equals fmt
+        # except for a mixed GGUF checkpoint (gate_up and down banks in different, both
+        # CPU-kernel-capable, K-quant/I-quant types -- see _resolve_gguf_format).
         if fmt == "gguf":
-            fmt = _resolve_gguf_format(cache)
-        if fmt not in _WFMT_IDS:
-            raise NotImplementedError(
-                f"--moe-strategy cpu/hybrid computes experts on the CPU and supports "
-                f"{sorted(_WFMT_IDS)} formats, but this checkpoint's experts are "
-                f"{fmt!r}; use --moe-strategy offload (GPU-side dequant) instead."
-            )
-        # ABI probe for weight layouts, the sibling of the activation one below: handing a
-        # stale .so a K-quant id is not a clean throw, it is a fault inside a worker thread
-        # that already received the bank pointer table.
-        if not compiled_extension_supports_format(fmt):
-            raise RuntimeError(
-                f"the compiled _cpu_moe extension cannot dispatch weight format {fmt!r} "
-                f"(id {_WFMT_IDS[fmt]}); it predates the GGUF K-quant layouts. rebuild it "
-                "with `python setup.py build_ext --inplace` (or reinstall the wheel) before "
-                "serving this checkpoint on the cpu/hybrid backend."
-            )
+            fmt, down_fmt = _resolve_gguf_format(cache)
+        else:
+            down_fmt = fmt
+        for f in (fmt, down_fmt):
+            if f not in _WFMT_IDS:
+                raise NotImplementedError(
+                    f"--moe-strategy cpu/hybrid computes experts on the CPU and supports "
+                    f"{sorted(_WFMT_IDS)} formats, but this checkpoint's experts are "
+                    f"{f!r}; use --moe-strategy offload (GPU-side dequant) instead."
+                )
+            # ABI probe for weight layouts, the sibling of the activation one below: handing
+            # a stale .so a K-quant id is not a clean throw, it is a fault inside a worker
+            # thread that already received the bank pointer table.
+            if not compiled_extension_supports_format(f):
+                raise RuntimeError(
+                    f"the compiled _cpu_moe extension cannot dispatch weight format {f!r} "
+                    f"(id {_WFMT_IDS[f]}); it predates the GGUF K-quant layouts. rebuild it "
+                    "with `python setup.py build_ext --inplace` (or reinstall the wheel) "
+                    "before serving this checkpoint on the cpu/hybrid backend."
+                )
         if activation not in _ACT_IDS:
             raise NotImplementedError(f"CPU MoE backend: unsupported activation {activation!r}")
         # ABI probe: a stale prebuilt _cpu_moe.so accepts newer act ids without
@@ -283,6 +322,7 @@ class CpuMoeExecutor:
         self.num_experts = int(cache.num_experts)
         self.top_k = int(top_k)
         self.quant_format = fmt
+        self.quant_format_down = down_fmt  # == fmt unless a mixed GGUF checkpoint resolved it
         self.device = device
         self.max_tokens = int(max_tokens)
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
@@ -290,7 +330,9 @@ class CpuMoeExecutor:
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
         ptrs, (self.H, self.I) = self._resolve_banks(
-            {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()}, fmt
+            {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()},
+            fmt,
+            down_fmt,
         )
 
         # Decide the flag handshake up front (env + device + a functional stream-memop
@@ -332,6 +374,7 @@ class CpuMoeExecutor:
             activation_id=_ACT_IDS[activation],
             apply_router_weight_on_input=1 if apply_router_weight_on_input else 0,
             weight_format=_WFMT_IDS[fmt],
+            down_weight_format=_WFMT_IDS[down_fmt],
             swiglu_alpha=float(swiglu_alpha),
             swiglu_limit=float(swiglu_limit) if swiglu_limit is not None else float("inf"),
             core_ids=core_ids,
@@ -413,7 +456,8 @@ class CpuMoeExecutor:
 
         logger.info_rank0(
             f"CPU MoE executor ready: threads={nthreads} (pinned to cores "
-            f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} fmt={fmt} "
+            f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} "
+            f"fmt={fmt if fmt == down_fmt else f'{fmt}(gate_up)+{down_fmt}(down)'} "
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens}"
         )
@@ -433,15 +477,22 @@ class CpuMoeExecutor:
         self._banks.extend(layers)
         return table
 
-    def _resolve_banks(self, banks: dict, fmt: str) -> tuple[dict, tuple[int, int]]:
-        """Return (pointer kwargs for the C++ ctor, (H, I)) for the given format.
+    def _resolve_banks(
+        self, banks: dict, fmt: str, down_fmt: str | None = None
+    ) -> tuple[dict, tuple[int, int]]:
+        """Return (pointer kwargs for the C++ ctor, (H, I)) for the given format(s).
 
         ``banks[name]`` is a list of ``num_layers`` ``[num_experts, ...]`` tensors
         (the per-layer host bank contract); shapes are read from the first layer so
         per-partition (TP) sizes are exact. Unused pointers are 0. Every pointer kwarg
         is actually a per-layer table's address (see ``_make_table``), not a single
         bank's -- the C++ ctor resolves ``tbl[layer_id]`` per task.
+
+        ``down_fmt`` only matters for the K-quant/I-quant family (see
+        ``_resolve_gguf_format``): every other format here is single-format-only, so it
+        defaults to ``fmt``.
         """
+        down_fmt = down_fmt or fmt
         if fmt == "bf16":
             gate_up = banks["gate_up"]
             down = banks["down"]
@@ -468,8 +519,8 @@ class CpuMoeExecutor:
         if fmt == "q4_0":
             return self._resolve_q4_0_banks(banks)
 
-        if fmt in _GGUF_KQUANT_BLOCK:
-            return self._resolve_kquant_banks(banks, fmt)
+        if fmt in _GGUF_KQUANT_BLOCK and down_fmt in _GGUF_KQUANT_BLOCK:
+            return self._resolve_kquant_banks(banks, fmt, down_fmt)
 
         if fmt == "mxfp4_triton":
             return self._resolve_mxfp4_banks(banks)
@@ -539,24 +590,31 @@ class CpuMoeExecutor:
         )
         return ptrs, (H, I)
 
-    def _resolve_kquant_banks(self, banks: dict, fmt: str) -> tuple[dict, tuple[int, int]]:
-        """Native GGUF K-quant expert banks (Q4_K, Q6_K), same schema as Q4_0 but with a
-        256-element block instead of 32.
+    def _resolve_kquant_banks(
+        self, banks: dict, fmt: str, down_fmt: str | None = None
+    ) -> tuple[dict, tuple[int, int]]:
+        """Native GGUF K-quant/I-quant expert banks (Q4_K, Q6_K, IQ3_S, IQ4_XS, IQ4_NL,
+        Q8_0), same schema as Q4_0 but with a 256- or 32-element block.
 
         These share Q4_0's contract: the banks handed here are byte-identical to the ones
         the GPU offload path streams, and the C++ GEMV dequantizes a block inside the
         K-loop rather than materialising the row. The only per-format quantities are the
-        block geometry, so the checks below are Q4_0's with (32, 18) parameterised out.
+        block geometry, so the checks below are Q4_0's with (32, 18) parameterised out --
+        independently per bank, since gate_up and down can use different formats from
+        this family (see ``_resolve_gguf_format`` / ``down_weight_format`` in
+        cpu_moe_ext.cpp): ``down_fmt`` defaults to ``fmt`` for the uniform case.
 
         Unlike Q4_0 these run W4A16 (see ``use_q4a8`` in cpu_moe_ext.cpp): the K-quant
         scalar dots read the bf16 activation directly, since the super-block scale
         structure does not map onto the int8 activation path.
         """
-        qk, blk = _GGUF_KQUANT_BLOCK[fmt]
+        down_fmt = down_fmt or fmt
+        gu_qk, gu_blk = _GGUF_KQUANT_BLOCK[fmt]
+        dn_qk, dn_blk = _GGUF_KQUANT_BLOCK[down_fmt]
         gate_up, down = banks["gate_up"], banks["down"]
         if gate_up[0].dtype != torch.uint8 or down[0].dtype != torch.uint8:
             raise TypeError(
-                f"{fmt} expert banks must be raw packed bytes (uint8), got "
+                f"{fmt}/{down_fmt} expert banks must be raw packed bytes (uint8), got "
                 f"gate_up={gate_up[0].dtype} down={down[0].dtype}"
             )
         I = int(gate_up[0].shape[1] // 2)
@@ -565,11 +623,11 @@ class CpuMoeExecutor:
             raise ValueError(f"gate_up must be a fused [S, 2I, ...] bank, got {gate_up[0].shape}")
         # A partial block has no representation in the format, so a non-multiple here means
         # the bank was built wrong; the C++ row arithmetic would silently truncate it.
-        if H % qk or I % qk:
-            raise ValueError(
-                f"{fmt} needs H and I to be multiples of {qk} (block size), got H={H} I={I}"
-            )
-        want_gu, want_dn = (H // qk) * blk, (I // qk) * blk
+        if H % gu_qk:
+            raise ValueError(f"{fmt} gate_up needs H to be a multiple of {gu_qk}, got H={H}")
+        if I % dn_qk:
+            raise ValueError(f"{down_fmt} down needs I to be a multiple of {dn_qk}, got I={I}")
+        want_gu, want_dn = (H // gu_qk) * gu_blk, (I // dn_qk) * dn_blk
         if int(gate_up[0].shape[2]) != want_gu:
             raise ValueError(
                 f"{fmt} gate_up row is {int(gate_up[0].shape[2])} bytes, expected {want_gu} "
@@ -577,7 +635,8 @@ class CpuMoeExecutor:
             )
         if int(down[0].shape[2]) != want_dn:
             raise ValueError(
-                f"{fmt} down row is {int(down[0].shape[2])} bytes, expected {want_dn} for K={I}"
+                f"{down_fmt} down row is {int(down[0].shape[2])} bytes, expected {want_dn} "
+                f"for K={I}"
             )
         ptrs = dict(
             gate_up_ptr=self._make_table(gate_up).data_ptr(),
