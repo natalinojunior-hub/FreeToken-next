@@ -3,13 +3,13 @@
 
 PORT=${1:-8081}
 PID=${2:-}
-TIMEOUT=${3:-60}
+TIMEOUT=${3:-180}
 START=$(date +%s)
 
 echo "Aguardando servidor na porta $PORT..."
 
 while true; do
-    if curl -s http://127.0.0.1:$PORT/health | grep -q "serving"; then
+    if curl -s http://127.0.0.1:$PORT/health | grep -Eq '"status"[[:space:]]*:[[:space:]]*"(ok|serving)"'; then
         echo "Servidor ONLINE!"
         exit 0
     fi

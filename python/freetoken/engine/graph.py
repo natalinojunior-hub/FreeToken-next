@@ -33,6 +33,11 @@ DRAFT_GRAPH_ENV = "FREETOKEN_DRAFT_GRAPH"
 DRAFT_GRAPH_CHECK_ENV = "FREETOKEN_DRAFT_GRAPH_CHECK"
 
 
+def draft_graph_enabled(model: object) -> bool:
+    """Draft graphs are currently supported for models with an MTP module."""
+    return getattr(model, "mtp", None) is not None and os.getenv(DRAFT_GRAPH_ENV, "1") == "1"
+
+
 # Most rejected-token replays a k=1 verify window re-feeds instead of replaying them alone.
 SPEC_DEFER_MAX = 2
 
@@ -232,11 +237,7 @@ class GraphRunner:
         if self.graph_map:
             for tokens in verify_tokens:
                 self._capture_verify(model, tokens, vocab_size)
-            if (
-                verify_tokens
-                and getattr(model, "mtp", None) is not None
-                and os.getenv(DRAFT_GRAPH_ENV, "1") == "1"
-            ):
+            if verify_tokens and draft_graph_enabled(model):
                 self._capture_draft(model, vocab_size)
 
     def _reset_moe_offload_cache(self) -> None:
