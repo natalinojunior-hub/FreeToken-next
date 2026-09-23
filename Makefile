@@ -1,4 +1,4 @@
-.PHONY: help install test test-safe bench format lint typecheck ci clean preflight profile crossref
+.PHONY: help install test test-safe bench bench-flash format lint typecheck ci clean preflight profile crossref
 
 export CUDA_HOME ?= /models/outros/cuda-13.3
 export CUDA_PATH ?= $(CUDA_HOME)
@@ -76,6 +76,16 @@ bench-turbo4:
 		--tokens 16384 --decode 16 --repeats 3 --label turbo4-mtp$(MTP) --mem-ratio 0.9 \
 		--serve-arg="--num-tokens 16576" --serve-arg="--kv-format turbo4" \
 		--serve-arg="--cache-type naive" $(MTP_ARG)
+
+# Flash-Next GGUF (IQ4_XS + MTP): 4K prompt, 256 tokens, 16K capacity, turbo3. Repeats hit the
+# radix prefix cache, so its PP is cached-prefix PP; cold PP needs a unique prompt per request.
+bench-flash:
+	TMPDIR=/models/desenvolvimento/tmp FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1 \
+	uv run --no-sync python benchmarks/bench_pp_tg.py \
+		--model /models/Qwen3.8-Flash-Next-Unsloth-IQ4_XS/UD-IQ4_XS \
+		--tokens 4096 --decode 256 --repeats 3 --label flash-gguf-mtp$(MTP) \
+		--serve-arg="--max-seq-len-override 16384" --serve-arg="--kv-format turbo3" \
+		--serve-arg="--cuda-graph-max-bs 1" --serve-arg="--max-running-requests 1" $(MTP_ARG)
 
 format:
 	uv run --no-sync ruff format .
