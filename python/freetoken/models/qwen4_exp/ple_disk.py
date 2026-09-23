@@ -260,6 +260,14 @@ class DiskRowTable:
             for t in _context(ids, position, self.eos_token_id)
         ]
 
+    @staticmethod
+    def _window_ids(batch: Batch, req) -> torch.Tensor:
+        """This forward's new tokens; a verify window's drafts are not in req.input_ids yet."""
+        host_ids = getattr(batch, "spec_host_ids", None)
+        if host_ids is not None:
+            return torch.tensor(host_ids, dtype=req.input_ids.dtype)
+        return req.input_ids[req.cached_len : req.device_len]
+
     def host_fill_batch(self, batch: Batch, use_graph: bool):
         """Stage this batch's rows; returns the post-dispatch fill callable under flag-sync, else None."""
         eos = self.eos_token_id
@@ -306,7 +314,7 @@ class DiskRowTable:
                     torch.tensor(
                         self._ple_context(req.input_ids, req.cached_len), dtype=torch.int64
                     ),
-                    self._ple_ids(req.input_ids[req.cached_len : req.device_len]).to(torch.int64),
+                    self._ple_ids(self._window_ids(batch, req)).to(torch.int64),
                 )
             )
             for req in batch.padded_reqs

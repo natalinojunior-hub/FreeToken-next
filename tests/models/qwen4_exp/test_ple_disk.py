@@ -317,6 +317,17 @@ def test_disk_table_matches_oracle(tmp_path):
     ids = emb.row_ids(_meta([prompt[:4], prompt[4:]], [[EOS, EOS], [prompt[2], prompt[3]]])).cuda()
     assert _bitwise_equal(disk.lookup(ids), oracle.lookup(ids)), "hook prefill"
 
+    # spec verify window: the draft (17) is only in spec_host_ids, not in req.input_ids
+    verify = SimpleNamespace(
+        input_ids=torch.tensor(prompt, dtype=torch.int32), device_len=7, cached_len=5
+    )
+    disk.host_fill_batch(
+        SimpleNamespace(is_decode=False, padded_reqs=[verify], spec_host_ids=[prompt[5], 17]),
+        use_graph=False,
+    )
+    ids = emb.row_ids(_meta([[prompt[5], 17]], [[prompt[3], prompt[4]]])).cuda()
+    assert _bitwise_equal(disk.lookup(ids), oracle.lookup(ids)), "hook verify"
+
 
 @requires_cuda
 def test_graph_sync_protocol(tmp_path, monkeypatch):

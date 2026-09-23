@@ -171,6 +171,10 @@ class Batch:
     # List of (recurrent_states, conv_states) per step when spec_logits_indices is set.
     # Each element is a tuple of tensors cloned from the linear_state_pool at that step.
     gdn_checkpoints: list | None = field(default=None, init=False)
+    # Host copy of a spec-decode verify window's input tokens. The drafts live only in the
+    # device token pool (req.input_ids holds committed tokens), so host-side consumers such
+    # as the disk PLE fill read the window from here.
+    spec_host_ids: List[int] | None = field(default=None, init=False)
 
     @property
     def is_prefill(self) -> bool:

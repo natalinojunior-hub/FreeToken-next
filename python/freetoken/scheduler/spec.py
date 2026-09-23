@@ -389,6 +389,7 @@ class SchedulerSpecMixin:
         fi = self._prepare_batch(vb)
         vb.spec_logits_indices = torch.arange(k + 1, device=self.device)
         vb.input_ids = self.token_pool[fi.input_tuple]
+        vb.spec_host_ids = [int(req.input_ids[d - 1]), *drafts]
         mark("verify_prepare_batch")
         out = self.engine.forward_batch(vb, fi.sample_args)
         out.copy_done_event.synchronize()
