@@ -146,6 +146,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._block_topk_kernel = _resolve_block_topk()
         # decode staging (static buffers under CUDA graphs; eager decode snapshots per step)
         self._graph: dict[str, torch.Tensor] = {}
+        # static addressing for the spec-verify graph (stage_verify), keyed by window length
+        self._verify: dict = {}
         self.capture_bs: List[int] = []
         self._ws_k: torch.Tensor | None = None
         self._ws_v: torch.Tensor | None = None
@@ -652,9 +654,38 @@ class QSASparseAttnBackend(BaseAttnBackend):
         assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
         self._stage_decode(md, batch.padded_size, batch.active_table_idx.to(torch.int64))
 
+    def stage_verify(self, batch: Batch) -> None:
+        """Copy a spec-verify window's addressing (one request, fixed extend) into static
+        buffers and point the metadata at them, so the verify graph reads current values.
+        ``prepare_metadata`` must have run on ``batch`` first."""
+        md = batch.attn_metadata
+        assert isinstance(md, QSASparseMetadata) and not md.is_decode
+        tokens = batch.input_ids.shape[0]
+        v = self._verify
+        if v.get("tokens") != tokens:
+            assert not torch.cuda.is_current_stream_capturing()
+            v.clear()
+            v.update(
+                tokens=tokens,
+                block_table=torch.zeros_like(md.block_table),
+                kvlen=torch.zeros_like(md.seq_lens),
+                table_idx=torch.zeros_like(md.ring_slots),
+                token_to_req=torch.zeros(tokens, dtype=torch.int32, device=self.device),
+                cu_seqlens=torch.tensor([0, tokens], dtype=torch.int32, device=self.device),
+            )
+        for name, src in (
+            ("block_table", md.block_table),
+            ("kvlen", md.seq_lens),
+            ("table_idx", md.ring_slots),
+        ):
+            v[name].copy_(src)
+        md.block_table, md.seq_lens, md.ring_slots = v["block_table"], v["kvlen"], v["table_idx"]
+        md.token_to_req, md.cu_seqlens = v["token_to_req"], v["cu_seqlens"]
+
     def reset_capture(self) -> None:
         super().reset_capture()
         self._graph = {}
+        self._verify = {}
 
 
 __all__ = ["QSASparseAttnBackend", "QSASparseMetadata"]

@@ -319,7 +319,8 @@ class DiskRowTable:
             )
             for req in batch.padded_reqs
         ]
-        self.fill(runs, graph=False)
+        # a graph-replayed prefill (the spec-verify window) knows its tokens up front
+        self.fill(runs, graph=use_graph)
         return None
 
     @contextmanager

@@ -230,6 +230,88 @@ def test_decode_graph_replay_matches_eager():
         assert torch.equal(replayed, eager), f"graph replay diverged at decode step {step}"
 
 
+def _kv_state(fixture: Fixture) -> list[torch.Tensor]:
+    """Every device tensor of the QSA pool (K/V slabs, pending ring, compressed index slab)."""
+    owners = (fixture.pool, getattr(fixture.pool, "_pool", None))
+    values = [v for owner in owners if owner is not None for v in vars(owner).values()]
+    flat = [t for v in values for t in (v if isinstance(v, (list, tuple)) else (v,))]
+    return [t for t in flat if isinstance(t, torch.Tensor) and t.is_cuda]
+
+
+def _verify_batch(fixture: Fixture, req, static: dict | None = None):
+    """A spec-verify window (prefill phase, spec_logits_indices set); ``static`` rebinds the
+    positions/out_loc to capture buffers after copying this window's values in."""
+    batch = fixture.batch([req], "prefill")
+    batch.spec_logits_indices = torch.arange(req.extend_len, device=fixture.device)
+    batch.input_ids = torch.zeros(req.extend_len, dtype=torch.int32, device=fixture.device)
+    if static is not None:
+        static["positions"].copy_(batch.positions)
+        static["out_loc"].copy_(batch.out_loc)
+        batch.positions, batch.out_loc = static["positions"], static["out_loc"]
+        batch.get_attn_positions = lambda: static["positions"]
+    return batch
+
+
+@requires_cuda
+@pytest.mark.parametrize("kv_format", ["auto", "turbo3"])
+def test_verify_graph_replay_matches_eager(kv_format):
+    """A captured 2-token spec-verify window (stage_verify) reproduces the eager verify
+    bitwise -- output and every pool tensor -- over accepted and rejected windows whose draft
+    rows change. Under capture the turbo path decompresses every page instead of the
+    selected ones; the attended values must not change."""
+    config = parsed_config()
+    fixture = Fixture(config, num_pages=256, kv_format=kv_format)
+    attn = fixture.layer(QSA_LAYER)
+    length, tokens = 300, 2
+    accepts = [True, False, True, True, False, False, True]
+    rows = _inputs(fixture, [length], extra=tokens * len(accepts))[0]
+    req = fixture.req(0, 0, length)
+    attn.forward(rows[:length], fixture.batch([req], "prefill"))
+
+    fixture.backend.init_capture_graph(max_seq_len=fixture.page_table.shape[1], bs_list=[1])
+    device, dtype = fixture.device, fixture.dtype
+    static = {
+        "x": torch.zeros(tokens, config.hidden_size, device=device, dtype=dtype),
+        "positions": torch.zeros(tokens, dtype=torch.int32, device=device),
+        "out_loc": torch.zeros(tokens, dtype=torch.int32, device=device),
+    }
+    dummy = SimpleNamespace(
+        table_idx=fixture.num_req_slots - 1, cached_len=1, device_len=3, extend_len=tokens
+    )
+    capture_batch = _verify_batch(fixture, dummy, static)
+    fixture.backend.stage_verify(capture_batch)
+    attn.forward(static["x"], capture_batch)  # warmup, same metadata object as the capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_out = attn.forward(static["x"], capture_batch)
+    torch.cuda.synchronize()
+
+    start = length
+    for window, accept in enumerate(accepts):
+        fixture.allocate(req.table_idx, start, start + tokens)
+        req.cached_len, req.device_len, req.extend_len = start, start + tokens, tokens
+        x = rows[length + tokens * window : length + tokens * (window + 1)]
+        state = _kv_state(fixture)
+        before = [t.clone() for t in state]
+        eager = attn.forward(x, _verify_batch(fixture, req))
+        expect = [t.clone() for t in state]
+        for t, b in zip(state, before):
+            t.copy_(b)
+
+        batch = _verify_batch(fixture, req, static)
+        static["x"].copy_(x)
+        fixture.backend.stage_verify(batch)
+        # replay must stage into the captured buffers, never reallocate them
+        staged = fixture.backend._verify["block_table"]
+        assert batch.attn_metadata.block_table.data_ptr() == staged.data_ptr()
+        graph.replay()
+        assert torch.equal(captured_out, eager), f"verify output diverged at window {window}"
+        bad = [i for i, (t, e) in enumerate(zip(state, expect)) if not torch.equal(t, e)]
+        assert not bad, f"pool tensors {bad} diverged at window {window}"
+        start += tokens if accept else 1
+
+
 @requires_cuda
 def test_row_chunked_scoring_matches_one_chunk(monkeypatch):
     """The scoring workspace bound splits long prefills into row chunks."""

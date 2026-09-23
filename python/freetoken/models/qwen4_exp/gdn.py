@@ -187,11 +187,13 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         B = 1  # speculative verification request is always a single sequence
         device = conv_in.device
 
-        # Initialize checkpoints on batch if present
-        if batch is not None and getattr(batch, "gdn_checkpoints", None) is None:
+        # Initialize checkpoints on batch if present. A captured verify graph takes none: no
+        # consumer restores them yet, and clones would pin graph-pool memory for good.
+        capturing = torch.cuda.is_current_stream_capturing()
+        if batch is not None and not capturing and getattr(batch, "gdn_checkpoints", None) is None:
             batch.gdn_checkpoints = {}
 
-        cu_dec = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        cu_dec = torch.arange(2, dtype=torch.int32, device=device)
         core_outs = []
 
         # Process each token step-by-step
@@ -225,7 +227,11 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             core_outs.append(out_t)
 
             # Checkpoint: clone recurrent + conv state after this step
-            if batch is not None and getattr(batch, "gdn_checkpoints", None) is not None:
+            if (
+                not capturing
+                and batch is not None
+                and getattr(batch, "gdn_checkpoints", None) is not None
+            ):
                 rec_state = pool.recurrent_states[li, fla.cache_indices].clone().squeeze(0)
                 conv_state = pool.conv_states[li, fla.cache_indices].clone().squeeze(0)
                 batch.gdn_checkpoints.setdefault(t, {})[li] = (rec_state, conv_state)

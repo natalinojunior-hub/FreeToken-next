@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
 
@@ -13,10 +14,22 @@ from tqdm import tqdm
 
 if TYPE_CHECKING:
     from freetoken.attention import BaseAttnBackend
+    from freetoken.attention.linear import FLAMetadata
     from freetoken.models import BaseLLMModel
     from freetoken.moe.offload_cache import OffloadMoeCache
 
 logger = init_logger(__name__)
+
+# "0" forces the eager spec-verify forward (debug / correctness reference).
+VERIFY_GRAPH_ENV = "FREETOKEN_VERIFY_GRAPH"
+
+
+def verify_graph_tokens(spec_mtp: int) -> int:
+    """Rows of the captured spec-verify window (k+1), or 0 for an eager verify. Only k=1
+    is captured."""
+    if spec_mtp != 1 or os.getenv(VERIFY_GRAPH_ENV, "1") == "0":
+        return 0
+    return spec_mtp + 1
 
 
 @dataclass
@@ -76,6 +89,44 @@ class GraphCaptureBuffer:
             self.table_idx[_slice] = batch.linear_table_idx
 
 
+@dataclass
+class VerifyGraph:
+    """The spec-verify forward of one request over a fixed ``tokens``-row window, captured
+    once. Replay restages every input below plus the attention addressing, so it always
+    consumes the current window; the GDN/PLE/KV/QSA state it updates lives in the pools."""
+
+    graph: torch.cuda.CUDAGraph
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    out_loc: torch.Tensor
+    mrope_positions: torch.Tensor | None
+    logits_rows: torch.Tensor  # arange(tokens): the batch's spec_logits_indices
+    fla: "FLAMetadata"
+    logits: torch.Tensor
+    # (owner, tensor): the captured MTP residual output, rebound on the model after replay
+    residual: tuple | None = None
+
+    @property
+    def tokens(self) -> int:
+        return self.input_ids.shape[0]
+
+    def bind(self, batch: Batch) -> None:
+        batch.input_ids = self.input_ids
+        batch.positions = self.positions
+        batch.out_loc = self.out_loc
+        batch.mrope_positions = self.mrope_positions
+        batch.spec_logits_indices = self.logits_rows
+        batch.fla_metadata = self.fla
+
+    def copy_from(self, batch: Batch) -> None:
+        self.input_ids.copy_(batch.input_ids)
+        self.positions.copy_(batch.positions)
+        self.out_loc.copy_(batch.out_loc)
+        if self.mrope_positions is not None:
+            self.mrope_positions.copy_(batch.mrope_positions)
+        self.fla.cache_indices.copy_(batch.fla_metadata.cache_indices)
+
+
 def _determine_cuda_graph_bs(
     cuda_graph_bs: List[int] | None,
     cuda_graph_max_bs: int | None,
@@ -117,6 +168,7 @@ class GraphRunner:
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
         mrope: bool = False,
+        verify_tokens: int = 0,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -131,7 +183,10 @@ class GraphRunner:
         self.mrope = mrope
         self.stream = stream
         self.device = device
+        self.verify: VerifyGraph | None = None
         self._capture_graphs(max_seq_len, vocab_size, model)
+        if verify_tokens and self.graph_map:
+            self._capture_verify(model, verify_tokens, vocab_size)
 
     def _reset_moe_offload_cache(self) -> None:
         if self.moe_offload_cache is not None:
@@ -198,16 +253,98 @@ class GraphRunner:
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph
+        self._pool = pool
 
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
+    def _capture_verify(self, model: BaseLLMModel, tokens: int, vocab_size: int) -> None:
+        """Capture the spec-verify forward on the dummy request/page (sharing the decode
+        graphs' pool). Any failure leaves ``self.verify`` None: verify stays eager."""
+        from freetoken.attention.linear import FLAMetadata
+
+        dummy = self.dummy_req
+        req = Req(
+            input_ids=torch.zeros(tokens + 1, dtype=torch.int32),
+            table_idx=dummy.table_idx,
+            cached_len=1,
+            output_len=1,
+            uid=-1,
+            sampling_params=None,  # type: ignore
+            cache_handle=None,  # type: ignore
+        )
+        req.linear_slot_idx = dummy.linear_slot_idx
+        slot = dummy.linear_slot_idx if dummy.linear_slot_idx is not None else dummy.table_idx
+        device = self.device
+        verify = VerifyGraph(
+            graph=torch.cuda.CUDAGraph(),
+            input_ids=torch.zeros(tokens, dtype=torch.int32, device=device),
+            positions=torch.arange(1, tokens + 1, dtype=torch.int32, device=device),
+            out_loc=get_global_ctx().page_table[dummy.table_idx, 1 : tokens + 1].clone(),
+            mrope_positions=(
+                torch.zeros(3, tokens, dtype=torch.int32, device=device) if self.mrope else None
+            ),
+            logits_rows=torch.arange(tokens, device=device),
+            fla=FLAMetadata(
+                cu_seqlens=torch.tensor([0, tokens], dtype=torch.int32, device=device),
+                cache_indices=torch.full((1,), slot, dtype=torch.int32, device=device),
+                has_initial_state=torch.ones(1, dtype=torch.bool, device=device),
+            ),
+            logits=torch.empty(tokens, vocab_size, dtype=torch.float32, device=device),
+        )
+        batch = Batch(reqs=[req], phase="prefill")
+        batch.padded_reqs = batch.reqs
+        verify.bind(batch)
+        try:
+            self.attn_backend.prepare_metadata(batch)
+            self.attn_backend.stage_verify(batch)
+            with get_global_ctx().forward_batch(batch):
+                verify.logits.copy_(model.forward())
+                with torch.cuda.graph(verify.graph, pool=self._pool, stream=self.stream):
+                    verify.logits.copy_(model.forward())
+        except Exception as e:
+            logger.warning_rank0(f"Spec-verify CUDA graph capture failed, verify stays eager: {e}")
+            return
+        finally:
+            self._reset_moe_offload_cache()
+        owner = getattr(model, "model", None)
+        residual = getattr(owner, "_last_residual", None)
+        verify.residual = (owner, residual) if residual is not None else None
+        self.verify = verify
+        logger.info_rank0(f"Captured spec-verify CUDA graph ({tokens} tokens)")
+
+    def _is_verify(self, batch: Batch) -> bool:
+        v = self.verify
+        return (
+            v is not None
+            and batch.is_prefill
+            and batch.spec_logits_indices is not None
+            and batch.size == 1
+            and batch.input_ids.shape[0] == v.tokens
+            and batch.reqs[0].cached_len > 0
+            and batch.mm_embeds is None
+        )
+
     def can_use_cuda_graph(self, batch: Batch) -> bool:
-        return batch.is_decode and batch.size <= self.max_graph_bs
+        if batch.is_decode:
+            return batch.size <= self.max_graph_bs
+        return self._is_verify(batch)
+
+    def _replay_verify(self, batch: Batch) -> torch.Tensor:
+        v = self.verify
+        v.copy_from(batch)
+        self.attn_backend.stage_verify(batch)
+        v.graph.replay()
+        if v.residual is not None:
+            owner, residual = v.residual
+            owner._last_residual = residual
+        return v.logits
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
+        if not batch.is_decode:
+            return self._replay_verify(batch)
         self.buffer.copy_from(batch)
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
@@ -231,4 +368,6 @@ class GraphRunner:
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
         self.buffer = None
+        self.verify = None
+        self._pool = None
         gc.collect()

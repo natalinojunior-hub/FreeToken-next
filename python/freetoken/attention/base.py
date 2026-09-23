@@ -75,6 +75,10 @@ class BaseAttnBackend(ABC):
     @abstractmethod
     def prepare_for_replay(self, batch: Batch) -> None: ...
 
+    def stage_verify(self, batch: Batch) -> None:
+        """Bind a prepared spec-verify batch's metadata to static buffers (verify graph)."""
+        raise NotImplementedError(f"{type(self).__name__} has no spec-verify graph")
+
     def reset_capture(self) -> None:
         """Drop CUDA-graph capture scratch so ``init_capture_graph`` can re-run after a
         runtime cache rebuild. The default clears the common capture state (guarded by

@@ -45,7 +45,7 @@ from .cache_budget import (
     pool_pages,
     required_bytes,
 )
-from .graph import GraphRunner, get_free_memory
+from .graph import GraphRunner, get_free_memory, verify_graph_tokens
 from .vram_ledger import (
     CALIBRATION_TOLERANCE,
     Kind,
@@ -714,6 +714,7 @@ class MemoryPlanner:
                 dummy_req=dummy_req,
                 moe_offload_cache=self._probe_expert_cache,
                 mrope=config.model_config.model_is_mrope,
+                verify_tokens=verify_graph_tokens(config.spec_mtp),
             )
             self._probe_graph_runner = runner
         except Exception as e:

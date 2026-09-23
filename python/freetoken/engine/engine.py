@@ -36,7 +36,7 @@ from freetoken.utils import (
 
 from .config import EngineConfig
 from .memory_planner import create_memory_planner, MemoryPlanner
-from .graph import GraphRunner, get_free_memory
+from .graph import GraphRunner, get_free_memory, verify_graph_tokens
 from .sample import BatchSamplingArgs, Sampler
 from .cache_budget import ceiling_bytes, pool_pages
 from .vram_ledger import (
@@ -555,6 +555,7 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
+            verify_tokens=verify_graph_tokens(config.spec_mtp),
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -1395,6 +1396,7 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
+            verify_tokens=verify_graph_tokens(config.spec_mtp),
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:

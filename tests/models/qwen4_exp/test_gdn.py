@@ -283,3 +283,59 @@ def test_decode_prefill_gdn_kernel_inequivalence():
     diff_rec = (dec_rec.float() - pref_rec.float()).abs().max().item()
     assert diff_out > 1e-4, f"Expected Bug A output inequivalence, got diff {diff_out}"
     assert diff_rec > 1e-4, f"Expected Bug A recurrent state inequivalence, got diff {diff_rec}"
+
+
+def test_spec_verify_graph_matches_eager():
+    """The 2-token spec-verify window (step-by-step decode kernel) captured once replays
+    bitwise-equal to the eager verify -- output and the slot's conv/recurrent state -- over
+    changing windows and slots. The capture takes no checkpoints; eager still does."""
+    from freetoken.attention.linear import FLAMetadata
+
+    op, _ = _make_layer(3, seed=3)
+    ctx = _ctx(3)
+    _, reqs, _ = _prefill(op, ctx, [128, 37], seed=13)
+    pool, tokens = ctx.linear_state_pool, 2
+
+    def fla(slot: int) -> FLAMetadata:
+        return FLAMetadata(
+            cu_seqlens=torch.tensor([0, tokens], dtype=torch.int32, device=DEV),
+            cache_indices=torch.tensor([slot], dtype=torch.int32, device=DEV),
+            has_initial_state=torch.ones(1, dtype=torch.bool, device=DEV),
+        )
+
+    def verify_batch(req, metadata: FLAMetadata) -> Batch:
+        batch = Batch(reqs=[req], phase="prefill")
+        batch.padded_reqs = [req]
+        batch.spec_logits_indices = torch.arange(tokens, device=DEV)
+        batch.fla_metadata = metadata
+        return batch
+
+    static_x = torch.zeros(tokens, HIDDEN, device=DEV, dtype=torch.bfloat16)
+    static_fla = fla(0)  # slot 0 is scratch here
+    with ctx.forward_batch(verify_batch(reqs[0], static_fla)):
+        op.forward(static_x)  # warmup
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    capture = verify_batch(reqs[0], static_fla)
+    with ctx.forward_batch(capture), torch.cuda.graph(graph):
+        captured = op.forward(static_x)
+    assert capture.gdn_checkpoints is None
+
+    gen = torch.Generator(device=DEV).manual_seed(5)
+    for step, req in enumerate([reqs[0], reqs[1], reqs[0], reqs[0], reqs[1]]):
+        slot = req.table_idx
+        x = torch.randn(tokens, HIDDEN, generator=gen, device=DEV, dtype=torch.bfloat16)
+        state = [pool.conv_states[:, slot], pool.recurrent_states[:, slot]]
+        before = [t.clone() for t in state]
+        eager_batch = verify_batch(req, fla(slot))
+        with ctx.forward_batch(eager_batch):
+            eager = op.forward(x)
+        assert sorted(eager_batch.gdn_checkpoints) == [0, 1]
+        expect = [t.clone() for t in state]
+        for t, b in zip(state, before):
+            t.copy_(b)
+        static_x.copy_(x)
+        static_fla.cache_indices.fill_(slot)
+        graph.replay()
+        assert torch.equal(captured, eager), f"verify output diverged at step {step}"
+        assert all(torch.equal(t, e) for t, e in zip(state, expect)), f"state at step {step}"

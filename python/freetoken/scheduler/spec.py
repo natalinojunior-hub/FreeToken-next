@@ -30,6 +30,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 SPEC_TIMING_ENV = "FREETOKEN_DEBUG_SPEC_TIMING"
+# "1": run every graph-eligible verify eagerly first and assert the graph replay reproduces it
+# bitwise (logits, sampled tokens, MTP residual, every state tensor the forward writes).
+VERIFY_GRAPH_CHECK_ENV = "FREETOKEN_VERIFY_GRAPH_CHECK"
 
 
 def _spec_mrope_positions(
@@ -158,6 +161,58 @@ class SchedulerSpecMixin:
         ring_buf[req.table_idx].copy_(snap_ring)
         scratch_base = getattr(kv, "_cmp_scratch_base", 0)
         kv._cmp_k_buffer[:, scratch_base + req.table_idx].copy_(snap_scratch)
+
+    def _verify_state(self, req: Req) -> List[torch.Tensor]:
+        """Every state tensor a verify forward can write: the request's linear-state slot
+        (GDN conv/recurrent, PLE context/conv) and the whole KV cache (QSA K/V slabs, pending
+        ring, compressed index slab) -- whole, so a write through a stale address shows too."""
+        pool = self.engine.linear_state_pool
+        slot = self._linear_slot(req)
+        state = [pool.conv_states[:, slot], pool.recurrent_states[:, slot]]
+        state += [t[:, slot] for t in pool.slot_states.values()]
+        kv = self.engine.kv_cache
+        for owner in (kv, getattr(kv, "_pool", None)):
+            for value in vars(owner).values() if owner is not None else ():
+                values = value if isinstance(value, (list, tuple)) else (value,)
+                state += [t for t in values if isinstance(t, torch.Tensor) and t.is_cuda]
+        return state
+
+    def _checked_verify_forward(self, req: Req, vb: Batch, sample_args):
+        """``VERIFY_GRAPH_CHECK_ENV``: eager verify, restore the pre-verify state, graph
+        verify, and assert both agree bitwise. Every 8th check starts from a cold expert
+        cache on one side, so hit/miss routing differs between the two runs."""
+        engine, runner = self.engine, self.engine.graph_runner
+        model = engine.model.model
+        n = self._verify_checks = getattr(self, "_verify_checks", 0) + 1
+        state = self._verify_state(req)
+        before = [t.clone() for t in state]
+        if n % 8 == 0 and engine.moe_offload_cache is not None:
+            engine.moe_offload_cache.reset()
+        verify, runner.verify = runner.verify, None
+        try:
+            eager = engine.forward_batch(vb, sample_args)
+        finally:
+            runner.verify = verify
+        expect = [t.clone() for t in state]
+        expect += [engine.last_batch_logits.clone(), eager.next_tokens_gpu.clone()]
+        expect.append(model._last_residual.clone())
+        for t, b in zip(state, before):
+            t.copy_(b)
+        vb.gdn_checkpoints = None
+        if n % 8 == 4 and engine.moe_offload_cache is not None:
+            engine.moe_offload_cache.reset()
+        out = engine.forward_batch(vb, sample_args)
+        got = state + [engine.last_batch_logits, out.next_tokens_gpu, model._last_residual]
+        bad = [i for i, (g, e) in enumerate(zip(got, expect)) if not torch.equal(g, e)]
+        if bad:
+            raise AssertionError(
+                f"verify graph != eager at check {n}: tensors {bad} of {len(got)} "
+                f"(last three: logits, tokens, residual)"
+            )
+        if n == 1 or n % 100 == 0:
+            nbytes = sum(t.numel() * t.element_size() for t in state)
+            logger.info(f"verify graph check {n} ok: {len(got)} tensors, {nbytes >> 20} MiB state")
+        return out
 
     def _snapshot_ple_state(self, req: Req) -> torch.Tensor | None:
         pool = getattr(self.engine, "linear_state_pool", None)
@@ -391,7 +446,12 @@ class SchedulerSpecMixin:
         vb.input_ids = self.token_pool[fi.input_tuple]
         vb.spec_host_ids = [int(req.input_ids[d - 1]), *drafts]
         mark("verify_prepare_batch")
-        out = self.engine.forward_batch(vb, fi.sample_args)
+        if os.getenv(VERIFY_GRAPH_CHECK_ENV, "0") == "1" and (
+            self.engine.graph_runner.can_use_cuda_graph(vb)
+        ):
+            out = self._checked_verify_forward(req, vb, fi.sample_args)
+        else:
+            out = self.engine.forward_batch(vb, fi.sample_args)
         out.copy_done_event.synchronize()
         mark("verify_forward")
         sampled = out.next_tokens_cpu.tolist()

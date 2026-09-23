@@ -206,6 +206,25 @@ Nenhuma das 3 falhas acima foi causada pelo fix do PLE; são pré-existentes e n
 
 ---
 
+## MTP k=1 verify in one CUDA graph (Unsloth-IQ4_XS GGUF, 16K, turbo3) — 2026-09-23
+
+Bench: 4K prompt, 256 tokens, 3 reps, `--cuda-graph-max-bs 1`, overlap off, `FREETOKEN_DEBUG_SPEC_TIMING=1`.
+
+| Metric | db12f41 | 28f7ec6 (PLE fix) | verify graph |
+|---|---|---|---|
+| verify ms | 53.7 | 54.0 | **37.1** |
+| draft / replay ms | 3.32 / 15.95 | 3.29 / 16.10 | 3.30 / 16.11 |
+| acceptance | 75.2% | 72.8% | 72.8% |
+| k1 TG / PP | 28.42 / 3153 | 27.85 / 3151 | **38.12** / 3153 |
+| k0 TG / PP (same-day rerun) | 41.56 / 3108 | — | 41.61 / 3112 |
+| peak VRAM MiB (k1) | 15868 | 15868 | 15846 |
+| expert slots (k1) / target miss | 2738 / 37.9% | 2738 | 2730 / 38.4% |
+
+nsys, per verify: launches 5975 -> 3 (1 graph, 5486 kernels). Syncs 90 -> 8. GPU idle 31.5 -> 1.9 ms.
+GPU busy stays about 35 ms: `fast_index_copy` (expert misses, H2D) 17 ms, dense `mul_mat_vec_q` 7.2 ms, `moe_vec_q` 3.3 ms.
+The capture takes about 1 s at startup and about 20 MiB of graph pool.
+The PLE fix changes the k1 output text (sha 0a7c5a94ca -> 1eebf6a554). With graphs off, disk PLE and pinned PLE give identical output.
+
 ## Referência Completa
 
 `old/docs/freetoken-next/PERFORMANCE.md` — Tabelas detalhadas por config/modelo, EXP-001 a EXP-045, metodologia, variáveis de controle.
