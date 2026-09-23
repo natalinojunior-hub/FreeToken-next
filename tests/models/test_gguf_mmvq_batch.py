@@ -35,6 +35,45 @@ def test_mmvq_batched_vectors_match_single_vector_launches(batch):
     torch.testing.assert_close(got.float(), ref, rtol=3e-2, atol=0.5)
 
 
+# gguf-py's `quantize()` has no encoder for these formats, so the a0adc18 test above
+# never covered them even though the UD-IQ4_XS checkpoint decodes through exactly these
+# types. The kernel only reads bytes, so a random block with a finite fp16 scale is enough
+# to exercise the same batched-vs-single-vector equality the Q8_0 test checks above.
+_IQ_FORMATS = [
+    ("IQ3_S", 256, 110),
+    ("IQ4_XS", 256, 136),
+    ("IQ4_NL", 32, 18),
+]
+
+
+@requires_cuda
+@pytest.mark.parametrize("fmt,blk_elems,blk_bytes", _IQ_FORMATS)
+@pytest.mark.parametrize("batch", [2, 3, 4, 5])
+def test_mmvq_batched_vectors_match_single_vector_launches_iq(fmt, blk_elems, blk_bytes, batch):
+    from gguf import GGMLQuantizationType
+
+    from freetoken.kernel.gguf import ggml_mul_mat_vec_a8
+
+    rows = 96
+    cols = blk_elems * 2
+    qtype = int(getattr(GGMLQuantizationType, fmt))
+    rng = np.random.default_rng(hash(fmt) & 0xFFFF)
+    row_bytes = (cols // blk_elems) * blk_bytes
+    raw = rng.integers(0, 256, size=(rows, row_bytes), dtype=np.uint8)
+    scale_bytes = np.frombuffer(np.float16(1.0).tobytes(), dtype=np.uint8)
+    for b in range(cols // blk_elems):
+        off = b * blk_bytes
+        raw[:, off : off + 2] = scale_bytes
+    weight = torch.from_numpy(np.ascontiguousarray(raw)).cuda()
+    x = torch.randn(batch, cols, dtype=torch.bfloat16, device="cuda")
+
+    got = ggml_mul_mat_vec_a8(weight, x, qtype, rows)
+    single = torch.cat(
+        [ggml_mul_mat_vec_a8(weight, x[i : i + 1], qtype, rows) for i in range(batch)]
+    )
+    assert torch.equal(got, single)
+
+
 @requires_cuda
 def test_host_resident_embedding_matches_device_lookup():
     from gguf import GGMLQuantizationType

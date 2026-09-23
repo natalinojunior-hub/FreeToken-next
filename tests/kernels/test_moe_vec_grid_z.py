@@ -108,6 +108,39 @@ def test_chunking_does_not_disturb_rows(banks, n):
     )
 
 
+def _run_row(b, i: int) -> torch.Tensor:
+    import freetoken.moe.fused_q4_0 as fq
+    from freetoken.models.gguf.dequant import GGML_Q4_0
+
+    saved, fq.DEQUANT_MIN_TOKENS = fq.DEQUANT_MIN_TOKENS, 1 << 30
+    try:
+        return fq.fused_experts_gguf(
+            b["x"][i : i + 1].contiguous(),
+            b["gate_up"],
+            b["down"],
+            b["w"][i : i + 1].contiguous(),
+            b["ids"][i : i + 1].contiguous(),
+            "silu",
+            GGML_Q4_0,
+        )
+    finally:
+        fq.DEQUANT_MIN_TOKENS = saved
+
+
+@pytest.mark.parametrize("n", [2, 3, 4])
+def test_spec_verify_window_matches_single_token(banks, n):
+    """Speculative-verify batches 2-4 draft rows through one GEMV launch.
+
+    moe_vec_q dispatches one (token, expert) pair per gridDim.z slice with no
+    cross-token accumulation, so a window's rows must equal running each row alone
+    -- this is the GEMV-path analogue of the a0adc18 MMVQ batching guarantee.
+    """
+    windowed = _run(banks, n)
+    per_row = torch.cat([_run_row(banks, i) for i in range(n)])
+    torch.cuda.synchronize()
+    assert torch.equal(windowed, per_row)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("tokens", [64, 300])
 @pytest.mark.parametrize("sparse", [False, True])  # every expert routed (sliced) or gathered
