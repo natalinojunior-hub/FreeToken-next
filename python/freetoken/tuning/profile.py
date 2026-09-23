@@ -16,7 +16,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import subprocess
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -46,46 +45,28 @@ def _ceil_pow2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
-def _git_rev() -> str:
-    """Best-effort short commit hash; "" outside a git checkout (e.g. a wheel install) --
-    an empty component still keys consistently, it just can't distinguish two commits."""
-    try:
-        out = subprocess.run(
-            ["git", "rev-parse", "--short=12", "HEAD"],
-            cwd=os.path.dirname(__file__),
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        return out.stdout.strip() if out.returncode == 0 else ""
-    except (OSError, subprocess.SubprocessError):
-        return ""
-
-
 def _kernel_source_fingerprint() -> str:
-    """Cheap proxy for "did the numerics-affecting kernel sources change": (path, size,
-    mtime) over kernel/moe source trees, not file contents -- a full content hash would
-    mean reading every .cu/.cpp/.py under kernel/ on every boot.
-
-    ponytail: mtime-based, not content-hashed -- a touch with no edit false-invalidates a
-    profile (safe, just a wasted re-tune); upgrade to a content hash if that proves noisy.
-    """
+    """Content hash of the kernel/moe source trees: a changed kernel can change the numerics
+    or timing a candidate was measured under. Contents, not mtimes, so a fresh checkout or a
+    second worktree of the same sources keys identically."""
     root = os.path.dirname(os.path.dirname(__file__))  # python/freetoken
-    roots = [os.path.join(root, "kernel"), os.path.join(root, "moe")]
-    entries: list[tuple[str, int, float]] = []
-    for base in roots:
+    h = hashlib.sha256()
+    paths = []
+    for base in (os.path.join(root, "kernel"), os.path.join(root, "moe")):
         for dirpath, _dirs, files in os.walk(base):
-            for name in files:
-                if not name.endswith((".py", ".cu", ".cuh", ".cpp", ".cc", ".h", ".hpp")):
-                    continue
-                p = os.path.join(dirpath, name)
-                try:
-                    st = os.stat(p)
-                except OSError:
-                    continue
-                entries.append((os.path.relpath(p, root), st.st_size, st.st_mtime))
-    entries.sort()
-    return hashlib.sha256(repr(entries).encode()).hexdigest()[:16]
+            paths += [
+                os.path.join(dirpath, n)
+                for n in files
+                if n.endswith((".py", ".cu", ".cuh", ".cpp", ".cc", ".h", ".hpp"))
+            ]
+    for p in sorted(paths, key=lambda p: os.path.relpath(p, root)):
+        try:
+            with open(p, "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        h.update(os.path.relpath(p, root).encode() + b"\0" + data)
+    return h.hexdigest()[:16]
 
 
 def _model_identity(model_path: str) -> str:
@@ -123,7 +104,7 @@ def compute_key(
 
     GPU (bandwidth/VRAM), model (weights + geometry), kv_format (attention backend/memory
     shape), a context-length bucket (ceil pow2 -- exact length doesn't matter, only which
-    power-of-two regime), the FreeToken build (version + git rev), and a kernel-source
+    power-of-two regime), the FreeToken version, and a kernel-source content
     fingerprint (a rebuilt kernel can change the numerics/timing a candidate was measured
     under). Any change to any of these invalidates the entry (a fresh key -> no file ->
     caller falls back to its own default).
@@ -135,7 +116,6 @@ def compute_key(
         "kv_format": kv_format,
         "ctx_bucket": _ceil_pow2(max(1, max_seq_len)),
         "freetoken_version": __version__,
-        "git_rev": _git_rev(),
         "kernel_fingerprint": _kernel_source_fingerprint(),
     }
     return hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()[:24]
