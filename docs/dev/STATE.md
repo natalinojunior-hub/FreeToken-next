@@ -8,5 +8,5 @@ Done:
 - make ci 2101 passed at e71c6a2+.
 Decisions: draft graph default ON (operator approved); tune profile schema 2 invalidates all old profiles.
 Next:
-1. Re-run `ft tune` (16K turbo3) so boot without --spec-mtp picks MTP k1 again.
+1. `ft tune` 16K re-run (af2651d): profile = k0 + draft graph on; MTP gain was within the 3% noise margin this run (1-11% run to run), so boot without --spec-mtp stays k0.
 2. >100 tok/s not met (cold 41-45): cut missed expert bytes per cycle (~1 GB, PCIe-bound).
