@@ -358,8 +358,11 @@ class ModelConfig:
     # n-gram embedding geometry and the QSA indexer scoring geometry the model module
     # needs. Opaque to model-agnostic engine code; None for every other model.
     qwen4_args: Any | None = None
-    # Opt-in draft-head layer; target depth and routed-bank count stay unchanged.
+    # Opt-in draft-head layer; target depth stays unchanged.
     mtp_layer_id: int | None = None
+    # The draft layer owns a routed-expert bank, appended after the target's banks (so it
+    # is MoE bank ``num_moe_layers - 1``); False = it reuses a target bank.
+    mtp_expert_bank: bool = False
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
@@ -378,7 +381,7 @@ class ModelConfig:
         Models with leading dense layers (``first_k_dense_replace`` > 0, e.g. GLM-4)
         only store experts for the trailing layers; everything else has all layers MoE.
         """
-        return self.num_layers - self.first_k_dense_replace
+        return self.num_layers - self.first_k_dense_replace + int(self.mtp_expert_bank)
 
     @property
     def is_multimodal(self) -> bool:
@@ -532,11 +535,15 @@ class ModelConfig:
         ]
 
 
-def with_mtp_layer(config: ModelConfig, layer_id: int) -> ModelConfig:
+def with_mtp_layer(
+    config: ModelConfig, layer_id: int, *, gguf_expert_types: tuple[int, int] | None = None
+) -> ModelConfig:
     """Register the draft head's KV/index slab without extending the target stack.
 
-    The caller must separately load the draft weights and append its expert bank before
-    executing the head. This helper does not enable speculative execution.
+    ``gguf_expert_types`` (the draft's own ``(gate_up, down)`` ggml types) registers its
+    own routed bank after the target's; the model's expert loader must supply it. The
+    caller must separately load the draft's dense weights. This helper does not enable
+    speculative execution.
     """
     from dataclasses import replace
 
@@ -557,8 +564,21 @@ def with_mtp_layer(config: ModelConfig, layer_id: int) -> ModelConfig:
     fields = {"layer_ids": ids}
     if group.num_index_layers:
         fields["num_index_layers"] = len(ids)
+    extra = {}
+    if gguf_expert_types is not None:
+        types = config.gguf_expert_types
+        if not isinstance(types, dict):
+            raise ValueError("an MTP GGUF expert bank needs the target's per-layer GGUF types")
+        extra = dict(
+            mtp_expert_bank=True,
+            gguf_expert_types={
+                "gate_up": [*types["gate_up"], gguf_expert_types[0]],
+                "down": [*types["down"], gguf_expert_types[1]],
+            },
+        )
     return replace(
         config,
         attention_groups=tuple(replace(g, **fields) if g is group else g for g in groups),
         mtp_layer_id=layer_id,
+        **extra,
     )

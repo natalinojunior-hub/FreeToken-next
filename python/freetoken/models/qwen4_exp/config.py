@@ -31,6 +31,9 @@ class Qwen4ExpMTPConfig:
     layer_types: Tuple[str, ...] = ()
     use_hidden_state_from_layer: int | None = None
     rope_theta: float | None = None
+    # (gate_up, down) ggml types of the draft's own routed-expert bank in its GGUF;
+    # None = no own bank known (the draft then reuses a target bank).
+    gguf_expert_types: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)

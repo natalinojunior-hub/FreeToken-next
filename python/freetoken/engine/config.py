@@ -170,7 +170,9 @@ class EngineConfig:
                 )
             from freetoken.models.config import with_mtp_layer
 
-            model_config = with_mtp_layer(model_config, model_config.num_layers)
+            model_config = with_mtp_layer(
+                model_config, model_config.num_layers, gguf_expert_types=mtp.gguf_expert_types
+            )
         return model_config
 
     @property

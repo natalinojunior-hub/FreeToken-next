@@ -18,8 +18,8 @@ from freetoken.models.config import (
     RotaryConfig,
 )
 from freetoken.models.qwen3_5_moe.gguf_experts import (
-    gguf_expert_types,
-    load_gguf_expert_sources,
+    gguf_expert_types as _gguf_expert_types_base,
+    load_gguf_expert_sources as _load_gguf_expert_sources_base,
 )
 from freetoken.models.qwen3_5_moe.gguf import _ungroup_packed_rows, _ungroup_v
 from freetoken.models.qwen4_exp.config import Qwen4ExpArgs, Qwen4ExpMTPConfig, ple_slot_states
@@ -79,7 +79,13 @@ def _parse_mtp_config_from_gguf(model_path: str) -> Qwen4ExpMTPConfig:
     hybrid = True
     num_hidden_layers = shim.metadata.get("qwen4exp.nextn_predict_layers", 0)
     layer_types = ("full_attention",)
-    shared = shim.metadata.get("qwen4exp.nextn_shared_target_tensors", False)
+    # nextn_shared_target_tensors covers the embedding / LM head the file omits; the draft
+    # block's routed experts are its own (blk.{N}.ffn_*_exps, independent of any target layer).
+    types = None
+    if enabled:
+        layer = _mtp_gguf_layer(shim)
+        t = _gguf_expert_types_base(mtp_path, 0, ((mtp_path, layer),))
+        types = (t["gate_up"][0], t["down"][0])
     return Qwen4ExpMTPConfig(
         enabled=enabled,
         hybrid=hybrid,
@@ -87,6 +93,52 @@ def _parse_mtp_config_from_gguf(model_path: str) -> Qwen4ExpMTPConfig:
         layer_types=layer_types,
         use_hidden_state_from_layer=None,
         rope_theta=None,
+        gguf_expert_types=types,
+    )
+
+
+def _mtp_gguf_layer(mtp_shim) -> int:
+    """GGUF block index of the (single) draft block: it follows the target stack."""
+    return int(mtp_shim.metadata["qwen4exp.block_count"]) - int(
+        mtp_shim.metadata["qwen4exp.nextn_predict_layers"]
+    )
+
+
+def _mtp_extra_banks(
+    model_path: str, num_banks: int, num_target: int
+) -> tuple[tuple[str, int], ...]:
+    """``(mtp_gguf_path, gguf_layer)`` for the banks past the target's: the draft's own."""
+    if num_banks == num_target:
+        return ()
+    mtp_path = _find_mtp_gguf_path(model_path)
+    if num_banks != num_target + 1 or mtp_path is None:
+        raise ValueError(
+            f"{num_banks} expert banks requested for a {num_target}-layer target; only one "
+            f"extra (the MTP draft's, from its MTP/*.gguf) is supported"
+        )
+    from freetoken.models.gguf.config import build_gguf_shim
+
+    return ((mtp_path, _mtp_gguf_layer(build_gguf_shim(mtp_path))),)
+
+
+def gguf_expert_types(model_path: str, num_layers: int) -> dict[str, list[int]]:
+    """Per-bank expert ggml types; ``num_layers`` past the target's block count includes
+    the MTP draft's own bank (``ModelConfig.num_moe_layers`` with ``mtp_expert_bank``)."""
+    from freetoken.models.gguf.config import build_gguf_shim
+    from freetoken.models.gguf.reader import resolve_gguf_path
+
+    num_target = int(_kv(build_gguf_shim(resolve_gguf_path(model_path)), "block_count"))
+    extra = _mtp_extra_banks(model_path, max(num_layers, num_target), num_target)
+    return _gguf_expert_types_base(model_path, min(num_layers, num_target), extra)
+
+
+def load_gguf_expert_sources(
+    model_path: str, config: ModelConfig, *, layer_sink=None
+) -> dict[str, list[torch.Tensor]]:
+    """Target expert banks plus, with ``config.mtp_expert_bank``, the MTP draft's own."""
+    extra = _mtp_extra_banks(model_path, config.num_moe_layers, config.num_layers)
+    return _load_gguf_expert_sources_base(
+        model_path, config, layer_sink=layer_sink, extra_banks=extra
     )
 
 

@@ -23,7 +23,7 @@ valid because gate and up share a quant type and therefore a row stride.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 
@@ -33,7 +33,21 @@ if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
 
-def gguf_expert_types(model_path: str, num_layers: int) -> dict[str, list[int]]:
+def _bank_files(
+    model_path: str, num_layers: int, extra_banks: Sequence[tuple[str, int]]
+) -> list[tuple[str, dict[int, int]]]:
+    """``[(gguf_path, {gguf_layer: bank_index})]``: the target's ``blk.0..num_layers-1``
+    first, then each ``extra_banks`` entry ``(gguf_path, gguf_layer)`` appended as bank
+    ``num_layers + i`` (a draft head's own routed bank stored in a separate GGUF)."""
+    files: dict[str, dict[int, int]] = {model_path: {layer: layer for layer in range(num_layers)}}
+    for i, (path, gguf_layer) in enumerate(extra_banks):
+        files.setdefault(path, {})[gguf_layer] = num_layers + i
+    return list(files.items())
+
+
+def gguf_expert_types(
+    model_path: str, num_layers: int, extra_banks: Sequence[tuple[str, int]] = ()
+) -> dict[str, list[int]]:
     """Scan the GGUF tensor table and return per-layer expert quant types.
 
     Returns a dict with two keys:
@@ -44,30 +58,34 @@ def gguf_expert_types(model_path: str, num_layers: int) -> dict[str, list[int]]:
 
     For qwen35moe: gate_up is always IQ3_S (uniformly), and down varies by layer
     (Q4_K for 0-4, IQ3_S for 5-39).
+
+    ``extra_banks`` appends banks read from other files (see ``_bank_files``).
     """
     from freetoken.models.gguf.reader import iter_gguf_tensors
 
-    gate_types: list[int | None] = [None] * num_layers
-    up_types: list[int | None] = [None] * num_layers
-    down_types: list[int | None] = [None] * num_layers
+    num_banks = num_layers + len(extra_banks)
+    gate_types: list[int | None] = [None] * num_banks
+    up_types: list[int | None] = [None] * num_banks
+    down_types: list[int | None] = [None] * num_banks
 
-    for t in iter_gguf_tensors(model_path):
-        if not t.name.startswith("blk."):
-            continue
-        layer = int(t.name.split(".")[1])
-        if layer >= num_layers:
-            continue  # skip the trailing NextN/MTP block
+    for path, bank_of in _bank_files(model_path, num_layers, extra_banks):
+        for t in iter_gguf_tensors(path):
+            if not t.name.startswith("blk."):
+                continue
+            layer = bank_of.get(int(t.name.split(".")[1]))
+            if layer is None:
+                continue  # e.g. the trailing NextN/MTP block of the target file
 
-        if t.name.endswith("ffn_gate_exps.weight"):
-            gate_types[layer] = t.ggml_type
-        elif t.name.endswith("ffn_up_exps.weight"):
-            up_types[layer] = t.ggml_type
-        elif t.name.endswith("ffn_down_exps.weight"):
-            down_types[layer] = t.ggml_type
+            if t.name.endswith("ffn_gate_exps.weight"):
+                gate_types[layer] = t.ggml_type
+            elif t.name.endswith("ffn_up_exps.weight"):
+                up_types[layer] = t.ggml_type
+            elif t.name.endswith("ffn_down_exps.weight"):
+                down_types[layer] = t.ggml_type
 
     # Validate that gate and up types agree for each layer (they must be row-concatenated).
     gate_up_types: list[int] = []
-    for layer in range(num_layers):
+    for layer in range(num_banks):
         gate_t = gate_types[layer]
         up_t = up_types[layer]
         if gate_t is None or up_t is None:
@@ -84,7 +102,7 @@ def gguf_expert_types(model_path: str, num_layers: int) -> dict[str, list[int]]:
         gate_up_types.append(gate_t)
 
     # Validate down tensors are present.
-    for layer in range(num_layers):
+    for layer in range(num_banks):
         if down_types[layer] is None:
             raise ValueError(f"missing ffn_down_exps for layer {layer}")
 
@@ -133,7 +151,11 @@ def gguf_expert_specs(
 
 
 def load_gguf_expert_sources(
-    model_path: str, config: ModelConfig, *, layer_sink=None
+    model_path: str,
+    config: ModelConfig,
+    *,
+    layer_sink=None,
+    extra_banks: Sequence[tuple[str, int]] = (),
 ) -> dict[str, list[torch.Tensor]]:
     """Per-layer host banks of the routed experts' native packed block bytes.
 
@@ -152,16 +174,17 @@ def load_gguf_expert_sources(
       internally-owned PinPipeline. If given (converter mode), fires the completion
       tracker into it instead -- nothing is pinned, and the sink may release banks,
       so returned tensors are only valid until the sink releases them.
+    - ``extra_banks``: banks appended after the target's layers (see ``_bank_files``).
     """
     from freetoken.models.gguf.reader import iter_gguf_tensors
 
-    types = gguf_expert_types(model_path, config.num_layers)
+    types = gguf_expert_types(model_path, config.num_layers, extra_banks)
 
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
 
     specs = gguf_expert_specs(config, types)
 
-    L = config.num_layers
+    L = config.num_layers + len(extra_banks)
     E = config.num_experts
     H = config.hidden_size
     I = config.moe_intermediate_size
@@ -181,12 +204,17 @@ def load_gguf_expert_sources(
         # Track completion: 2 banks per layer (gate_up and down).
         tracker = LayerCompletionTracker(2, hb, sink) if sink is not None else None
 
-        for t in iter_gguf_tensors(model_path):
+        tensors = (
+            (bank_of, t)
+            for path, bank_of in _bank_files(model_path, config.num_layers, extra_banks)
+            for t in iter_gguf_tensors(path)
+        )
+        for bank_of, t in tensors:
             if not t.name.startswith("blk."):
                 continue
-            layer = int(t.name.split(".")[1])
-            if layer >= L:
-                continue  # skip the trailing NextN/MTP block
+            layer = bank_of.get(int(t.name.split(".")[1]))
+            if layer is None:
+                continue  # e.g. the trailing NextN/MTP block of the target file
 
             if t.name.endswith("ffn_gate_exps.weight"):
                 # Shape from GGUF: [E, I, H] in torch order = [H, I, E] in ggml order

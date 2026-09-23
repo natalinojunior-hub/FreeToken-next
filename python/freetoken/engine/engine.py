@@ -996,6 +996,17 @@ class Engine:
                         pass
         except Exception:
             pass
+        if config.moe_prefill_overlap and not all(
+            all(s.shape == layers[0].shape and s.dtype == layers[0].dtype for s in layers)
+            for layers in banks.sources.values()
+        ):
+            # the cache turns overlap off for mixed per-layer geometry (its fixed-shape double
+            # buffers cannot hold every layer); decide it here so the planner does not reserve
+            # the 2 * num_experts slot floor the overlap buffers would have borrowed
+            logger.info_rank0(
+                "MoE banks have non-uniform layer geometry; disabling prefill overlap"
+            )
+            object.__setattr__(config, "moe_prefill_overlap", False)
         if config.moe_cache_auto:
             # Use new multi-stage memory planner
             logger.info_rank0("--moe-cache-auto: invoking multi-stage VRAM planner")
@@ -1077,10 +1088,11 @@ class Engine:
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
         layers = attach_offload_moe_cache(self.model, cache)
-        # The registered MTP draft layer's MoE block aliases the target's own expert bank
-        # (_MTPQuantConfig / moe_layer_id) but is a distinct module the generic walk also finds.
-        expected_moe_layers = config.model_config.num_moe_layers
-        if getattr(config.model_config, "mtp_layer_id", None) is not None:
+        # The registered MTP draft layer's MoE block is a distinct module the generic walk
+        # also finds; without its own bank (mtp_expert_bank) it aliases a target bank.
+        mc = config.model_config
+        expected_moe_layers = mc.num_moe_layers
+        if getattr(mc, "mtp_layer_id", None) is not None and not mc.mtp_expert_bank:
             expected_moe_layers += 1
         assert len(layers) == expected_moe_layers
         if cache.decode_target in ("cpu", "hybrid"):

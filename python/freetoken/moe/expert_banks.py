@@ -330,7 +330,9 @@ def _gguf_banks(
     types_fn = _load_attr(spec.module, "gguf_expert_types")
 
     sink = None if dummy else layer_sink
-    types = types_fn(model_path, model_config.num_layers)
+    # one bank per MoE layer; num_moe_layers also counts an MTP draft's own bank
+    num_banks = model_config.num_moe_layers
+    types = types_fn(model_path, num_banks)
     from freetoken.models.gguf.dequant import GGML_NAME
 
     sources = loader(model_path, model_config, layer_sink=sink)
@@ -338,12 +340,12 @@ def _gguf_banks(
     gguf_types = (
         (types["gate_up"][0], types["down"][0])
         if is_uniform
-        else [(types["gate_up"][l], types["down"][l]) for l in range(model_config.num_layers)]
+        else [(types["gate_up"][l], types["down"][l]) for l in range(num_banks)]
     )
 
     # Keying by exact geometry (bank, role, type) - Phase 7
     geometry: dict[tuple[int, str, str], tuple[tuple[int, ...], torch.dtype]] = {}
-    for layer in range(model_config.num_layers):
+    for layer in range(num_banks):
         for role in ("gate_up", "down"):
             t = types[role][layer]
             t_name = GGML_NAME.get(t, str(t))

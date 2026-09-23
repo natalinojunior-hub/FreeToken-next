@@ -93,6 +93,20 @@ def test_mtp_registration_preserves_target_depth_and_extends_qsa_only():
     assert with_mtp_layer(head_cfg, 48) == head_cfg
 
 
+def test_mtp_registration_with_gguf_types_appends_the_draft_expert_bank():
+    from dataclasses import replace
+
+    cfg = parse_config(_hf_config())
+    with pytest.raises(ValueError, match="per-layer GGUF types"):
+        with_mtp_layer(cfg, cfg.num_layers, gguf_expert_types=(8, 8))
+    cfg = replace(cfg, gguf_expert_types={"gate_up": [26] * 48, "down": [20] * 48})
+    head_cfg = with_mtp_layer(cfg, cfg.num_layers, gguf_expert_types=(8, 8))
+    assert head_cfg.mtp_expert_bank and not cfg.mtp_expert_bank
+    assert head_cfg.num_moe_layers == cfg.num_moe_layers + 1 == 49
+    assert head_cfg.gguf_expert_types["gate_up"][-1] == head_cfg.gguf_expert_types["down"][-1] == 8
+    assert head_cfg.gguf_expert_types["gate_up"][:48] == [26] * 48
+
+
 def test_mtp_registration_rejects_target_slot_and_ambiguous_full_groups():
     from dataclasses import replace
 

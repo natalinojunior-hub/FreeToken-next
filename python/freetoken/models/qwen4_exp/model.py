@@ -88,9 +88,9 @@ class Qwen4ExpDecoderLayer(BaseOP):
             self.linear_attn = build_linear_mixer(config, layer_id, f"{prefix}.linear_attn")
         else:
             self.self_attn = Qwen4ExpAttention(config, layer_id, prefix=f"{prefix}.self_attn")
-        # The MTP draft layer shares the target's expert bank (_MTPQuantConfig), so its MoE
-        # block must index the offload cache at the TARGET layer's id, not its own KV/attention
-        # layer_id (one past the target stack) -- moe_layer_id lets the caller alias the two.
+        # The MTP draft layer's MoE block indexes the offload cache by bank, not by its own
+        # KV/attention layer_id (one past the target stack): its own bank when registered
+        # (ModelConfig.mtp_expert_bank), else a target bank -- moe_layer_id carries that.
         self.mlp = Qwen4ExpMoE(
             config, moe_layer_id if moe_layer_id is not None else layer_id, prefix=f"{prefix}.mlp"
         )
@@ -218,7 +218,12 @@ class Qwen4ExpMTP(BaseOP):
                     head_config,
                     layer_id,
                     prefix="mtp.layers.0",
-                    moe_layer_id=config.first_k_dense_replace,
+                    # own bank (the last MoE bank) when registered, else the target's first
+                    moe_layer_id=(
+                        config.num_moe_layers - 1
+                        if config.mtp_expert_bank
+                        else config.first_k_dense_replace
+                    ),
                 )
             ]
         )
