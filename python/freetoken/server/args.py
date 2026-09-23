@@ -114,6 +114,19 @@ def _json_object(text: str) -> dict:
     return value
 
 
+def _tuned_spec_mtp(kwargs: dict) -> int:
+    """--spec-mtp left unset: the stored `ft tune` choice for this machine, model, KV format
+    and context, else the built-in default. MTP serves one request at a time, so a profile
+    never turns it on for a multi-request server."""
+    if kwargs.get("max_running_req") not in (None, 1):
+        return ServerArgs.spec_mtp
+    from freetoken.tuning.profile import load_for
+
+    model_path = os.path.expanduser(kwargs["model_path"])
+    profile = load_for(model_path, kwargs["kv_format"], kwargs["max_seq_len_override"])
+    return profile.chosen.spec_mtp if profile is not None else ServerArgs.spec_mtp
+
+
 def parse_args(
     args: List[str],
     run_shell: bool = False,
@@ -441,8 +454,10 @@ def parse_args(
     parser.add_argument(
         "--spec-mtp",
         type=_nonnegative_int,
-        default=ServerArgs.spec_mtp,
-        help="Native checkpoint MTP draft depth; 0 keeps speculative decoding disabled.",
+        default=None,
+        help="Native checkpoint MTP draft depth; 0 keeps speculative decoding disabled. "
+        "Unset: the `ft tune` profile's measured choice for this machine and context, else "
+        f"{ServerArgs.spec_mtp}.",
     )
 
     parser.add_argument(
@@ -851,6 +866,8 @@ def parse_args(
         )
 
     # resolve some arguments
+    if kwargs["spec_mtp"] is None:
+        kwargs["spec_mtp"] = _tuned_spec_mtp(kwargs)
     run_shell |= kwargs.pop("shell_mode")
     kwargs["shell_mode"] = run_shell
     if run_shell:

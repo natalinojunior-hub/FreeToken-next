@@ -224,6 +224,25 @@ def load(key: str, path: str | None = None) -> Profile | None:
     )
 
 
+def load_for(model_path: str, kv_format: str, max_seq_len: int | None) -> Profile | None:
+    """The stored profile for this machine's first GPU and this serve configuration, or
+    ``None``. NVML, not torch.cuda: callers run in the parent before the scheduler spawns."""
+    if max_seq_len is None:
+        return None
+    try:
+        from freetoken.gpu_select import _nvml_uuids
+
+        uuids = _nvml_uuids()
+    except Exception:  # noqa: BLE001 -- best-effort; a broken NVML load must never block boot
+        return None
+    if not uuids:
+        return None
+    key = compute_key(
+        gpu_uuid=uuids[0], model_path=model_path, kv_format=kv_format, max_seq_len=max_seq_len
+    )
+    return load(key)
+
+
 def env_overrides(settings: TunedSettings) -> dict[str, str]:
     """The env-backed v1 tunables' values for ``settings``, as the env-var strings
     ``scheduler/spec.py`` / ``engine/graph.py`` read (``os.getenv(..., "1"/"0") != "0"``)."""

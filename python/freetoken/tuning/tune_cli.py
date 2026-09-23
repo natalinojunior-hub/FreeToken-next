@@ -334,7 +334,9 @@ def main(argv: list[str] | None = None, prog: str = "ft tune") -> int:
     p.add_argument("--decode-tokens", type=int, default=256, help="TG decode length")
     p.add_argument("--gpu-uuid", default=None, help="override the GPU uuid in the profile key")
     p.add_argument(
-        "--prompt-file", default=None, help="prompt text file (default: a synthetic prompt)"
+        "--prompt-file", default=None, help="representative prompt filling most of --ctx: the profile is keyed by the context "
+        "bucket, and MTP's win depends on occupancy and content (default: a synthetic "
+        "prompt of about 85%% of --ctx, repetitive, so it overstates MTP acceptance)"
     )
     p.add_argument(
         "--log-dir",
@@ -380,7 +382,8 @@ def main(argv: list[str] | None = None, prog: str = "ft tune") -> int:
         with open(ns.prompt_file) as f:
             prompt_text = f.read()
     else:
-        prompt_text = "The quick brown fox jumps over the lazy dog. " * 400  # ~ a few k tokens
+        # ~10 tokens per sentence
+        prompt_text = "The quick brown fox jumps over the lazy dog. " * max(1, int(ns.ctx * 0.85) // 10)
 
     results = [
         run_candidate(

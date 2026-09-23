@@ -84,33 +84,18 @@ def apply_tuning_profile_env_gate(server_args: "ServerArgs", logger: logging.Log
     context bucket needs a concrete value), skips the profile lookup entirely; a serving
     request never depends on it.
     """
-    if server_args.max_seq_len_override is None:
-        return
-    try:
-        from freetoken.gpu_select import _nvml_uuids
+    from freetoken.tuning.profile import apply_env_defaults, load_for
 
-        uuids = _nvml_uuids()
-        gpu_uuid = uuids[0] if uuids else None
-    except Exception:  # noqa: BLE001 -- best-effort; a broken NVML load must never block boot
-        gpu_uuid = None
-    if not gpu_uuid:
-        return
-    from freetoken.tuning.profile import apply_env_defaults, compute_key, load
-
-    key = compute_key(
-        gpu_uuid=gpu_uuid,
-        model_path=server_args.model_path,
-        kv_format=server_args.kv_format,
-        max_seq_len=server_args.max_seq_len_override,
+    profile = load_for(
+        server_args.model_path, server_args.kv_format, server_args.max_seq_len_override
     )
-    profile = load(key)
     if profile is None:
         return
     applied = apply_env_defaults(profile.chosen, os.environ)
     if applied:
         logger.info(
             "ft tune profile %s: setting %s from measured evidence (%s)",
-            key,
+            profile.key,
             ", ".join(applied),
             profile.evidence.date,
         )
