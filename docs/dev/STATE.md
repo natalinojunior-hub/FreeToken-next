@@ -1,10 +1,10 @@
 # State — 2026-09-23
 
-Doing: Campaign 2 docs written (docs/dev/PERFORMANCE.md, LESSONS.md, DECISIONS.md); `ft tune` 16K result still PENDING (orchestrator to fill).
-Done: GGUF beats native NVFP4-Radix end-to-end (TG 2.06x at k1) — native kept as fallback only. Offload beats hybrid on GGUF (hybrid 3.5x slower, IQ3_S CPU kernel bound) — offload stays default. Cold-prefill non-determinism fixed (bf16 index_add_ atomic order, 211efb6); verify-window vs decode KL traced to cuBLAS M=1-vs-M>=2 row divergence, not a correctness bug.
-Decisions: see docs/dev/DECISIONS.md D-024..D-028 (GGUF primary, offload default, bench-bw threshold kept, deferred replay kept, profile key shape).
+Doing: nothing in progress. Campaign 2 closed; report /models/desenvolvimento/ft-campaign2/RELATORIO.md.
+Done: GGUF chosen over native NVFP4 (TG 2x). Offload default (hybrid -8% with benched split). Deterministic cold prefill (211efb6). cache_prompt:false honored. Greedy at temperature 0 regardless of top_p (MTP now runs for such requests). `ft tune` profiles applied at boot: 16K turbo3 picks MTP k1 (43.88 vs 40.48).
+Decisions: docs/dev/DECISIONS.md D-024..D-028.
 Next:
-1. compute-sanitizer memcheck on draft-graph v2 replay to find the illegal-access kernel (QSA draft-slot addressing suspected).
-2. Add hit/miss overlap to the verify-window miss path (currently serialized, no cross-layer prefetch).
-3. IQ3_S AVX-512 CPU kernel throughput, only if hybrid strategy is revisited.
-4. 128K/256K runs stay gated on hitting >100 tok/s first (not met yet).
+1. Draft-step CUDA graph: compute-sanitizer memcheck on replay (illegal access in qsa_forward), ~2 ms/cycle.
+2. Verify-window hit/miss overlap (miss gather serialized with GEMV).
+3. turbo3 verify-vs-decode KL outliers (0.97 at one position) - open, bf16 explained by cuBLAS M=1 vs M>=2.
+4. >100 tok/s not met (cold 40-44); 128K/256K runs gated on it.

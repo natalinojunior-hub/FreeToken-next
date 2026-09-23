@@ -79,7 +79,7 @@ offset it). No further native specialization or 16K/3-repeat native runs planned
 `ft-campaign2/LEDGER.md`.
 
 ## D-025 — `offload` is the default MoE strategy for this checkpoint; hybrid only by measured profile
-**Status:** accepted | GGUF hybrid measured 3.5x slower than offload (IQ3_S CPU kernel 8-11 GB/s
+**Status:** accepted | GGUF hybrid measured 8% slower than offload with the benched fetch split (37.05 vs 40.48; 3.5x before d52f287's lookup fix) (IQ3_S CPU kernel 8-11 GB/s
 bound + per-layer CPU/GPU handshake overhead), after fixing the per-layer format bug (7bbf2af).
 Hybrid stays available behind `--moe-strategy hybrid` / a future profile recommendation, never
 auto-selected without a measured win on this hardware.

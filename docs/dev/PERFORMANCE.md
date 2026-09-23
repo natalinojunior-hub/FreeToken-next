@@ -295,9 +295,10 @@ further (no 16K/3-repeat native runs run).
 | Config | 4K TG | 15.7K TG | Cold PP (4K / 15.7K) |
 |---|---|---|---|
 | Offload (default) | 40.48 | 43.39 | 1475 / 2086 |
-| Hybrid (`--moe-strategy hybrid`, fixed) | 11.72 | 16.30 | 1475 / 2086 (equal) |
+| Hybrid, fallback fetch cap 1 (before d52f287) | 11.72 | 16.30 | 1475 / 2086 (equal) |
+| Hybrid, benched fetch split 82.6% (d52f287) | 37.05 | - | 1475 |
 
-Hybrid is 3.5x slower than offload on this checkpoint — dominated. Root cause: 47/48 layers'
+Hybrid with the benched split is 8% slower than offload (37.05 vs 40.48 at 4K) — dominated; the 3.5x gap was a missing profile lookup. Root cause: 47/48 layers'
 gate_up experts are IQ3_S, whose AVX-512 CPU kernel only reaches 8-11 GB/s (latency-bound grid
 gather), well under PCIe gather bandwidth, plus per-layer CPU/GPU handshake overhead. First hybrid
 attempt produced garbage output (`"!!!!"`, NaN on minority-format layers) — see LESSONS.md; fixed
@@ -367,7 +368,7 @@ serialized before the GEMM — no hit/miss overlap today, see C1 audit). Even a 
 ceiling of about 75 tok/s at 1.8 tokens/cycle acceptance — still short of 100 tok/s; reaching >100
 needs copies **and** compute cut together, or more tokens/cycle (k2/k3).
 
-`ft tune` 16K (prompt16k, turbo3, 3 reps, matched argv, 6b84ae4): k0 TG 39.63 / PP 2093, k1 TG 39.29 / PP 2083 -> profile keeps k0 (k1 must beat it by 3%). Same workload in `ft-campaign2/bench.sh`: k1 43.39 vs k0 40.17 (+8%). At 4K cold k1 is below k0 in both harnesses. MTP's gain here is marginal and content-dependent; `--spec-mtp 1` stays an explicit opt-in. Profile at `~/.cache/freetoken/tune/<key>.json`; an unset `--spec-mtp` on a single-request server takes its choice.
+`ft tune` 16K (prompt16k, turbo3, 3 reps, matched argv, after 5de83aa/d52f287): k0 TG 40.48 / PP 2095, k1 TG 43.88 / PP 2084 -> profile picks k1 (+8.4%, above the 3% margin). A server started without `--spec-mtp` (single request, 16K, turbo3) applied it: TG 43.43, 138 verify cycles. Earlier tunes that showed a tie never ran MTP (temperature-0 requests with the model's top_p 0.95 were not greedy). At 4K cold, k1 was below k0 in the bench harness (40.48 vs 40.91). Hybrid with the correct fetch split (82.6% over PCIe): 37.05 vs offload 40.48 at 4K -> offload stays default; the 11.72 figure used a fallback fetch cap of 1.
 
 ## Referência Completa
 
