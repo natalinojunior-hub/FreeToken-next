@@ -225,6 +225,41 @@ GPU busy stays about 35 ms: `fast_index_copy` (expert misses, H2D) 17 ms, dense 
 The capture takes about 1 s at startup and about 20 MiB of graph pool.
 The PLE fix changes the k1 output text (sha 0a7c5a94ca -> 1eebf6a554). With graphs off, disk PLE and pinned PLE give identical output.
 
+## Overnight campaign: GGUF IQ4_XS + MTP, 16K turbo3 (2026-09-23)
+
+Commits a0adc18..d078f5f. RTX 5080, `--max-seq-len-override 16384 --cuda-graph-max-bs 1
+--kv-format=turbo3 --max-running-requests 1`, overlap off, 256 output tokens, greedy.
+Scripts and logs: `/models/desenvolvimento/ft-campaign/` (`ft.sh`, `ft16.sh`, `cold.sh`, `CAMPAIGN.md`).
+
+**PP definition.** The old anchors (3153/3112) are cached-prefix PP: the client repeats one prompt
+and the server reuses 4032 of its 4096 tokens from the radix cache. True cold PP (unique prompt per
+request, warm server) was 377 tok/s at 55ed10f. Both are reported below.
+
+| Workload | 55ed10f | HEAD | Change |
+|---|---|---|---|
+| 4K, k1 TG (cached prefix) | 37.95 | **44.69** | +18% (a) |
+| 4K, k0 TG (cached prefix) | 41.23 | 40.51 | noise band (b) |
+| 4K, cached-prefix PP | 3127-3151 | 3209 | no regression |
+| 4K, cold PP (k0 and k1) | 377 | **1472** | 3.9x |
+| 15.7K occupied, cold PP | 398 | **2064** | 5.2x |
+| 15.7K occupied, k1 TG (cold prompts) | 42.02 | 41.97-44.18 | (c) |
+| 15.7K occupied, k0 TG (cold prompts) | 40.23 | 40.29-40.53 | = |
+| 15.7K occupied, k1 TG (cached prefix) | - | 43.57-44.74 | |
+
+(a) Batched mmvq (a two-row verify no longer re-reads dense weights), host-resident token
+embedding (+290 expert slots at k1), deferred replay (rejections replay on 2% of cycles instead of
+27%). (b) k0 output is bitwise unchanged by those three commits. (c) Output text changes, so
+acceptance changes; spread over runs 42.0-44.7.
+
+MTP now beats k0 on every tested workload, but >100 tok/s was **not** reached. Remaining k1 cycle
+at 4K: about 40 ms = draft 3.3 + verify 36.6 (2 rows) + commit/scheduling ~1. In the verify, expert
+misses copy ~16 ms over PCIe (~47 GB/s, saturated). 100 tok/s at 75% acceptance needs 17.5 ms.
+
+Rejected with evidence: LFU and ghost-admission expert caches (miss 0.38-0.48 vs LRU 0.384; Belady
+0.225); next-layer routing prefetch (44% top-10 recall); CPU hybrid for IQ3_S/IQ4_NL (no CPU kernel,
+NVFP4 hybrid gave only +3%); MTP draft in a CUDA graph (illegal access on replay, unresolved).
+Contexts above 16K were not run: the >100 TG gate was not met.
+
 ## Referência Completa
 
 `old/docs/freetoken-next/PERFORMANCE.md` — Tabelas detalhadas por config/modelo, EXP-001 a EXP-045, metodologia, variáveis de controle.
