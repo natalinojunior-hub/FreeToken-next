@@ -283,12 +283,43 @@ class GGUFEmbedding(BaseOP):
         )
         self._embed_scale = embed_scale
         self._embed_scale_t: torch.Tensor | None = None
+        # pinned host table (rows padded for the gather kernel); qweight then views into it
+        self._host_rows: torch.Tensor | None = None
+
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
+        super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
+        from freetoken.kernel.pinned import _host_ptr_identity, alloc_pinned_tensor
+
+        # A lookup reads a few rows per forward, so the table lives in pinned host memory
+        # and its VRAM goes to the expert cache. Needs host pointers the GPU can dereference.
+        if not self.qweight.is_cuda or not _host_ptr_identity():
+            return
+        rows, width = self.qweight.shape
+        host = alloc_pinned_tensor(rows, -(-width // 256) * 256, dtype=torch.uint8)
+        host[:, :width].copy_(self.qweight)
+        self._host_rows = host
+        self.qweight = host[:, :width]
+
+    def _gather_rows(self, flat: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.fast_index_copy import fast_index_copy_jit
+
+        host = self._host_rows
+        assert host is not None
+        n = flat.shape[0]
+        out = torch.empty(n, host.shape[1], dtype=torch.uint8, device=flat.device)
+        dst = torch.arange(n, dtype=flat.dtype, device=flat.device)
+        num = torch.full((1,), n, dtype=torch.int64, device=flat.device)
+        fast_index_copy_jit(out, dst, host, flat, num)
+        return out[:, : self.qweight.shape[1]].contiguous()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from freetoken.kernel.gguf import ggml_dequantize
 
         flat = x.flatten()
-        rows = self.qweight.index_select(0, flat)  # [n, row_bytes] packed
+        if self._host_rows is not None:
+            rows = self._gather_rows(flat)
+        else:
+            rows = self.qweight.index_select(0, flat)  # [n, row_bytes] packed
         if self._quant_type in GGML_UNQUANTIZED:
             # Raw value bytes, not blocks: there is no dequant kernel for the unquantized
             # types (ggml_dequantize rejects type 1), so reinterpret the gathered rows.
