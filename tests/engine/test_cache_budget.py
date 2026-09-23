@@ -764,9 +764,7 @@ def test_adjust_config_gguf_hybrid_upgrade_degrades_on_stale_extension(monkeypat
     monkeypatch.setattr(
         "freetoken.moe.bench_profile.load_backend_recommendation", lambda *a, **k: "hybrid"
     )
-    monkeypatch.setattr(
-        "freetoken.moe.cpu_executor.compiled_extension_supports", lambda act: True
-    )
+    monkeypatch.setattr("freetoken.moe.cpu_executor.compiled_extension_supports", lambda act: True)
     monkeypatch.setattr(
         "freetoken.moe.cpu_executor.compiled_extension_supports_format", lambda fmt: False
     )
@@ -788,9 +786,7 @@ def test_adjust_config_gguf_hybrid_upgrade_applies_when_everything_checks_out(mo
     monkeypatch.setattr(
         "freetoken.moe.bench_profile.load_backend_recommendation", lambda *a, **k: "hybrid"
     )
-    monkeypatch.setattr(
-        "freetoken.moe.cpu_executor.compiled_extension_supports", lambda act: True
-    )
+    monkeypatch.setattr("freetoken.moe.cpu_executor.compiled_extension_supports", lambda act: True)
     monkeypatch.setattr(
         "freetoken.moe.cpu_executor.compiled_extension_supports_format", lambda fmt: True
     )

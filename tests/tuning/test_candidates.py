@@ -30,7 +30,11 @@ def test_matrix_is_data_driven_dicts():
 
 def _r(tg, pp, traceback=False, settings=None):
     return CandidateResult(
-        settings or {}, cold_pp=pp, committed_tg=tg, ttft_s=0.1, peak_vram_mib=100.0,
+        settings or {},
+        cold_pp=pp,
+        committed_tg=tg,
+        ttft_s=0.1,
+        peak_vram_mib=100.0,
         had_traceback=traceback,
     )
 
@@ -56,8 +60,14 @@ def test_select_best_excludes_tracebacks():
 
 def test_select_best_excludes_missing_measurements():
     results = [
-        CandidateResult({"id": "no-pp"}, cold_pp=None, committed_tg=10.0, ttft_s=None,
-                         peak_vram_mib=None, had_traceback=False),
+        CandidateResult(
+            {"id": "no-pp"},
+            cold_pp=None,
+            committed_tg=10.0,
+            ttft_s=None,
+            peak_vram_mib=None,
+            had_traceback=False,
+        ),
         _r(tg=5.0, pp=500.0, settings={"id": "ok"}),
     ]
     best = select_best(results)

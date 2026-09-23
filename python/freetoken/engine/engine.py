@@ -1457,9 +1457,7 @@ class Engine:
             kind = "spec-verify"
             positions = batch.positions.tolist()
             input_ids = (
-                batch.spec_host_ids
-                if batch.spec_host_ids is not None
-                else batch.input_ids.tolist()
+                batch.spec_host_ids if batch.spec_host_ids is not None else batch.input_ids.tolist()
             )
             logits_rows = batch_logits
         elif batch.is_prefill:
@@ -1479,7 +1477,11 @@ class Engine:
             slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
             state = {
                 "conv": pool.conv_states[:, slot].detach().to(torch.float32).cpu().clone(),
-                "recurrent": pool.recurrent_states[:, slot].detach().to(torch.float32).cpu().clone(),
+                "recurrent": pool.recurrent_states[:, slot]
+                .detach()
+                .to(torch.float32)
+                .cpu()
+                .clone(),
             }
 
         rec = {

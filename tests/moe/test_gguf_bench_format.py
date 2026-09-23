@@ -127,9 +127,7 @@ def test_resolve_gguf_format_handles_per_layer_list_shape():
 
 def test_profile_lookup_matches_gguf_pair_key(tmp_path):
     path = tmp_path / "benchbw.json"
-    path.write_text(
-        json.dumps({"gpu": {"name": "FAKE GPU"}, "dtypes": {"iq3_s+iq4_nl": "hybrid"}})
-    )
+    path.write_text(json.dumps({"gpu": {"name": "FAKE GPU"}, "dtypes": {"iq3_s+iq4_nl": "hybrid"}}))
     key = gguf_bench_key(21, 20)
     assert load_backend_recommendation(key, gpu_name="FAKE GPU", path=str(path)) == "hybrid"
     # a bare "gguf" container tag (unresolved) finds no entry -> safe default (offload)

@@ -102,7 +102,15 @@ _GGUF_KQUANT_BLOCK = {
 # per tensor, so the concrete CPU format has to be recovered from the bank types. Only
 # types with a CPU dot kernel appear here; everything else has to stay on --moe-strategy
 # offload, where the GPU dequantizes.
-_GGML_TO_CPU_FMT = {2: "q4_0", 8: "q8_0", 12: "q4_k", 14: "q6_k", 20: "iq4_nl", 21: "iq3_s", 23: "iq4_xs"}
+_GGML_TO_CPU_FMT = {
+    2: "q4_0",
+    8: "q8_0",
+    12: "q4_k",
+    14: "q6_k",
+    20: "iq4_nl",
+    21: "iq3_s",
+    23: "iq4_xs",
+}
 
 
 def _resolve_gguf_format(cache) -> tuple[str, str]:
@@ -498,7 +506,9 @@ class CpuMoeExecutor:
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
-        banks_by_role = {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()}
+        banks_by_role = {
+            canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()
+        }
         ptrs, (self.H, self.I) = self._resolve_banks(banks_by_role, fmt, down_fmt)
 
         # Per-layer format dispatch (see _per_layer_gguf_formats): a mixed GGUF checkpoint's

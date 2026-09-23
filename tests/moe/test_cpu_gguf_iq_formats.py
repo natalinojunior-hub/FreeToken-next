@@ -87,11 +87,15 @@ def test_multi_block_row_matches_reference(fmt, nbytes, K, ggml_type, dot_fn):
     a single block)."""
     rng = np.random.default_rng((hash(fmt) & 0xFFFF) ^ 0x5EED)
     n_blocks = 2
-    raw = b"".join(_random_block(rng, nbytes, scale=0.01 + 0.02 * rng.random()) for _ in range(n_blocks))
+    raw = b"".join(
+        _random_block(rng, nbytes, scale=0.01 + 0.02 * rng.random()) for _ in range(n_blocks)
+    )
     w = torch.frombuffer(bytearray(raw), dtype=torch.uint8).clone()
     ref = np.concatenate(
         [
-            quants.dequantize(np.frombuffer(raw[i * nbytes : (i + 1) * nbytes], dtype=np.uint8), ggml_type)
+            quants.dequantize(
+                np.frombuffer(raw[i * nbytes : (i + 1) * nbytes], dtype=np.uint8), ggml_type
+            )
             for i in range(n_blocks)
         ]
     ).astype(np.float32)

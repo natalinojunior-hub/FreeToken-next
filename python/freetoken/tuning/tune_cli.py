@@ -335,9 +335,11 @@ def main(argv: list[str] | None = None, prog: str = "ft tune") -> int:
     p.add_argument("--decode-tokens", type=int, default=256, help="TG decode length")
     p.add_argument("--gpu-uuid", default=None, help="override the GPU uuid in the profile key")
     p.add_argument(
-        "--prompt-file", default=None, help="representative prompt filling most of --ctx: the profile is keyed by the context "
+        "--prompt-file",
+        default=None,
+        help="representative prompt filling most of --ctx: the profile is keyed by the context "
         "bucket, and MTP's win depends on occupancy and content (default: a synthetic "
-        "prompt of about 85%% of --ctx, repetitive, so it overstates MTP acceptance)"
+        "prompt of about 85%% of --ctx, repetitive, so it overstates MTP acceptance)",
     )
     p.add_argument(
         "--log-dir",
@@ -384,7 +386,9 @@ def main(argv: list[str] | None = None, prog: str = "ft tune") -> int:
             prompt_text = f.read()
     else:
         # ~10 tokens per sentence
-        prompt_text = "The quick brown fox jumps over the lazy dog. " * max(1, int(ns.ctx * 0.85) // 10)
+        prompt_text = "The quick brown fox jumps over the lazy dog. " * max(
+            1, int(ns.ctx * 0.85) // 10
+        )
 
     results = [
         run_candidate(
@@ -421,7 +425,10 @@ def main(argv: list[str] | None = None, prog: str = "ft tune") -> int:
             date=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         ),
         candidates=[
-            {"settings": r.settings, "result": {k: v for k, v in asdict(r).items() if k != "settings"}}
+            {
+                "settings": r.settings,
+                "result": {k: v for k, v in asdict(r).items() if k != "settings"},
+            }
             for r in results
         ],
     )

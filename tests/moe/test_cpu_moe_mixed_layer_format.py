@@ -92,7 +92,10 @@ def _dequant_bank(packed: torch.Tensor, ggml_type: int, K: int, dev) -> torch.Te
 
     S, OUT, row_bytes = packed.shape
     flat = ggml_dequantize(
-        packed.reshape(-1, row_bytes).to(dev).contiguous(), ggml_type, S * OUT, K,
+        packed.reshape(-1, row_bytes).to(dev).contiguous(),
+        ggml_type,
+        S * OUT,
+        K,
         torch.bfloat16,
     )
     return flat.reshape(S, OUT, K)

@@ -22,9 +22,7 @@ def _clean_env(monkeypatch):
 
 
 def _args(**over):
-    base = dict(
-        model_path="/tmp/model", kv_format="turbo3", max_seq_len_override=16384
-    )
+    base = dict(model_path="/tmp/model", kv_format="turbo3", max_seq_len_override=16384)
     base.update(over)
     return SimpleNamespace(**base)
 

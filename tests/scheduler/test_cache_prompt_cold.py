@@ -16,7 +16,9 @@ from freetoken.server.openai_api import _usage
 
 def _pend(ids, *, skip_prefix_cache=False):
     t = torch.tensor(ids, dtype=torch.int32)
-    return PendingReq(uid=0, input_ids=t, sampling_params=SamplingParams(skip_prefix_cache=skip_prefix_cache))
+    return PendingReq(
+        uid=0, input_ids=t, sampling_params=SamplingParams(skip_prefix_cache=skip_prefix_cache)
+    )
 
 
 def test_cache_prompt_false_skips_prefix_match():
@@ -43,15 +45,30 @@ def test_cache_prompt_false_skips_prefix_match():
 
 def test_resolve_sampling_maps_cache_prompt_false():
     assert resolve_sampling(
-        temperature=0, top_k=-1, top_p=1.0, max_tokens=1, ignore_eos=False, model_sampling={},
+        temperature=0,
+        top_k=-1,
+        top_p=1.0,
+        max_tokens=1,
+        ignore_eos=False,
+        model_sampling={},
         cache_prompt=False,
     ).skip_prefix_cache
     assert not resolve_sampling(
-        temperature=0, top_k=-1, top_p=1.0, max_tokens=1, ignore_eos=False, model_sampling={},
+        temperature=0,
+        top_k=-1,
+        top_p=1.0,
+        max_tokens=1,
+        ignore_eos=False,
+        model_sampling={},
         cache_prompt=None,
     ).skip_prefix_cache
     assert not resolve_sampling(
-        temperature=0, top_k=-1, top_p=1.0, max_tokens=1, ignore_eos=False, model_sampling={},
+        temperature=0,
+        top_k=-1,
+        top_p=1.0,
+        max_tokens=1,
+        ignore_eos=False,
+        model_sampling={},
         cache_prompt=True,
     ).skip_prefix_cache
 
@@ -60,4 +77,6 @@ def test_usage_reports_cached_tokens():
     usage = _usage(prompt_tokens=10, completion_tokens=3, cached_tokens=4)
     assert usage["prompt_tokens_details"] == {"cached_tokens": 4}
     # No hit (e.g. the cache_prompt: false path) -> no details block at all.
-    assert "prompt_tokens_details" not in _usage(prompt_tokens=10, completion_tokens=3, cached_tokens=0)
+    assert "prompt_tokens_details" not in _usage(
+        prompt_tokens=10, completion_tokens=3, cached_tokens=0
+    )

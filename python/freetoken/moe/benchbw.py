@@ -87,6 +87,8 @@ def _split_gguf_fmt(fmt: str) -> tuple[str, str] | None:
     if gu in _GGUF_KQUANT_BLOCK and dn in _GGUF_KQUANT_BLOCK:
         return gu, dn
     return None
+
+
 # Friendlier CLI/display aliases for the internal quant_format strings.
 _FORMAT_ALIASES = {"fp8": "fp8_block", "mxfp4": "mxfp4_triton"}
 _FORMAT_DISPLAY = {"fp8_block": "fp8", "mxfp4_triton": "mxfp4"}
@@ -503,7 +505,10 @@ def _offload_cache_quant_kwargs(fmt: str) -> dict:
 
     name_to_ggml = {name: ggml for ggml, name in _GGML_TO_CPU_FMT.items()}
     gu_fmt, dn_fmt = pair
-    return {"quant_format": "gguf", "gguf_expert_types": (name_to_ggml[gu_fmt], name_to_ggml[dn_fmt])}
+    return {
+        "quant_format": "gguf",
+        "gguf_expert_types": (name_to_ggml[gu_fmt], name_to_ggml[dn_fmt]),
+    }
 
 
 def _build_gather_rig(fmt: str, wl: Workload, device: torch.device):

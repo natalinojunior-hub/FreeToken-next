@@ -136,7 +136,9 @@ def test_resolve_leaves_sentinel_when_no_tuned_value():
 
 
 def test_env_overrides_maps_booleans_to_getenv_strings():
-    settings = TunedSettings(spec_mtp=1, defer_replay=True, draft_graph=False, moe_strategy="offload")
+    settings = TunedSettings(
+        spec_mtp=1, defer_replay=True, draft_graph=False, moe_strategy="offload"
+    )
     assert env_overrides(settings) == {
         "FREETOKEN_SPEC_DEFER_REPLAY": "1",
         "FREETOKEN_DRAFT_GRAPH": "0",
@@ -144,7 +146,9 @@ def test_env_overrides_maps_booleans_to_getenv_strings():
 
 
 def test_apply_env_defaults_only_fills_unset_keys():
-    settings = TunedSettings(spec_mtp=1, defer_replay=True, draft_graph=True, moe_strategy="offload")
+    settings = TunedSettings(
+        spec_mtp=1, defer_replay=True, draft_graph=True, moe_strategy="offload"
+    )
     environ = {"FREETOKEN_DRAFT_GRAPH": "0"}  # user explicitly disabled it
     applied = apply_env_defaults(settings, environ)
     assert applied == ["FREETOKEN_SPEC_DEFER_REPLAY"]
