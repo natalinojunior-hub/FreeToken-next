@@ -1829,6 +1829,14 @@ struct CpuMoeExecutor {
   int act, apply_on_input;
   int fmt;                // WFmt (gate_up; also the single format for non-mixing families)
   int fmt_dn;             // WFmt for the down bank; equals `fmt` unless mixed (K/I-quant only)
+  // Per-layer K-quant/I-quant format override (real GGUF checkpoints mix types across
+  // layers, e.g. IQ3_S gate_up everywhere but IQ4_XS on one layer -- see
+  // _resolve_gguf_format in cpu_executor.py). Empty => every layer uses the scalar
+  // fmt/fmt_dn above (every non-GGUF format, and uniform GGUF checkpoints). When
+  // non-empty, length == num_layers and do_pass1/do_pass2 index it by t->layer_id
+  // instead of reading the scalar `fmt`/`fmt_dn` fields.
+  std::vector<int> fmt_layer, fmt_dn_layer;
+  std::vector<int> gu_row_bytes_layer, dn_row_bytes_layer;  // parallel to fmt_layer/fmt_dn_layer
   bool needs_di = false;  // pre-deinterleave activations to fp32 (nvfp4/ds_fp4)
   // Per-layer pointer tables (one base address per layer, see tbl_at). gate_up_tbl
   // doubles as the bf16 gate_up table and the nvfp4/mxfp4/q4_0/ds_fp4 packed-gate_up
@@ -1949,7 +1957,8 @@ struct CpuMoeExecutor {
                  uintptr_t gate_up_global_ptr, uintptr_t down_scale_ptr,
                  uintptr_t down_global_ptr, uintptr_t gate_up_bias_ptr,
                  uintptr_t down_bias_ptr, double swiglu_alpha_, double swiglu_limit_,
-                 std::vector<int> core_ids_)
+                 std::vector<int> core_ids_, std::vector<int> weight_format_per_layer,
+                 std::vector<int> down_weight_format_per_layer)
       : num_threads(num_threads_ > 0 ? num_threads_ : 1),
         num_layers(num_layers_),
         num_experts(num_experts_),
@@ -2017,6 +2026,28 @@ struct CpuMoeExecutor {
         throw std::runtime_error("CPU MoE down format requires I to be a multiple of "
                                  + std::to_string(qk));
       q4_dn_row_bytes = (I / qk) * blk;
+    }
+    if (!weight_format_per_layer.empty()) {
+      TORCH_CHECK(static_cast<int>(weight_format_per_layer.size()) == num_layers,
+                  "weight_format_per_layer must have num_layers entries");
+      TORCH_CHECK(static_cast<int>(down_weight_format_per_layer.size()) == num_layers,
+                  "down_weight_format_per_layer must have num_layers entries");
+      fmt_layer = weight_format_per_layer;
+      fmt_dn_layer = down_weight_format_per_layer;
+      gu_row_bytes_layer.resize(num_layers);
+      dn_row_bytes_layer.resize(num_layers);
+      for (int l = 0; l < num_layers; ++l) {
+        const auto [gu_qk, gu_blk] = kquant_geom(fmt_layer[l]);
+        const auto [dn_qk, dn_blk] = kquant_geom(fmt_dn_layer[l]);
+        TORCH_CHECK(gu_qk && dn_qk, "weight_format_per_layer[", l,
+                    "] is not a K-quant/I-quant format");
+        TORCH_CHECK(H % gu_qk == 0, "CPU MoE gate_up format requires H to be a multiple of ",
+                    gu_qk);
+        TORCH_CHECK(I % dn_qk == 0, "CPU MoE down format requires I to be a multiple of ",
+                    dn_qk);
+        gu_row_bytes_layer[l] = (H / gu_qk) * gu_blk;
+        dn_row_bytes_layer[l] = (I / dn_qk) * dn_blk;
+      }
     }
     isa = c.name;
     // nvfp4 (AVX-VNNI only): W4A8 int8 decode when the CPU supports it. q4_0 is always
@@ -2113,46 +2144,46 @@ struct CpuMoeExecutor {
   inline float gemm1_dot(const bf16_t* gate_up_l, const uint8_t* gu_packed_l,
                          const uint8_t* gu_scale_l, const uint16_t* gu_global_l, int e, int row,
                          const bf16_t* x, const float* xe, const float* xo, const int8_t* xi8,
-                         const float* xas) {
-    if (fmt == WF_BF16) {
+                         const float* xas, int fmt_l, int row_bytes_l) {
+    if (fmt_l == WF_BF16) {
       const bf16_t* w = gate_up_l + ((size_t)e * (2 * I) + row) * H;
       return dot(w, x, H);
     }
-    if (fmt == WF_Q4_0) {
+    if (fmt_l == WF_Q4_0) {
       const uint8_t* w =
-          gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
+          gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)row_bytes_l;
       return q4dot(w, xi8, xas, H);  // W4A8: int8 activations (Q8_0), scale in xas
     }
-    if (fmt == WF_Q4_K) {
-      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
+    if (fmt_l == WF_Q4_K) {
+      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)row_bytes_l;
       return q4_k_dot_f32_scalar(w, x, H);  // W4A16: bf16 activations, K-quant dequant
     }
-    if (fmt == WF_Q6_K) {
-      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
+    if (fmt_l == WF_Q6_K) {
+      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)row_bytes_l;
       return q6_k_dot_f32_scalar(w, x, H);  // W4A16: bf16 activations, K-quant dequant
     }
-    if (fmt == WF_IQ3_S) {
-      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
+    if (fmt_l == WF_IQ3_S) {
+      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)row_bytes_l;
       return iq3sdot(w, x, H);  // W4A16: bf16 activations, i-quant dequant
     }
-    if (fmt == WF_IQ4_XS) {
-      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
+    if (fmt_l == WF_IQ4_XS) {
+      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)row_bytes_l;
       return iq4xsdot(w, x, H);  // W4A16: bf16 activations, i-quant dequant (AVX-512 when available)
     }
-    if (fmt == WF_IQ4_NL) {
-      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
+    if (fmt_l == WF_IQ4_NL) {
+      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)row_bytes_l;
       return iq4nldot(w, x, H);  // W4A16: bf16 activations, i-quant dequant (AVX-512 when available)
     }
-    if (fmt == WF_Q8_0) {
-      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
+    if (fmt_l == WF_Q8_0) {
+      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)row_bytes_l;
       return q80dot(w, x, H);  // W4A16: bf16 activations, Q8_0 dequant (AVX-512 when available)
     }
     // Anything that reaches here is assumed NVFP4 and dereferences the scale/global
     // pointers, which are null for formats that do not have them (the GGUF banks pass 0).
     // Falling through with an unhandled format therefore segfaults inside the worker
     // thread rather than reporting anything useful, so reject it here instead.
-    TORCH_CHECK(fmt == WF_NVFP4 || fmt == WF_DSFP4,
-                "cpu_moe gemm1_dot: unhandled weight_format ", fmt,
+    TORCH_CHECK(fmt_l == WF_NVFP4 || fmt_l == WF_DSFP4,
+                "cpu_moe gemm1_dot: unhandled weight_format ", fmt_l,
                 " (handled: bf16=0, nvfp4=1, mxfp4=2, dsfp4=3, q4_0=4, q4_k=5, q6_k=6, "
                 "iq3_s=7, iq4_xs=8, iq4_nl=9, q8_0=10)");
     const size_t r = (size_t)e * (2 * I) + row;
@@ -2168,37 +2199,37 @@ struct CpuMoeExecutor {
   inline float gemm2_dot(const bf16_t* down_l, const uint8_t* dn_packed_l,
                          const uint8_t* dn_scale_l, const uint16_t* dn_global_l, int e, int row,
                          const bf16_t* g, const float* ge, const float* go, const int8_t* gi8,
-                         const float* gas) {
-    if (fmt_dn == WF_BF16) {
+                         const float* gas, int fmt_l, int row_bytes_l) {
+    if (fmt_l == WF_BF16) {
       const bf16_t* w = down_l + ((size_t)e * H + row) * I;
       return dot(w, g, I);
     }
-    if (fmt_dn == WF_Q4_0) {
-      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
+    if (fmt_l == WF_Q4_0) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)row_bytes_l;
       return q4dot(w, gi8, gas, I);  // W4A8: int8 activations (Q8_0), scale in gas
     }
-    if (fmt_dn == WF_Q4_K) {
-      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
+    if (fmt_l == WF_Q4_K) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)row_bytes_l;
       return q4_k_dot_f32_scalar(w, g, I);  // W4A16: bf16 activations, K-quant dequant
     }
-    if (fmt_dn == WF_Q6_K) {
-      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
+    if (fmt_l == WF_Q6_K) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)row_bytes_l;
       return q6_k_dot_f32_scalar(w, g, I);  // W4A16: bf16 activations, K-quant dequant
     }
-    if (fmt_dn == WF_IQ3_S) {
-      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
+    if (fmt_l == WF_IQ3_S) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)row_bytes_l;
       return iq3sdot(w, g, I);  // W4A16: bf16 activations, i-quant dequant
     }
-    if (fmt_dn == WF_IQ4_XS) {
-      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
+    if (fmt_l == WF_IQ4_XS) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)row_bytes_l;
       return iq4xsdot(w, g, I);  // W4A16: bf16 activations, i-quant dequant (AVX-512 when available)
     }
-    if (fmt_dn == WF_IQ4_NL) {
-      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
+    if (fmt_l == WF_IQ4_NL) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)row_bytes_l;
       return iq4nldot(w, g, I);  // W4A16: bf16 activations, i-quant dequant (AVX-512 when available)
     }
-    if (fmt_dn == WF_Q8_0) {
-      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
+    if (fmt_l == WF_Q8_0) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)row_bytes_l;
       return q80dot(w, g, I);  // W4A16: bf16 activations, Q8_0 dequant (AVX-512 when available)
     }
     const size_t r = (size_t)e * H + row;
@@ -2300,12 +2331,16 @@ struct CpuMoeExecutor {
     const bool clamped = act == ACT_SWIGLUOAI || act == ACT_SWIGLU_CLAMP;
     const float up_bias = act == ACT_SWIGLUOAI ? 1.0f : 0.0f;
     const float lim = swiglu_limit, alpha = swiglu_alpha;
+    const int fmt_l = fmt_layer.empty() ? fmt : fmt_layer[t->layer_id];
+    const int row_bytes_l = gu_row_bytes_layer.empty() ? q4_gu_row_bytes
+                                                        : gu_row_bytes_layer[t->layer_id];
     for (int i = i0; i < i1; ++i) {
       // gate = row i, up = row I+i
       float gate =
-          gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i, x_row, xe, xo, xi8, xas) * w_in;
+          gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i, x_row, xe, xo, xi8,
+                    xas, fmt_l, row_bytes_l) * w_in;
       float up = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, I + i, x_row,
-                           xe, xo, xi8, xas) * w_in;
+                           xe, xo, xi8, xas, fmt_l, row_bytes_l) * w_in;
       if (clamped) {
         // clamp(gate, max=lim) * sigmoid(alpha * gate) * (clamp(up, +-lim) + up_bias)
         // -- swigluoai carries the +1 up bias (gpt-oss/MiniMax); swiglu_clamp
@@ -2341,6 +2376,9 @@ struct CpuMoeExecutor {
     const uint16_t* dn_global_l =
         reinterpret_cast<const uint16_t*>(tbl_at(dn_global_tbl, t->layer_id));
     bf16_t* y_row = t->y + (size_t)tok * H;
+    const int fmt_dn_l = fmt_dn_layer.empty() ? fmt_dn : fmt_dn_layer[t->layer_id];
+    const int row_bytes_dn_l = dn_row_bytes_layer.empty() ? q4_dn_row_bytes
+                                                           : dn_row_bytes_layer[t->layer_id];
     for (int h = h0; h < h1; ++h) {
       float acc = 0.0f;
       for (int k = 0; k < top_k; ++k) {
@@ -2356,7 +2394,7 @@ struct CpuMoeExecutor {
                          : use_q4a8 ? gas_scratch.data() + gr * (I / 32)
                                       : nullptr;
         acc += gemm2_dot(down_l, dn_packed_l, dn_scale_l, dn_global_l, e, h, g_row, ge, go, gi8,
-                         gas) * w_out;
+                         gas, fmt_dn_l, row_bytes_dn_l) * w_out;
       }
       y_row[h] = f32_to_bf16(acc);
     }
@@ -2801,7 +2839,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<CpuMoeExecutor>(m, "CpuMoeExecutor")
       .def(py::init<int, int, int, int, int, int, int, int, int, int, int, uintptr_t, uintptr_t,
                     uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
-                    double, double, std::vector<int>>(),
+                    double, double, std::vector<int>, std::vector<int>, std::vector<int>>(),
            py::arg("num_threads"), py::arg("num_layers"), py::arg("num_experts"),
            py::arg("top_k"), py::arg("hidden_size"), py::arg("inter_size"),
            py::arg("max_tokens"), py::arg("activation_id"),
@@ -2811,7 +2849,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("gate_up_global_ptr"), py::arg("down_scale_ptr"),
            py::arg("down_global_ptr"), py::arg("gate_up_bias_ptr"),
            py::arg("down_bias_ptr"), py::arg("swiglu_alpha"), py::arg("swiglu_limit"),
-           py::arg("core_ids"))
+           py::arg("core_ids"), py::arg("weight_format_per_layer") = std::vector<int>(),
+           py::arg("down_weight_format_per_layer") = std::vector<int>())
       .def("create_task", &CpuMoeExecutor::create_task, py::arg("layer_id"),
            py::arg("num_tokens"), py::arg("x_ptr"), py::arg("ids_ptr"), py::arg("w_ptr"),
            py::arg("y_ptr"))

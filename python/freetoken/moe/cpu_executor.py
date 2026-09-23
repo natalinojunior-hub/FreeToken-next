@@ -155,6 +155,111 @@ def _resolve_gguf_format(cache) -> tuple[str, str]:
     return gu_fmt, dn_fmt
 
 
+def _per_layer_gguf_formats(cache, num_layers: int) -> tuple[list[str], list[str]] | None:
+    """Per-layer (gate_up_fmt, down_fmt) CPU format names, or ``None`` if this checkpoint's
+    ``gguf_expert_types`` doesn't carry per-layer info (a flat pair broadcasts to every
+    layer; a per-layer dict is used as-is).
+
+    Unlike ``_resolve_gguf_format`` (which keys the whole executor's --moe-strategy
+    cpu/hybrid *support* decision on the dominant pair), this is what the executor actually
+    dispatches per layer with: real GGUF checkpoints mix types across layers (see
+    ``dominant_gguf_pair``'s docstring), and applying one scalar weight_format to every
+    layer misreads the minority-format layers' block geometry -- wrong row stride, garbage
+    output, not just wrong math on correctly-strided data. Raises the same
+    NotImplementedError as ``_resolve_gguf_format`` for a layer whose (gate_up, down) pair
+    this CPU backend cannot serve (unsupported type, or a non-mixable pair) -- refuse
+    instead of silently misdecoding it.
+    """
+    types = getattr(cache, "gguf_expert_types", None)
+    if types is None:
+        return None
+    if isinstance(types, dict):
+        gu_list, dn_list = types.get("gate_up"), types.get("down")
+        if not gu_list or not dn_list:
+            raise NotImplementedError(
+                "--moe-strategy cpu/hybrid: this GGUF checkpoint's gguf_expert_types dict "
+                "is missing 'gate_up'/'down'; refusing rather than silently decoding every "
+                "layer with the dominant pair. Use --moe-strategy offload."
+            )
+        gu_list, dn_list = [int(t) for t in gu_list], [int(t) for t in dn_list]
+    elif isinstance(types, (tuple, list)) and types and isinstance(types[0], (tuple, list)):
+        # The shape OffloadMoeCache.__post_init__ / expert_banks.py actually produce for a
+        # non-uniform checkpoint: one (gate_up, down) pair per layer, not two parallel
+        # lists. This is the common real-world case (offload_cache.py:189, expert_banks.py
+        # ~line 341) -- without this branch, every mixed GGUF checkpoint silently falls
+        # through to the ``return None`` below and keeps decoding every layer with the
+        # dominant pair (the exact bug this function exists to fix).
+        gu_list = [int(p[0]) for p in types]
+        dn_list = [int(p[1]) for p in types]
+    elif (
+        isinstance(types, (tuple, list))
+        and len(types) == 2
+        and all(isinstance(t, int) for t in types)
+    ):
+        gu_list = [int(types[0])] * num_layers
+        dn_list = [int(types[1])] * num_layers
+    else:
+        # Unreachable in practice: _resolve_gguf_format's dominant_gguf_pair recognizes
+        # the same three shapes and already raised if it didn't, before this function is
+        # ever called. Refuse rather than silently falling back to the dominant pair.
+        raise NotImplementedError(
+            f"--moe-strategy cpu/hybrid: unrecognized gguf_expert_types shape "
+            f"{type(types).__name__!r}; refusing rather than guessing. Use "
+            "--moe-strategy offload."
+        )
+
+    if len(gu_list) != num_layers or len(dn_list) != num_layers:
+        # A length mismatch means this cache's gguf_expert_types wasn't sized for the
+        # executor's actual layer count (e.g. the MTP draft bank wasn't included) --
+        # refuse rather than silently falling back to the dominant pair for every layer,
+        # which is the exact bug this function exists to fix.
+        raise NotImplementedError(
+            f"--moe-strategy cpu/hybrid: gguf_expert_types has {len(gu_list)} entries but "
+            f"the executor has {num_layers} layers; refusing rather than guessing which "
+            "layers they belong to. Use --moe-strategy offload."
+        )
+
+    from freetoken.models.gguf.dequant import GGML_NAME
+
+    gu_names, dn_names = [], []
+    for layer, (gu, dn) in enumerate(zip(gu_list, dn_list)):
+        for t in (gu, dn):
+            if t not in _GGML_TO_CPU_FMT:
+                raise NotImplementedError(
+                    f"--moe-strategy cpu/hybrid layer {layer}: no CPU kernel for "
+                    f"{GGML_NAME.get(t, t)} experts (supported: "
+                    f"{', '.join(sorted(set(_GGML_TO_CPU_FMT.values())))}); use "
+                    "--moe-strategy offload, which dequantizes on the GPU and covers "
+                    "every type."
+                )
+        gu_fmt, dn_fmt = _GGML_TO_CPU_FMT[gu], _GGML_TO_CPU_FMT[dn]
+        if gu_fmt != dn_fmt and (
+            gu_fmt not in _GGUF_KQUANT_BLOCK or dn_fmt not in _GGUF_KQUANT_BLOCK
+        ):
+            raise NotImplementedError(
+                f"--moe-strategy cpu/hybrid layer {layer}: gate_up is "
+                f"{GGML_NAME.get(gu, gu)} and down is {GGML_NAME.get(dn, dn)}, and at "
+                "least one of those isn't in the mixable K-quant/I-quant family "
+                f"({', '.join(sorted(_GGUF_KQUANT_BLOCK))}); use --moe-strategy offload, "
+                "or a --pure requantization to make it uniform."
+            )
+        gu_names.append(gu_fmt)
+        dn_names.append(dn_fmt)
+
+    if not (set(gu_names) | set(dn_names)) <= set(_GGUF_KQUANT_BLOCK):
+        # q4_0 (or anything else outside the K-quant/I-quant family): never mixes across
+        # layers (see _resolve_gguf_format), so the scalar weight_format/down_weight_format
+        # this function's caller falls back to is already correct -- no per-layer table,
+        # and _GGUF_KQUANT_BLOCK[gn] below would KeyError on "q4_0" otherwise.
+        return None
+    if len(set(zip(gu_names, dn_names))) == 1:
+        # Uniform: every layer already gets the right format from the scalar
+        # weight_format/down_weight_format (fmt/down_fmt computed via _resolve_gguf_format).
+        # Skip the per-layer table -- same behavior, smaller C++ ctor payload.
+        return None
+    return gu_names, dn_names
+
+
 def dominant_gguf_pair(types) -> tuple[int, int] | None:
     """The (gate_up, down) ggml type pair to key a GGUF checkpoint's CPU-viability / bench
     decision on.
@@ -335,12 +440,17 @@ class CpuMoeExecutor:
         from freetoken.moe.legacy_format import canonical_role
 
         fmt = fmt or cache.quant_format
+        gguf_container = fmt == "gguf"
         # "gguf" is a container tag; resolve it to the concrete per-type CPU format(s) first
         # so everything downstream (the _WFMT_IDS gate, _resolve_banks, the C++
         # weight_format/down_weight_format) sees plain layout names. down_fmt equals fmt
         # except for a mixed GGUF checkpoint (gate_up and down banks in different, both
-        # CPU-kernel-capable, K-quant/I-quant types -- see _resolve_gguf_format).
-        if fmt == "gguf":
+        # CPU-kernel-capable, K-quant/I-quant types -- see _resolve_gguf_format). fmt/down_fmt
+        # (the *dominant* pair) still gate capability/ABI probing and size the IO scratch
+        # below; per-layer dispatch itself goes through layer_fmt_ids/layer_dn_fmt_ids
+        # (computed further down), which carry each layer's *own* type instead of applying
+        # the dominant pair to every layer -- see _per_layer_gguf_formats.
+        if gguf_container:
             fmt, down_fmt = _resolve_gguf_format(cache)
         else:
             down_fmt = fmt
@@ -388,11 +498,55 @@ class CpuMoeExecutor:
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
-        ptrs, (self.H, self.I) = self._resolve_banks(
-            {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()},
-            fmt,
-            down_fmt,
-        )
+        banks_by_role = {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()}
+        ptrs, (self.H, self.I) = self._resolve_banks(banks_by_role, fmt, down_fmt)
+
+        # Per-layer format dispatch (see _per_layer_gguf_formats): a mixed GGUF checkpoint's
+        # minority-format layers must not be decoded with the dominant fmt/down_fmt above --
+        # that misreads their block geometry (wrong row stride) and produces garbage, not
+        # just wrong math. Empty lists (the common case: non-GGUF, or a uniform GGUF
+        # checkpoint) fall back to the scalar weight_format/down_weight_format in C++.
+        layer_fmt_ids: list[int] = []
+        layer_dn_fmt_ids: list[int] = []
+        if gguf_container:
+            per_layer = _per_layer_gguf_formats(cache, self.num_layers)
+            if per_layer is not None:
+                gu_names, dn_names = per_layer
+                gu_bank, dn_bank = banks_by_role["gate_up"], banks_by_role["down"]
+                for layer, (gn, dn) in enumerate(zip(gu_names, dn_names)):
+                    if not compiled_extension_supports_format(gn):
+                        raise RuntimeError(
+                            f"the compiled _cpu_moe extension cannot dispatch weight format "
+                            f"{gn!r} (layer {layer}); rebuild it with `python setup.py "
+                            "build_ext --inplace` before serving this checkpoint on the "
+                            "cpu/hybrid backend."
+                        )
+                    if not compiled_extension_supports_format(dn):
+                        raise RuntimeError(
+                            f"the compiled _cpu_moe extension cannot dispatch weight format "
+                            f"{dn!r} (layer {layer} down); rebuild it with `python setup.py "
+                            "build_ext --inplace` before serving this checkpoint on the "
+                            "cpu/hybrid backend."
+                        )
+                    gu_qk, gu_blk = _GGUF_KQUANT_BLOCK[gn]
+                    dn_qk, dn_blk = _GGUF_KQUANT_BLOCK[dn]
+                    H_l = int(dn_bank[layer].shape[1])
+                    I_l = int(gu_bank[layer].shape[1] // 2)
+                    want_gu = (H_l // gu_qk) * gu_blk
+                    want_dn = (I_l // dn_qk) * dn_blk
+                    if int(gu_bank[layer].shape[2]) != want_gu:
+                        raise ValueError(
+                            f"layer {layer}: {gn} gate_up row is "
+                            f"{int(gu_bank[layer].shape[2])} bytes, expected {want_gu} for "
+                            f"H={H_l}"
+                        )
+                    if int(dn_bank[layer].shape[2]) != want_dn:
+                        raise ValueError(
+                            f"layer {layer}: {dn} down row is {int(dn_bank[layer].shape[2])} "
+                            f"bytes, expected {want_dn} for I={I_l}"
+                        )
+                layer_fmt_ids = [_WFMT_IDS[n] for n in gu_names]
+                layer_dn_fmt_ids = [_WFMT_IDS[n] for n in dn_names]
 
         # Decide the flag handshake up front (env + device + a functional stream-memop
         # probe): its coordinator needs a core of its own, which the auto thread sizing
@@ -437,6 +591,8 @@ class CpuMoeExecutor:
             swiglu_alpha=float(swiglu_alpha),
             swiglu_limit=float(swiglu_limit) if swiglu_limit is not None else float("inf"),
             core_ids=core_ids,
+            weight_format_per_layer=layer_fmt_ids,
+            down_weight_format_per_layer=layer_dn_fmt_ids,
             **ptrs,
         )
         self.num_threads = nthreads
