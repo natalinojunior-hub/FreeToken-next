@@ -1781,12 +1781,16 @@ def _cpu_moe_executor_viable(model_config) -> bool:
         # silently disables the automatic residency split on hosts where CUDA pinning is
         # quota-capped (WSL caps it near half of RAM). The symptom is not a clear refusal
         # but cudaHostRegister failing partway through the banks.
-        from freetoken.moe.cpu_executor import _GGML_TO_CPU_FMT
+        from freetoken.moe.cpu_executor import _GGML_TO_CPU_FMT, dominant_gguf_pair
 
-        types = getattr(model_config, "gguf_expert_types", None)
-        if not types:
+        # types is a flat (gate_up, down) pair when every layer is uniform, or a per-layer
+        # {"gate_up": [...], "down": [...]} dict otherwise (real checkpoints do mix -- see
+        # dominant_gguf_pair) -- fixed here: this used to index a dict with [0]/[1] and
+        # crash (KeyError) on any non-uniform GGUF checkpoint instead of returning False.
+        pair = dominant_gguf_pair(getattr(model_config, "gguf_expert_types", None))
+        if pair is None:
             return False
-        gate_up, down = int(types[0]), int(types[1])
+        gate_up, down = pair
         # one weight_format serves both banks, so mixed types cannot run on the CPU path
         return gate_up == down and gate_up in _GGML_TO_CPU_FMT
     return fmt == "mxfp4" or fmt in _WFMT_IDS
@@ -2127,6 +2131,18 @@ def _adjust_config(config: EngineConfig):
         # expert_quant is "none", and "none" with no weight format means plain bf16 experts.
         moe_wfmt = getattr(model_config, "moe_weight_format", None)
         bench_fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
+        if bench_fmt == "gguf":
+            # "gguf" is a container tag, not a layout (see _cpu_moe_executor_viable above) --
+            # recover the real (gate_up, down) ggml types and key the profile lookup on the
+            # same string ft bench bw would write for this pair (gguf_bench_key is the one
+            # place both sides compute it). No types recorded, or a pair with no CPU kernel
+            # (e.g. mixed non-K-quant), leaves bench_fmt == "gguf" -- no profile entry, stays
+            # offload, the safe default.
+            from freetoken.moe.cpu_executor import dominant_gguf_pair, gguf_bench_key
+
+            pair = dominant_gguf_pair(getattr(model_config, "gguf_expert_types", None))
+            if pair is not None:
+                bench_fmt = gguf_bench_key(*pair) or bench_fmt
         from freetoken.moe.bench_profile import load_backend_recommendation
 
         gpu_name, gpu_uuid = _profile_gpu()
@@ -2136,7 +2152,10 @@ def _adjust_config(config: EngineConfig):
             and load_backend_recommendation(bench_fmt, gpu_name=gpu_name, gpu_uuid=gpu_uuid)
             == "hybrid"
         ):
-            from freetoken.moe.cpu_executor import compiled_extension_supports
+            from freetoken.moe.cpu_executor import (
+                compiled_extension_supports,
+                compiled_extension_supports_format,
+            )
 
             _act = getattr(model_config, "hidden_act", "silu")
             if not _cpu_moe_act_ok:
@@ -2152,6 +2171,17 @@ def _adjust_config(config: EngineConfig):
                 logger.info_rank0(
                     f"benchbw profile recommends hybrid, but the compiled _cpu_moe "
                     f"extension predates activation {_act!r} (rebuild with "
+                    f"`python setup.py build_ext --inplace`); staying on offload"
+                )
+            elif expert_quant == "gguf" and not all(
+                compiled_extension_supports_format(f) for f in bench_fmt.split("+")
+            ):
+                # Same ABI probe as the activation one, for the weight layout: a stale .so
+                # predating the GGUF K-quant ids would otherwise fault inside a worker
+                # thread instead of throwing cleanly (see compiled_extension_supports_format).
+                logger.info_rank0(
+                    f"benchbw profile recommends hybrid, but the compiled _cpu_moe "
+                    f"extension cannot dispatch {bench_fmt!r} (rebuild with "
                     f"`python setup.py build_ext --inplace`); staying on offload"
                 )
             else:

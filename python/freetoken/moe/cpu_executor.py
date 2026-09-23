@@ -18,6 +18,7 @@ the subsequent capture embeds in its host/memcpy nodes.
 from __future__ import annotations
 
 import os
+from collections import Counter
 import threading
 import time
 import weakref
@@ -118,13 +119,13 @@ def _resolve_gguf_format(cache) -> tuple[str, str]:
     quantization). Q4_0 sits outside that family (its own W4A8 dot path, single-format
     only in the C++ side) and never mixes with anything, uniform or not.
     """
-    types = getattr(cache, "gguf_expert_types", None)
-    if not types:
+    pair = dominant_gguf_pair(getattr(cache, "gguf_expert_types", None))
+    if pair is None:
         raise NotImplementedError(
             "--moe-strategy cpu/hybrid needs the GGUF expert bank types, but this cache "
             "did not record them; use --moe-strategy offload."
         )
-    gate_up, down = int(types[0]), int(types[1])
+    gate_up, down = pair
 
     def name(t: int) -> str:
         from freetoken.models.gguf.dequant import GGML_NAME
@@ -152,6 +153,64 @@ def _resolve_gguf_format(cache) -> tuple[str, str]:
             f"--pure requantization to make it uniform."
         )
     return gu_fmt, dn_fmt
+
+
+def dominant_gguf_pair(types) -> tuple[int, int] | None:
+    """The (gate_up, down) ggml type pair to key a GGUF checkpoint's CPU-viability / bench
+    decision on.
+
+    ``model_config.gguf_expert_types`` is a flat ``(gate_up, down)`` pair when every layer
+    uses the same types, or a ``{"gate_up": [...], "down": [...]}`` per-layer dict when they
+    don't -- real checkpoints do mix (Qwen3.8-Flash-Next-Unsloth-IQ4_XS: gate_up is iq3_s on
+    47/48 layers and iq4_xs on one; down is iq4_nl on 45/48 and q8_0 on 3). The majority type
+    per bank is the "dominant pair" this checkpoint benches and auto-resolves against (ties
+    break on the smaller ggml type id, for a deterministic key). ``None`` for an unrecognized
+    shape or an empty/missing list.
+    """
+    if types is None:
+        return None
+    if isinstance(types, dict):
+        gu_list, dn_list = types.get("gate_up"), types.get("down")
+        if not gu_list or not dn_list:
+            return None
+        return _majority_type(gu_list), _majority_type(dn_list)
+    if (
+        isinstance(types, (tuple, list))
+        and len(types) == 2
+        and all(isinstance(t, int) for t in types)
+    ):
+        return int(types[0]), int(types[1])
+    if isinstance(types, (tuple, list)) and types and isinstance(types[0], (tuple, list)):
+        return _majority_type([t[0] for t in types]), _majority_type([t[1] for t in types])
+    return None
+
+
+def _majority_type(values) -> int:
+    counts = Counter(int(v) for v in values)
+    return max(counts.items(), key=lambda kv: (kv[1], -kv[0]))[0]
+
+
+def gguf_bench_key(gate_up_type: int, down_type: int) -> str | None:
+    """(gate_up, down) ggml types -> the ``ft bench bw`` / benchbw-profile format key.
+
+    Single source of truth for both sides of the auto-config join: ``benchbw.py`` keys a
+    bench entry by this same string, and the engine's ``moe_strategy=auto`` resolution
+    looks the checkpoint's real types up through this function before reading the profile
+    -- so a checkpoint's real ``(gate_up, down)`` pair and a bench run of that pair always
+    produce byte-identical keys. Uniform banks collapse to one format name (matching every
+    other ``_QUANT_TO_BENCH_FORMAT`` entry); a mixed K-quant/I-quant pair becomes
+    ``"gate_up_fmt+down_fmt"``. Returns ``None`` for anything ``_resolve_gguf_format``
+    itself would refuse (unmapped type, or a non-mixable pair) -- the safe "no profile
+    entry" outcome, which resolves to offload.
+    """
+    if gate_up_type not in _GGML_TO_CPU_FMT or down_type not in _GGML_TO_CPU_FMT:
+        return None
+    gu_fmt, dn_fmt = _GGML_TO_CPU_FMT[gate_up_type], _GGML_TO_CPU_FMT[down_type]
+    if gu_fmt == dn_fmt:
+        return gu_fmt
+    if gu_fmt not in _GGUF_KQUANT_BLOCK or dn_fmt not in _GGUF_KQUANT_BLOCK:
+        return None
+    return f"{gu_fmt}+{dn_fmt}"
 
 
 def compiled_extension_supports(activation: str) -> bool:

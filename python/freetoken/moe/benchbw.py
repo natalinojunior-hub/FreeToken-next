@@ -56,7 +56,11 @@ from freetoken.gpu_select import (
     single_gpu_arg,
 )
 from freetoken.kernel.pinned import alloc_pinned_tensor
-from freetoken.moe.cpu_executor import physical_core_cpus, resolve_threads_and_affinity
+from freetoken.moe.cpu_executor import (
+    _GGUF_KQUANT_BLOCK,
+    physical_core_cpus,
+    resolve_threads_and_affinity,
+)
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -66,6 +70,23 @@ logger = init_logger(__name__)
 _CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4"})
 # Formats this bench can build synthetic (correctly-sized) banks for.
 _BUILDABLE_FORMATS = frozenset({"bf16", "nvfp4", "fp8_block", "mxfp4_triton", "ds_fp4"})
+
+
+def _split_gguf_fmt(fmt: str) -> tuple[str, str] | None:
+    """``fmt`` as a GGUF K-quant/I-quant (gate_up, down) pair, or ``None`` if it isn't one.
+
+    ``"iq3_s"`` (uniform) -> ``("iq3_s", "iq3_s")``; ``"iq3_s+iq4_nl"`` (mixed, real
+    checkpoints do this -- down projections tolerate less aggressive quantization) ->
+    ``("iq3_s", "iq4_nl")``. Both sides must be in ``_GGUF_KQUANT_BLOCK`` -- the family
+    ``CpuMoeExecutor._resolve_kquant_banks`` actually computes (Q4_K, Q6_K, IQ3_S, IQ4_XS,
+    IQ4_NL, Q8_0); this is the one place both the bench writer and ``gguf_bench_key`` (the
+    engine's reader-side counterpart) parse the key, so they can never drift apart.
+    """
+    gu, _, dn = fmt.partition("+")
+    dn = dn or gu
+    if gu in _GGUF_KQUANT_BLOCK and dn in _GGUF_KQUANT_BLOCK:
+        return gu, dn
+    return None
 # Friendlier CLI/display aliases for the internal quant_format strings.
 _FORMAT_ALIASES = {"fp8": "fp8_block", "mxfp4": "mxfp4_triton"}
 _FORMAT_DISPLAY = {"fp8_block": "fp8", "mxfp4_triton": "mxfp4"}
@@ -174,6 +195,19 @@ DTYPE_WORKLOADS: dict[str, Workload] = {
         swiglu_limit=7.0,
     ),
     "ds_fp4": Workload("dtype:ds_fp4", 4096, 2048, 128, 6, ("ds_fp4",), swiglu_limit=7.0),
+    # GGUF K-quant/I-quant formats (CpuMoeExecutor since cd8cbe3). H/I match nvfp4's
+    # canonical geometry (already a multiple of every block size here: 256 for the K/I
+    # families, 32 for iq4_nl/q8_0). Uniform single formats plus the mixed pair real
+    # checkpoints actually ship (Qwen3.8-Flash-Next-Unsloth-IQ4_XS: gate_up ggml type 21 /
+    # iq3_s, down type 20 / iq4_nl -- down projections tolerate less aggressive
+    # quantization than gate_up).
+    "q4_k": Workload("dtype:q4_k", 3072, 1536, 128, 8, ("q4_k",)),
+    "q6_k": Workload("dtype:q6_k", 3072, 1536, 128, 8, ("q6_k",)),
+    "iq3_s": Workload("dtype:iq3_s", 3072, 1536, 128, 8, ("iq3_s",)),
+    "iq4_xs": Workload("dtype:iq4_xs", 3072, 1536, 128, 8, ("iq4_xs",)),
+    "iq4_nl": Workload("dtype:iq4_nl", 3072, 1536, 128, 8, ("iq4_nl",)),
+    "q8_0": Workload("dtype:q8_0", 3072, 1536, 128, 8, ("q8_0",)),
+    "iq3_s+iq4_nl": Workload("dtype:iq3_s+iq4_nl", 3072, 1536, 128, 8, ("iq3_s+iq4_nl",)),
 }
 
 
@@ -350,6 +384,17 @@ def _offload_bank_specs(fmt: str, H: int, I: int) -> dict[str, tuple[int, torch.
             "down_packed": (H * (I // 2), u8),
             "down_scale": (H * (I // 32), u8),
         }
+    pair = _split_gguf_fmt(fmt)
+    if pair is not None:
+        gu_fmt, dn_fmt = pair
+        gu_qk, gu_blk = _GGUF_KQUANT_BLOCK[gu_fmt]
+        dn_qk, dn_blk = _GGUF_KQUANT_BLOCK[dn_fmt]
+        if H % gu_qk or I % dn_qk:
+            raise NotImplementedError(f"{fmt}: H={H}, I={I} not block-aligned")
+        return {
+            "gate_up": (2 * I * (H // gu_qk) * gu_blk, u8),
+            "down": (H * (I // dn_qk) * dn_blk, u8),
+        }
     raise NotImplementedError(fmt)
 
 
@@ -418,10 +463,47 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
         b["gate_up_scale"].fill_(127)  # e8m0 unit exponent
         b["down_scale"].fill_(127)
         return b
+    pair = _split_gguf_fmt(fmt)
+    if pair is not None:
+        gu_fmt, dn_fmt = pair
+        gu_qk, gu_blk = _GGUF_KQUANT_BLOCK[gu_fmt]
+        dn_qk, dn_blk = _GGUF_KQUANT_BLOCK[dn_fmt]
+        # Zero-filled blocks: every K-quant/I-quant super-block scale field this bench
+        # touches is a raw byte, and zero decodes to a zero scale (finite weights) for all
+        # six formats -- same "avoid denormal/Inf, don't care about the actual value"
+        # posture as the other formats' explicit fills above, cheapest to produce here.
+        gate_up = pin(E, 2 * I, (H // gu_qk) * gu_blk, dtype=torch.uint8)
+        down = pin(E, H, (I // dn_qk) * dn_blk, dtype=torch.uint8)
+        gate_up.zero_()
+        down.zero_()
+        return {"gate_up": gate_up, "down": down}
     raise NotImplementedError(fmt)
 
 
 # ========================= real kernels (per workload) =========================
+
+
+def _offload_cache_quant_kwargs(fmt: str) -> dict:
+    """``OffloadMoeCache(quant_format=..., ...)`` kwargs for ``fmt``.
+
+    ``OffloadMoeCache.__post_init__`` asserts ``quant_format in _BANK_SCHEMAS``
+    (offload_cache.py), which only knows the container tag ``"gguf"`` (bank names
+    ``gate_up``/``down``, same as ``_offload_bank_specs`` above) -- not a concrete layout
+    name like ``"iq3_s"`` or a mixed-pair key like ``"iq3_s+iq4_nl"``. Passing a K-quant
+    format straight through as ``quant_format`` would trip that assert (an ``AssertionError``
+    the callers' ``except (ImportError, RuntimeError)`` doesn't catch, aborting the whole
+    default ``ft bench bw`` run for every format, not just this one) -- so every GGUF
+    K-quant/I-quant format goes through the same "gguf" + gguf_expert_types shape real
+    checkpoints use instead.
+    """
+    pair = _split_gguf_fmt(fmt)
+    if pair is None:
+        return {"quant_format": fmt}
+    from freetoken.moe.cpu_executor import _GGML_TO_CPU_FMT
+
+    name_to_ggml = {name: ggml for ggml, name in _GGML_TO_CPU_FMT.items()}
+    gu_fmt, dn_fmt = pair
+    return {"quant_format": "gguf", "gguf_expert_types": (name_to_ggml[gu_fmt], name_to_ggml[dn_fmt])}
 
 
 def _build_gather_rig(fmt: str, wl: Workload, device: torch.device):
@@ -435,7 +517,11 @@ def _build_gather_rig(fmt: str, wl: Workload, device: torch.device):
     E = _synth_experts(wl.experts, _expert_bytes(fmt, H, I))
     specs = _offload_bank_specs(fmt, H, I)
     cache = OffloadMoeCache(
-        num_layers=1, num_experts=E, cache_size=E, device=device, quant_format=fmt
+        num_layers=1,
+        num_experts=E,
+        cache_size=E,
+        device=device,
+        **_offload_cache_quant_kwargs(fmt),
     )
     total_bytes = 0
     for name, (elems, dtype) in specs.items():
@@ -494,13 +580,19 @@ def _build_cpu_moe_executor(fmt: str, wl: Workload, banks: dict, num_threads: in
     """A production ``CpuMoeExecutor`` over synthetic banks (via a minimal cache stand-in)."""
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
+    # Uniform (bf16, nvfp4, ...) and single-format GGUF (e.g. "iq3_s", a valid _WFMT_IDS
+    # name on its own) pass straight through as cache.quant_format, which
+    # CpuMoeExecutor.__init__ reads directly. Only a mixed GGUF pair needs the "gguf" +
+    # gguf_expert_types container shape CpuMoeExecutor derives it from (_resolve_gguf_format);
+    # _offload_cache_quant_kwargs picks the right one -- same rule _build_gather_rig uses.
+    cache_kwargs = _offload_cache_quant_kwargs(fmt)
     cache = SimpleNamespace(
-        quant_format=fmt,
         bank_sources={name: [t] for name, t in banks.items()},
         num_layers=1,
         num_experts=E,
         decode_target="cpu",
         cpu_executor=None,
+        **cache_kwargs,
     )
     return CpuMoeExecutor(
         cache,
@@ -704,7 +796,7 @@ def _bench_format(
     finally:
         torch.cuda.empty_cache()
 
-    if fmt not in _CPU_MOE_FORMATS:
+    if fmt not in _CPU_MOE_FORMATS and _split_gguf_fmt(fmt) is None:
         _note(entry, f"CPU MoE has no {fmt} weight path; hybrid unavailable")
     else:
         try:
@@ -1011,11 +1103,12 @@ def _dtype_list(s: str) -> tuple[str, ...]:
 
 def _format_list(s: str) -> tuple[str, ...]:
     items = [_FORMAT_ALIASES.get(x.strip(), x.strip()) for x in s.split(",") if x.strip()]
-    bad = [x for x in items if x not in _BUILDABLE_FORMATS]
+    bad = [x for x in items if x not in _BUILDABLE_FORMATS and _split_gguf_fmt(x) is None]
     if bad or not items:
         raise argparse.ArgumentTypeError(
             f"comma-separated subset of {sorted(_BUILDABLE_FORMATS)} (aliases "
-            f"{sorted(_FORMAT_ALIASES)}), got {s!r}"
+            f"{sorted(_FORMAT_ALIASES)}), or a GGUF K-quant pair like 'iq3_s+iq4_nl' "
+            f"(from {sorted(_GGUF_KQUANT_BLOCK)}), got {s!r}"
         )
     return tuple(dict.fromkeys(items))
 

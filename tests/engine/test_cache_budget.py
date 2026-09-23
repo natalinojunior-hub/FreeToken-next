@@ -714,6 +714,91 @@ def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
     assert config.moe_cache_size == 0  # still unresolved -- the scheduler sizes it from VRAM
 
 
+def test_adjust_config_resolves_gguf_bench_key_before_profile_lookup(monkeypatch):
+    """expert_quant == "gguf" is a container tag, not a layout (see gguf_bench_key /
+    _cpu_moe_executor_viable): the auto resolution must recover the real (gate_up, down)
+    format pair from model_config.gguf_expert_types and key the benchbw-profile lookup on
+    that pair's string, not on the literal "gguf" tag (which would never match any profile
+    entry -- see D0-autoconfig-audit.md 1a-bis)."""
+    from freetoken.engine.engine import _adjust_config
+
+    config = _offload_engine_config()
+    config.model_config.expert_quant = "gguf"
+    config.model_config.moe_weight_format = None
+    # Qwen3.8-Flash-Next-Unsloth-IQ4_XS's real per-layer bank types (dict shape, matching
+    # what gguf_expert_types() actually returns): gate_up mostly iq3_s (21) with one iq4_xs
+    # (23) outlier, down mostly iq4_nl (20) with a few q8_0 (8) outliers -- dominant pair
+    # (21, 20) -> "iq3_s+iq4_nl".
+    config.model_config.gguf_expert_types = {
+        "gate_up": [21, 21, 23, 21, 21],
+        "down": [20, 20, 8, 20, 20],
+    }
+
+    seen_fmts: list[str] = []
+
+    def fake_recommendation(fmt, **kwargs):
+        seen_fmts.append(fmt)
+        return None
+
+    monkeypatch.setattr(
+        "freetoken.moe.bench_profile.load_backend_recommendation", fake_recommendation
+    )
+    _adjust_config(config)
+
+    assert seen_fmts == ["iq3_s+iq4_nl"]
+
+
+def test_adjust_config_gguf_hybrid_upgrade_degrades_on_stale_extension(monkeypatch):
+    """A benchbw profile recommending hybrid for a GGUF pair must not turn into a post-load
+    crash when the compiled _cpu_moe extension predates that weight format id -- same
+    stale-.so degrade-to-offload posture as the existing activation check."""
+    from freetoken.engine.engine import _adjust_config
+    from freetoken.moe import is_offload_moe_strategy
+
+    config = _offload_engine_config()
+    config.model_config.expert_quant = "gguf"
+    config.model_config.moe_weight_format = None
+    config.model_config.hidden_act = "silu"
+    config.model_config.gguf_expert_types = (21, 20)
+
+    monkeypatch.setattr(
+        "freetoken.moe.bench_profile.load_backend_recommendation", lambda *a, **k: "hybrid"
+    )
+    monkeypatch.setattr(
+        "freetoken.moe.cpu_executor.compiled_extension_supports", lambda act: True
+    )
+    monkeypatch.setattr(
+        "freetoken.moe.cpu_executor.compiled_extension_supports_format", lambda fmt: False
+    )
+    _adjust_config(config)
+
+    assert is_offload_moe_strategy(config.moe_strategy)
+    assert config.moe_strategy != "hybrid"
+
+
+def test_adjust_config_gguf_hybrid_upgrade_applies_when_everything_checks_out(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    config = _offload_engine_config()
+    config.model_config.expert_quant = "gguf"
+    config.model_config.moe_weight_format = None
+    config.model_config.hidden_act = "silu"
+    config.model_config.gguf_expert_types = (21, 20)
+
+    monkeypatch.setattr(
+        "freetoken.moe.bench_profile.load_backend_recommendation", lambda *a, **k: "hybrid"
+    )
+    monkeypatch.setattr(
+        "freetoken.moe.cpu_executor.compiled_extension_supports", lambda act: True
+    )
+    monkeypatch.setattr(
+        "freetoken.moe.cpu_executor.compiled_extension_supports_format", lambda fmt: True
+    )
+    _adjust_config(config)
+
+    assert config.moe_strategy == "hybrid"
+
+
 def test_page_table_width_covers_whole_trailing_pages():
     # _write_page_table writes WHOLE trailing pages, so the width must reach the last
     # page's end, not just the next multiple of 32 (DSV4's P=128 exposed the gap).

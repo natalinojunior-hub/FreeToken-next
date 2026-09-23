@@ -46,6 +46,76 @@ def _detach_process_group() -> None:
         pass
 
 
+def apply_mtp_env_gate(server_args: "ServerArgs", logger: logging.Logger) -> None:
+    """``--spec-mtp > 0`` needs ``FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1`` in the spawned
+    scheduler (the verify step's accept decision is host-side and must land before the next
+    forward launches -- see ``scheduler.py``'s raise). Auto-set it here, in the parent,
+    before the scheduler subprocess spawns (a spawned child re-execs and inherits
+    ``os.environ``) instead of making the user export it by hand. A user who explicitly set
+    it to "0" is left alone -- the scheduler still raises in that case."""
+    if server_args.spec_mtp <= 0:
+        return
+    if "FREETOKEN_DISABLE_OVERLAP_SCHEDULING" in os.environ:
+        return
+    os.environ["FREETOKEN_DISABLE_OVERLAP_SCHEDULING"] = "1"
+    logger.info(
+        "--spec-mtp %d: auto-setting FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1 for the "
+        "spawned scheduler",
+        server_args.spec_mtp,
+    )
+
+
+def apply_tuning_profile_env_gate(server_args: "ServerArgs", logger: logging.Logger) -> None:
+    """Env-backed v1 tunables (``FREETOKEN_SPEC_DEFER_REPLAY``, ``FREETOKEN_DRAFT_GRAPH``)
+    from a persisted ``ft tune`` profile, setdefault'd into the parent's environ before the
+    scheduler subprocess spawns -- same inheritance mechanism as ``apply_mtp_env_gate``, and
+    never touches a key the user (or an earlier gate) already set.
+
+    Only the two env-backed tunables are applied here; ``spec_mtp`` and ``moe_strategy`` are
+    CLI-flag/config-level tunables that need arg-resolution-time application (args.py /
+    engine.py, not this spawn-time hook), and are deliberately left to a later pass -- see
+    ``freetoken.tuning.profile.apply_env_defaults`` for why the "only if unset" precedence is
+    the same either way.
+
+    GPU identification uses NVML directly (``gpu_select._nvml_uuids``), not
+    ``torch.cuda`` -- this runs before ``mp.Process(..., start_method="spawn")``, and
+    initializing a CUDA context in the parent here would be the exact kind of side effect
+    that mechanism has to avoid. No NVML, or no ``--max-seq-len-override`` (the key's
+    context bucket needs a concrete value), skips the profile lookup entirely; a serving
+    request never depends on it.
+    """
+    if server_args.max_seq_len_override is None:
+        return
+    try:
+        from freetoken.gpu_select import _nvml_uuids
+
+        uuids = _nvml_uuids()
+        gpu_uuid = uuids[0] if uuids else None
+    except Exception:  # noqa: BLE001 -- best-effort; a broken NVML load must never block boot
+        gpu_uuid = None
+    if not gpu_uuid:
+        return
+    from freetoken.tuning.profile import apply_env_defaults, compute_key, load
+
+    key = compute_key(
+        gpu_uuid=gpu_uuid,
+        model_path=server_args.model_path,
+        kv_format=server_args.kv_format,
+        max_seq_len=server_args.max_seq_len_override,
+    )
+    profile = load(key)
+    if profile is None:
+        return
+    applied = apply_env_defaults(profile.chosen, os.environ)
+    if applied:
+        logger.info(
+            "ft tune profile %s: setting %s from measured evidence (%s)",
+            key,
+            ", ".join(applied),
+            profile.evidence.date,
+        )
+
+
 def _run_tokenize_worker(detach: bool, **kwargs) -> None:
     """Module-level so it survives the spawn pickle; exists only to detach the group first."""
     if detach:
@@ -155,6 +225,8 @@ def launch_server(
 
         mp.set_start_method("spawn", force=True)
         detach = server_args.shell_mode  # see _detach_process_group
+        apply_tuning_profile_env_gate(server_args, logger)
+        apply_mtp_env_gate(server_args, logger)
 
         world_size = server_args.tp_info.size
         ack_queue: mp.Queue = mp.Queue()

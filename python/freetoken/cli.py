@@ -17,6 +17,7 @@ Commands:
   launch      Configure and launch an agent against a FreeToken server
   checkpoint  Convert an HF safetensors checkpoint to FTW
   bench       Run a micro-benchmark (e.g. "bench bw" = CPU vs PCIe bandwidth)
+  tune        Measure the v1 auto-config candidate matrix and persist the winner
 
 Use "ft <command> --help" for command-specific options.
 Use "ft --version" to print the FreeToken version.""",
@@ -73,6 +74,12 @@ Use "ft bench <subcommand> --help" for subcommand-specific options.""",
     )
 
 
+def _run_tune(argv: list[str]) -> int:
+    from freetoken.tuning.tune_cli import main
+
+    return main(argv, prog="ft tune")
+
+
 def _run_bench(argv: list[str]) -> int:
     if not argv:
         _print_bench_help(sys.stderr)
@@ -98,6 +105,7 @@ COMMANDS = {
     "launch": "_run_launch",
     "checkpoint": "_run_checkpoint",
     "bench": "_run_bench",
+    "tune": "_run_tune",
 }
 
 
