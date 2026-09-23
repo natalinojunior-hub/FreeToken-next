@@ -76,7 +76,9 @@ def _fused_experts_dequant(
     used_host = used.tolist()
     token_of = order // top_k
     weights = topk_weights.reshape(-1)[order].unsqueeze(1)
-    out = torch.zeros_like(hidden_states)
+    # Each (token, slot) pair is written once, then summed over top_k in a fixed order:
+    # index_add_ into bf16 rounded per expert in atomic, run-dependent order.
+    out = hidden_states.new_empty(num_tokens * top_k, h)
     start = 0
     for c0 in range(0, used.numel(), DEQUANT_EXPERT_CHUNK):
         experts = used[c0 : c0 + DEQUANT_EXPERT_CHUNK]
@@ -102,8 +104,8 @@ def _fused_experts_dequant(
         local = torch.searchsorted(experts, sorted_ids[rows]).to(torch.int32).unsqueeze(1)
         x = hidden_states.index_select(0, token_of[rows])
         y = fused_experts_impl(x, w1, w2, weights[rows].contiguous(), local, activation)
-        out.index_add_(0, token_of[rows], y)
-    return out
+        out[order[rows]] = y
+    return out.view(num_tokens, top_k, h).sum(dim=1, dtype=torch.float32).to(hidden_states.dtype)
 
 
 def fused_experts_gguf(

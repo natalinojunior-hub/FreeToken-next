@@ -139,8 +139,10 @@ def test_large_batch_dequant_path_matches_gemv(tokens, sparse):
     try:
         fq.DEQUANT_MIN_TOKENS = 1
         got = fq.fused_experts_gguf(x.clone(), gate_up, down, w, ids, "silu", qt)
+        again = fq.fused_experts_gguf(x.clone(), gate_up, down, w, ids, "silu", qt)
         fq.DEQUANT_MIN_TOKENS = 1 << 30
         ref = fq.fused_experts_gguf(x.clone(), gate_up, down, w, ids, "silu", qt)
     finally:
         fq.DEQUANT_MIN_TOKENS = saved
+    assert torch.equal(got, again)  # cold prefill must be run-to-run bitwise stable
     torch.testing.assert_close(got.float(), ref.float(), rtol=3e-2, atol=3e-2)
