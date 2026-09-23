@@ -71,12 +71,10 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
     Dispatch order:
     1. Unquantized (F32/F16/BF16): plain torch matmul
     2. Small-batch quantized (batch <= 6, in MMVQ_TYPES): GEMV kernel
-    3. Large-batch standard quants (in MMQ_TYPES): MMQ kernel
-    4. Large-batch with I-quants (in DEQUANT_TYPES but not MMQ_TYPES): dequant + torch matmul
+    3. Large-batch (DEQUANT_TYPES, a superset of the MMQ types): dequant + torch matmul
     """
     from freetoken.kernel.gguf import (
         ggml_dequantize,
-        ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
 
@@ -102,9 +100,9 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
         return (x.to(w.dtype) @ w.T).to(x.dtype)
     if x.shape[0] <= _MMVQ_SAFE and qweight_type in MMVQ_TYPES:
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
-    if qweight_type in MMQ_TYPES:
-        return ggml_mul_mat_a8(qweight, x, qweight_type, out_features)
     if qweight_type in DEQUANT_TYPES:
+        # Beats the vendored MMQ ~9x on SM120 from 64 rows up, and is more accurate (no
+        # int8 activation rounding): Q8_0 [2560x6144] x 4096 rows 10.9 ms MMQ, 1.2 ms here.
         block, type_size = BLOCK_SHAPE[qweight_type]
         in_features = qweight.shape[1] // type_size * block
         weight = ggml_dequantize(qweight, qweight_type, out_features, in_features, x.dtype)
