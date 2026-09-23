@@ -104,9 +104,10 @@ def _settings_to_argv(
         str(settings["spec_mtp"]),
         "--max-running-requests",
         "1",
+        # every candidate, so MTP on/off differ only in the tunable being measured
+        "--cuda-graph-max-bs",
+        "1",
     ]
-    if settings["spec_mtp"] > 0:
-        argv += ["--cuda-graph-max-bs", "1"]
     env = dict(os.environ)
     env["FREETOKEN_SPEC_DEFER_REPLAY"] = "1" if settings["defer_replay"] else "0"
     env["FREETOKEN_DRAFT_GRAPH"] = "1" if settings["draft_graph"] else "0"

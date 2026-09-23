@@ -47,12 +47,15 @@ class CandidateResult:
 
 
 def select_best(
-    results: list[CandidateResult], *, pp_tolerance: float = 0.97
+    results: list[CandidateResult], *, pp_tolerance: float = 0.97, tg_margin: float = 0.03
 ) -> CandidateResult | None:
     """Best median committed TG among the candidates that: had no traceback, produced a
     committed_tg, and whose cold_pp is >= ``pp_tolerance`` x the best cold_pp among the
-    surviving (no-traceback) candidates. ``None`` when nothing survives -- the caller must
-    not write a profile in that case."""
+    surviving (no-traceback) candidates. Candidates are in preference order (defaults
+    first): a later one displaces the current pick only if its TG beats it by more than
+    ``tg_margin`` -- repeated tunes of MTP on/off at 16K swapped places within 2.5%, which is
+    noise, not a win. ``None`` when nothing survives -- the caller must not write a profile
+    in that case."""
     survivors = [
         r
         for r in results
@@ -65,4 +68,8 @@ def select_best(
     eligible = [r for r in survivors if r.cold_pp >= floor]
     if not eligible:
         return None
-    return max(eligible, key=lambda r: r.committed_tg)
+    best = eligible[0]
+    for r in eligible[1:]:
+        if r.committed_tg > best.committed_tg * (1 + tg_margin):
+            best = r
+    return best

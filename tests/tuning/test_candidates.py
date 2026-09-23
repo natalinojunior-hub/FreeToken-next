@@ -71,3 +71,13 @@ def test_select_best_returns_none_when_everything_failed():
 
 def test_select_best_returns_none_on_empty_list():
     assert select_best([]) is None
+
+
+def test_later_candidate_needs_a_margin_over_noise():
+    from freetoken.tuning.candidates import CandidateResult, select_best
+
+    def r(tg):
+        return CandidateResult({"tg": tg}, 2000.0, tg, 1.0, 1.0, False)
+
+    assert select_best([r(38.0), r(38.9)]).committed_tg == 38.0  # +2.4%: noise, keep default
+    assert select_best([r(38.0), r(40.0)]).committed_tg == 40.0  # +5.3%: a real win
