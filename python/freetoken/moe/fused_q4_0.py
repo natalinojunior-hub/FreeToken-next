@@ -25,12 +25,28 @@ from freetoken.models.gguf.dequant import GGML_Q4_0, MOE_VEC_TYPES
 _ACT = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
 
 
-# From this many tokens the GEMV kernel, which re-reads each expert's weights per routed
+# From this many tokens (measured crossover, 512 experts x top-10) the GEMV kernel, which re-reads each expert's weights per routed
 # row, loses to dequantizing the used experts and running the bf16 grouped GEMM.
-DEQUANT_MIN_TOKENS = 64
+DEQUANT_MIN_TOKENS = 512
 # Experts dequantized at once: bounds the bf16 transient (~10 MB per expert here), which
 # the memory planner otherwise takes from the expert cache.
 DEQUANT_EXPERT_CHUNK = 16
+
+
+def _gather_experts(
+    bank: torch.Tensor, experts: torch.Tensor, first: int, last: int
+) -> torch.Tensor:
+    """``bank[experts]`` for a packed uint8 bank: a view when the ids are the contiguous run
+    ``first..last`` (a prefill uses nearly every expert), else a gather in the widest element
+    that divides an expert's bytes (a byte-wise index_select is ~8x slower than int64)."""
+    flat = bank.reshape(bank.shape[0], -1)
+    if last - first + 1 == experts.numel():
+        return flat[first : last + 1]
+    for dtype in (torch.int64, torch.int32, torch.int16):
+        size = dtype.itemsize
+        if flat.shape[1] % size == 0 and flat.data_ptr() % size == 0:
+            return flat.view(dtype).index_select(0, experts).view(torch.uint8)
+    return flat.index_select(0, experts)
 
 
 def _fused_experts_dequant(
@@ -57,6 +73,7 @@ def _fused_experts_dequant(
     sorted_ids = flat[order]
     used, counts = torch.unique_consecutive(sorted_ids, return_counts=True)
     counts_host = counts.tolist()
+    used_host = used.tolist()
     token_of = order // top_k
     weights = topk_weights.reshape(-1)[order].unsqueeze(1)
     out = torch.zeros_like(hidden_states)
@@ -67,15 +84,16 @@ def _fused_experts_dequant(
         rows = slice(start, start + n)
         start += n
         e = experts.numel()
+        ends = used_host[c0], used_host[c0 + e - 1]
         w1 = ggml_dequantize(
-            gate_up_q.index_select(0, experts).reshape(e * n2, -1),
+            _gather_experts(gate_up_q, experts, *ends).reshape(e * n2, -1),
             quant_type,
             e * n2,
             h,
             hidden_states.dtype,
         ).view(e, n2, h)
         w2 = ggml_dequantize(
-            down_q.index_select(0, experts).reshape(e * h, -1),
+            _gather_experts(down_q, experts, *ends).reshape(e * h, -1),
             down_quant_type,
             e * h,
             inter,

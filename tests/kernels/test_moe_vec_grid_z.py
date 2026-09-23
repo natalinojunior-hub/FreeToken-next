@@ -110,7 +110,8 @@ def test_chunking_does_not_disturb_rows(banks, n):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("tokens", [64, 300])
-def test_large_batch_dequant_path_matches_gemv(tokens):
+@pytest.mark.parametrize("sparse", [False, True])  # every expert routed (sliced) or gathered
+def test_large_batch_dequant_path_matches_gemv(tokens, sparse):
     """The dequantize + bf16 grouped-GEMM prefill path agrees with the per-row GEMV kernel."""
     import numpy as np
     from gguf import GGMLQuantizationType
@@ -131,14 +132,15 @@ def test_large_batch_dequant_path_matches_gemv(tokens):
     gate_up, down = bank(2 * inter, hidden), bank(hidden, inter)
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda")
     ids = torch.stack([torch.randperm(experts, device="cuda")[:top_k] for _ in range(tokens)])
-    ids = ids.to(torch.int32)
+    ids = (ids // 2 * 2 if sparse else ids).to(torch.int32)
     w = torch.softmax(torch.randn(tokens, top_k, device="cuda"), dim=-1)
 
-    got = fq.fused_experts_gguf(x.clone(), gate_up, down, w, ids, "silu", qt)
-    ref_min = fq.DEQUANT_MIN_TOKENS
-    fq.DEQUANT_MIN_TOKENS = 1 << 30
+    saved = fq.DEQUANT_MIN_TOKENS
     try:
+        fq.DEQUANT_MIN_TOKENS = 1
+        got = fq.fused_experts_gguf(x.clone(), gate_up, down, w, ids, "silu", qt)
+        fq.DEQUANT_MIN_TOKENS = 1 << 30
         ref = fq.fused_experts_gguf(x.clone(), gate_up, down, w, ids, "silu", qt)
     finally:
-        fq.DEQUANT_MIN_TOKENS = ref_min
+        fq.DEQUANT_MIN_TOKENS = saved
     torch.testing.assert_close(got.float(), ref.float(), rtol=3e-2, atol=3e-2)
