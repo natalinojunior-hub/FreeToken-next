@@ -142,11 +142,11 @@ class TunedSettings:
 
 @dataclass
 class Profile:
-    schema: int
     key: str
     chosen: TunedSettings
     evidence: CandidateEvidence
     candidates: list[dict[str, Any]] = field(default_factory=list)  # every measured candidate
+    schema: int = SCHEMA_VERSION
 
     def to_json(self) -> dict:
         return {

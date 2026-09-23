@@ -71,7 +71,6 @@ def test_key_changes_when_weight_file_is_touched(tmp_path):
 
 def _sample_profile(key: str) -> Profile:
     return Profile(
-        schema=SCHEMA_VERSION,
         key=key,
         chosen=TunedSettings(
             spec_mtp=1, defer_replay=True, draft_graph=False, moe_strategy="hybrid"
@@ -155,3 +154,8 @@ def test_apply_env_defaults_only_fills_unset_keys():
     assert applied == ["FREETOKEN_SPEC_DEFER_REPLAY"]
     assert environ["FREETOKEN_DRAFT_GRAPH"] == "0"  # untouched
     assert environ["FREETOKEN_SPEC_DEFER_REPLAY"] == "1"
+
+
+def test_new_profile_carries_current_schema():
+    # ft tune once hardcoded schema=1, so every profile it wrote after a bump was ignored
+    assert _sample_profile("k").schema == SCHEMA_VERSION

@@ -411,7 +411,6 @@ def main(argv: list[str] | None = None, prog: str = "ft tune") -> int:
         return 1
 
     profile = Profile(
-        schema=1,
         key=key,
         chosen=TunedSettings(
             spec_mtp=best.settings["spec_mtp"],
