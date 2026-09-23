@@ -1,10 +1,12 @@
 # State — 2026-09-23
 
-Doing: Campaign 3 block 3 (MTP draft-step CUDA graph): Sonnet worker reproducing the replay illegal access in worktree ft-campaign2/wt3 (compute-sanitizer), deliverables ft-campaign2/c3/REPORT.md + draft-graph-v3.patch. GPU owned by that worker.
+Doing: nothing in progress. Campaign 3 closed; report /models/desenvolvimento/ft-campaign2/RELATORIO.md (Campaign 3 section) + LEDGER.md.
 Done:
-- Block 1 CLOSED (e42ac55, ft-campaign2/A2b-outlier-4098.md): turbo3 KL 0.97 @4098 = cuBLAS bf16 M=1 vs M>=2 only (row-wise GEMMs -> bitwise k0). No code change.
-- Block 2 NO-GO (ft-campaign2/B2-verdict.md): per k1 cycle gathers 19.3 ms vs routed GEMV 4.0 ms; hit/miss overlap ceiling <3 ms realistic. Not coded.
-Decisions: no row-wise GEMM promotion (parity only, cost); overlap rejected on measured cost model; nsys not installed -> torch.profiler traces (no system change).
+- Block 1 (e42ac55): turbo3 KL 0.97 @4098 = cuBLAS bf16 M=1 vs M>=2 only; no state defect.
+- Block 2: hit/miss overlap NO-GO (gathers 19.3 ms vs routed GEMV 4.0 ms per k1 cycle).
+- Block 3 (841e8fa): QSA replan bug fixed; MTP draft graph opt-in FREETOKEN_DRAFT_GRAPH=1, +2.9% k1 TG (4K 41.65, 15.7K 44.60), identical output.
+- make ci 2101 passed at e71c6a2+.
+Decisions: draft graph default stays OFF (default flip blocked by permission classifier -> operator call).
 Next:
-1. Review worker's root cause/fix; if valid apply v3 in wt, run CHECK=1 end-to-end + cold bench 4K/15.7K k1 (bench.sh), enable only on net gain.
-2. make ci on final HEAD; update ft-campaign2/RELATORIO.md + LEDGER.md with commits/verdicts; >100 tok/s still unmet (cold 40-44).
+1. Operator: approve FREETOKEN_DRAFT_GRAPH default "1" (engine/graph.py), then re-run `ft tune` so profiles include it.
+2. >100 tok/s not met (cold 41-45): cut missed expert bytes per cycle (~1 GB, PCIe-bound).
