@@ -52,6 +52,14 @@ from .vram_ledger import (
 )
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
+
+# Debug hook for MTP defer-replay teacher-forcing comparison (A2). Read once at import
+# so the flag off path costs nothing; see _debug_dump_logits below.
+_DEBUG_LOGIT_DUMP_DIR = os.environ.get("FREETOKEN_DEBUG_LOGIT_DUMP")
+_DEBUG_LOGIT_DUMP_MAX = int(os.environ.get("FREETOKEN_DEBUG_LOGIT_DUMP_MAX", "600"))
+if _DEBUG_LOGIT_DUMP_DIR:
+    os.makedirs(_DEBUG_LOGIT_DUMP_DIR, exist_ok=True)
+_debug_dump_counter = 0
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
     _linear_pool_min_slots,
@@ -1428,7 +1436,65 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         self.last_batch_logits = batch_logits
+        if _DEBUG_LOGIT_DUMP_DIR is not None:
+            self._debug_dump_logits(batch, batch_logits)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def _debug_dump_logits(self, batch: Batch, batch_logits: torch.Tensor) -> None:
+        """FREETOKEN_DEBUG_LOGIT_DUMP=<dir> only. One torch.save per forward, single-request
+        batches only: input position(s), input token id(s), fp16 logits row(s), batch kind,
+        and a linear/GDN state-slot fingerprint. Used by ft-campaign2/replay_equiv.py to
+        compare MTP defer-replay logits against a teacher-forced baseline. Must stay off the
+        CUDA-graph capture path since it does host-side torch.save.
+        """
+        global _debug_dump_counter
+        if torch.cuda.is_current_stream_capturing():
+            return
+        if batch.size != 1 or _debug_dump_counter >= _DEBUG_LOGIT_DUMP_MAX:
+            return
+        req = batch.reqs[0]
+        if batch.spec_logits_indices is not None:
+            kind = "spec-verify"
+            positions = batch.positions.tolist()
+            input_ids = (
+                batch.spec_host_ids
+                if batch.spec_host_ids is not None
+                else batch.input_ids.tolist()
+            )
+            logits_rows = batch_logits
+        elif batch.is_prefill:
+            kind = "prefill"
+            positions = [int(batch.positions[-1].item())]
+            input_ids = [int(batch.input_ids[-1].item())]
+            logits_rows = batch_logits[-1:]
+        else:
+            kind = "decode"
+            positions = [int(batch.positions[-1].item())]
+            input_ids = [int(batch.input_ids[-1].item())]
+            logits_rows = batch_logits[-1:]
+
+        state = None
+        pool = self.linear_state_pool
+        if pool is not None:
+            slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
+            state = {
+                "conv": pool.conv_states[:, slot].detach().to(torch.float32).cpu().clone(),
+                "recurrent": pool.recurrent_states[:, slot].detach().to(torch.float32).cpu().clone(),
+            }
+
+        rec = {
+            "counter": _debug_dump_counter,
+            "kind": kind,
+            "uid": req.uid,
+            "positions": positions,
+            "input_ids": input_ids,
+            "logits_fp16": logits_rows.detach().to(torch.float16).cpu().clone(),
+            "req_cached_len": req.cached_len,
+            "req_device_len": req.device_len,
+            "state": state,
+        }
+        torch.save(rec, os.path.join(_DEBUG_LOGIT_DUMP_DIR, f"rec_{_debug_dump_counter}.pt"))
+        _debug_dump_counter += 1
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
