@@ -20,6 +20,7 @@ def test_matrix_size_with_draft_graph_and_hybrid():
     assert len(c) == 8
     assert {x["moe_strategy"] for x in c} == {"offload", "hybrid"}
     assert {x["draft_graph"] for x in c} == {False, True}
+    assert c[0]["draft_graph"] is True  # engine default first: wins ties in select_best
 
 
 def test_matrix_is_data_driven_dicts():

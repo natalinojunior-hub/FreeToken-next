@@ -19,7 +19,8 @@ def build_candidates(*, draft_graph_available: bool, hybrid_capable: bool) -> li
     nothing in v1 measures turning it off); it's a field on every candidate for symmetry
     with the profile schema, not a swept axis.
     """
-    draft_graph_values = (False, True) if draft_graph_available else (False,)
+    # the engine default (graph on) goes first: select_best prefers earlier candidates on ties
+    draft_graph_values = (True, False) if draft_graph_available else (False,)
     moe_strategies = ("offload", "hybrid") if hybrid_capable else ("offload",)
     candidates = []
     for spec_mtp in (0, 1):
