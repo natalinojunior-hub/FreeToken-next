@@ -229,7 +229,7 @@ The PLE fix changes the k1 output text (sha 0a7c5a94ca -> 1eebf6a554). With grap
 
 Commits a0adc18..d078f5f. RTX 5080, `--max-seq-len-override 16384 --cuda-graph-max-bs 1
 --kv-format=turbo3 --max-running-requests 1`, overlap off, 256 output tokens, greedy.
-Scripts and logs: `/models/desenvolvimento/ft-campaign/` (`ft.sh`, `ft16.sh`, `cold.sh`, `CAMPAIGN.md`).
+Scripts and logs: `/models/desenvolvimento/ft-campaign/` (`ft.sh`, `ft16.sh`, `cold.sh`, campaign notes).
 
 **PP definition.** The old anchors (3153/3112) are cached-prefix PP: the client repeats one prompt
 and the server reuses 4032 of its 4096 tokens from the radix cache. True cold PP (unique prompt per
