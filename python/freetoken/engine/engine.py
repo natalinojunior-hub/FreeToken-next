@@ -20,7 +20,11 @@ from freetoken.models.weight import ftw_lacks_vision
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.host_banks import PinFailed
-from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
+from freetoken.moe.offload_cache import (
+    OffloadMoeCache,
+    attach_offload_moe_cache,
+    decode_pool_floor,
+)
 from freetoken.utils import (
     align_ceil,
     init_logger,
@@ -731,16 +735,14 @@ class Engine:
         a named non-negotiable line it is now subtracted from every LATER plan (a rebuild, a
         second auto resolve) and shows up in the report instead of in an OOM.
         """
-        from freetoken.engine.cache_budget import expert_bytes_per_slot
-
         measured = tensor_bytes(cache)
-        per_slot = expert_bytes_per_slot(cache.bank_sources)
-        promised = min(measured, cache.cache_size * per_slot)
+        promised = min(measured, cache.expert_pool_bytes)
         self.vram_ledger.charge(
             "cache:expert",
             promised,
             Kind.PERSISTENT,
-            f"{cache.cache_size} slots x {per_slot / (1 << 20):.2f} MiB priced by the plan",
+            f"{cache.cache_size} slots in {len(cache.pool_caps)} geometry pool(s), "
+            f"{promised / (1 << 20):.1f} MiB priced by the plan",
         )
         side = measured - promised
         if side > 0:
@@ -1077,6 +1079,11 @@ class Engine:
             hybrid_max_fetch=config.moe_hybrid_max_fetch,
             layout=layout,
             max_slots=max_slots,
+            min_pool_rows=decode_pool_floor(
+                config.model_config.num_experts,
+                config.model_config.num_experts_per_tok,
+                config.max_running_req,
+            ),
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
@@ -1190,19 +1197,25 @@ class Engine:
         return min_free_memory, max_free_memory
 
     def _target_moe_and_expert_bytes(self, moe_cache_size: int | None) -> tuple[int, int]:
-        from freetoken.engine.cache_budget import expert_bytes_per_slot
+        from freetoken.engine.cache_budget import expert_bytes_per_slot, expert_cache_bytes
+        from freetoken.utils import div_ceil
 
         target_moe = (
             moe_cache_size
             if moe_cache_size is not None
             else (self.moe_offload_cache.cache_size if self.moe_offload_cache else 0)
         )
-        per_expert_bytes = (
-            expert_bytes_per_slot(self.moe_offload_cache.bank_sources)
-            if self.moe_offload_cache is not None
-            else 0
-        )
-        return target_moe, per_expert_bytes
+        cache = self.moe_offload_cache
+        if cache is None:
+            return target_moe, 0
+        if len(cache.pools) > 1 and target_moe > 0:
+            # geometry pools are not linear in slots: price the target exactly, per slot
+            # rounded up so ``target_moe * per_expert_bytes`` never under-prices it
+            exact = expert_cache_bytes(
+                cache.pools, cache.num_experts, target_moe, cache.min_pool_rows
+            )
+            return target_moe, div_ceil(exact, target_moe)
+        return target_moe, expert_bytes_per_slot(cache.bank_sources)
 
     def _resize_kv_pool(self, config, num_pages: int, num_swa_pages: int | None) -> None:
         # IN-PLACE, identity-preserving: the CacheManager's swa_pool reference, ctx.kv_cache and

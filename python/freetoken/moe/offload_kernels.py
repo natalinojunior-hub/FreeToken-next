@@ -23,13 +23,15 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     flat ``layer * num_experts + expert`` space the cache indexes by, and maps
     ``src_indices`` back, so ``copy_missing`` still resolves against this layer's own host
     tensor. ``out_indices`` aliases the input, preserving the in-place rewrite every
-    downstream GEMM depends on.
+    downstream GEMM depends on. The LRU runs on the layer's geometry pool, so the slot ids
+    written are pool-local.
     """
+    id_of_slot, usage = cache.pool_state(layer_id)
     lru_ensure(
         expert_ids,
         cache.slot_for_id.view(-1),
-        cache.id_of_slot,
-        cache.usage,
+        id_of_slot,
+        usage,
         cache.step,
         expert_ids,
         cache.src_indices,
@@ -93,14 +95,15 @@ def reset_cache(cache) -> None:
 def _ensure_experts_hybrid_gpu(
     cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
 ) -> None:
+    id_of_slot, usage = cache.pool_state(layer_id)
     block_e = triton.next_power_of_2(cache.num_experts)
-    block_c = triton.next_power_of_2(cache.cache_size)
+    block_c = triton.next_power_of_2(id_of_slot.numel())
     num_warps = 8 if block_c >= 2048 else 4
     _ensure_experts_hybrid_kernel[(1,)](
         expert_ids,
         cache.slot_for_id,
-        cache.id_of_slot,
-        cache.usage,
+        id_of_slot,
+        usage,
         cache.step,
         cache.active_mask,
         cache.evict_slots,
@@ -113,7 +116,7 @@ def _ensure_experts_hybrid_gpu(
         int(max_fetch),
         int(frac_q16),
         cache.num_experts,
-        cache.cache_size,
+        id_of_slot.numel(),
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
@@ -129,6 +132,7 @@ def _ensure_experts_hybrid_cpu(
     the bandwidth-matched ``~frac_q16/2^16 * misses`` when ``frac_q16`` > 0) of the missing
     experts; overflow misses are rewritten to -1. With ``BY_RECENCY`` the fetch set is the
     most-recently-active misses (ties -> lower id); else the lowest ids."""
+    id_of_slot, pool_usage = cache.pool_state(layer_id)
     seen = []
     for expert in expert_ids.view(-1).tolist():
         if expert not in seen:
@@ -143,7 +147,7 @@ def _ensure_experts_hybrid_cpu(
     for expert in seen:
         slot = int(cache.slot_for_id[layer_id, expert].item())
         if slot != -1:
-            cache.usage[slot] = step
+            pool_usage[slot] = step
 
     missing = [e for e in seen if int(cache.slot_for_id[layer_id, e].item()) == -1]
     if _HYBRID_FETCH_BY_RECENCY:
@@ -160,16 +164,16 @@ def _ensure_experts_hybrid_cpu(
     cache.num_missing_full.fill_(len(missing))
     cache.num_indices.fill_(num_fetch)
 
-    usage = cache.usage.tolist()
+    usage = pool_usage.tolist()
     for idx in range(num_fetch):
         expert = missing[idx]
-        victim = min(range(cache.cache_size), key=lambda s: (usage[s], s))
-        old_id = int(cache.id_of_slot[victim].item())
+        victim = min(range(len(usage)), key=lambda s: (usage[s], s))
+        old_id = int(id_of_slot[victim].item())
         if old_id >= 0:
             cache.slot_for_id.view(-1)[old_id] = -1
-        cache.id_of_slot[victim] = layer_id * cache.num_experts + expert
+        id_of_slot[victim] = layer_id * cache.num_experts + expert
         cache.slot_for_id[layer_id, expert] = victim
-        cache.usage[victim] = step
+        pool_usage[victim] = step
         usage[victim] = step
         cache.evict_slots[idx] = victim
         cache.src_indices[idx] = expert  # layer-local row
@@ -185,23 +189,39 @@ def _ensure_experts_hybrid_cpu(
 
 
 def _materialize_layer_gpu(cache, layer_id: int) -> None:
+    """Stage all of ``layer_id``'s experts at rows ``0..E-1`` (position == expert id).
+
+    A pool holding a full layer registers them as its first ``E`` resident slots. A smaller
+    pool copies into the staging window instead (``cache._staging``): the rows it overlays
+    are invalidated in every pool, and the staged layer is not registered as resident."""
     E = cache.num_experts
     base = layer_id * E
-    slot_ids = cache.id_of_slot.clone()
-    same_layer = (slot_ids >= base) & (slot_ids < base + E)
-    cache.id_of_slot.masked_fill_(same_layer, -1)
-    cache.usage.masked_fill_(same_layer, 0)
-
-    old_ids = slot_ids[:E]
-    valid = (old_ids >= 0) & (~same_layer[:E])
-    if valid.any():
-        cache.slot_for_id.view(-1)[old_ids[valid].to(torch.int64)] = -1
-
-    cache.step.add_(1)
     off = torch.arange(E, device=cache.device, dtype=torch.int32)
-    cache.id_of_slot[:E] = base + off
-    cache.slot_for_id[layer_id, :E] = off
-    cache.usage[:E] = cache.step
+    staging = cache._staging.get(cache.pool_of_layer[layer_id])
+    if staging is not None:
+        overlaid = staging[1]
+        old_ids = cache.id_of_slot[overlaid]
+        valid = old_ids >= 0
+        if valid.any():
+            cache.slot_for_id.view(-1)[old_ids[valid].to(torch.int64)] = -1
+        cache.id_of_slot[overlaid] = -1
+        cache.usage[overlaid] = 0
+    else:
+        id_of_slot, usage = cache.pool_state(layer_id)
+        slot_ids = id_of_slot.clone()
+        same_layer = (slot_ids >= base) & (slot_ids < base + E)
+        id_of_slot.masked_fill_(same_layer, -1)
+        usage.masked_fill_(same_layer, 0)
+
+        old_ids = slot_ids[:E]
+        valid = (old_ids >= 0) & (~same_layer[:E])
+        if valid.any():
+            cache.slot_for_id.view(-1)[old_ids[valid].to(torch.int64)] = -1
+
+        cache.step.add_(1)
+        id_of_slot[:E] = base + off
+        cache.slot_for_id[layer_id, :E] = off
+        usage[:E] = cache.step
     cache.evict_slots[:E] = off
     cache.src_indices[:E] = off
     cache.num_indices.fill_(E)

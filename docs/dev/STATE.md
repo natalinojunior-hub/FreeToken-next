@@ -1,15 +1,21 @@
-# State Snapshot — 2026-09-22
+# State — 2026-09-23
 
-## Doing Now
-- MTP usa banco próprio blk.48 (Q8_0) no cache de offload (banco 48, `ModelConfig.mtp_expert_bank`). Sem commit.
+## Doing
+- Nothing in progress. The geometry-pool expert cache is committed.
 
 ## Done
-- Aceitação k=1 55.5 % -> 75.2 %. k=1 TG 22.43 -> 22.47 (sem ganho): verify 59.3 -> 69.9 ms, replay 15.5 -> 20.1 ms, draft 3.2 -> 3.8 ms.
-- Causa da piora de verify/replay: gate_up Q8_0 do MTP cria pool GPU extra de cache_size slots (per-geometria) -> expert slots 1181 -> 738 -> mais misses.
-- k=0 35.30 (inalterado, mesma sha). make ci PASS (1973).
-- Estudo: `relatorio-estudo-mtp-lto.md`.
+- a9d30f4: the MTP draft uses its own blk.48 expert bank (acceptance 55.5% -> 75.2%).
+- Geometry pools: one byte budget for all experts, each geometry gets its own LRU range.
+  - Resident rows: target 1181 -> ~2650 at k0, and 738 -> 2658 at k1. The MTP bank gets 80 rows.
+  - Miss rate at k1: target 83.3% -> 37.8%, MTP 99% -> 49%.
+  - Timings at k1: verify 70.2 -> 53.0 ms, replay 20.1 -> 15.4 ms.
+  - Speed: k1 TG 22.34 -> 28.42, k0 TG 35.11 -> 41.35. PP unchanged. sha identical before and after.
+- make ci PASS.
+
+## Decisions
+- Layers are grouped by row geometry. Each layer gets an equal row share, clamped to [decode floor, layers*E].
+- A pool below E rows stages its prefill layer at the front of each arena.
 
 ## Next
-1. Pool por geometria dimensionado pela demanda (banco único de 1 camada não deve custar cache_size slots) — toca planner/offload_cache; pedir aval.
-2. Verify em CUDA graph. 3. Zero-replay GDN+QSA+PLE.
-- Commit só quando o operador pedir.
+1. Verify step in a CUDA graph (verify 53 ms vs decode ~24 ms).
+2. Zero-replay for GDN+QSA+PLE.

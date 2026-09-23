@@ -115,6 +115,16 @@ _BANK_BYTES_PER_EXPERT = {
 MARLIN_MAX_CACHE_SIZE = 992
 
 
+# Most tokens a single-request prefill-phase batch may carry and still take the MoE decode
+# path (speculative verify/replay windows); see layers/moe.py ``_use_decode_path``.
+DECODE_PATH_MAX_TOKENS = 8
+
+
+def decode_pool_floor(num_experts: int, top_k: int, max_running_req: int) -> int:
+    """Most distinct experts one decode step can route: every geometry pool's LRU floor."""
+    return min(num_experts, max(DECODE_PATH_MAX_TOKENS, max_running_req) * top_k)
+
+
 @dataclass
 class ExpertBank:
     weight: torch.Tensor
@@ -169,6 +179,9 @@ class OffloadMoeCache:
     # bank layout from the expert kernel (a BankSpec per role); when given it replaces the _BANK_SCHEMAS lookup and the slot cap comes from max_slots
     layout: dict | None = None
     max_slots: int | None = None
+    # Mixed-geometry banks only: most distinct experts one decode step may route (decode-path
+    # tokens * top_k), the floor of every geometry pool's LRU range; 0 = one full layer.
+    min_pool_rows: int = 0
 
     def __post_init__(self) -> None:
         if isinstance(self.gguf_expert_types, dict):
@@ -297,6 +310,15 @@ class OffloadMoeCache:
         # machinery that moves bank bytes (copy_missing, the prefill double buffers,
         # bank_views) iterates this list, so the slot cache is bank-count agnostic.
         self.banks: list[tuple[list[torch.Tensor], torch.Tensor]] = []
+        # Geometry pools (see _alloc_bank_caches); until banks register, one pool = all slots.
+        self.pools: list = []
+        self.pool_caps = [self.cache_size]
+        self.pool_of_layer = [0] * self.num_layers
+        self._pool_starts = [0]
+        self._pool_views: list[tuple[torch.Tensor, ...]] = []
+        self._staging: dict[int, tuple[tuple[torch.Tensor, ...], torch.Tensor]] = {}
+        self._arenas: list[torch.Tensor] = []
+        self._bind_pool_state()
         # Fused multi-bank copy descriptor (built by set_bank_sources/_build_copy_plan).
         # Source pointers are per layer (_copy_src_ptrs[layer_id] -> [num_banks] device
         # tensor); dst/feat are layer-invariant.
@@ -454,31 +476,10 @@ class OffloadMoeCache:
                 key = (layer_id, name, qt)
                 self.expert_geometry[key] = (tuple(source.shape), source.dtype)
             self.bank_sources[name] = list(per_layer)
-            if is_uniform:
-                c = torch.empty(
-                    (self.cache_size, *head.shape[1:]),
-                    dtype=head.dtype,
-                    device=self.device,
-                )
-                self.bank_caches[name] = c
-                for layer_id in range(self.num_layers):
-                    qt = self._get_layer_quant_type(layer_id, name)
-                    self.bank_caches[(layer_id, name, qt)] = c
-            else:
-                geom_caches: dict[tuple, torch.Tensor] = {}
-                for layer_id, source in enumerate(per_layer):
-                    g = (tuple(source.shape[1:]), source.dtype)
-                    if g not in geom_caches:
-                        geom_caches[g] = torch.empty(
-                            (self.cache_size, *source.shape[1:]),
-                            dtype=source.dtype,
-                            device=self.device,
-                        )
-                    c = geom_caches[g]
-                    qt = self._get_layer_quant_type(layer_id, name)
-                    self.bank_caches[(layer_id, name, qt)] = c
-                self.bank_caches[name] = next(iter(geom_caches.values()))
-        self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
+        size = self._alloc_bank_caches(self.cache_size)
+        if size != self.cache_size:
+            self._alloc_slot_state(size)
+        self._bind_pool_state()
         self._build_copy_plan()
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
@@ -587,6 +588,135 @@ class OffloadMoeCache:
                 f"{MARLIN_MAX_CACHE_SIZE} (vLLM moe_align_block_size caps padded experts at "
                 "1024); reduce moe_cache_size or force --quant-backend moe.nvfp4=triton"
             )
+        if getattr(self, "bank_sources", None):  # unset while __post_init__ validates
+            self._pool_plan(cache_size)
+
+    def _alloc_slot_state(self, cache_size: int) -> None:
+        """(Re)allocate the ``cache_size``-shaped LRU bookkeeping, all slots empty."""
+        self.cache_size = cache_size
+        self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=self.device)
+        self.usage = torch.zeros((cache_size,), dtype=torch.int64, device=self.device)
+        plan_slots = max(self.num_experts, cache_size)
+        self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+
+    def _alloc_bank_caches(self, cache_size: int) -> int:
+        """Allocate the GPU slot cache as one byte arena per bank, split into geometry pools.
+
+        Layers with the same row geometry in every bank share a pool: a contiguous range of
+        the global slot index space (its own LRU) and one aligned byte range per arena. The
+        slot ids a layer's ``slot_for_id`` holds are local to its pool, so the kernels index
+        the pool's views directly. One geometry = one pool of ``cache_size`` rows (the
+        historic layout); several split ``cache_size`` rows by ``pool_capacities``, so a
+        one-layer pool (an MTP draft's own bank) never costs rows sized for every layer.
+        A pool smaller than one layer stages a prefill layer at the front of each arena
+        (``_staging``), invalidating whatever resident rows it overlays. Returns the total
+        resident rows allocated (``sum`` of the pool capacities)."""
+        from freetoken.utils import div_ceil
+
+        banks = {n: self.bank_sources[n] for n in self.bank_schema}
+        pools, caps, offsets, ends = self._pool_plan(cache_size)
+        arenas = [torch.empty((end,), dtype=torch.uint8, device=self.device) for end in ends]
+        starts = [sum(caps[:i]) for i in range(len(caps))]
+
+        def view(arena: torch.Tensor, off: int, rows: int, head: torch.Tensor) -> torch.Tensor:
+            rb = head[0].numel() * head.element_size()
+            return arena[off : off + rows * rb].view(head.dtype).view(rows, *head.shape[1:])
+
+        E = self.num_experts
+        self.bank_caches = {}
+        self.pool_caps = caps
+        self.pool_of_layer = [0] * self.num_layers
+        self._pool_views: list[tuple[torch.Tensor, ...]] = []
+        self._staging: dict[int, tuple[tuple[torch.Tensor, ...], torch.Tensor]] = {}
+        for p, (pool, cap) in enumerate(zip(pools, caps)):
+            heads = [banks[n][pool.layers[0]] for n in self.bank_schema]
+            views = tuple(view(a, off, cap, h) for a, off, h in zip(arenas, offsets[p], heads))
+            self._pool_views.append(views)
+            for layer_id in pool.layers:
+                self.pool_of_layer[layer_id] = p
+                for name, v in zip(self.bank_schema, views):
+                    self.bank_caches[
+                        (layer_id, name, self._get_layer_quant_type(layer_id, name))
+                    ] = v
+            if cap < E:
+                window = [E * rb for rb in pool.row_bytes]  # staging bytes per arena
+                overlaid = [
+                    i
+                    for q, (q_pool, q_cap) in enumerate(zip(pools, caps))
+                    for i in range(
+                        starts[q],
+                        starts[q]
+                        + min(
+                            q_cap,
+                            max(
+                                div_ceil(max(0, w - off), rb)
+                                for w, off, rb in zip(window, offsets[q], q_pool.row_bytes)
+                            ),
+                        ),
+                    )
+                ]
+                self._staging[p] = (
+                    tuple(view(a, 0, E, h) for a, h in zip(arenas, heads)),
+                    torch.tensor(overlaid, dtype=torch.int64, device=self.device),
+                )
+        for name, v in zip(self.bank_schema, self._pool_views[0]):
+            self.bank_caches[name] = v
+        self.pools = pools
+        self._pool_starts = starts
+        self._arenas = arenas
+        self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
+        return sum(caps)
+
+    def _pool_plan(self, cache_size: int):
+        """``(pools, capacities, offsets, arena_bytes)`` for ``cache_size`` rows; raises
+        ``ValueError`` when a sub-layer pool's prefill staging window exceeds an arena."""
+        from freetoken.engine.cache_budget import (
+            expert_pools,
+            pool_capacities,
+            pool_layout,
+            pool_staging_fits,
+        )
+
+        pools = expert_pools({n: self.bank_sources[n] for n in self.bank_schema})
+        caps = (
+            [cache_size]
+            if len(pools) == 1
+            else pool_capacities(pools, self.num_experts, cache_size, self.min_pool_rows)
+        )
+        offsets, ends = pool_layout(pools, caps)
+        if not pool_staging_fits(pools, caps, self.num_experts, ends):
+            raise ValueError(
+                f"moe_cache_size={cache_size} is too small for the mixed expert geometry: a "
+                f"pool below one layer ({caps}) cannot stage a prefill layer in its arenas"
+            )
+        return pools, caps, offsets, ends
+
+    def _bind_pool_state(self) -> None:
+        """Per-pool ``(id_of_slot, usage)`` views the LRU kernels run on."""
+        self._pool_state = [
+            (self.id_of_slot[s : s + c], self.usage[s : s + c])
+            for s, c in zip(self._pool_starts, self.pool_caps)
+        ]
+
+    def pool_state(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(id_of_slot, usage)`` of ``layer_id``'s pool; its slot ids index these."""
+        return self._pool_state[self.pool_of_layer[layer_id]]
+
+    @property
+    def expert_pool_bytes(self) -> int:
+        """GPU bytes the slot arenas hold (every pool, alignment padding included)."""
+        return sum(a.nbytes for a in self._arenas)
+
+    def _layer_rows(self, layer_id: int, bank: int, whole_layer: bool) -> torch.Tensor:
+        """The GPU rows a copy/GEMM of ``layer_id`` addresses in bank ``bank``: its pool,
+        or the staging window when a whole layer does not fit the pool."""
+        if not self._pool_views:  # banks attached by hand (benchbw), no pools
+            return self.banks[bank][1]
+        p = self.pool_of_layer[layer_id]
+        if whole_layer and p in self._staging:
+            return self._staging[p][0][bank]
+        return self._pool_views[p][bank]
 
     def rebuild(self, cache_size: int) -> None:
         """Resize the GPU slot cache + bookkeeping to ``cache_size`` IN PLACE.
@@ -611,44 +741,19 @@ class OffloadMoeCache:
         # 2. Drop old GPU tensors (free-before-alloc).
         self.banks = []
         self.bank_caches = {}
-        self.cache_size = cache_size
+        self._arenas = []
+        self._pool_views = []
+        self._staging = {}
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
             torch.cuda.empty_cache()
         # 3. Reallocate the slot cache from the retained host sources.
-        for name in self.bank_schema:
-            per_layer = self.bank_sources[name]
-            head = per_layer[0]
-            is_uniform = all(s.shape == head.shape and s.dtype == head.dtype for s in per_layer)
-            if is_uniform:
-                c = torch.empty((cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device)
-                self.bank_caches[name] = c
-                for layer_id in range(self.num_layers):
-                    qt = self._get_layer_quant_type(layer_id, name)
-                    self.bank_caches[(layer_id, name, qt)] = c
-            else:
-                geom_caches: dict[tuple, torch.Tensor] = {}
-                for layer_id, source in enumerate(per_layer):
-                    g = (tuple(source.shape[1:]), source.dtype)
-                    if g not in geom_caches:
-                        geom_caches[g] = torch.empty(
-                            (cache_size, *source.shape[1:]),
-                            dtype=source.dtype,
-                            device=self.device,
-                        )
-                    c = geom_caches[g]
-                    qt = self._get_layer_quant_type(layer_id, name)
-                    self.bank_caches[(layer_id, name, qt)] = c
-                self.bank_caches[name] = next(iter(geom_caches.values()))
-        self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
+        cache_size = self._alloc_bank_caches(cache_size)
         self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
         # 4. Reallocate cache_size-shaped bookkeeping; reset the slot map (cold start).
         self.slot_for_id.fill_(-1)
-        self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=self.device)
-        self.usage = torch.zeros((cache_size,), dtype=torch.int64, device=self.device)
-        plan_slots = max(self.num_experts, cache_size)
-        self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
-        self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        self._alloc_slot_state(cache_size)
+        self._bind_pool_state()
         self.step.zero_()
         self.active_mask.zero_()
         self.num_indices.zero_()
@@ -725,7 +830,8 @@ class OffloadMoeCache:
         ``layer_id`` -- are ever read by the grouped GEMM."""
         if self.gate_up_alpha is None:
             return None
-        idx = layer_id * self.num_experts + (self.id_of_slot.clamp(min=0).long() % self.num_experts)
+        ids = self.pool_state(layer_id)[0]
+        idx = layer_id * self.num_experts + (ids.clamp(min=0).long() % self.num_experts)
         return self.gate_up_alpha[idx], self.down_alpha[idx]
 
     def alphas_for_layer(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -741,11 +847,15 @@ class OffloadMoeCache:
     def bank_views(
         self, n: int | None = None, layer_id: int | None = None
     ) -> tuple[torch.Tensor, ...]:
-        """Per-bank cache views in registration order: the full ``[S]`` slot cache
-        (decode), or its first ``n`` slots (materialized layer). Supports per-layer exact geometry (Phase 7)."""
+        """Per-bank cache views in registration order: the layer's whole geometry pool
+        (decode; its slot ids are pool-local), or its first ``n`` rows (materialized layer;
+        the staging window when the pool holds fewer than ``n``)."""
         assert self.banks, "set_bank_sources must register the banks first"
         if layer_id is None:
             layer_id = self._pending_src_layer if self._pending_src_layer is not None else 0
+        p = self.pool_of_layer[layer_id] if self._staging else None
+        if n is not None and p in self._staging and n > self.pool_caps[p]:
+            return tuple(v[:n] for v in self._staging[p][0])
         views = []
         for name in self.bank_schema:
             qt = self._get_layer_quant_type(layer_id, name)
@@ -1191,12 +1301,9 @@ class OffloadMoeCache:
                     f"pageable materialize (position == expert id); ensure_experts's "
                     f"LRU slot remap cannot be honored without a device alias"
                 )
-            for name in self.bank_schema:
-                per_layer = self.bank_sources[name]
-                qt = self._get_layer_quant_type(layer_id, name)
-                key = (layer_id, name, qt)
-                cache = self.bank_caches.get(key, self.bank_caches[name])
-                cache[: self.num_experts].copy_(per_layer[layer_id])
+            for i, name in enumerate(self.bank_schema):
+                cache = self._layer_rows(layer_id, i, whole_layer=True)
+                cache[: self.num_experts].copy_(self.bank_sources[name][layer_id])
             return
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
@@ -1213,23 +1320,10 @@ class OffloadMoeCache:
 
         from freetoken.kernel import fast_index_copy_jit
 
-        for name in self.bank_schema:
-            per_layer = self.bank_sources[name]
-            qt = self._get_layer_quant_type(layer_id, name)
-            key = (layer_id, name, qt)
-            source_layer = per_layer[layer_id]
-            cache = self.bank_caches.get(key)
-            if cache is None:
-                for candidate in self.bank_caches.values():
-                    if isinstance(candidate, torch.Tensor) and tuple(candidate.shape[1:]) == tuple(
-                        source_layer.shape[1:]
-                    ):
-                        cache = candidate
-                        break
-            if cache is None:
-                raise KeyError(f"missing GPU cache geometry for {key!r}")
+        for i, name in enumerate(self.bank_schema):
+            source_layer = self.bank_sources[name][layer_id]
             fast_index_copy_jit(
-                cache,
+                self._layer_rows(layer_id, i, self._pending_whole_layer),
                 self.evict_slots,
                 source_layer,
                 self.src_indices,

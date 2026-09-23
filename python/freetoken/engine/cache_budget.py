@@ -6,6 +6,7 @@ measured quantities, so it is unit-testable without a device.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from freetoken.utils import div_ceil
@@ -40,6 +41,136 @@ def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
         }
         total += sum(unique_geoms.values())
     return total
+
+
+# Byte alignment of each expert pool inside a bank's slot arena (keeps every view dtype- and
+# vector-copy-aligned); the padding is part of the priced bytes.
+POOL_ALIGN = 256
+
+
+@dataclass(frozen=True)
+class ExpertPool:
+    """Layers whose rows share one geometry in every bank: they share one LRU slot range.
+
+    ``row_bytes`` is one expert row per bank, in the sources' bank order."""
+
+    layers: tuple[int, ...]
+    row_bytes: tuple[int, ...]
+
+
+def expert_pools(sources: dict[str, "list[torch.Tensor]"]) -> list[ExpertPool]:
+    """Group layers by their per-bank row geometry, the largest group first.
+
+    One geometry across all layers is one pool (the uniform case). A mixed GGUF (a few
+    layers at a wider quant, an MTP draft's own Q8_0 bank) gets one pool per distinct
+    geometry, so a small group never costs rows sized for every layer."""
+    banks = [per_layer for per_layer in sources.values() if per_layer]
+    groups: dict[tuple, list[int]] = {}
+    for layer in range(len(banks[0]) if banks else 0):
+        key = tuple((tuple(b[layer].shape[1:]), b[layer].dtype) for b in banks)
+        groups.setdefault(key, []).append(layer)
+    pools = [
+        ExpertPool(
+            tuple(layers),
+            tuple(b[layers[0]][0].numel() * b[layers[0]].element_size() for b in banks),
+        )
+        for layers in groups.values()
+    ]
+    return sorted(pools, key=lambda p: (-len(p.layers), p.layers[0]))
+
+
+def pool_capacities(
+    pools: list[ExpertPool], num_experts: int, rows: int, min_rows: int
+) -> list[int]:
+    """Split ``rows`` resident expert rows over ``pools``: an equal share per layer (what a
+    global LRU converges to), each pool clamped to ``[min(min_rows, hi), hi]`` where
+    ``hi = layers * num_experts`` is all it can ever hold. ``min_rows`` is the most distinct
+    experts one decode step may route (the LRU needs them resident at once); 0 means one
+    full layer. The remainder goes to unsaturated pools, largest first."""
+    hi = [len(p.layers) * num_experts for p in pools]
+    lo = [min(h, min_rows or num_experts) for h in hi]
+    rows = min(rows, sum(hi))
+
+    def caps(share: int) -> list[int]:
+        return [min(h, max(l, len(p.layers) * share)) for p, l, h in zip(pools, lo, hi)]
+
+    a, b = 0, num_experts  # largest share with sum(caps) <= rows
+    while a < b:
+        m = (a + b + 1) // 2
+        a, b = (m, b) if sum(caps(m)) <= rows else (a, m - 1)
+    out = caps(a)
+    left = rows - sum(out)
+    for i, h in enumerate(hi):
+        add = max(0, min(left, h - out[i]))
+        out[i] += add
+        left -= add
+    return out
+
+
+def pool_layout(pools: list[ExpertPool], caps: list[int]) -> tuple[list[list[int]], list[int]]:
+    """Byte offset of every pool in each bank's arena (``offsets[pool][bank]``) and each
+    arena's total bytes; pools are laid out in order, each start ``POOL_ALIGN``-aligned."""
+    num_banks = len(pools[0].row_bytes) if pools else 0
+    ends = [0] * num_banks
+    offsets = []
+    for pool, cap in zip(pools, caps):
+        offs = [div_ceil(end, POOL_ALIGN) * POOL_ALIGN for end in ends]
+        offsets.append(offs)
+        ends = [off + cap * rb for off, rb in zip(offs, pool.row_bytes)]
+    return offsets, ends
+
+
+def pool_staging_fits(
+    pools: list[ExpertPool], caps: list[int], num_experts: int, arena_bytes: list[int]
+) -> bool:
+    """A pool smaller than one layer materializes a prefill layer into the front of each
+    arena (overlaying resident rows), so every arena must hold ``num_experts`` of its rows."""
+    return all(
+        num_experts * rb <= size
+        for pool, cap in zip(pools, caps)
+        if cap < num_experts
+        for rb, size in zip(pool.row_bytes, arena_bytes)
+    )
+
+
+def expert_cache_bytes(pools: list[ExpertPool], num_experts: int, rows: int, min_rows: int) -> int:
+    """GPU bytes of an expert cache holding ``rows`` resident rows (all arenas, padding
+    included); what ``OffloadMoeCache`` allocates for the same arguments. No rows = no
+    cache (0 bytes), not the pools' decode floors."""
+    if rows <= 0:
+        return 0
+    _, ends = pool_layout(pools, pool_capacities(pools, num_experts, rows, min_rows))
+    return sum(ends)
+
+
+def expert_rows_bounds(pools: list[ExpertPool], num_experts: int, min_rows: int) -> tuple[int, int]:
+    """Smallest and largest usable ``rows``: the floor is one full layer (the offload
+    cache's historic minimum), raised until every sub-layer pool can stage a prefill layer
+    (monotone in ``rows``, so a bisection finds it)."""
+    top = sum(len(p.layers) for p in pools) * num_experts
+
+    def fits(rows: int) -> bool:
+        caps = pool_capacities(pools, num_experts, rows, min_rows)
+        return pool_staging_fits(pools, caps, num_experts, pool_layout(pools, caps)[1])
+
+    lo, hi = min(num_experts, top), top
+    while lo < hi:
+        m = (lo + hi) // 2
+        lo, hi = (lo, m) if fits(m) else (m + 1, hi)
+    return lo, top
+
+
+def max_expert_rows(
+    pools: list[ExpertPool], num_experts: int, budget_bytes: int, min_rows: int, lo: int, hi: int
+) -> int:
+    """Most rows in ``[lo, hi]`` whose cache fits ``budget_bytes`` (``lo`` if none does)."""
+    while lo < hi:
+        m = (lo + hi + 1) // 2
+        if expert_cache_bytes(pools, num_experts, m, min_rows) <= budget_bytes:
+            lo = m
+        else:
+            hi = m - 1
+    return lo
 
 
 def ceiling_bytes(baseline_free: int, memory_ratio: float, reserve_bytes: int = 0) -> int:

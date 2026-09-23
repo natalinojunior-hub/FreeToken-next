@@ -102,14 +102,15 @@ def test_offload_cache_exact_geometry_views():
     with pytest.raises(KeyError, match="expert_geometry / geometria inválida"):
         cache.get_expert(0, "gate_up", "INVALID")
 
-    # bank_views per layer
+    # bank_views per layer: each geometry pool holds only its own share of the rows
     views0 = cache.bank_views(layer_id=0)
-    assert views0[0].shape == (cache_size, 8, 64)
-    assert views0[1].shape == (cache_size, 4, 32)
+    assert views0[0].shape == (cache_size // 2, 8, 64)
+    assert views0[1].shape == (cache_size // 2, 4, 32)
 
     views1 = cache.bank_views(layer_id=1)
-    assert views1[0].shape == (cache_size, 8, 32)
-    assert views1[1].shape == (cache_size, 4, 16)
+    assert views1[0].shape == (cache_size // 2, 8, 32)
+    assert views1[1].shape == (cache_size // 2, 4, 16)
+    assert cache.expert_pool_bytes == 4 * (512 + 256) + 4 * (128 + 64)
 
 
 def test_offload_cache_normalizes_per_layer_gguf_gate_up_types():

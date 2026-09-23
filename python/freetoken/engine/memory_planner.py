@@ -35,7 +35,16 @@ from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cach
 from freetoken.utils import align_ceil, div_ceil, init_logger, mem_GB, torch_dtype
 
 from .config import EngineConfig
-from .cache_budget import expert_bytes_per_slot, pool_pages, required_bytes
+from .cache_budget import (
+    ExpertPool,
+    expert_bytes_per_slot,
+    expert_cache_bytes,
+    expert_pools,
+    expert_rows_bounds,
+    max_expert_rows,
+    pool_pages,
+    required_bytes,
+)
 from .graph import GraphRunner, get_free_memory
 from .vram_ledger import (
     CALIBRATION_TOLERANCE,
@@ -153,6 +162,10 @@ class StaticCostModel:
     max_expert_slots: int
     total_experts: int
     prefill_overlap: bool
+    # Mixed-geometry banks: the cache's geometry pools, priced exactly (expert_cache_bytes);
+    # empty = one geometry, linear in slots.
+    expert_pools: tuple[ExpertPool, ...] = ()
+    min_pool_rows: int = 0
 
     def kv_pages_for_context(self, tokens: int) -> int:
         return div_ceil(tokens, self.page_tokens)
@@ -162,7 +175,24 @@ class StaticCostModel:
         return pool_pages(pages) * self.kv_bytes_per_page + self.kv_fixed_bytes
 
     def expert_bytes_for_slots(self, slots: int) -> int:
+        if self.expert_pools:
+            return expert_cache_bytes(
+                list(self.expert_pools), self.total_experts, slots, self.min_pool_rows
+            )
         return slots * self.expert_bytes_per_slot
+
+    def expert_slots_for_bytes(self, budget: int) -> int:
+        """Most slots (within the min/max bounds) whose expert cache fits ``budget``."""
+        if self.expert_pools:
+            return max_expert_rows(
+                list(self.expert_pools),
+                self.total_experts,
+                budget,
+                self.min_pool_rows,
+                self.min_expert_slots,
+                self.max_expert_slots,
+            )
+        return min(self.max_expert_slots, budget // self.expert_bytes_per_slot)
 
     def gdn_state_total_bytes(self) -> int:
         return self.gdn_state_bytes_per_slot * self.gdn_num_slots
@@ -312,6 +342,14 @@ class MemoryPlanner:
         logger.info_rank0(f"  Post-mandatory: {snapshot}")
         return snapshot
 
+    def min_pool_rows(self, num_experts: int) -> int:
+        """Every geometry pool's LRU floor (see ``decode_pool_floor``)."""
+        from freetoken.moe.offload_cache import decode_pool_floor
+
+        return decode_pool_floor(
+            num_experts, self.model_config.num_experts_per_tok, self.config.max_running_req
+        )
+
     def _expert_bytes_per_slot(self) -> int:
         """Compute per-expert slot bytes from method layout (primary), banks.sources, or banks.expert_geometry."""
         # Primary: method layout (always available when method is set)
@@ -395,6 +433,15 @@ class MemoryPlanner:
             raise RuntimeError("Unable to determine expert slot geometry for automatic planning")
         if method_slot_limit is not None:
             max_slots = min(max_slots, method_slot_limit)
+        # Mixed geometry: the cache splits its rows into per-geometry pools (OffloadMoeCache.
+        # _alloc_bank_caches), so price those pools instead of one row of every geometry.
+        pools = expert_pools(self.banks_sources) if self.banks_sources else []
+        pool_floor = self.min_pool_rows(num_experts)
+        if len(pools) > 1:
+            lo, hi = expert_rows_bounds(pools, num_experts, pool_floor)
+            min_slots, max_slots = max(min_slots, lo), min(max_slots, hi)
+        else:
+            pools = []
 
         self.static_model = StaticCostModel(
             weights_bytes=weights_bytes,
@@ -414,6 +461,8 @@ class MemoryPlanner:
             max_expert_slots=max_slots,
             total_experts=num_experts,
             prefill_overlap=prefill_overlap,
+            expert_pools=tuple(pools),
+            min_pool_rows=pool_floor,
         )
 
         logger.info_rank0(
@@ -468,6 +517,7 @@ class MemoryPlanner:
             decode_target="gpu",
             layout=None,
             max_slots=method_slot_limit,
+            min_pool_rows=self.min_pool_rows(self.model_config.num_experts),
         )
         expert_cache.set_bank_sources(self.banks_sources)
         expert_cache.set_alphas(
@@ -750,7 +800,7 @@ class MemoryPlanner:
                 self.ledger(config, candidates[-1], sm.min_expert_slots, required_pages),
             )
         left = residual(chunk)
-        expert_slots = min(sm.max_expert_slots, left // sm.expert_bytes_per_slot)
+        expert_slots = sm.expert_slots_for_bytes(left)
         kv_pages = (
             required_pages
             + (left - sm.expert_bytes_for_slots(expert_slots)) // sm.kv_bytes_per_page
@@ -800,6 +850,7 @@ class MemoryPlanner:
             decode_target="gpu",
             layout=None,
             max_slots=method_slot_limit,
+            min_pool_rows=self.min_pool_rows(self.model_config.num_experts),
         )
         expert_cache.set_bank_sources(self.banks_sources)
         expert_cache.set_alphas(

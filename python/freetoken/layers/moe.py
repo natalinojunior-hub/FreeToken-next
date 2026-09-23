@@ -6,7 +6,7 @@ from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.fused import fused_topk
-from freetoken.moe.offload_cache import OffloadMoeCache
+from freetoken.moe.offload_cache import DECODE_PATH_MAX_TOKENS, OffloadMoeCache
 
 
 from .base import BaseOP
@@ -203,7 +203,7 @@ class OffloadMoELayer(MoELayer):
         # Speculative micro-batches (verify windows, replay) run as phase="prefill"
         # but only process a tiny number of tokens (k+1 <= 8). Routing them through
         # the decode resident cache avoids materializing all num_experts across layers.
-        return hidden_states.shape[0] <= 8 and len(ctx.batch.reqs) == 1
+        return hidden_states.shape[0] <= DECODE_PATH_MAX_TOKENS and len(ctx.batch.reqs) == 1
 
     def forward(
         self,
