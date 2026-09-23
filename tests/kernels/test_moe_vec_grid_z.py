@@ -57,18 +57,23 @@ def banks():
 
 
 def _run(b, n: int) -> torch.Tensor:
+    import freetoken.moe.fused_q4_0 as fq
     from freetoken.models.gguf.dequant import GGML_Q4_0
-    from freetoken.moe.fused_q4_0 import fused_experts_gguf
 
-    return fused_experts_gguf(
-        b["x"][:n].contiguous(),
-        b["gate_up"],
-        b["down"],
-        b["w"][:n].contiguous(),
-        b["ids"][:n].contiguous(),
-        "silu",
-        GGML_Q4_0,
-    )
+    # these tests cover the GEMV kernel's grid chunking, not the large-batch dequant path
+    saved, fq.DEQUANT_MIN_TOKENS = fq.DEQUANT_MIN_TOKENS, 1 << 30
+    try:
+        return fq.fused_experts_gguf(
+            b["x"][:n].contiguous(),
+            b["gate_up"],
+            b["down"],
+            b["w"][:n].contiguous(),
+            b["ids"][:n].contiguous(),
+            "silu",
+            GGML_Q4_0,
+        )
+    finally:
+        fq.DEQUANT_MIN_TOKENS = saved
 
 
 @pytest.mark.parametrize(
@@ -101,3 +106,39 @@ def test_chunking_does_not_disturb_rows(banks, n):
         f"first 64 rows differ at n={n}: chunk offsets are wrong "
         f"(max abs diff {(got[:64].float() - ref.float()).abs().max().item()})"
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("tokens", [64, 300])
+def test_large_batch_dequant_path_matches_gemv(tokens):
+    """The dequantize + bf16 grouped-GEMM prefill path agrees with the per-row GEMV kernel."""
+    import numpy as np
+    from gguf import GGMLQuantizationType
+    from gguf.quants import quantize
+
+    import freetoken.moe.fused_q4_0 as fq
+
+    experts, hidden, inter, top_k = 40, 256, 128, 4
+    qt = int(GGMLQuantizationType.Q8_0)
+    gen = np.random.default_rng(0)
+
+    def bank(rows, cols):
+        w = gen.standard_normal((experts * rows, cols)).astype(np.float32) * 0.05
+        return (
+            torch.from_numpy(np.ascontiguousarray(quantize(w, qt))).cuda().view(experts, rows, -1)
+        )
+
+    gate_up, down = bank(2 * inter, hidden), bank(hidden, inter)
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda")
+    ids = torch.stack([torch.randperm(experts, device="cuda")[:top_k] for _ in range(tokens)])
+    ids = ids.to(torch.int32)
+    w = torch.softmax(torch.randn(tokens, top_k, device="cuda"), dim=-1)
+
+    got = fq.fused_experts_gguf(x.clone(), gate_up, down, w, ids, "silu", qt)
+    ref_min = fq.DEQUANT_MIN_TOKENS
+    fq.DEQUANT_MIN_TOKENS = 1 << 30
+    try:
+        ref = fq.fused_experts_gguf(x.clone(), gate_up, down, w, ids, "silu", qt)
+    finally:
+        fq.DEQUANT_MIN_TOKENS = ref_min
+    torch.testing.assert_close(got.float(), ref.float(), rtol=3e-2, atol=3e-2)

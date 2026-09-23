@@ -25,6 +25,69 @@ from freetoken.models.gguf.dequant import GGML_Q4_0, MOE_VEC_TYPES
 _ACT = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
 
 
+# From this many tokens the GEMV kernel, which re-reads each expert's weights per routed
+# row, loses to dequantizing the used experts and running the bf16 grouped GEMM.
+DEQUANT_MIN_TOKENS = 64
+# Experts dequantized at once: bounds the bf16 transient (~10 MB per expert here), which
+# the memory planner otherwise takes from the expert cache.
+DEQUANT_EXPERT_CHUNK = 16
+
+
+def _fused_experts_dequant(
+    hidden_states: torch.Tensor,
+    gate_up_q: torch.Tensor,
+    down_q: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str,
+    quant_type: int,
+    down_quant_type: int,
+) -> torch.Tensor:
+    """Large-batch GGUF MoE: dequantize only the routed experts, a chunk at a time, and run
+    the bf16 fused-MoE kernel on the (token, expert) rows each chunk owns."""
+    from freetoken.kernel.gguf import ggml_dequantize
+    from freetoken.moe.fused import fused_experts_impl
+
+    num_tokens, h = hidden_states.shape
+    n2 = gate_up_q.shape[1]
+    inter = n2 // 2
+    top_k = topk_ids.shape[1]
+    flat = topk_ids.reshape(-1).long()
+    order = torch.argsort(flat)
+    sorted_ids = flat[order]
+    used, counts = torch.unique_consecutive(sorted_ids, return_counts=True)
+    counts_host = counts.tolist()
+    token_of = order // top_k
+    weights = topk_weights.reshape(-1)[order].unsqueeze(1)
+    out = torch.zeros_like(hidden_states)
+    start = 0
+    for c0 in range(0, used.numel(), DEQUANT_EXPERT_CHUNK):
+        experts = used[c0 : c0 + DEQUANT_EXPERT_CHUNK]
+        n = sum(counts_host[c0 : c0 + DEQUANT_EXPERT_CHUNK])
+        rows = slice(start, start + n)
+        start += n
+        e = experts.numel()
+        w1 = ggml_dequantize(
+            gate_up_q.index_select(0, experts).reshape(e * n2, -1),
+            quant_type,
+            e * n2,
+            h,
+            hidden_states.dtype,
+        ).view(e, n2, h)
+        w2 = ggml_dequantize(
+            down_q.index_select(0, experts).reshape(e * h, -1),
+            down_quant_type,
+            e * h,
+            inter,
+            hidden_states.dtype,
+        ).view(e, h, inter)
+        local = torch.searchsorted(experts, sorted_ids[rows]).to(torch.int32).unsqueeze(1)
+        x = hidden_states.index_select(0, token_of[rows])
+        y = fused_experts_impl(x, w1, w2, weights[rows].contiguous(), local, activation)
+        out.index_add_(0, token_of[rows], y)
+    return out
+
+
 def fused_experts_gguf(
     hidden_states: torch.Tensor,
     gate_up_q: torch.Tensor,  # [num_slots, 2I, H//32*18] uint8 (or other quant format)
@@ -70,6 +133,17 @@ def fused_experts_gguf(
     h = down_q.shape[1]  # hidden
     top_k = topk_ids.shape[1]
     qt = int(quant_type)
+    if num_tokens >= DEQUANT_MIN_TOKENS and not torch.cuda.is_current_stream_capturing():
+        return _fused_experts_dequant(
+            hidden_states,
+            gate_up_q,
+            down_q,
+            topk_weights,
+            topk_ids,
+            activation,
+            qt,
+            int(down_quant_type),
+        )
 
     # gate_up: [num_tokens*top_k, 2I] -> activation -> [num_tokens*top_k, I]
     gate_up = ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens)
