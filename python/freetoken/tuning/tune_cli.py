@@ -174,7 +174,9 @@ def _unique_prompt(base_text: str, rep: int) -> str:
     # A nonce prefix, not a repetition of base_text -- MTP's draft accept rate rides on how
     # predictable the continuation is, and a self-repeating prompt biases every candidate's
     # committed TG toward whichever one accepts drafts best on repetition, not on real text.
-    nonce = hashlib.sha256(f"{rep}:{time.time_ns()}".encode()).hexdigest()[:16]
+    # Deterministic per rep: every candidate is a fresh boot (cold anyway), and rep N must
+    # decode the same text on every candidate or MTP acceptance/expert misses swing with it.
+    nonce = hashlib.sha256(f"ft-tune:{rep}".encode()).hexdigest()[:16]
     return f"[{nonce}] {base_text}"
 
 

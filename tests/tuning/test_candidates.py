@@ -92,3 +92,11 @@ def test_later_candidate_needs_a_margin_over_noise():
 
     assert select_best([r(38.0), r(38.9)]).committed_tg == 38.0  # +2.4%: noise, keep default
     assert select_best([r(38.0), r(40.0)]).committed_tg == 40.0  # +5.3%: a real win
+
+
+def test_tune_prompts_paired_across_candidates():
+    from freetoken.tuning.tune_cli import _unique_prompt
+
+    # rep N decodes the same text on every candidate boot; reps within a boot differ
+    assert _unique_prompt("x", 1) == _unique_prompt("x", 1)
+    assert _unique_prompt("x", 1) != _unique_prompt("x", 2)
