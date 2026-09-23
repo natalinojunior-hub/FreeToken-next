@@ -69,6 +69,7 @@
 - **Batch detokenization com múltiplos tokens por UID em MTP (EXP-048)** -> quando spec-decode aceita $m \ge 2$ tokens, o scheduler despacha múltiplos `DetokenizeMsg` com o mesmo `uid` no mesmo lote -> `DetokenizeManager.detokenize()` acumulava todos os tokens no histórico antes de calcular `batch_decode`, mas os offsets de leitura assumiam 1 mensagem por UID -> resultado: fatia de caracteres duplicada (`--0` em vez de `-0`), alterando o texto e o SHA1 mesmo com os tokens do modelo 100% idênticos -> **fix:** detectar repetição de UID no lote e processar sequencialmente para manter os invariantes de offsets progressivos.
 
 - **Bisecção de commit não serve quando o bug sobrevive a TODOS os reverts testados** (EXP-048) -> sha1 idêntico entre árvore 100% revertida e árvore com MoE quebrado (TG 0.47 tok/s) -> **causa está fora do range bisectado** -> **fix:** ao ver conteúdo invariante a reverts de código funcional, trocar de eixo (aqui: comprimento de decode em vez de commit) para achar o ponto exato de divergência antes de continuar revertendo commits.
+- **KL 0.97 verify vs decode na posição 4098 (turbo3)** -> não é corrupção: GEMM bf16 do cuBLAS dá resultado diferente com 1 linha e com 2+ linhas; na 4098 os logits turbo3 estão quase empatados (margem 0.19) e amplificam isso. Prova: GEMMs linha a linha na janela de verify tornam todas as linhas bitwise iguais ao k0 -> **sem fix** (ft-campaign2/A2b-outlier-4098.md, patch de diagnóstico rowwise-gemm-debug.patch).
 
 ---
 
