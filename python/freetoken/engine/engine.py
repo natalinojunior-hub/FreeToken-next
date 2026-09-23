@@ -1130,10 +1130,16 @@ class Engine:
             return  # explicit fixed cap
         from freetoken.moe.bench_profile import load_hybrid_fetch_fraction
 
+        bench_fmt = cache.quant_format
+        if bench_fmt == "gguf":
+            # the container tag has no profile entry: key by the pair ft bench bw benches
+            from freetoken.moe.cpu_executor import dominant_gguf_pair, gguf_bench_key
+
+            pair = dominant_gguf_pair(getattr(cache, "gguf_expert_types", None))
+            if pair is not None:
+                bench_fmt = gguf_bench_key(*pair) or bench_fmt
         gpu_name, gpu_uuid = _profile_gpu(self.device.index)
-        fraction = load_hybrid_fetch_fraction(
-            cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid
-        )
+        fraction = load_hybrid_fetch_fraction(bench_fmt, gpu_name=gpu_name, gpu_uuid=gpu_uuid)
         if fraction is None:
             cache.hybrid_max_fetch = 1
             logger.warning_rank0(
