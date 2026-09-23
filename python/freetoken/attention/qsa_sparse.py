@@ -89,6 +89,7 @@ class QSASparseMetadata(BaseAttnMetadata):
     # positions is bound here (not in prepare_metadata) because a capture batch has none yet.
     cmp_rows:         torch.Tensor | None = None  # [T] int32, compressed slab destination
     ring_rows:        torch.Tensor | None = None  # [T] int32, flat ring row or -1
+    last_slot:        int = -1  # QSA slot of the latest qsa_forward on this metadata
     positions:        torch.Tensor | None = None  # [T] int32, logical query positions
     # mrope only, built once per forward: row r of the caches is token r's [cos | sin] (queries) or its group start's (keys)
     rope_rows:        torch.Tensor | None = None  # [T] int32 arange
@@ -314,12 +315,15 @@ class QSASparseAttnBackend(BaseAttnBackend):
         mark("store_kv")
         if md.block_table is None:
             self._snapshot_decode(md, batch)
-        if slot == 0 or md.cmp_rows is None:
+        if md.cmp_rows is None or slot <= md.last_slot:
             # Rebuilt at the first QSA layer of every forward, not cached on the metadata: a
             # capture batch runs its warmup and its capture through ONE metadata object, and a
-            # cached plan would bake the warmup's addresses into the graph.
+            # cached plan would bake the warmup's addresses into the graph. Layers run in
+            # ascending slot order, so a slot at or below the last one seen starts a new forward
+            # (the draft graph's single MTP layer sits at a non-zero slot).
             self._plan_index_writes(md, batch)
 
+        md.last_slot = slot
         self._update_index_cache(index, md, slot)
         mark("index_cache")
         indices = self._select(index, md, slot)

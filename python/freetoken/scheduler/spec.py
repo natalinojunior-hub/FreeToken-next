@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.core import Batch, Req
-from freetoken.engine.graph import SPEC_DEFER_MAX
+from freetoken.engine.graph import DRAFT_GRAPH_CHECK_ENV, SPEC_DEFER_MAX
 from freetoken.engine.spec import accept_drafts, spec_rollback_lengths
 from freetoken.scheduler.adaptive_mtp import (
     AdaptiveMTPController,
@@ -356,6 +356,37 @@ class SchedulerSpecMixin:
                 self._replay(req, req.cached_len, end - req.cached_len)
                 req.cached_len, req.device_len = end, end + 1
 
+    def _draft_step(
+        self, req: Req, pos: int, residual: torch.Tensor, token: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One MTP draft step at ``pos``: (next residual, logits, argmax token)."""
+        db = Batch(reqs=[req], phase="prefill")
+        db.padded_reqs = [req]
+        db.positions = torch.tensor([pos], dtype=torch.int32, device=self.device)
+        if self._model_is_mrope:
+            db.mrope_positions = _spec_mrope_positions(req, pos, pos + 1, self.device)
+        db.out_loc = self.engine.page_table[req.table_idx, pos : pos + 1]
+        db.input_ids = token
+        db.spec_logits_indices = torch.arange(1, device=self.device)
+        self.engine.attn_backend.prepare_metadata(db)
+        runner = self.engine.graph_runner
+        if runner is not None and runner.draft is not None:
+            if os.getenv(DRAFT_GRAPH_CHECK_ENV, "0") != "1":
+                return runner.replay_draft(db, residual, token)
+            got = [t.clone() for t in runner.replay_draft(db, residual, token)]
+        model = self.engine.model
+        with self.engine.ctx.forward_batch(db):
+            r = model.mtp.forward(residual, token, db)
+            logits = model.lm_head.forward(model.mtp.to_head(r))
+        out = (r, logits, torch.argmax(logits, dim=-1))
+        if runner is not None and runner.draft is not None:
+            bad = [i for i, (g, e) in enumerate(zip(got, out)) if not torch.equal(g, e)]
+            if bad:
+                raise AssertionError(
+                    f"draft graph != eager: outputs {bad} (residual, logits, token)"
+                )
+        return out
+
     def run_spec_step(self) -> bool:
         """Run one speculative decode step for the single eligible request. Returns True if
         it ran (the caller should skip its own _schedule_next_batch/_forward this iteration)."""
@@ -418,51 +449,21 @@ class SchedulerSpecMixin:
         # ---- draft chain: k autoregressive steps through the draft head's own QSA slot ----
         r_prev = model.model._last_residual[-1:].clone()
         tok_prev = self.token_pool[req.table_idx, d - 1 : d]
-        drafts: List[int] = []
 
         # Confidence gating: run first draft step, check top-1 prob, skip if low confidence
-        req.cached_len = d - 1  # the draft's own attention sees its KV through d-1
-        db = Batch(reqs=[req], phase="prefill")
-        db.padded_reqs = [req]
-        db.positions = torch.tensor([d - 1], dtype=torch.int32, device=self.device)
-        if self._model_is_mrope:
-            db.mrope_positions = _spec_mrope_positions(req, d - 1, d, self.device)
-        db.out_loc = self.engine.page_table[req.table_idx, d - 1 : d]
-        db.input_ids = tok_prev
-        db.spec_logits_indices = torch.arange(1, device=self.device)
-        self.engine.attn_backend.prepare_metadata(db)
-        with self.engine.ctx.forward_batch(db):
-            r_prev = mtp.forward(r_prev, tok_prev, db)
-            logits = model.lm_head.forward(mtp.to_head(r_prev))
+        drafts: List[int] = []
         controller = getattr(self, "_adaptive_mtp_controller", None)
-        if controller is not None:
-            top1_prob = torch.softmax(logits, dim=-1).max().item()
-            if top1_prob < controller.config.min_draft_prob:
-                return False
-
-        tok_prev = torch.argmax(logits, dim=-1)
-        drafts.append(int(tok_prev.item()))
-        self.token_pool[req.table_idx, d] = tok_prev
-
-        # Continue draft chain for remaining k-1 steps
-        for i in range(1, k):
+        for i in range(k):
             # prepare_metadata (e.g. qsa_sparse) reads req.cached_len/device_len for
             # seqlens_k/extend_len; at i >= 1 the draft's own query must see its own prior
             # draft-step KV, which needs these advanced per step, not left at the entry value.
             req.cached_len, req.device_len = d - 1 + i, d + i
-            db = Batch(reqs=[req], phase="prefill")
-            db.padded_reqs = [req]
-            db.positions = torch.tensor([d - 1 + i], dtype=torch.int32, device=self.device)
-            if self._model_is_mrope:
-                db.mrope_positions = _spec_mrope_positions(req, d - 1 + i, d + i, self.device)
-            db.out_loc = self.engine.page_table[req.table_idx, d - 1 + i : d + i]
-            db.input_ids = tok_prev
-            db.spec_logits_indices = torch.arange(1, device=self.device)
-            self.engine.attn_backend.prepare_metadata(db)
-            with self.engine.ctx.forward_batch(db):
-                r_prev = mtp.forward(r_prev, tok_prev, db)
-                logits = model.lm_head.forward(mtp.to_head(r_prev))
-            tok_prev = torch.argmax(logits, dim=-1)
+            r_prev, logits, tok_prev = self._draft_step(req, d - 1 + i, r_prev, tok_prev)
+            if i == 0 and controller is not None:
+                top1_prob = torch.softmax(logits, dim=-1).max().item()
+                if top1_prob < controller.config.min_draft_prob:
+                    req.cached_len, req.device_len = c0, d
+                    return False
             drafts.append(int(tok_prev.item()))
             self.token_pool[req.table_idx, d + i] = tok_prev
         req.cached_len, req.device_len = c0, d

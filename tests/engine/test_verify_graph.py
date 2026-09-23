@@ -248,3 +248,68 @@ def test_verify_graph_env_off_and_destroy(monkeypatch):
     assert runner.can_use_cuda_graph(batch)
     runner.destroy_cuda_graphs()
     assert not runner.verify_graphs and not runner.can_use_cuda_graph(batch)
+
+
+class _FakeMTP:
+    """Draft layer reading the staged residual, token, positions and attention metadata."""
+
+    def __init__(self, model: _FakeModel) -> None:
+        self.model = model
+
+    def forward(self, residual, next_ids, batch):
+        feat = (next_ids * 3 + batch.positions * 5 + batch.out_loc * 7).float()
+        feat = feat + batch.attn_metadata.kv.float()
+        return residual * 0.5 + feat.unsqueeze(1)
+
+    def to_head(self, residual):
+        return residual
+
+
+class _FakeHead:
+    def forward(self, x):
+        return x * torch.arange(1, x.shape[1] + 1, dtype=x.dtype, device=x.device)
+
+
+@requires_cuda
+def test_draft_replay_matches_eager(monkeypatch):
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    monkeypatch.setenv("FREETOKEN_DRAFT_GRAPH", "1")  # opt in: default is off until GPU-validated
+    monkeypatch.setattr(core, "_GLOBAL_CTX", Context(page_size=1))
+    ctx = get_global_ctx()
+    ctx.page_table = torch.arange(SLOTS * WIDTH, dtype=torch.int32, device=DEV).view(SLOTS, WIDTH)
+    events: list = []
+    model = _FakeModel(events)
+    model.mtp, model.lm_head = _FakeMTP(model), _FakeHead()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        runner = GraphRunner(
+            stream=stream,
+            device=DEV,
+            model=model,
+            attn_backend=_FakeBackend(),
+            cuda_graph_bs=[1],
+            cuda_graph_max_bs=1,
+            free_memory=1 << 30,
+            max_seq_len=WIDTH,
+            vocab_size=VOCAB,
+            dummy_req=_req(SLOTS - 1, 0, 1),
+            moe_offload_cache=_FakeCache(events),
+            verify_tokens=SIZES,
+        )
+    torch.cuda.synchronize()
+    assert runner.draft is not None
+    residual = torch.randn(1, VOCAB, device=DEV).to(model.model._last_residual.dtype)
+    for slot, pos, token in [(0, 10, 3), (1, 20, 5), (0, 11, 7)]:
+        req = _req(slot, pos, pos + 1)
+        batch = _verify_batch(ctx, runner, req, [token])
+        tok = torch.tensor([token], dtype=torch.int32, device=DEV)
+        with ctx.forward_batch(batch):
+            r = model.mtp.forward(residual, tok, batch)
+            logits = model.lm_head.forward(r)
+        got = runner.replay_draft(batch, residual, tok)
+        assert torch.equal(got[0], r) and torch.equal(got[1], logits)
+        assert torch.equal(got[2], torch.argmax(logits, dim=-1))
+        residual = got[0].clone()
+    runner.destroy_cuda_graphs()
+    assert runner.draft is None

@@ -23,6 +23,15 @@ logger = init_logger(__name__)
 # "0" forces the eager spec-verify forward (debug / correctness reference).
 VERIFY_GRAPH_ENV = "FREETOKEN_VERIFY_GRAPH"
 
+# "0" disables the captured MTP draft-step graph (falls back to the eager draft chain).
+# Default OFF ("0"), opt-in: FREETOKEN_DRAFT_GRAPH_CHECK=1 runs clean and "1" is +3% k1 TG at
+# 4K and 15.7K with identical output (ft-campaign2 LEDGER, campaign 3 block 3).
+DRAFT_GRAPH_ENV = "FREETOKEN_DRAFT_GRAPH"
+
+# "1": every draft step also runs eagerly and asserts (residual, logits, token) match the
+# graph replay bitwise -- same shape of check as FREETOKEN_VERIFY_GRAPH_CHECK.
+DRAFT_GRAPH_CHECK_ENV = "FREETOKEN_DRAFT_GRAPH_CHECK"
+
 
 # Most rejected-token replays a k=1 verify window re-feeds instead of replaying them alone.
 SPEC_DEFER_MAX = 2
@@ -131,6 +140,36 @@ class VerifyGraph:
         self.fla.cache_indices.copy_(batch.fla_metadata.cache_indices)
 
 
+@dataclass
+class DraftGraph:
+    """One MTP draft step (draft layer, LM head, argmax) for one request, captured once.
+    Replay restages the residual, token and addressing; outputs stay at fixed addresses."""
+
+    graph: torch.cuda.CUDAGraph
+    residual: torch.Tensor
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    out_loc: torch.Tensor
+    mrope_positions: torch.Tensor | None
+    logits_rows: torch.Tensor
+    # Pre-allocated OUTSIDE torch.cuda.graph(), like VerifyGraph.logits / GraphCaptureBuffer.logits:
+    # the capture writes into these via copy_() instead of returning fresh tensors from inside the
+    # graph. A tensor first allocated *inside* torch.cuda.graph(..., pool=self._pool) only keeps a
+    # stable address across replays as long as this graph is the last one captured in that shared
+    # pool (decode + verify + draft all share it); pre-allocating removes that fragile ordering
+    # dependency and matches every other captured buffer in this file.
+    out_residual: torch.Tensor
+    logits: torch.Tensor
+    token: torch.Tensor
+
+    def bind(self, batch: Batch) -> None:
+        batch.input_ids = self.input_ids
+        batch.positions = self.positions
+        batch.out_loc = self.out_loc
+        batch.mrope_positions = self.mrope_positions
+        batch.spec_logits_indices = self.logits_rows
+
+
 def _determine_cuda_graph_bs(
     cuda_graph_bs: List[int] | None,
     cuda_graph_max_bs: int | None,
@@ -188,10 +227,17 @@ class GraphRunner:
         self.stream = stream
         self.device = device
         self.verify_graphs: dict[int, VerifyGraph] = {}
+        self.draft: DraftGraph | None = None
         self._capture_graphs(max_seq_len, vocab_size, model)
         if self.graph_map:
             for tokens in verify_tokens:
                 self._capture_verify(model, tokens, vocab_size)
+            if (
+                verify_tokens
+                and getattr(model, "mtp", None) is not None
+                and os.getenv(DRAFT_GRAPH_ENV, "0") == "1"
+            ):
+                self._capture_draft(model, vocab_size)
 
     def _reset_moe_offload_cache(self) -> None:
         if self.moe_offload_cache is not None:
@@ -319,6 +365,83 @@ class GraphRunner:
         self.verify_graphs[tokens] = verify
         logger.info_rank0(f"Captured spec-verify CUDA graph ({tokens} tokens)")
 
+    def _capture_draft(self, model: BaseLLMModel, vocab_size: int) -> None:
+        """Capture one MTP draft step on the dummy request/page (decode graphs' pool). Any
+        failure leaves the draft chain eager."""
+        dummy = self.dummy_req
+        req = Req(
+            input_ids=torch.zeros(2, dtype=torch.int32),
+            table_idx=dummy.table_idx,
+            cached_len=1,
+            output_len=1,
+            uid=-1,
+            sampling_params=None,  # type: ignore
+            cache_handle=None,  # type: ignore
+        )
+        device = self.device
+        ref = getattr(model.model, "_last_residual", None)  # set by the verify capture
+        if ref is None:
+            return
+        draft = DraftGraph(
+            graph=torch.cuda.CUDAGraph(),
+            residual=torch.zeros(1, ref.shape[1], dtype=ref.dtype, device=device),
+            input_ids=torch.zeros(1, dtype=torch.int32, device=device),
+            positions=torch.ones(1, dtype=torch.int32, device=device),
+            out_loc=get_global_ctx().page_table[dummy.table_idx, 1:2].clone(),
+            mrope_positions=(
+                torch.zeros(3, 1, dtype=torch.int32, device=device) if self.mrope else None
+            ),
+            logits_rows=torch.zeros(1, dtype=torch.int64, device=device),
+            out_residual=torch.zeros(1, ref.shape[1], dtype=ref.dtype, device=device),
+            logits=torch.empty(1, vocab_size, dtype=torch.float32, device=device),
+            token=torch.zeros(1, dtype=torch.int64, device=device),
+        )
+        batch = Batch(reqs=[req], phase="prefill")
+        batch.padded_reqs = batch.reqs
+        draft.bind(batch)
+
+        def step():
+            r = model.mtp.forward(draft.residual, draft.input_ids, batch)
+            logits = model.lm_head.forward(model.mtp.to_head(r))
+            # Copy into the pre-allocated, externally-referenced buffers (see DraftGraph's
+            # out_residual/logits/token docstring) instead of returning fresh tensors -- keeps
+            # this graph's outputs at addresses the shared capture pool cannot hand to a later
+            # graph, exactly like VerifyGraph.logits.copy_(model.forward()) above.
+            draft.out_residual.copy_(r)
+            draft.logits.copy_(logits)
+            draft.token.copy_(torch.argmax(logits, dim=-1))
+
+        try:
+            self.attn_backend.prepare_metadata(batch)
+            self.attn_backend.stage_verify(batch)
+            with get_global_ctx().forward_batch(batch):
+                step()
+                with torch.cuda.graph(draft.graph, pool=self._pool, stream=self.stream):
+                    step()
+        except Exception as e:
+            logger.warning_rank0(f"MTP draft CUDA graph capture failed, draft stays eager: {e}")
+            return
+        finally:
+            self._reset_moe_offload_cache()
+        self.draft = draft
+        logger.info_rank0("Captured MTP draft-step CUDA graph")
+
+    def replay_draft(
+        self, batch: Batch, residual: torch.Tensor, token: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One draft step on the prepared 1-row ``batch``: (residual, logits, token)."""
+        d = self.draft
+        assert d is not None
+        d.residual.copy_(residual)
+        d.input_ids.copy_(token)
+        d.positions.copy_(batch.positions)
+        d.out_loc.copy_(batch.out_loc)
+        if d.mrope_positions is not None:
+            d.mrope_positions.copy_(batch.mrope_positions)
+        self.attn_backend.stage_verify(batch)
+        d.graph.replay()
+        return d.out_residual, d.logits, d.token
+
     def _is_verify(self, batch: Batch) -> bool:
         return (
             batch.is_prefill
@@ -372,5 +495,6 @@ class GraphRunner:
         self.graph_map = {}
         self.buffer = None
         self.verify_graphs = {}
+        self.draft = None
         self._pool = None
         gc.collect()

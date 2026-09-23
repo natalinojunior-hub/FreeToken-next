@@ -313,6 +313,133 @@ def test_verify_graph_replay_matches_eager(kv_format):
 
 
 @requires_cuda
+def test_draft_window_graph_replay_matches_eager():
+    """A captured 1-token draft window (stage_verify with ``tokens=1`` -- the MTP draft
+    step's own window, never a size any spec-verify graph captures) reproduces the eager
+    forward bitwise: repeated single-token replays crossing page boundaries, two requests
+    in different KV slots taking turns through the one captured graph, and a step replayed
+    twice in a row with no new input. Regression for the draft-graph illegal-memory-access
+    (qsa_sparse.py qsa_forward, surfaced via ``indices[indices >= 0]``)."""
+    # Two QSA layers, like the real model + its separate MTP layer: layer 3 stands in for the
+    # main model (prefilled, decode/verify-captured -- its slab slot is warm), layer 7 stands
+    # in for the MTP draft layer and is *never forwarded* before its own warmup+capture step,
+    # exactly as graph.py._capture_draft is model.mtp's first-ever invocation in the process.
+    config = parsed_config(num_layers=8)
+    assert config.attention_groups[1].layer_ids == (3, 7)
+    fixture = Fixture(config, num_pages=64)
+    attn_main = fixture.layer(3)
+    attn = fixture.layer(7, seed=7)  # the draft layer capture/replay below all use this one
+    length, tokens, steps = 60, 1, 150  # length near the page_size=64 boundary
+    rows = _inputs(fixture, [length, length], extra=steps + 5)
+    req_a = fixture.req(0, 0, length)
+    req_b = fixture.req(1, 0, length)
+    attn_main.forward(rows[0][:length], fixture.batch([req_a], "prefill"))
+    attn_main.forward(rows[1][:length], fixture.batch([req_b], "prefill"))
+
+    fixture.backend.init_capture_graph(max_seq_len=fixture.page_table.shape[1], bs_list=[1])
+    device, dtype = fixture.device, fixture.dtype
+    static = {
+        "x": torch.zeros(tokens, config.hidden_size, device=device, dtype=dtype),
+        "positions": torch.zeros(tokens, dtype=torch.int32, device=device),
+        "out_loc": torch.zeros(tokens, dtype=torch.int32, device=device),
+    }
+    dummy = SimpleNamespace(
+        table_idx=fixture.num_req_slots - 1, cached_len=1, device_len=2, extend_len=tokens
+    )
+
+    # Real capture order (graph.py GraphRunner): decode graph first (owns the shared pool),
+    # then spec-verify window(s), then the draft graph LAST in that same pool -- the ordering
+    # the C3b audit flags as the one place a fresh torch.empty_like(q) allocated *inside* a
+    # capture could get handed an address a still-live earlier-graph tensor also claims.
+    decode_static = {
+        "x": torch.zeros(1, config.hidden_size, device=device, dtype=dtype),
+        "positions": torch.zeros(1, dtype=torch.int32, device=device),
+        "out_loc": torch.zeros(1, dtype=torch.int32, device=device),
+    }
+    decode_dummy = SimpleNamespace(
+        table_idx=fixture.num_req_slots - 1, cached_len=1, device_len=2, extend_len=1
+    )
+    decode_batch = SimpleNamespace(
+        padded_reqs=[decode_dummy],
+        reqs=[decode_dummy],
+        phase="decode",
+        size=1,
+        padded_size=1,
+        is_prefill=False,
+        is_decode=True,
+        positions=decode_static["positions"],
+        get_attn_positions=lambda: decode_static["positions"],
+        out_loc=decode_static["out_loc"],
+        attn_metadata=None,
+        active_table_idx=None,
+    )
+    fixture.backend.prepare_for_capture(decode_batch)
+    attn_main.forward(decode_static["x"], decode_batch)  # warmup, same metadata object as capture
+    torch.cuda.synchronize()
+    decode_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(decode_graph):
+        attn_main.forward(decode_static["x"], decode_batch)
+    torch.cuda.synchronize()
+    pool = decode_graph.pool()
+
+    verify2_static = {
+        "x": torch.zeros(2, config.hidden_size, device=device, dtype=dtype),
+        "positions": torch.zeros(2, dtype=torch.int32, device=device),
+        "out_loc": torch.zeros(2, dtype=torch.int32, device=device),
+    }
+    verify2_dummy = SimpleNamespace(
+        table_idx=fixture.num_req_slots - 1, cached_len=1, device_len=3, extend_len=2
+    )
+    verify2_batch = _verify_batch(fixture, verify2_dummy, verify2_static)
+    fixture.backend.stage_verify(verify2_batch)
+    attn_main.forward(verify2_static["x"], verify2_batch)  # warmup
+    torch.cuda.synchronize()
+    verify2_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(verify2_graph, pool=pool):
+        attn_main.forward(verify2_static["x"], verify2_batch)
+    torch.cuda.synchronize()
+
+    capture_batch = _verify_batch(fixture, dummy, static)
+    assert tokens not in fixture.backend._verify, "tokens=1 must not alias a verify window"
+    fixture.backend.stage_verify(capture_batch)
+    attn.forward(static["x"], capture_batch)  # warmup, same metadata object as the capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, pool=pool):
+        captured_out = attn.forward(static["x"], capture_batch)
+    torch.cuda.synchronize()
+
+    reqs = [req_a, req_b]
+    for step in range(steps):
+        req, slot = reqs[step % 2], step % 2
+        fixture.step(req)
+        x = rows[slot][req.cached_len : req.device_len]
+
+        state = _kv_state(fixture)
+        before = [t.clone() for t in state]
+        eager = attn.forward(x, _verify_batch(fixture, req))
+        expect = [t.clone() for t in state]
+        for t, b in zip(state, before):
+            t.copy_(b)
+
+        batch = _verify_batch(fixture, req, static)
+        static["x"].copy_(x)
+        fixture.backend.stage_verify(batch)
+        staged = fixture.backend._verify[tokens]["block_table"]
+        assert batch.attn_metadata.block_table.data_ptr() == staged.data_ptr()
+        graph.replay()
+        assert torch.equal(captured_out, eager), f"draft output diverged at step {step}"
+        bad = [i for i, (t, e) in enumerate(zip(state, expect)) if not torch.equal(t, e)]
+        assert not bad, f"pool tensors {bad} diverged at step {step} (single replay)"
+        # Replay the same step again with no new input: must be idempotent (same reqs, same
+        # addressing, same pool state) -- a stale baked pointer/size or a workspace buffer the
+        # capture didn't restage would show up as a second-replay-only divergence.
+        graph.replay()
+        bad2 = [i for i, (t, e) in enumerate(zip(state, expect)) if not torch.equal(t, e)]
+        assert not bad2, f"pool tensors {bad2} diverged at step {step} (repeated replay)"
+
+
+@requires_cuda
 def test_row_chunked_scoring_matches_one_chunk(monkeypatch):
     """The scoring workspace bound splits long prefills into row chunks."""
     import freetoken.attention.qsa_sparse as qsa_sparse
