@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.core import Batch, Req
+from freetoken.engine.graph import SPEC_DEFER_MAX
 from freetoken.engine.spec import accept_drafts, spec_rollback_lengths
 from freetoken.scheduler.adaptive_mtp import (
     AdaptiveMTPController,
@@ -33,6 +34,8 @@ SPEC_TIMING_ENV = "FREETOKEN_DEBUG_SPEC_TIMING"
 # "1": run every graph-eligible verify eagerly first and assert the graph replay reproduces it
 # bitwise (logits, sampled tokens, MTP residual, every state tensor the forward writes).
 VERIFY_GRAPH_CHECK_ENV = "FREETOKEN_VERIFY_GRAPH_CHECK"
+# "0" replays a k=1 rejection at once instead of re-feeding its tokens in the next verify window.
+DEFER_REPLAY_ENV = "FREETOKEN_SPEC_DEFER_REPLAY"
 
 
 def _spec_mrope_positions(
@@ -171,10 +174,16 @@ class SchedulerSpecMixin:
         state = [pool.conv_states[:, slot], pool.recurrent_states[:, slot]]
         state += [t[:, slot] for t in pool.slot_states.values()]
         kv = self.engine.kv_cache
+        # QSA's per-slot scratch rows sink the non-closing rows' racing writes and are never read
+        scratch = getattr(kv, "_cmp_k_buffer", None)
         for owner in (kv, getattr(kv, "_pool", None)):
             for value in vars(owner).values() if owner is not None else ():
                 values = value if isinstance(value, (list, tuple)) else (value,)
-                state += [t for t in values if isinstance(t, torch.Tensor) and t.is_cuda]
+                state += [
+                    t[:, : kv.cmp_scratch_base] if t is scratch else t
+                    for t in values
+                    if isinstance(t, torch.Tensor) and t.is_cuda
+                ]
         return state
 
     def _checked_verify_forward(self, req: Req, vb: Batch, sample_args):
@@ -188,11 +197,11 @@ class SchedulerSpecMixin:
         before = [t.clone() for t in state]
         if n % 8 == 0 and engine.moe_offload_cache is not None:
             engine.moe_offload_cache.reset()
-        verify, runner.verify = runner.verify, None
+        graphs, runner.verify_graphs = runner.verify_graphs, {}
         try:
             eager = engine.forward_batch(vb, sample_args)
         finally:
-            runner.verify = verify
+            runner.verify_graphs = graphs
         expect = [t.clone() for t in state]
         expect += [engine.last_batch_logits.clone(), eager.next_tokens_gpu.clone()]
         expect.append(model._last_residual.clone())
@@ -206,7 +215,8 @@ class SchedulerSpecMixin:
         bad = [i for i, (g, e) in enumerate(zip(got, expect)) if not torch.equal(g, e)]
         if bad:
             raise AssertionError(
-                f"verify graph != eager at check {n}: tensors {bad} of {len(got)} "
+                f"verify graph != eager at check {n} ({vb.input_ids.shape[0]} rows): tensors "
+                f"{[(i, tuple(got[i].shape), got[i].dtype) for i in bad]} of {len(got)} "
                 f"(last three: logits, tokens, residual)"
             )
         if n == 1 or n % 100 == 0:
@@ -325,11 +335,33 @@ class SchedulerSpecMixin:
                 self.finished_reqs.add(req)
         return committed
 
+    def _replay(self, req: Req, start: int, n: int) -> None:
+        """Re-run the target over tokens [start, start + n) from the restored state; the
+        sampled output is discarded (those successors are already committed)."""
+        rb = Batch(reqs=[req], phase="decode" if n == 1 else "prefill")
+        if rb.is_decode:
+            rb.padded_reqs = [req]
+        req.cached_len = start
+        req.device_len = start + n
+        rfi = self._prepare_batch(rb, skip_alloc=True)
+        rb.input_ids = self.token_pool[rfi.input_tuple]
+        rout = self.engine.forward_batch(rb, rfi.sample_args)
+        rout.copy_done_event.synchronize()
+
+    def _flush_deferred_replays(self) -> None:
+        """Replay deferred tokens before any non-spec forward, which expects one pending token."""
+        for req in list(self.decode_manager.running_reqs):
+            end = req.device_len - 1
+            if end > req.cached_len:
+                self._replay(req, req.cached_len, end - req.cached_len)
+                req.cached_len, req.device_len = end, end + 1
+
     def run_spec_step(self) -> bool:
         """Run one speculative decode step for the single eligible request. Returns True if
         it ran (the caller should skip its own _schedule_next_batch/_forward this iteration)."""
         req = self._spec_eligible_req()
         if req is None:
+            self._flush_deferred_replays()
             return False
         from freetoken.scheduler.adaptive_mtp import resolve_adaptive_k
 
@@ -349,6 +381,7 @@ class SchedulerSpecMixin:
             top_k_experts=top_k,
         )
         if k <= 0:
+            self._flush_deferred_replays()
             return False
 
         debug_timing = os.getenv(SPEC_TIMING_ENV, "0") == "1"
@@ -362,7 +395,11 @@ class SchedulerSpecMixin:
                 print(f"[spec-timing] k={k} {stage} {now - _t0:.4f}s", flush=True)
                 _t0 = now
 
-        d = req.device_len  # invariant: d == req.cached_len + 1
+        d = req.device_len
+        # Tokens [c0, d) are unprocessed: token d-1, plus the p tokens earlier steps deferred
+        # instead of replaying them after a rejection. The verify window re-feeds them all.
+        c0 = req.cached_len
+        p = d - 1 - c0
         model = self.engine.model
         mtp = model.mtp
 
@@ -384,6 +421,7 @@ class SchedulerSpecMixin:
         drafts: List[int] = []
 
         # Confidence gating: run first draft step, check top-1 prob, skip if low confidence
+        req.cached_len = d - 1  # the draft's own attention sees its KV through d-1
         db = Batch(reqs=[req], phase="prefill")
         db.padded_reqs = [req]
         db.positions = torch.tensor([d - 1], dtype=torch.int32, device=self.device)
@@ -427,7 +465,7 @@ class SchedulerSpecMixin:
             tok_prev = torch.argmax(logits, dim=-1)
             drafts.append(int(tok_prev.item()))
             self.token_pool[req.table_idx, d + i] = tok_prev
-        req.cached_len, req.device_len = d - 1, d
+        req.cached_len, req.device_len = c0, d
         mark("draft_chain")
 
         # ---- restore state before target verification ----
@@ -442,9 +480,9 @@ class SchedulerSpecMixin:
         req.device_len = d + k
         vb = Batch(reqs=[req], phase="prefill")
         fi = self._prepare_batch(vb)
-        vb.spec_logits_indices = torch.arange(k + 1, device=self.device)
+        vb.spec_logits_indices = torch.arange(p + k + 1, device=self.device)
         vb.input_ids = self.token_pool[fi.input_tuple]
-        vb.spec_host_ids = [int(req.input_ids[d - 1]), *drafts]
+        vb.spec_host_ids = [*req.input_ids[c0:d].tolist(), *drafts]
         mark("verify_prepare_batch")
         if os.getenv(VERIFY_GRAPH_CHECK_ENV, "0") == "1" and (
             self.engine.graph_runner.can_use_cuda_graph(vb)
@@ -454,13 +492,16 @@ class SchedulerSpecMixin:
             out = self.engine.forward_batch(vb, fi.sample_args)
         out.copy_done_event.synchronize()
         mark("verify_forward")
-        sampled = out.next_tokens_cpu.tolist()
+        # rows [0, p) re-feed deferred tokens whose successors are already committed
+        sampled = out.next_tokens_cpu.tolist()[p:]
         accepted = accept_drafts(sampled, drafts)
         m = len(accepted)
-        logger.info(f"spec: k={k} m={m} accepted={m - 1}/{k} drafts={drafts} sampled={sampled}")
+        logger.info(
+            f"spec: k={k} p={p} m={m} accepted={m - 1}/{k} drafts={drafts} sampled={sampled}"
+        )
 
         # ---- commit: only the tokens up to (and including) any finish reason count ----
-        self.token_pool[req.table_idx, d : d + m] = out.next_tokens_gpu[:m]
+        self.token_pool[req.table_idx, d : d + m] = out.next_tokens_gpu[p : p + m]
         committed = self._commit_spec_tokens(req, accepted, start_pos=d, spec_alloc_len=d + k)
         finished = committed < m or (committed == m and req in self.finished_reqs)
         mark("commit")
@@ -483,47 +524,26 @@ class SchedulerSpecMixin:
         # Update _last_residual to last committed token for next draft chain
         # (verify_forward overwrites it; we need the residual of the last accepted token)
         last_res = getattr(model.model, "_last_residual", None)
-        if last_res is not None and last_res.shape[0] >= committed:
-            model.model._last_residual = last_res[committed - 1 : committed].clone()
+        if last_res is not None and last_res.shape[0] >= p + committed:
+            model.model._last_residual = last_res[p + committed - 1 : p + committed].clone()
 
         if committed <= k:
-            checkpoints = None
-            target_step = committed - 1
-            if checkpoints is not None and target_step in checkpoints and pool is not None:
-                # Phase 10 Pillar 2 Zero-Replay GDN: restore recurrent + conv states from verify checkpoint
-                # ponytail: single-slot restore is O(num_layers); add batched restore if spec decode expands beyond batch=1.
-                step_ckpts = checkpoints[target_step]
-                slot = self._linear_slot(req)
-                for li, (rec_s, conv_s) in step_ckpts.items():
-                    pool.recurrent_states[li, slot].copy_(rec_s)
-                    pool.conv_states[li, slot].copy_(conv_s)
-                # Seed residual for the next draft chain from verify forward
-                last_res = getattr(model.model, "_last_residual", None)
-                if last_res is not None and last_res.shape[0] >= committed:
-                    model.model._last_residual = last_res[committed - 1 : committed].clone()
-                self._restore_qsa_state(req)
-                req.cached_len = keep_cached
-                req.device_len = keep_device
-                mark("zero_replay_gdn")
-            else:
-                # Fallback replay path if checkpoints are not available
-                if snap_slot is not None:
-                    pool.copy_from(snap_slot, self._linear_slot(req))
-                self._restore_qsa_state(req)
-                start = d - 1
-                phase = "decode" if committed == 1 else "prefill"
-                rb = Batch(reqs=[req], phase=phase)
-                if rb.is_decode:
-                    rb.padded_reqs = [req]
-                req.cached_len = start
-                req.device_len = start + committed
-                rfi = self._prepare_batch(rb, skip_alloc=True)
-                rb.input_ids = self.token_pool[rfi.input_tuple]
-                rout = self.engine.forward_batch(rb, rfi.sample_args)
-                rout.copy_done_event.synchronize()
-                req.cached_len = keep_cached
-                req.device_len = keep_device
-                mark("gdn_replay")
+            # The verify advanced every state past the rejected draft: restore the pre-verify
+            # snapshot S0, then replay all but the deferred tail of the accepted tokens.
+            if snap_slot is not None:
+                pool.copy_from(snap_slot, self._linear_slot(req))
+            self._restore_qsa_state(req)
+            defer = SPEC_DEFER_MAX if k == 1 and os.getenv(DEFER_REPLAY_ENV, "1") != "0" else 0
+            defer = min(defer, keep_cached - c0)
+            n = keep_cached - c0 - defer
+            if n > 0:
+                next_residual = model.model._last_residual
+                self._replay(req, c0, n)
+                if defer:  # the replay stopped short of the last committed input
+                    model.model._last_residual = next_residual
+            req.cached_len = c0 + n
+            req.device_len = keep_device
+            mark("gdn_replay" if n > 0 else "deferred_replay")
 
         self.cache_manager.cache_req(req, finished=False)
         mark("cache_req")

@@ -303,7 +303,7 @@ def test_verify_graph_replay_matches_eager(kv_format):
         static["x"].copy_(x)
         fixture.backend.stage_verify(batch)
         # replay must stage into the captured buffers, never reallocate them
-        staged = fixture.backend._verify["block_table"]
+        staged = fixture.backend._verify[tokens]["block_table"]
         assert batch.attn_metadata.block_table.data_ptr() == staged.data_ptr()
         graph.replay()
         assert torch.equal(captured_out, eager), f"verify output diverged at window {window}"

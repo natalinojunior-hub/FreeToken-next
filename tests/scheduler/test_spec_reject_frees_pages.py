@@ -364,3 +364,22 @@ def test_spec_snapshot_slot_evicts_radix_snapshots_when_free_list_is_drained():
     req = SimpleNamespace(uid=3)
     assert SchedulerSpecMixin._spec_snapshot_slot(stub, req) == 7
     assert stub._spec_snapshot_slots == {3: 7}
+
+
+def test_flush_deferred_replays_feeds_every_pending_token_before_a_plain_decode():
+    """A deferred k=1 rejection leaves two unprocessed tokens (device_len - cached_len == 2).
+    Before any non-spec forward, which assumes one, the flush must replay all but the last."""
+    from types import SimpleNamespace
+
+    replays = []
+    pending, current = _req(0, prompt_len=8), _req(1, prompt_len=8)
+    pending.cached_len, pending.device_len = 5, 7
+    current.cached_len, current.device_len = 6, 7
+    stub = SimpleNamespace(decode_manager=SimpleNamespace(running_reqs={pending, current}))
+    stub._replay = lambda req, start, n: replays.append((req.uid, start, n))
+
+    SchedulerSpecMixin._flush_deferred_replays(stub)
+
+    assert replays == [(0, 5, 1)]
+    assert (pending.cached_len, pending.device_len) == (6, 7)
+    assert (current.cached_len, current.device_len) == (6, 7)

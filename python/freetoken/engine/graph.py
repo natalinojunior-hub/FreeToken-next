@@ -24,12 +24,16 @@ logger = init_logger(__name__)
 VERIFY_GRAPH_ENV = "FREETOKEN_VERIFY_GRAPH"
 
 
-def verify_graph_tokens(spec_mtp: int) -> int:
-    """Rows of the captured spec-verify window (k+1), or 0 for an eager verify. Only k=1
-    is captured."""
+# Most rejected-token replays a k=1 verify window re-feeds instead of replaying them alone.
+SPEC_DEFER_MAX = 2
+
+
+def verify_graph_tokens(spec_mtp: int) -> tuple[int, ...]:
+    """Row counts of the captured spec-verify windows, empty for an eager verify: k+1 plus
+    up to SPEC_DEFER_MAX deferred-replay tokens. Only k=1 is captured."""
     if spec_mtp != 1 or os.getenv(VERIFY_GRAPH_ENV, "1") == "0":
-        return 0
-    return spec_mtp + 1
+        return ()
+    return tuple(range(spec_mtp + 1, spec_mtp + 2 + SPEC_DEFER_MAX))
 
 
 @dataclass
@@ -168,7 +172,7 @@ class GraphRunner:
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
         mrope: bool = False,
-        verify_tokens: int = 0,
+        verify_tokens: tuple[int, ...] = (),
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -183,10 +187,11 @@ class GraphRunner:
         self.mrope = mrope
         self.stream = stream
         self.device = device
-        self.verify: VerifyGraph | None = None
+        self.verify_graphs: dict[int, VerifyGraph] = {}
         self._capture_graphs(max_seq_len, vocab_size, model)
-        if verify_tokens and self.graph_map:
-            self._capture_verify(model, verify_tokens, vocab_size)
+        if self.graph_map:
+            for tokens in verify_tokens:
+                self._capture_verify(model, tokens, vocab_size)
 
     def _reset_moe_offload_cache(self) -> None:
         if self.moe_offload_cache is not None:
@@ -261,7 +266,7 @@ class GraphRunner:
 
     def _capture_verify(self, model: BaseLLMModel, tokens: int, vocab_size: int) -> None:
         """Capture the spec-verify forward on the dummy request/page (sharing the decode
-        graphs' pool). Any failure leaves ``self.verify`` None: verify stays eager."""
+        graphs' pool). Any failure leaves that window size eager."""
         from freetoken.attention.linear import FLAMetadata
 
         dummy = self.dummy_req
@@ -311,17 +316,15 @@ class GraphRunner:
         owner = getattr(model, "model", None)
         residual = getattr(owner, "_last_residual", None)
         verify.residual = (owner, residual) if residual is not None else None
-        self.verify = verify
+        self.verify_graphs[tokens] = verify
         logger.info_rank0(f"Captured spec-verify CUDA graph ({tokens} tokens)")
 
     def _is_verify(self, batch: Batch) -> bool:
-        v = self.verify
         return (
-            v is not None
-            and batch.is_prefill
+            batch.is_prefill
             and batch.spec_logits_indices is not None
             and batch.size == 1
-            and batch.input_ids.shape[0] == v.tokens
+            and batch.input_ids.shape[0] in self.verify_graphs
             and batch.reqs[0].cached_len > 0
             and batch.mm_embeds is None
         )
@@ -332,7 +335,7 @@ class GraphRunner:
         return self._is_verify(batch)
 
     def _replay_verify(self, batch: Batch) -> torch.Tensor:
-        v = self.verify
+        v = self.verify_graphs[batch.input_ids.shape[0]]
         v.copy_from(batch)
         self.attn_backend.stage_verify(batch)
         v.graph.replay()
@@ -368,6 +371,6 @@ class GraphRunner:
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
         self.buffer = None
-        self.verify = None
+        self.verify_graphs = {}
         self._pool = None
         gc.collect()

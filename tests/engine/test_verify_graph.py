@@ -22,20 +22,21 @@ from freetoken.engine.graph import VERIFY_GRAPH_ENV, GraphRunner, verify_graph_t
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 VOCAB, SLOTS, WIDTH, TOKENS = 8, 4, 64, 2
+SIZES = (TOKENS, TOKENS + 1, TOKENS + 2)  # k+1 rows plus up to two deferred-replay tokens
 DEV = torch.device("cuda")
 
 
 def test_verify_graph_tokens(monkeypatch):
-    assert verify_graph_tokens(1) == 2
-    assert verify_graph_tokens(0) == 0
-    assert verify_graph_tokens(2) == 0  # only k=1 is captured
+    assert verify_graph_tokens(1) == SIZES
+    assert verify_graph_tokens(0) == ()
+    assert verify_graph_tokens(2) == ()  # only k=1 is captured
     monkeypatch.setenv(VERIFY_GRAPH_ENV, "0")
-    assert verify_graph_tokens(1) == 0
+    assert verify_graph_tokens(1) == ()
 
 
 def test_verify_gate():
     runner = GraphRunner.__new__(GraphRunner)
-    runner.max_graph_bs, runner.verify = 1, SimpleNamespace(tokens=TOKENS)
+    runner.max_graph_bs, runner.verify_graphs = 1, {TOKENS: SimpleNamespace(tokens=TOKENS)}
     ok = dict(
         is_decode=False,
         is_prefill=True,
@@ -59,7 +60,7 @@ def test_verify_gate():
         SimpleNamespace(is_decode=False, is_prefill=True, spec_logits_indices=None)
     )
     assert runner.can_use_cuda_graph(SimpleNamespace(is_decode=True, size=1))
-    runner.verify = None
+    runner.verify_graphs = {}
     assert not runner.can_use_cuda_graph(SimpleNamespace(**ok))
 
 
@@ -154,7 +155,7 @@ def _runner(monkeypatch, verify: bool = True):
             vocab_size=VOCAB,
             dummy_req=_req(SLOTS - 1, 0, 1),
             moe_offload_cache=_FakeCache(events),
-            verify_tokens=TOKENS,
+            verify_tokens=SIZES,
         )
     torch.cuda.synchronize()
     return ctx, runner, model, events
@@ -168,9 +169,9 @@ def _verify_batch(ctx, runner, req: Req, tokens: list[int]) -> Batch:
     batch.input_ids = torch.tensor(tokens, dtype=torch.int32, device=DEV)
     batch.positions = torch.arange(req.cached_len, req.device_len, dtype=torch.int32, device=DEV)
     batch.out_loc = ctx.page_table[req.table_idx, req.cached_len : req.device_len]
-    batch.spec_logits_indices = torch.arange(TOKENS, device=DEV)
+    batch.spec_logits_indices = torch.arange(len(tokens), device=DEV)
     batch.fla_metadata = FLAMetadata(
-        cu_seqlens=torch.tensor([0, TOKENS], dtype=torch.int32, device=DEV),
+        cu_seqlens=torch.tensor([0, len(tokens)], dtype=torch.int32, device=DEV),
         cache_indices=torch.tensor([req.table_idx], dtype=torch.int32, device=DEV),
     )
     runner.attn_backend.prepare_metadata(batch)
@@ -193,13 +194,21 @@ def test_verify_replay_matches_eager(monkeypatch):
     an eager forward interleaved: each verify replay equals the eager forward (logits, slot state,
     residual) and leaves the model's residual bound to the captured output."""
     ctx, runner, model, events = _runner(monkeypatch)
-    verify = runner.verify
-    assert verify is not None and runner.graph_map
+    assert sorted(runner.verify_graphs) == list(SIZES) and runner.graph_map
     assert events[-2:] == ["forward", "reset"]  # expert cache reset after the verify capture
 
-    windows = [(0, 10, [5, 9]), (1, 20, [7, 7]), (0, 12, [3, 1]), (0, 13, [2, 8]), (2, 30, [1, 4])]
+    windows = [
+        (0, 10, [5, 9]),
+        (1, 20, [7, 7, 2]),
+        (0, 12, [3, 1]),
+        (0, 13, [2, 8, 6]),
+        (2, 30, [1, 4]),
+        (2, 31, [4, 4, 1]),
+        (1, 40, [6, 2, 5, 3]),
+    ]
     for step, (slot, start, tokens) in enumerate(windows):
-        req = _req(slot, start, start + TOKENS)
+        verify = runner.verify_graphs[len(tokens)]
+        req = _req(slot, start, start + len(tokens))
         state0 = model.state.clone()
         eager_batch = _verify_batch(ctx, runner, req, tokens)
         with ctx.forward_batch(eager_batch):
@@ -223,7 +232,7 @@ def test_verify_replay_matches_eager(monkeypatch):
 @requires_cuda
 def test_verify_capture_failure_falls_back_to_eager(monkeypatch):
     ctx, runner, _, events = _runner(monkeypatch, verify=False)
-    assert runner.verify is None and runner.graph_map  # decode graphs unaffected
+    assert not runner.verify_graphs and runner.graph_map  # decode graphs unaffected
     assert events[-1] == "reset"
     batch = _verify_batch(ctx, runner, _req(0, 10, 10 + TOKENS), [1, 2])
     assert not runner.can_use_cuda_graph(batch)
@@ -232,10 +241,10 @@ def test_verify_capture_failure_falls_back_to_eager(monkeypatch):
 @requires_cuda
 def test_verify_graph_env_off_and_destroy(monkeypatch):
     monkeypatch.setenv(VERIFY_GRAPH_ENV, "0")
-    assert verify_graph_tokens(1) == 0
+    assert verify_graph_tokens(1) == ()
     monkeypatch.delenv(VERIFY_GRAPH_ENV)
     ctx, runner, _, _ = _runner(monkeypatch)
     batch = _verify_batch(ctx, runner, _req(0, 10, 10 + TOKENS), [1, 2])
     assert runner.can_use_cuda_graph(batch)
     runner.destroy_cuda_graphs()
-    assert runner.verify is None and not runner.can_use_cuda_graph(batch)
+    assert not runner.verify_graphs and not runner.can_use_cuda_graph(batch)

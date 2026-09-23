@@ -661,12 +661,11 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata) and not md.is_decode
         tokens = batch.input_ids.shape[0]
-        v = self._verify
-        if v.get("tokens") != tokens:
+        # one buffer set per window size: each captured verify graph keeps its own addresses
+        v = self._verify.setdefault(tokens, {})
+        if not v:
             assert not torch.cuda.is_current_stream_capturing()
-            v.clear()
             v.update(
-                tokens=tokens,
                 block_table=torch.zeros_like(md.block_table),
                 kvlen=torch.zeros_like(md.seq_lens),
                 table_idx=torch.zeros_like(md.ring_slots),
