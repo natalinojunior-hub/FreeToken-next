@@ -370,6 +370,15 @@ needs copies **and** compute cut together, or more tokens/cycle (k2/k3).
 
 `ft tune` 16K (prompt16k, turbo3, 3 reps, matched argv, after 5de83aa/d52f287): k0 TG 40.48 / PP 2095, k1 TG 43.88 / PP 2084 -> profile picks k1 (+8.4%, above the 3% margin). A server started without `--spec-mtp` (single request, 16K, turbo3) applied it: TG 43.43, 138 verify cycles. Earlier tunes that showed a tie never ran MTP (temperature-0 requests with the model's top_p 0.95 were not greedy). At 4K cold, k1 was below k0 in the bench harness (40.48 vs 40.91). Hybrid with the correct fetch split (82.6% over PCIe): 37.05 vs offload 40.48 at 4K -> offload stays default; the 11.72 figure used a fallback fetch cap of 1.
 
+## Campaigns 3-4 (2026-09-23): correctness outlier, overlap cost model, MTP draft graph, tune fixes
+
+Commits 787d796..14e0478; evidence in `ft-campaign2/RELATORIO.md` / `LEDGER.md`.
+- turbo3 verify-vs-decode KL 0.97 at pos 4098: cuBLAS bf16 M=1 vs M>=2 only (row-wise GEMMs make every row bitwise equal to k0). No state defect.
+- Hit/miss copy overlap rejected before coding: per k1 cycle expert gathers 19.3 ms vs routed GEMV 4.0 ms (torch.profiler); ceiling < 3 ms.
+- MTP draft-step CUDA graph: the Campaign 1 "illegal access on replay" is fixed (841e8fa, QSA replan on reused metadata); on by default for qwen4_exp MTP k1 (815f1eb). Cold k1 turbo3, paired prompts: 4K 40.48 -> 41.65, 15.7K 43.34 -> 44.60 (+2.9%), PP 1475/2085 unchanged, VRAM 15842 MiB, identical output.
+- `ft tune` 16K (paired prompts, f90a5e2/14e0478): k0 37.77, k1 41.34 with draft graph / 40.28 without -> profile k1 + draft graph, applied on restart without `--spec-mtp`.
+- >100 tok/s not met; the k1 cycle is PCIe-bound (~1 GB missed expert bytes per cycle).
+
 ## Referência Completa
 
 `old/docs/freetoken-next/PERFORMANCE.md` — Tabelas detalhadas por config/modelo, EXP-001 a EXP-045, metodologia, variáveis de controle.
