@@ -25,7 +25,8 @@ from freetoken.version import __version__
 
 logger = init_logger(__name__)
 
-SCHEMA_VERSION = 1
+# 2: v1 profiles were measured before the MTP draft graph worked and all store draft_graph=False.
+SCHEMA_VERSION = 2
 
 # v1 tunables this profile stores a chosen value for.
 TUNABLE_FIELDS = ("spec_mtp", "defer_replay", "draft_graph", "moe_strategy", "cpu_threads")

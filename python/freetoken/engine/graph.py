@@ -24,8 +24,8 @@ logger = init_logger(__name__)
 VERIFY_GRAPH_ENV = "FREETOKEN_VERIFY_GRAPH"
 
 # "0" disables the captured MTP draft-step graph (falls back to the eager draft chain).
-# Default OFF ("0"), opt-in: FREETOKEN_DRAFT_GRAPH_CHECK=1 runs clean and "1" is +3% k1 TG at
-# 4K and 15.7K with identical output (ft-campaign2 LEDGER, campaign 3 block 3).
+# Default ON: +3% k1 TG at 4K and 15.7K with identical output (ft-campaign2 LEDGER, campaign 3
+# block 3); "0" is the fallback if a regression shows up.
 DRAFT_GRAPH_ENV = "FREETOKEN_DRAFT_GRAPH"
 
 # "1": every draft step also runs eagerly and asserts (residual, logits, token) match the
@@ -235,7 +235,7 @@ class GraphRunner:
             if (
                 verify_tokens
                 and getattr(model, "mtp", None) is not None
-                and os.getenv(DRAFT_GRAPH_ENV, "0") == "1"
+                and os.getenv(DRAFT_GRAPH_ENV, "1") == "1"
             ):
                 self._capture_draft(model, vocab_size)
 

@@ -5,6 +5,7 @@ only -- no server, no CUDA."""
 from __future__ import annotations
 
 from freetoken.tuning.profile import (
+    SCHEMA_VERSION,
     CandidateEvidence,
     Profile,
     TunedSettings,
@@ -70,7 +71,7 @@ def test_key_changes_when_weight_file_is_touched(tmp_path):
 
 def _sample_profile(key: str) -> Profile:
     return Profile(
-        schema=1,
+        schema=SCHEMA_VERSION,
         key=key,
         chosen=TunedSettings(
             spec_mtp=1, defer_replay=True, draft_graph=False, moe_strategy="hybrid"

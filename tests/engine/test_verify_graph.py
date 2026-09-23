@@ -274,7 +274,7 @@ class _FakeHead:
 def test_draft_replay_matches_eager(monkeypatch):
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
-    monkeypatch.setenv("FREETOKEN_DRAFT_GRAPH", "1")  # opt in: default is off until GPU-validated
+    monkeypatch.setenv("FREETOKEN_DRAFT_GRAPH", "1")
     monkeypatch.setattr(core, "_GLOBAL_CTX", Context(page_size=1))
     ctx = get_global_ctx()
     ctx.page_table = torch.arange(SLOTS * WIDTH, dtype=torch.int32, device=DEV).view(SLOTS, WIDTH)
