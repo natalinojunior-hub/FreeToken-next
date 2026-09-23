@@ -1,20 +1,10 @@
 # State — 2026-09-23
 
-## Doing
-- Nothing in progress. Overnight GGUF campaign committed (a0adc18..7eb12b5).
-
-## Done
-- 4K k1 TG 37.95 -> 44.69 (batched mmvq, host token embedding, deferred replay). k0 unchanged.
-- Cold PP 377 -> 1472 (4K), 398 -> 2064 (15.7K): dequant+cuBLAS dense, dequant+bf16 fused-MoE for >= 512 tokens.
-- Old PP anchors were cached-prefix PP. Cold PP needs a unique prompt per request (ft-campaign/cold.sh).
-- `make bench-flash MTP=1` runs the Flash-Next GGUF bench. make ci PASS (2003).
-- Details and matrix: docs/dev/PERFORMANCE.md "Overnight campaign"; logs in /models/desenvolvimento/ft-campaign/.
-
-## Decisions
-- Deferred replay: up to 2 rejected-window tokens ride in the next verify (graphs for 2-4 rows). FREETOKEN_SPEC_DEFER_REPLAY=0 disables.
-- >100 TG not reachable on this path: ~16 ms/verify of PCIe expert copies. No >16K runs (gate unmet).
-
-## Next
-1. MTP draft CUDA graph: illegal access on replay (patch ft-campaign/draft-graph.patch), ~2 ms/cycle.
-2. Dequant MoE prefill floor ~24 ms/layer: tune fused_moe config, dequant straight into the kernel.
-3. Expert copy overlap with hit/shared-expert compute inside the verify graph.
+Doing: Campaign 2 docs written (docs/dev/PERFORMANCE.md, LESSONS.md, DECISIONS.md); `ft tune` 16K result still PENDING (orchestrator to fill).
+Done: GGUF beats native NVFP4-Radix end-to-end (TG 2.06x at k1) — native kept as fallback only. Offload beats hybrid on GGUF (hybrid 3.5x slower, IQ3_S CPU kernel bound) — offload stays default. Cold-prefill non-determinism fixed (bf16 index_add_ atomic order, 211efb6); verify-window vs decode KL traced to cuBLAS M=1-vs-M>=2 row divergence, not a correctness bug.
+Decisions: see docs/dev/DECISIONS.md D-024..D-028 (GGUF primary, offload default, bench-bw threshold kept, deferred replay kept, profile key shape).
+Next:
+1. compute-sanitizer memcheck on draft-graph v2 replay to find the illegal-access kernel (QSA draft-slot addressing suspected).
+2. Add hit/miss overlap to the verify-window miss path (currently serialized, no cross-layer prefetch).
+3. IQ3_S AVX-512 CPU kernel throughput, only if hybrid strategy is revisited.
+4. 128K/256K runs stay gated on hitting >100 tok/s first (not met yet).

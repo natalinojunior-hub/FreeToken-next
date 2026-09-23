@@ -73,6 +73,34 @@
 ## D-023 — Split-kernel Turbo4/QSA: decompress kernel separate from attention
 **Status:** implemented | Avoids ptxas host-RAM explosion (70 GiB); `block_n=32`, `num_stages=1`.
 
+## D-024 — GGUF is the primary format for Qwen3.8 Flash-Next; native NVFP4-Radix kept as fallback only
+**Status:** accepted | GGUF TG 2.06x native at k1, 1.34x at k0 (native's +10% PP at 4K does not
+offset it). No further native specialization or 16K/3-repeat native runs planned. Campaign 2,
+`ft-campaign2/LEDGER.md`.
+
+## D-025 — `offload` is the default MoE strategy for this checkpoint; hybrid only by measured profile
+**Status:** accepted | GGUF hybrid measured 3.5x slower than offload (IQ3_S CPU kernel 8-11 GB/s
+bound + per-layer CPU/GPU handshake overhead), after fixing the per-layer format bug (7bbf2af).
+Hybrid stays available behind `--moe-strategy hybrid` / a future profile recommendation, never
+auto-selected without a measured win on this hardware.
+
+## D-026 — `ft bench bw` hybrid-vs-offload threshold (2.0x CPU/PCIe bandwidth ratio) retained as-is
+**Status:** accepted | Calibrated against end-to-end measurements, not bandwidth alone (bandwidth
+predicts a hybrid win at 61 > 53.6 GB/s aggregate; measured e2e is -71%, so per-layer launch
+latency dominates raw bandwidth). Consistent with every measured e2e point: GGUF hybrid -71%,
+native hybrid historic +3%.
+
+## D-027 — Deferred spec-decode replay kept; `FREETOKEN_SPEC_DEFER_REPLAY=0` stays a fallback, not default-off
+**Status:** accepted | Bisected to a cuBLAS bf16 non-row-independence property (M=1 vs M>=2 differ
+by up to 2.4e-3), not a defer-specific error class — deferred replay's KL stays within the same
+envelope as ordinary verify windows. `FREETOKEN_SPEC_DEFER_REPLAY=0` remains available for
+debugging/isolation, not required for correctness.
+
+## D-028 — Tuning profiles are keyed by GPU UUID + model + KV format + context bucket + version/kernel source; explicit flags always win
+**Status:** accepted | `ft tune` (af3dcdf) persists per-machine winners under this key; a stale key
+is ignored rather than trusted. The launcher only fills flags the user left unset; `--spec-mtp`
+left unset resolves from the stored profile, an explicit `--spec-mtp` value is never overridden.
+
 ---
 
 **Referência completa:** `old/docs/freetoken-next/DECISIONS.md` (D-001 a D-023 detalhados com rationale, alternativas, file:line).

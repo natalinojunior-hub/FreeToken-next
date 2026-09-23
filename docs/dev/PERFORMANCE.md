@@ -260,6 +260,115 @@ Rejected with evidence: LFU and ghost-admission expert caches (miss 0.38-0.48 vs
 NVFP4 hybrid gave only +3%); MTP draft in a CUDA graph (illegal access on replay, unresolved).
 Contexts above 16K were not run: the >100 TG gate was not met.
 
+## Campaign 2 (2026-09-23): cold-bench contract, FTW vs GGUF, correctness, hybrid, auto-config
+
+Base commit ea8ae8a; commits ea8ae8a..HEAD: 86eae99 (`cache_prompt:false` honored), a102c14
+(teacher-forced logit dump), cd8cbe3 (AVX-512 CPU GGUF expert kernels, per-bank formats), 211efb6
+(determinism fix), a8a1b6c (verify-window equality tests), af3dcdf (`ft tune` persisted profiles,
+`ft bench bw` GGUF coverage), 7bbf2af (hybrid per-layer format fix), 7a297f7 (unset `--spec-mtp`
+resolves from the `ft tune` profile). Model: Qwen3.8 Flash-Next, native
+NVFP4-Radix vs GGUF Unsloth-IQ4_XS. Harness: `/models/desenvolvimento/ft-campaign2/bench.sh`
+(one boot, 1 warmup + REPS requests, peak VRAM/RSS, refuses to start if GPU >500 MiB used or
+port busy). Full workstream ledger: `/models/desenvolvimento/ft-campaign2/LEDGER.md`.
+
+**Cold-bench contract.** `coldclient.py` sends `cache_prompt:false` + a unique `[run N]` prefix
+per request so the radix cache cannot serve a cached/reused prefix; `ft-campaign2/coldclient.py`
+also reports processed-token counts via `--enable-cache-report` usage field. Test:
+`tests/scheduler/test_cache_prompt_cold.py`.
+
+**Native NVFP4 vs GGUF, 4K cold (one boot each, cold prompts; native runs predate 211efb6, which
+only touches the GGUF dequant-combine path):**
+
+| Config | TG (tok/s) | Cold PP (tok/s) | Peak VRAM |
+|---|---|---|---|
+| Native NVFP4-Radix, k0 | 30.30 | 1624 | 15770 MiB |
+| Native NVFP4-Radix, k1 (MTP) | 21.72 (below its own k0) | 1630 | 15836 MiB |
+| GGUF IQ4_XS, k1 (clean control, 4K, after 211efb6) | 40.48 | 1475 | 15842 MiB (slots 2886) |
+| GGUF IQ4_XS, k1 (15.7K occupied, after 211efb6) | 43.39 | 2074 | 15842 MiB (slots 2886) |
+
+**Verdict: GGUF wins.** TG is 2.06x native at k1 and 1.34x at k0; native's +10% PP at 4K does not
+offset the TG gap. Native is dominated end-to-end — kept only as a fallback, not specialized
+further (no 16K/3-repeat native runs run).
+
+**Hybrid (CPU+GPU) vs GPU offload, GGUF, k1:**
+
+| Config | 4K TG | 15.7K TG | Cold PP (4K / 15.7K) |
+|---|---|---|---|
+| Offload (default) | 40.48 | 43.39 | 1475 / 2086 |
+| Hybrid (`--moe-strategy hybrid`, fixed) | 11.72 | 16.30 | 1475 / 2086 (equal) |
+
+Hybrid is 3.5x slower than offload on this checkpoint — dominated. Root cause: 47/48 layers'
+gate_up experts are IQ3_S, whose AVX-512 CPU kernel only reaches 8-11 GB/s (latency-bound grid
+gather), well under PCIe gather bandwidth, plus per-layer CPU/GPU handshake overhead. First hybrid
+attempt produced garbage output (`"!!!!"`, NaN on minority-format layers) — see LESSONS.md; fixed
+in 7bbf2af (per-layer GGUF expert format resolution instead of one format per whole layer).
+Default is `offload`; hybrid is not recommended for this checkpoint.
+
+**`ft bench bw` bandwidth calibration** (`benchbw-gguf.json`, merged into
+`~/.cache/freetoken/benchbw/<gpu-uuid>.json`): CPU MoE alone 63 GB/s (nvfp4 AVX-512, historic) /
+per-format GGUF AVX-512 (`C2b-cpu-kernel-bench.txt`): Q8_0 70-93 GB/s, IQ4_XS 59-69 GB/s, IQ4_NL
+42-49 GB/s, IQ3_S 8-11 GB/s; PCIe gather alone 53 GB/s, overlapped CPU+PCIe 78 GB/s aggregate
+(1.47x PCIe alone). `iq3_s+iq4_nl` CPU 14.1 vs PCIe 53.6 GB/s (ratio 0.26) → recommends offload;
+`iq4_xs` 1.19x and `q8_0` 1.27x → recommends offload. This matches the measured end-to-end result
+(hybrid -71%): the bandwidth-only model over-predicts hybrid (aggregate 61 > 53.6 GB/s would
+suggest a win) because per-layer CPU handshake/launch latency dominates, not raw bandwidth — the
+2.0x threshold was kept (conservative, consistent with every measured end-to-end point so far:
+GGUF hybrid -71%, native hybrid historic +3%). Before af3dcdf, GGUF was not covered by
+`ft bench bw`'s `_offload_bank_specs()` (only `bf16`/`fp8_block`/`nvfp4`/`mxfp4_triton`/`ds_fp4`);
+af3dcdf added GGUF coverage by benching each layer's dominant (gate_up, down) K-quant/I-quant
+pair (`_split_gguf_fmt`/`gguf_bench_key`), so the hybrid-vs-offload decision now also runs for
+GGUF checkpoints through the normal auto-picker path, not only the standalone `--dtype` bench.
+
+**Auto-config (`ft tune`, D1/af3dcdf).** `ft tune --model <path> --ctx <n>` boots each candidate
+(MTP on/off, deferred replay on/off, offload vs hybrid) once, measures cold PP + committed TG +
+peak VRAM, and persists the winner to a profile keyed by GPU UUID, model checkpoint path, KV
+format, context-length bucket, and version/kernel source hash (a stale key is ignored, not
+trusted). The launcher applies the stored env-backed choices only for flags the user left unset;
+explicit CLI flags always win. `--spec-mtp` now sets `FREETOKEN_DISABLE_OVERLAP_SCHEDULING` itself
+instead of hard-failing at boot, and an unset `--spec-mtp` resolves from the stored profile
+(`_tuned_spec_mtp`, `server/args.py`, 7a297f7). **Not yet wired:** `moe_strategy` is stored in the
+profile but `server/args.py` does not yet read it back — the hybrid-vs-offload pick still comes
+only from the separate `ft bench bw` bandwidth-ratio heuristic, not this profile field.
+`_cpu_moe_executor_viable` (`engine.py:1759`) only gates the *automatic* CPU-residency heuristic
+(requires the checkpoint's dominant `(gate_up, down)` GGUF pair to match, i.e. `gate_up == down`);
+it does not block an explicit `--moe-strategy hybrid` — HY2 measured 11.72 tok/s hybrid TG on this
+mixed-format checkpoint, confirming the CPU executor does run, just slower than offload.
+
+**Determinism fix (211efb6).** Cold prefill was non-deterministic in-process: `_fused_experts_dequant`
+wrote its bf16 `index_add_` combine with non-fixed atomic order (per-expert rounding differed run
+to run), producing prefill last-row logit deltas of 2.8-3.8 and different output text across
+identical requests. Fixed by writing each (token, slot) row once and summing top-k in fixed order,
+fp32, matching the GEMV path's temp shape. After the fix: 3 identical cold prefills bitwise equal
+(same run repeated). Cold PP/TG vs the pre-fix recorded baselines: 4K improved 1386/38.45 →
+1476/40.48; 15.7K PP improved 1969 → 2074 while TG was flat-to-slightly-lower, 43.51 → 43.39 (noise
+band, not a regression). Slots dropped 2992→2886, attributed to 211efb6's fixed-order combine
+changing the temp buffer's memory shape (cause noted in the ledger, effect on capacity not
+separately quantified).
+
+**Reproducible commands:**
+
+```bash
+# cold-bench harness (bench.sh env vars; coldclient.py always uses cache_prompt:false)
+MODEL=/path/to/checkpoint CLIENT=cold PROMPT=prompt4k.txt CTX=16384 KV=turbo3 REPS=3 \
+  ft-campaign2/bench.sh LABEL [--moe-strategy offload|hybrid] [--spec-mtp 1]
+
+# per-format CPU MoE bandwidth bench (GGUF dtype tuning, not the offload auto-picker)
+ft bench bw --dtype iq3_s+iq4_nl,iq4_xs,q8_0
+
+# per-machine serve profile (measure + persist; --dry-run prints the candidate matrix only)
+ft tune --model /path/to/checkpoint --ctx 16384 --kv-format turbo3 --prompt-file prompt16k.txt
+```
+
+**>100 tok/s target: not met.** Frontier committed TG on this system is ~40-44 tok/s (GGUF, k1
+MTP, offload). Cost-model ledger for the k1 verify cycle (4K, ~40 ms/cycle total): draft 3.3 ms +
+verify 36.6 ms, of which ~16 ms is expert-miss copies (the zero-copy UVA gather kernel, PCIe-bound,
+serialized before the GEMM — no hit/miss overlap today, see C1 audit). Even a zero-copy miss path
+(copies eliminated entirely from the 36.6 ms verify cost) caps the cycle at ~24 ms → a zero-copy
+ceiling of about 75 tok/s at 1.8 tokens/cycle acceptance — still short of 100 tok/s; reaching >100
+needs copies **and** compute cut together, or more tokens/cycle (k2/k3).
+
+`ft tune` 16K (prompt16k, turbo3, 3 reps, matched argv, 6b84ae4): k0 TG 39.63 / PP 2093, k1 TG 39.29 / PP 2083 -> profile keeps k0 (k1 must beat it by 3%). Same workload in `ft-campaign2/bench.sh`: k1 43.39 vs k0 40.17 (+8%). At 4K cold k1 is below k0 in both harnesses. MTP's gain here is marginal and content-dependent; `--spec-mtp 1` stays an explicit opt-in. Profile at `~/.cache/freetoken/tune/<key>.json`; an unset `--spec-mtp` on a single-request server takes its choice.
+
 ## Referência Completa
 
 `old/docs/freetoken-next/PERFORMANCE.md` — Tabelas detalhadas por config/modelo, EXP-001 a EXP-045, metodologia, variáveis de controle.
