@@ -272,6 +272,13 @@ class OffloadMoELayer(MoELayer):
     # which kernel runs is decided afterwards, in ``_expert_gemm``.
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _trace_kind(hidden_states: torch.Tensor) -> str:
+        # MTP draft runs as a one-row prefill Batch; verify is multi-row prefill.
+        if hidden_states.shape[0] > 1:
+            return "verify"
+        return "draft" if get_global_ctx().batch.is_prefill else "decode"
+
     def _decode_routed(
         self,
         hidden_states: torch.Tensor,
@@ -296,7 +303,10 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
-        cache.ensure_experts(self.layer_id, topk_ids)
+        if cache.tracer is not None:
+            cache.ensure_experts(self.layer_id, topk_ids, kind=self._trace_kind(hidden_states))
+        else:
+            cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
         return self._expert_gemm(
             cache,

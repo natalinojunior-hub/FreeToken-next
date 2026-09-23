@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Iterator
 
 import torch
 from flashlib.kernels.slot_cache import N_STATS, Stat
+from freetoken.moe.trace import MoeTracer, _capturing
 
 # Fuse the per-bank expert copies into a single multi-bank launch (one per copy_missing
 # instead of one per bank). Set FREETOKEN_FUSED_COPY=0 to force the legacy per-bank path
@@ -354,6 +356,12 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        self.tracer = MoeTracer.from_env()
+        self._trace_kind = "decode"
+        self._trace_ids: list[int] | None = None
+        self._trace_pool_id: int | None = None
+        self._trace_evicted_ids: list[int] = []
+        self._trace_resident_rows = 0
 
     def _get_layer_quant_type(self, layer_id: int, role: str) -> str:
         if self.quant_format == "gguf" and self.gguf_expert_types is not None:
@@ -483,6 +491,8 @@ class OffloadMoeCache:
         self._build_copy_plan()
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+        if self.tracer is not None:
+            self.tracer.write_snapshot(self)
 
     def _build_copy_plan(self) -> None:
         self._build_fused_copy_plan()
@@ -1118,7 +1128,9 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
-    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+    def ensure_experts(
+        self, layer_id: int, expert_ids: torch.Tensor, *, kind: str = "decode"
+    ) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
         if self.collect_decode_freq:
@@ -1126,9 +1138,27 @@ class OffloadMoeCache:
             # slot ids in place), so snapshot the routing histogram before that happens.
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        trace_active = self.tracer is not None and not _capturing()
+        if trace_active:
+            self._trace_kind = kind
+            self._trace_ids = [int(i) for i in expert_ids.reshape(-1).tolist()]
+            self._trace_pool_id = self.pool_of_layer[layer_id]
+            pool_ids, _ = self.pool_state(layer_id)
+            before = [int(i) for i in pool_ids.tolist()]
+            if not self.tracer.initial_written:
+                self.tracer.write_initial_residency(
+                    [int(i) for i in self.id_of_slot.tolist()],
+                    [int(i) for i in self.usage.tolist()],
+                )
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
+        if trace_active:
+            pool_ids, _ = self.pool_state(layer_id)
+            after = [int(i) for i in pool_ids.tolist()]
+            after_set = {i for i in after if i >= 0}
+            self._trace_evicted_ids = sorted({i for i in before if i >= 0} - after_set)
+            self._trace_resident_rows = len(after_set)
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
@@ -1294,6 +1324,12 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        trace_active = self.tracer is not None and self._trace_ids is not None and not _capturing()
+        trace_start = time.perf_counter() if trace_active and self.device.type != "cuda" else None
+        trace_event = None
+        if trace_active and self.device.type == "cuda":
+            trace_event = torch.cuda.Event(enable_timing=True)
+            trace_event.record()
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 raise RuntimeError(
@@ -1304,6 +1340,7 @@ class OffloadMoeCache:
             for i, name in enumerate(self.bank_schema):
                 cache = self._layer_rows(layer_id, i, whole_layer=True)
                 cache[: self.num_experts].copy_(self.bank_sources[name][layer_id])
+            self._trace_copy_missing(layer_id, trace_event, trace_start)
             return
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
@@ -1316,6 +1353,7 @@ class OffloadMoeCache:
                 self.src_indices,
                 self.num_indices,
             )
+            self._trace_copy_missing(layer_id, trace_event, trace_start)
             return
 
         from freetoken.kernel import fast_index_copy_jit
@@ -1329,6 +1367,51 @@ class OffloadMoeCache:
                 self.src_indices,
                 self.num_indices,
             )
+
+        self._trace_copy_missing(layer_id, trace_event, trace_start)
+
+    def _trace_copy_missing(
+        self,
+        layer_id: int,
+        start_event: torch.cuda.Event | None,
+        start_time: float | None,
+    ) -> None:
+        if self.tracer is None or self._trace_ids is None:
+            return
+        if start_event is not None:
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record()
+            end_event.synchronize()
+            transfer_ms = start_event.elapsed_time(end_event)
+        else:
+            transfer_ms = (
+                (time.perf_counter() - start_time) * 1000 if start_time is not None else None
+            )
+        bank_bytes = {
+            name: self.bank_sources[name][layer_id][0].numel()
+            * self.bank_sources[name][layer_id][0].element_size()
+            for name in self.bank_schema
+        }
+        missing = int(self.num_indices.item())
+        available_vram = (
+            torch.cuda.mem_get_info(self.device)[0] if self.device.type == "cuda" else None
+        )
+        self.tracer.record(
+            kind=self._trace_kind,
+            layer_id=layer_id,
+            pool_id=self._trace_pool_id
+            if self._trace_pool_id is not None
+            else self.pool_of_layer[layer_id],
+            expert_ids=self._trace_ids,
+            missing=missing,
+            miss_bytes=missing * sum(bank_bytes.values()),
+            bank_bytes=bank_bytes,
+            evicted_ids=self._trace_evicted_ids,
+            resident_rows=self._trace_resident_rows,
+            transfer_ms=transfer_ms,
+            available_vram_bytes=available_vram,
+        )
+        self._trace_ids = None
 
 
 def iter_offload_moe_layers(model) -> Iterator:
