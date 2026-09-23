@@ -78,6 +78,7 @@ def chat_request_to_genspec(
             model_sampling=model_sampling,
             stop=req.stop,
             default_max_tokens=default_max_tokens,
+            cache_prompt=req.cache_prompt,
         ),
         chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),
@@ -596,6 +597,7 @@ def _resolve_sampling(
         model_sampling=model_sampling,
         stop=req.stop,
         default_max_tokens=default_max_tokens,
+        cache_prompt=req.cache_prompt,
     )
 
 

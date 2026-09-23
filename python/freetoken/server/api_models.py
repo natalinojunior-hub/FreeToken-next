@@ -90,6 +90,9 @@ class ChatCompletionRequest(BaseModel):
     function_call: Any | None = None
     logit_bias: dict[str, float] | None = None
     response_format: dict[str, Any] | None = None
+    # llama.cpp-style wire name, taken as-is. False forces a cold prefill (no prefix-cache
+    # reuse for this request); None/True leave the scheduler's normal cache matching in place.
+    cache_prompt: bool | None = None
 
     @model_validator(mode="after")
     def _sync_max_completion_tokens(self) -> "ChatCompletionRequest":
@@ -120,6 +123,9 @@ class CompletionRequest(BaseModel):
     suffix: str | None = None
     logit_bias: dict[str, float] | None = None
     response_format: dict[str, Any] | None = None
+    # llama.cpp-style wire name, taken as-is. False forces a cold prefill (no prefix-cache
+    # reuse for this request); None/True leave the scheduler's normal cache matching in place.
+    cache_prompt: bool | None = None
 
     @model_validator(mode="after")
     def _sync_max_completion_tokens(self) -> "CompletionRequest":

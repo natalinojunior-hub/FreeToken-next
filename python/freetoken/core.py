@@ -24,6 +24,12 @@ class SamplingParams:
     # Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Generation finishes when one
     # appears in the decoded output; the matched substring (and anything after) is trimmed.
     stop_strs: list[str] = field(default_factory=list)
+    # `cache_prompt: false` (llama.cpp-style wire name) -- force a cold prefill by skipping
+    # prefix-cache lookup for this request's prompt. Riding on SamplingParams because it is
+    # already threaded uncopied through TokenizeMsg -> UserMsg -> PendingReq -> Req; the request
+    # still inserts into the cache afterward (nothing else reads it during this pass), so later
+    # requests keep benefiting.
+    skip_prefix_cache: bool = False
 
     @property
     def is_greedy(self) -> bool:

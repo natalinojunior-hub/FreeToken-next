@@ -107,7 +107,14 @@ class CacheManager:
     def match_req(self, req: PendingReq) -> MatchResult:
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
-        ids = req.input_ids[: input_len - 1]
+        # cache_prompt: false -- match against an empty prefix so the request processes every
+        # prompt token instead of reusing a radix hit. The prefill still runs match_prefix (not
+        # a bespoke cold path) so cache insertion after generation is untouched, and later
+        # requests still reuse this one's KV.
+        if getattr(getattr(req, "sampling_params", None), "skip_prefix_cache", False):
+            ids = req.input_ids[:0]
+        else:
+            ids = req.input_ids[: input_len - 1]
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
 
