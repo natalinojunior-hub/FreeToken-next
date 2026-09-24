@@ -417,3 +417,4 @@ Campaign 12 audit (2026-09-24, HEAD `0e9d00c`, read-only, no GPU job): every >1%
 
 ## Campaign 13 (2026-09-24, `b5d4243`): engine fixes + existing-model qualification
 UD-IQ4_XS k0 4K anchor unchanged after fixes (TG 47.28, hash `3af3056b98c0`). KV format (UD, k0): 4K auto/turbo3/turbo4 TG 47.46/42.10/39.27; 16K 45.55/39.68/39.98 — turbo formats are a capacity lever, not speed. ISTA GSQ-RCO IQ3_XXS (existing file, Q2_0 support added): 4K PP 1651.5 / TG 59.06, 16K PP 2360.1 / TG 58.49, 5555 expert slots, 20/20 usage tasks. 16K chunk cap 4096: TG +3.4%, PP -34% (rejected). Ledger: `/models/desenvolvimento/ft-campaign2/campaign13/LEDGER.md`.
+MTP heads (campaign 13, cold graph-on): ISTA k1 16K sq8 TG 63.65 vs k0 58.49 (+8.8%, accept 86.8%); UD k1 16K sq8 49.27 vs 45.55 (+8.2%, 84.8%). ISTA 4K k1: Q4 heads 60.14 (+1.8%, 61.4%), Q8 heads 56.6 (-4%, 58.8%); k2 4K 42.78 (-28%). Acceptance depends on prompt content; usage eval after tokenizer fix: UD/AD/ISTA 20/20.

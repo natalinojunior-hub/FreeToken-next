@@ -8,4 +8,6 @@ Finding: 16K prefill transient (chunk 8192, 2.02 GiB) costs ~550 expert slots; s
 Decision: k0 stays default; k1 opt-in. No tests >16K until engine final. Engine stays universal (no model hardcoding).
 Decision: MTP standalone Q8 head = same bytes as shared-Q8_0 (no perf gain from fc_hidden tensor).
 Evidence: `/models/desenvolvimento/ft-campaign2/campaign13/LEDGER.md`.
-Next: MTP matrix (UD/AD/ISTA x 4 heads x k1/k2 x 4K/16K) via `campaign13/heads/`; pfeifferj split-metadata shards; prefill borrows expert arena; UD/AD usage eval post-fix; ISTA as default candidate after real-usage review.
+Done: usage eval post tokenizer fix: UD 20/20 (was 12/20), AD 20/20, ISTA 20/20.
+Done: MTP k1 16K: ISTA sq8 TG 63.65 (+8.8%, accept 86.8%), UD sq8 49.27 (+8.2%, 84.8%); 4K accept ~59-61%, Q4 heads best (+1.8%); k2 4K -28%.
+Next: `/models/desenvolvimento/ft-campaign2/campaign13/CODEX-CONTINUE.md` (MTP acceptance >75% at k1/k2/k3 per head/model, pfeifferj split shards, prefill borrows expert arena).
