@@ -382,3 +382,6 @@ Commits 787d796..14e0478; evidence in `ft-campaign2/RELATORIO.md` / `LEDGER.md`.
 ## Referência Completa
 
 `old/docs/freetoken-next/PERFORMANCE.md` — Tabelas detalhadas por config/modelo, EXP-001 a EXP-045, metodologia, variáveis de controle.
+## Campaign 7 (2026-09-23/24): matched cold GGUF controls
+
+Qwen3.8 Flash Next Unsloth IQ4_XS, RTX 5080, HEAD `437b5a6`, turbo3, 16K context, cold 4101-token prompt, zero prefix reuse, 256 output tokens: k0 36.60 TG/1456 PP; automatic k1 42.53 TG/1466 PP. Single observations, not replacement anchors. The 96-token graph trace measured 27.39 TG with synchronized counters/profiler and is diagnostic only. See `/models/desenvolvimento/ft-campaign2/campaign7/TRACE-ANALYSIS.md`. Later trace cycles averaged 0.847 GB misses; a conditional all-copy-removal model projects 70.47 tok/s under explicit assumptions. Y=2/Y=4 changed small dense kernels only; no end-to-end candidate was accepted.

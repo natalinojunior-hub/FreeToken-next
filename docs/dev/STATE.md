@@ -27,3 +27,5 @@ ledger and expert pool analysis under `/models/desenvolvimento/ft-campaign2/e1/`
 Next: evaluate a routing-compatible way to lower target-pool expert bytes per
 committed token. Use a 4K cost model before any implementation or GPU A/B.
 Do not retry unchanged LFU/ghost, CPU hybrid, or copy/compute overlap.
+- Campaign 7 (2026-09-24): matched cold IQ4_XS controls at HEAD `437b5a6` measured k0 36.60 TG/1456 PP and automatic k1 42.53 TG/1466 PP, with 4101 prompt tokens, zero prefix reuse, and 256 output tokens. k1 resolved profile `3528c0705928df183b3d878c`; 109/145 drafts accepted. One pair only; output hashes differ, no quality equivalence claim.
+- Opt-in graph trace used 96 output tokens, 57 SPEC cycles, and 8 profiled cycles. Later cycles averaged 0.847 GB expert misses; target/MTP totals were 55.394/1.467 GB. Synchronized profiler TG is diagnostic. Conditional removal of all later-cohort copies projects 70.47 tok/s under explicit assumptions, not a measurement or physical ceiling. Y=1/2/4 geometry changed only tiny dense kernels; production remains Y=1.
