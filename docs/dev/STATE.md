@@ -1,5 +1,11 @@
 # State — 2026-09-23
 
+## Current-head MTP bank audit — 2026-09-24
+
+At HEAD `ab7fe76`, Gate A is closed with no production change. CPU/metadata proof found the IQ4_XS MTP shard contains `blk.48.ffn_{gate,up,down}_exps.weight` (512 experts, GGML type 8). `qwen4_exp/gguf.py` derives block 48, appends it after target banks 0–47, and `ModelConfig.num_moe_layers=49` with `mtp_expert_bank=True`; `Qwen4ExpMTP` routes its MoE layer to bank 48. Focused proof: `tests/models/qwen4_exp/test_config.py` 23 passed. The old claim that MTP aliases target layer 0 is false on current HEAD. `weight.py` still has a stale explanatory comment saying draft expert tensors are skipped; the separate expert-source loader is the actual path.
+
+Gate B remains no-go for implementation. Current IQ4_XS decode calls `ggml_moe_a8_vec` twice per MoE layer (gate/up and down); large-prefill dequant reuse already exists. No current interval-union GPU event profiler covers this path, so there is no evidence for a safe >5% mechanism. Next distinct step is one matched cold 4K k0/k1 eager event profile before any kernel edit.
+
 ## MTP depth diagnostic handoff
 
 Production remains on k1; this diagnostic did not remeasure or change the production profile. Acceptance survivors: k1 31/63; k2 q1=27/54, q2=14/27; k3 q1=26/53, q2=13/26, q3=3/13. Expert misses per SPEC committed token (not all request tokens): k1/k2/k3 = 0.549/0.646/0.791 GB. Counters synchronize each cycle. Optimistic k2 cost is 55.27 ms versus a 48.8 ms break-even; k2+ is NO-GO. k4, k5, and 16K probes were not run for economic reasons. CPU coverage uses fake target/draft outputs, replay, and a scalar pool-slot control-flow fake; it does not prove Qwen/GDN/PLE numerical parity. EOS/cancel integration remains untested. Evidence: `/models/desenvolvimento/ft-campaign2/mtp-depth/k2-correctness.md` and `k2-correctness.log`. Current integrated validation record: `/models/desenvolvimento/ft-campaign2/mtp-depth/ci-final.log`; consult its recorded exit status. The CI result cited below is historical. Retain k1 and evaluate routing-compatible ways to lower target-pool expert bytes using the existing 4K cost model before implementation or GPU A/B.

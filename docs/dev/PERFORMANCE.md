@@ -1,5 +1,9 @@
 # PERFORMANCE — freetoken-next
 
+## 2026-09-24 current-head MTP-bank audit
+
+No performance result or production change. CPU metadata proof confirms the IQ4_XS draft bank is `blk.48`, loaded as bank 48 after target banks 0–47; focused config proof passed 23 tests. Gate B optimization is deferred pending interval-union CUDA events for matched cold 4K k0/k1. Existing source uses two inline `ggml_moe_a8_vec` calls per decode MoE layer; prefill dequant reuse is already present. Do not infer a TG gain from this source observation.
+
 **Todas as métricas em hardware real** (RTX 5080 15.51 GiB VRAM, SM120, 96 GB DDR5, NVMe). Source: `old/docs/freetoken-next/PERFORMANCE.md` (544 linhas).
 
 ---
