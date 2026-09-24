@@ -22,7 +22,9 @@ def main(path: str) -> None:
                 union += max(0.0, stop - cursor)
             cursor = max(cursor, stop)
         print(f"{label}: samples={len(intervals)} sum_ms={total:.3f} union_ms={union:.3f}")
-    print(f"event_count={data.get('event_count', 0)} record_overhead_ms={data.get('record_overhead_ms', 0.0):.3f}")
+    print(
+        f"event_count={data.get('event_count', 0)} record_overhead_ms={data.get('record_overhead_ms', 0.0):.3f}"
+    )
 
 
 if __name__ == "__main__":

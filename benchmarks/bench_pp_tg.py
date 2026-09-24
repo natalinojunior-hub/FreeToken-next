@@ -57,6 +57,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--decode", type=int, default=128, help="generated tokens per request")
     p.add_argument("--repeats", type=int, default=3, help="measured requests after warmup")
     p.add_argument("--warmups", type=int, default=2, help="untimed requests at full context")
+    p.add_argument(
+        "--fresh-server-each-repeat",
+        action="store_true",
+        help="restart server before every measured repetition (cold cache)",
+    )
+    p.add_argument(
+        "--token-trace",
+        default=None,
+        help="absolute JSONL path for the opt-in server token trace",
+    )
     p.add_argument("--prompt-file", default=os.environ.get("FREETOKEN_NEXT_PROMPT", DEFAULT_CORPUS))
     p.add_argument(
         "--prompt-file-exact",
@@ -548,6 +558,66 @@ def stop_server(proc) -> None:
     wait_process_exit(proc)
 
 
+def run_cold_repeats(args: argparse.Namespace, prompt: str) -> list[dict]:
+    """Run each measured request in a new server process and cache."""
+    rows: list[dict] = []
+    for index in range(args.repeats):
+        port = free_port()
+        origin = f"http://127.0.0.1:{port}"
+        tmp_dir = os.environ.get("TMPDIR", "/models/desenvolvimento/tmp")
+        os.makedirs(tmp_dir, exist_ok=True)
+        fd, log_path = tempfile.mkstemp(prefix="bench-pp-tg-", suffix=".log", dir=tmp_dir)
+        cmd = serve_cmd(args, port)
+        print(f"[bench] cold repeat {index + 1}/{args.repeats}: serve: {' '.join(cmd)}", flush=True)
+        env = dict(os.environ)
+        trace_path = None
+        if args.token_trace:
+            trace_path = str(Path(args.token_trace).resolve())
+            if args.repeats > 1:
+                trace_path = f"{trace_path}.{index + 1}"
+            env["FREETOKEN_TOKEN_TRACE"] = trace_path
+            print(f"[bench] token trace: {trace_path}", flush=True)
+        if any("--spec-mtp" in value for value in args.serve_args):
+            env["FREETOKEN_DISABLE_OVERLAP_SCHEDULING"] = "1"
+        with os.fdopen(fd, "wb") as log_f:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=env,
+            )
+            pump = threading.Thread(target=pump_output, args=(proc.stdout, log_f), daemon=True)
+            pump.start()
+            try:
+                wait_ready(origin, proc, log_path, args.server_timeout)
+                model_id = get_json(f"{origin}/v1/models")["data"][0]["id"]
+                row = one_run(origin, model_id, prompt, args, proc)
+                rows.append(row)
+                print(
+                    f"[bench] cold repeat {index + 1}/{args.repeats}: "
+                    f"PP {row['prefill_tok_s']:.1f} TG {row['decode_tok_s']:.2f}",
+                    flush=True,
+                )
+            finally:
+                stop_server(proc)
+                pump.join(timeout=10)
+        if trace_path:
+            trace_file = Path(trace_path)
+            if not trace_file.is_file() or trace_file.stat().st_size == 0:
+                die_with_log(f"token trace missing or empty: {trace_path}", log_path)
+            try:
+                records = [
+                    json.loads(line) for line in trace_file.read_text(encoding="utf-8").splitlines()
+                ]
+            except (OSError, json.JSONDecodeError) as exc:
+                die_with_log(f"invalid token trace {trace_path}: {exc}", log_path)
+            if not records or not all(isinstance(item.get("kind"), str) for item in records):
+                die_with_log(f"token trace has invalid schema: {trace_path}", log_path)
+        print(f"[bench] cold repeat log: {log_path}", flush=True)
+    return rows
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     prompt = (
@@ -555,6 +625,37 @@ def main(argv: list[str] | None = None) -> int:
         if args.prompt_file_exact
         else build_prompt_text(args.model, args.prompt_file, args.tokens, args.prompt_offset)
     )
+    if args.fresh_server_each_repeat:
+        rows = run_cold_repeats(args, prompt)
+        if not rows:
+            return 1
+        summary = {
+            "label": args.label,
+            "model": args.model,
+            "n": len(rows),
+            "prompt_tokens": rows[0]["prompt_tokens"],
+            "PP_mean": mean(rows, "prefill_tok_s"),
+            "PP_min": min(r["prefill_tok_s"] for r in rows),
+            "TG_mean": mean(rows, "decode_tok_s"),
+            "TG_min": min(r["decode_tok_s"] for r in rows),
+            "TTFT_mean": mean(rows, "ttft_ms"),
+            "itl_p50_mean": mean(rows, "itl_ms_p50"),
+            "itl_p95_mean": mean(rows, "itl_ms_p95"),
+            "vram_gib_mean": mean(rows, "vram_gib"),
+            "gpu_util_mean": mean(rows, "gpu_util_mean"),
+            "server_rss_gib_mean": mean(rows, "server_rss_gib"),
+            "kv_total_pages": rows[-1]["kv_total_pages"],
+            "output_sha1": rows[-1]["output_sha1"],
+            "runs": rows,
+        }
+        print(f"\n==== [{args.label}] {summary['prompt_tokens']} tok / {args.decode} gen ====")
+        print(f"  PP mean {summary['PP_mean']:9.1f} tok/s (min {summary['PP_min']:.1f})")
+        print(f"  TG mean {summary['TG_mean']:9.2f} tok/s (min {summary['TG_min']:.2f})")
+        print(f"  output hashes: {sorted({r['output_sha1'] for r in rows})}")
+        if args.json_out:
+            with open(args.json_out, "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(summary) + "\n")
+        return 0
     port = free_port()
     origin = f"http://127.0.0.1:{port}"
     tmp_dir = os.environ.get("TMPDIR", "/models/desenvolvimento/tmp")

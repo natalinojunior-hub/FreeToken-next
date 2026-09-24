@@ -19,7 +19,7 @@ CORRECTNESS → 16K/32K A/B → KEEP/REVERT → NEXT.
 | 12 | Phase 10 MTP + TurboKV fused verify | **done (D-022/023)** | Pillar 1 shipped (in-SRAM FP4 dequant in Triton QSA attend kernel); Pillar 2 shipped (zero-replay GDN step-by-step checkpoint rollback) |
 | 13 | Phase 8 D2D expert reuse | **done** | H2D bytes avoided vs sync cost, auto-enabled on Blackwell SM120 (`moe_prefill_hit_d2d`) |
 | 14 | Phase 5 tiered/paged RAM KV | **gated out for decode** | D-016: a full-context RAM tier costs 47-462 ms of PCIe per generated token (2.2-2.7 tok/s ceiling); keep RAM for pinned expert banks, PLE and *prefix* streaming into KV, and revisit only for a bounded-read (sparse/windowed) tier |
-| 15 | Adaptive MTP + full context governor UX (`--context auto`) | **done** | `AdaptiveMTPController` confidence-gated draft launch (top-1 prob ≥0.85), EMA smoothing, context-length heuristic fallback; legacy API compatible with tests |
+| 15 | Adaptive MTP + full context governor UX (`--context auto`) | **done** | context-length heuristic `resolve_adaptive_k`; `AdaptiveMTPController` confidence gate is unwired (campaign 9 no-go) |
 | 16 | 512K/1M certification (memory physics first) | **ready** | auto-extending RoPE table to `seq_override` positions without OOB table reads; testing deferred |
 | 17 | **Certification matrix green** (`benchmarks/cert_matrix.py`) | **ready** | Flash GGUF unblocked; dry-run validates all active rows |
 | 18 | Close the matrix gaps | **done** | shard joining + `qwen4exp` GGUF adapter + PLE-table mapping (unblocks Flash UD-IQ4_XS GGUF) |

@@ -17,12 +17,9 @@ import torch
 from freetoken.core import Batch, Req
 from freetoken.engine.graph import DRAFT_GRAPH_CHECK_ENV, SPEC_DEFER_MAX
 from freetoken.engine.spec import accept_drafts, spec_rollback_lengths
-from freetoken.scheduler.adaptive_mtp import (
-    AdaptiveMTPController,
-    AdaptiveMTPConfig,
-    resolve_adaptive_k,
-)
 from freetoken.message import DetokenizeMsg
+from freetoken.debug.token_trace import enabled as trace_enabled
+from freetoken.debug.token_trace import record as trace_token
 from freetoken.utils import init_logger
 
 if TYPE_CHECKING:
@@ -271,6 +268,15 @@ class SchedulerSpecMixin:
         finished_now = False
         with self.cache_manager.lazy_free_region():
             for offset, next_token in enumerate(tokens):
+                trace_token(
+                    kind="spec_commit",
+                    uid=req.uid,
+                    token_index=int(start_pos + offset),
+                    token_id=int(next_token),
+                    table_idx=req.table_idx,
+                    linear_slot_idx=req.linear_slot_idx,
+                    accepted_length=int(committed),
+                )
                 req.append_host(torch.tensor([next_token], dtype=req.input_ids.dtype))
                 committed += 1
                 req.cached_len = start_pos + offset
@@ -450,21 +456,26 @@ class SchedulerSpecMixin:
         r_prev = model.model._last_residual[-1:].clone()
         tok_prev = self.token_pool[req.table_idx, d - 1 : d]
 
-        # Confidence gating: run first draft step, check top-1 prob, skip if low confidence
         drafts: List[int] = []
-        controller = getattr(self, "_adaptive_mtp_controller", None)
         for i in range(k):
             # prepare_metadata (e.g. qsa_sparse) reads req.cached_len/device_len for
             # seqlens_k/extend_len; at i >= 1 the draft's own query must see its own prior
             # draft-step KV, which needs these advanced per step, not left at the entry value.
             req.cached_len, req.device_len = d - 1 + i, d + i
             r_prev, logits, tok_prev = self._draft_step(req, d - 1 + i, r_prev, tok_prev)
-            if i == 0 and controller is not None:
-                top1_prob = torch.softmax(logits, dim=-1).max().item()
-                if top1_prob < controller.config.min_draft_prob:
-                    req.cached_len, req.device_len = c0, d
-                    return False
             drafts.append(int(tok_prev.item()))
+            trace_token(
+                kind="spec_draft",
+                uid=req.uid,
+                cycle=int(d + i),
+                token_index=int(d - 1 + i),
+                token_id=drafts[-1],
+                draft_prob=(
+                    float(torch.softmax(logits.float(), dim=-1).max()) if trace_enabled() else None
+                ),
+                table_idx=req.table_idx,
+                linear_slot_idx=req.linear_slot_idx,
+            )
             self.token_pool[req.table_idx, d + i] = tok_prev
         req.cached_len, req.device_len = c0, d
         mark("draft_chain")
@@ -497,6 +508,30 @@ class SchedulerSpecMixin:
         sampled = out.next_tokens_cpu.tolist()[p:]
         accepted = accept_drafts(sampled, drafts)
         m = len(accepted)
+        verify_scores = None
+        verify_margins = None
+        if trace_enabled():
+            verify_logits = self.engine.last_batch_logits[p:].detach().float().cpu()
+            top_values, top_ids = torch.topk(verify_logits, k=2, dim=-1)
+            verify_scores = [
+                float(row[int(token)]) for row, token in zip(verify_logits.tolist(), sampled)
+            ]
+            verify_margins = (top_values[:, 0] - top_values[:, 1]).tolist()
+        trace_token(
+            kind="spec_verify",
+            uid=req.uid,
+            cycle=int(d),
+            speculative_position=int(p),
+            drafts=drafts,
+            sampled=sampled,
+            accepted=accepted,
+            accepted_length=int(m - 1),
+            selected_scores=verify_scores,
+            top2_ids=top_ids.tolist() if trace_enabled() else None,
+            top2_margin=verify_margins,
+            table_idx=req.table_idx,
+            linear_slot_idx=req.linear_slot_idx,
+        )
         logger.info(
             f"spec: k={k} p={p} m={m} accepted={m - 1}/{k} drafts={drafts} sampled={sampled}"
         )

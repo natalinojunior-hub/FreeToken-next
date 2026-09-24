@@ -251,3 +251,4 @@
 - **Dois `ft tune` 16K discordaram (MTP +11% vs +1.5%)** -> cada candidato recebia um nonce de prompt por tempo, então decodificava texto diferente (aceitação e misses de expert mudam com o texto) -> **fix:** f90a5e2 (prompts pareados por rep); tune8/tune9 reproduziram dentro de 0.6%.
 - **Perfil novo do `ft tune` ignorado no boot (spec_mtp=0)** -> `tune_cli` gravava `schema=1` fixo após o bump para 2 -> **fix:** 14e0478 (`Profile.schema` usa `SCHEMA_VERSION`).
 - **Boot OOM na validação do VRAM ledger** -> agente rodou pytest com testes CUDA na GPU durante o boot (260 MiB) -> **fix:** agentes sem GPU usam `CUDA_VISIBLE_DEVICES=""` em todo comando.
+- **Pacote `freetoken/debug` sem `__init__.py` importado por scheduler/spec** -> `[tool.setuptools.packages.find]` ignora diretórios sem `__init__.py`; só funcionava em install editável -> **fix:** adicionado `python/freetoken/debug/__init__.py`.

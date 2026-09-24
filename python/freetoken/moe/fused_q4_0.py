@@ -63,7 +63,11 @@ class _MoeEvents:
         try:
             torch.cuda.synchronize()
             intervals = [
-                {"label": label, "start_ms": self.anchor.elapsed_time(start), "end_ms": self.anchor.elapsed_time(end)}
+                {
+                    "label": label,
+                    "start_ms": self.anchor.elapsed_time(start),
+                    "end_ms": self.anchor.elapsed_time(end),
+                }
                 for label, start, end in self.items
             ]
             with open(self.path, "w", encoding="utf-8") as stream:
@@ -236,7 +240,8 @@ def fused_experts_gguf(
     # gate_up: [num_tokens*top_k, 2I] -> activation -> [num_tokens*top_k, I]
     if _MOE_EVENTS.path:
         gate_up = _MOE_EVENTS.record(
-            "gate_up", lambda: ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens)
+            "gate_up",
+            lambda: ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens),
         )
     else:
         gate_up = ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens)
@@ -244,10 +249,15 @@ def fused_experts_gguf(
     # down: each of the num_tokens*top_k intermediate rows uses its own expert id.
     if _MOE_EVENTS.path:
         out = _MOE_EVENTS.record(
-            "down", lambda: ggml_moe_a8_vec(inter, down_q, topk_ids, 1, int(down_quant_type), h, num_tokens * top_k)
+            "down",
+            lambda: ggml_moe_a8_vec(
+                inter, down_q, topk_ids, 1, int(down_quant_type), h, num_tokens * top_k
+            ),
         )
     else:
-        out = ggml_moe_a8_vec(inter, down_q, topk_ids, 1, int(down_quant_type), h, num_tokens * top_k)
+        out = ggml_moe_a8_vec(
+            inter, down_q, topk_ids, 1, int(down_quant_type), h, num_tokens * top_k
+        )
     out = out.reshape(num_tokens, top_k, h) * topk_weights.reshape(num_tokens, top_k, 1).to(
         out.dtype
     )

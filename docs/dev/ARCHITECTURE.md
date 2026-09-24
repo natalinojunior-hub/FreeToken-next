@@ -106,7 +106,7 @@ Spec Loop (per decode step):
 **Key Fixes (2026-09-20):**
 - **Warmup**: Removed `spec_logits_indices` to populate draft KV over full prefill window (was only last token)
 - **SHA1 Equivalence**: Decode replay for all accepted tokens ensures bit-identical output vs k=0 greedy baseline
-- **Adaptive Gating**: `AdaptiveMTPController` skips speculation when draft confidence < 0.85
+- **Adaptive Gating**: `AdaptiveMTPController` is not wired into the speculative loop; confidence gating was measured as a no-go (campaign 9).
 - **Residual Seeding**: `_last_residual` updated after commit from verify window's last accepted token
 
 **Current Optimal Config**: K=4 achieves 27.8 tok/s TG (baseline 30.0, -7%), PP 1732 tok/s, SHA1 `573a19610680` matches k=0.

@@ -21,6 +21,7 @@ from freetoken.message import (
     PromptAdmittedMsg,
     UserMsg,
 )
+from freetoken.debug.token_trace import record as trace_token
 from freetoken.utils import (
     init_logger,
     load_eos_token_ids,
@@ -392,6 +393,14 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
+                trace_token(
+                    kind="decode",
+                    uid=req.uid,
+                    token_index=int(req.device_len),
+                    token_id=next_token,
+                    table_idx=req.table_idx,
+                    linear_slot_idx=req.linear_slot_idx,
+                )
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
                 hit_length = not req.can_decode
