@@ -10,4 +10,5 @@ Decision: MTP standalone Q8 head = same bytes as shared-Q8_0 (no perf gain from 
 Evidence: `/models/desenvolvimento/ft-campaign2/campaign13/LEDGER.md`.
 Done: usage eval post tokenizer fix: UD 20/20 (was 12/20), AD 20/20, ISTA 20/20.
 Done: MTP k1 16K: ISTA sq8 TG 63.65 (+8.8%, accept 86.8%), UD sq8 49.27 (+8.2%, 84.8%); 4K accept ~59-61%, Q4 heads best (+1.8%); k2 4K -28%.
+Finding: MTP gap = PCIe: k1 verify misses 419 MB (hit 66%) vs k0 193 MB/token (hit 75.6%); +22% bytes per output token. Best: ISTA sq4 k1 16K 64.99 (+11.1%, accept 88.1%); k2/k3 16K 47.98/44.30.
 Next: `/models/desenvolvimento/ft-campaign2/campaign13/CODEX-CONTINUE.md` (MTP acceptance >75% at k1/k2/k3 per head/model, pfeifferj split shards, prefill borrows expert arena).
