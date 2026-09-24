@@ -1,11 +1,11 @@
-# State — 2026-09-24 (campaign 11 closed NO-GO; campaign 10 state at `git show 3f3ba92:docs/dev/STATE.md`)
+# State — 2026-09-24 (campaign 13 in progress; campaign 12/11 state at `git show 0e9d00c:docs/dev/STATE.md`)
 
-Anchor: cold graph-on k0 4096/256 UD-IQ4_XS: PP 1464.3, TG 47.24, hash `3af3056b98c0` (paired control, matches campaign 10), slots 3519.
-Done: Gate 1 byte model (no source change): LRU replay + measured dense MMVQ time vs Q8_0 — Q6_K 0.942, Q5_K 0.706, Q4_K 0.650.
-Ceilings: resident-expert reclaim +1.2..2.7% (reject); dense Q6_K +3.6% (reject); AD-4.27 experts +9.5..10.5%; dense Q5_K +11.5% (conversion not authorized).
-Done: Gate 3 AD-4.27 A/B (operator-authorized, order AD/UD/AD): TG 49.68/49.54 vs 47.24 = +4.97% mean, PP +8.5%, slots 4135, VRAM 14.82 GiB, RSS 79.0 GiB, hash `03a0b9bc7715` stable, 0 Tracebacks.
-Decision: NO-GO — gain not reproducibly >=5%; realized about half of the modeled ceiling; unlisted checkpoint with unmeasured IQ2_S quality. Quality gate and 15.7K skipped.
-Decision: k0 on UD-IQ4_XS stays default. No source change, `make ci` not required.
-Evidence: `/models/desenvolvimento/ft-campaign2/campaign11/GATE1.md` (sha256 `0d3e5f968cb2`), `ad-k0.json` `3d6db8592e8d`, `ud-k0.json` `709ddb30fcf9`, `ad-k0-r2.json` `dc8a82f539d5`.
-Lesson: byte-model ceilings from the k1 proxy trace overstate realized gain about 2x; discount before authorizing conversions.
-Next: only unexplored lever is dense Q5_K conversion (needs new qwen4exp converter + quality gate; expect well below its +11.5% ceiling). >100 tok/s: no measured path.
+Anchor: UD-IQ4_XS cold graph-on k0 4096/256: PP 1467, TG 47.28, hash `3af3056b98c0` (re-verified after `b5d4243`).
+Done (`b5d4243`): GGUF tokenizer control/user tokens atomic (chat prompts were corrupted: <think>/<tool_call> split); ggml Q2_0; tiled ssm_out input gather for 256-block types; split MTP head load; `find_gguf_tensor`.
+Done: ISTA GSQ-RCO IQ3_XXS loads: 4K TG 59.06 (+24.9%) PP 1651; 16K TG 58.49 (+28.4%) PP 2360; slots 5555; usage eval 20/20.
+Done: KV matrix — turbo3/turbo4 cost 11-17% TG at 4K/16K; capacity lever only. KV-in-RAM deferred until engine final.
+Finding: 16K prefill transient (chunk 8192, 2.02 GiB) costs ~550 expert slots; static chunk cap gives +3.4% TG but -34% PP (rejected).
+Decision: k0 stays default; k1 opt-in. No tests >16K until engine final. Engine stays universal (no model hardcoding).
+Decision: MTP standalone Q8 head = same bytes as shared-Q8_0 (no perf gain from fc_hidden tensor).
+Evidence: `/models/desenvolvimento/ft-campaign2/campaign13/LEDGER.md`.
+Next: MTP matrix (UD/AD/ISTA x 4 heads x k1/k2 x 4K/16K) via `campaign13/heads/`; pfeifferj split-metadata shards; prefill borrows expert arena; UD/AD usage eval post-fix; ISTA as default candidate after real-usage review.
