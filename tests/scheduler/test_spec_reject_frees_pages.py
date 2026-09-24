@@ -4,8 +4,9 @@ CacheManager, no engine."""
 
 from __future__ import annotations
 
-import torch
+from types import SimpleNamespace
 
+import torch
 from freetoken.core import Req, SamplingParams
 from freetoken.scheduler.cache import CacheManager
 from freetoken.scheduler.scheduler import Scheduler
@@ -296,8 +297,9 @@ def test_free_req_resources_clears_qsa_pool_and_snapshots():
 
 
 def test_idle_asserts_spec_snapshot_slots_empty():
-    import pytest
     from types import SimpleNamespace
+
+    import pytest
 
     page_table = torch.zeros(2, 32, dtype=torch.int32)
     cm = CacheManager(8, 4, page_table, "radix")
@@ -383,3 +385,160 @@ def test_flush_deferred_replays_feeds_every_pending_token_before_a_plain_decode(
     assert replays == [(0, 5, 1)]
     assert (pending.cached_len, pending.device_len) == (6, 7)
     assert (current.cached_len, current.device_len) == (6, 7)
+
+
+def test_run_spec_step_k2_rejection_and_acceptance_positions():
+    """Run the production k=2 scheduler path over deterministic CPU fakes."""
+    cases = (
+        ("reject0", [71, 80, 90], 1, 4, 5, 1, 2, 1, True, 71),
+        ("reject1", [50, 81, 90], 2, 5, 6, 2, 2, 1, False, 81),
+        ("all_accept", [50, 60, 90], 3, 6, 7, 0, 1, 1, False, 90),
+    )
+    for (
+        name,
+        sampled,
+        committed,
+        cached,
+        device,
+        replay_count,
+        qsa_count,
+        ple_count,
+        free_last_page,
+        pending,
+    ) in cases:
+        cm, page_table = _make(page_size=1, num_pages=16)
+        req = _req(0, prompt_len=4)
+        req.cached_len, req.device_len, req.output_len = 3, 4, 0
+        req.sampling_params = SamplingParams(max_tokens=16)
+        req.cache_handle = cm.prefix_cache.match_prefix(req.input_ids[:0]).cuda_handle
+        cm.allocate_paged([req])
+        draft_tokens = iter((50, 60))
+        draft_steps = []
+        replayed = []
+        slot_at_replay = []
+        qsa_restores = []
+        ple_restores = []
+        state_copies = []
+        token_pool = torch.zeros((2, 32), dtype=torch.int64)
+        token_pool[0, 3] = 7
+        model_state = SimpleNamespace(_last_residual=torch.zeros((1, 4)))
+        model = SimpleNamespace(
+            mtp=object(),
+            model=model_state,
+            config=SimpleNamespace(num_experts_per_tok=2),
+        )
+
+        class StatePool:
+            def __init__(self):
+                self.slot_value = torch.zeros(16, dtype=torch.int64)
+                self.slot_value[0] = 123
+
+            def has_slot_state(self, key):
+                return key == "ple_ngram_ctx"
+
+            def slot_state(self, _key):
+                return self.slot_value
+
+            def copy_from(self, src, dst):
+                state_copies.append((src, dst))
+                self.slot_value[dst] = self.slot_value[src]
+
+        pool = StatePool()
+        scheduler = SimpleNamespace(
+            spec_mtp=2,
+            device=torch.device("cpu"),
+            engine=SimpleNamespace(
+                model=model,
+                linear_state_pool=pool,
+                moe_offload_cache=None,
+                forward_batch=None,
+            ),
+            token_pool=token_pool,
+            cache_manager=cm,
+            decode_manager=SimpleNamespace(filter_reqs=lambda _reqs: None),
+            finished_reqs=set(),
+            eos_token_ids=set(),
+            toolcall_anchor_id=None,
+            _spec_eligible_req=lambda: req,
+            _flush_deferred_replays=lambda: None,
+            _snapshot_qsa_state=lambda _req: None,
+            _spec_snapshot_slot=lambda _req: 9,
+            _linear_slot=lambda _req: 0,
+            _restore_qsa_state=lambda _req: qsa_restores.append(name),
+            _restore_ple_state=lambda _req: ple_restores.append(name),
+            _draft_step=None,
+            _prepare_batch=None,
+            _checked_verify_forward=None,
+            _commit_spec_tokens=None,
+            _replay=None,
+            free_spec_snapshot_slot=lambda _req: None,
+            _match_stop_str=lambda _req: None,
+            send_result=lambda _messages: None,
+        )
+        # Keep preparation real enough to allocate the speculative pages and
+        # provide the same (row, position) mapping as the scheduler.
+        verify_pages = []
+
+        def prepare(batch):
+            cm.allocate_paged([req])
+            verify_pages[:] = page_table[0, 4:6].tolist()
+            batch.positions = torch.arange(3, 6, dtype=torch.int32)
+            return SimpleNamespace(
+                input_tuple=(torch.zeros(3, dtype=torch.long), torch.arange(3, 6)),
+                sample_args=None,
+            )
+
+        def forward(_batch, _sample_args):
+            pool.slot_value[0] = 888
+            model_state._last_residual = torch.arange(3, dtype=torch.float32).view(3, 1)
+            return SimpleNamespace(
+                next_tokens_cpu=torch.tensor(sampled),
+                next_tokens_gpu=torch.tensor(sampled),
+                copy_done_event=SimpleNamespace(synchronize=lambda: None),
+            )
+
+        def draft(_req, pos, residual, _token):
+            draft_steps.append((pos, _req.cached_len, _req.device_len))
+            pool.slot_value[0] = 900 + pos
+            return residual, torch.zeros((1, 2)), torch.tensor([next(draft_tokens)])
+
+        def replay(_req, start, count):
+            slot_at_replay.append(pool.slot_value[0].item())
+            replayed.append((start, count))
+            pool.slot_value[0] = 1000 + count
+
+        scheduler._draft_step = draft
+        scheduler._replay = replay
+        scheduler._snapshot_ple_state = lambda r: SchedulerSpecMixin._snapshot_ple_state(
+            scheduler, r
+        )
+        scheduler._restore_ple_state = lambda r: (
+            ple_restores.append(name),
+            SchedulerSpecMixin._restore_ple_state(scheduler, r),
+        )
+        scheduler._prepare_batch = prepare
+        scheduler.engine.forward_batch = forward
+        scheduler._checked_verify_forward = lambda *_args: None
+        scheduler._commit_spec_tokens = lambda r, tokens, **kwargs: (
+            SchedulerSpecMixin._commit_spec_tokens(scheduler, r, tokens, **kwargs)
+        )
+        scheduler.free_spec_snapshot_slot = lambda _req: None
+        scheduler.table_manager = TableManager(max_running_reqs=2, page_table=page_table)
+        ran = SchedulerSpecMixin.run_spec_step(scheduler)
+
+        assert ran, name
+        assert draft_steps == [(3, 3, 4), (4, 4, 5)], name
+        assert (req.cached_len, req.device_len) == (cached, device), name
+        assert req.device_len - req.cached_len == 1, name
+        assert token_pool[0, req.cached_len].item() == pending, name
+        assert replayed == ([(3, replay_count)] if replay_count else []), name
+        assert len(qsa_restores) == qsa_count, name
+        assert len(ple_restores) == ple_count, name
+        assert model_state._last_residual.item() == committed - 1, name
+        if replay_count:
+            assert slot_at_replay == [123], name
+        assert pool.slot_value[0].item() == (1000 + replay_count if replay_count else 888), name
+        if free_last_page:
+            assert verify_pages[1] in set(cm.free_slots.tolist()), name
+        else:
+            assert verify_pages[1] not in set(cm.free_slots.tolist()), name

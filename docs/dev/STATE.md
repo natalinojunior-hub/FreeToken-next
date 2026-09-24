@@ -1,5 +1,9 @@
 # State — 2026-09-23
 
+## MTP depth diagnostic handoff
+
+Production remains on k1; this diagnostic did not remeasure or change the production profile. Acceptance survivors: k1 31/63; k2 q1=27/54, q2=14/27; k3 q1=26/53, q2=13/26, q3=3/13. Expert misses per SPEC committed token (not all request tokens): k1/k2/k3 = 0.549/0.646/0.791 GB. Counters synchronize each cycle. Optimistic k2 cost is 55.27 ms versus a 48.8 ms break-even; k2+ is NO-GO. k4, k5, and 16K probes were not run for economic reasons. CPU coverage uses fake target/draft outputs, replay, and a scalar pool-slot control-flow fake; it does not prove Qwen/GDN/PLE numerical parity. EOS/cancel integration remains untested. Evidence: `/models/desenvolvimento/ft-campaign2/mtp-depth/k2-correctness.md` and `k2-correctness.log`. Current integrated validation record: `/models/desenvolvimento/ft-campaign2/mtp-depth/ci-final.log`; consult its recorded exit status. The CI result cited below is historical. Retain k1 and evaluate routing-compatible ways to lower target-pool expert bytes using the existing 4K cost model before implementation or GPU A/B.
+
 Doing: activation complete; expert-cache policy NO-GO. Evidence: Campaign 5
 ledger and expert pool analysis under `/models/desenvolvimento/ft-campaign2/e1/`.
 
