@@ -51,6 +51,8 @@ class EngineConfig:
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
+    # Opt-in only; capability checks must keep the all-VRAM path otherwise.
+    kv_tiering: str = "off"
     # Buy the serving context out of the expert cache instead of hand-tuning the floor above:
     # the plan funds max_seq_len of KV and sizes experts from what remains, and refuses with the
     # shortfall when that context is not affordable. Opt-in, because it trades decode speed for

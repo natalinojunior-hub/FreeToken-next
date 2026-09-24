@@ -716,6 +716,12 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-tiering",
+        choices=("off", "auto", "force"),
+        default=ServerArgs.kv_tiering,
+        help="KV RAM tiering mode; off keeps the all-VRAM path.",
+    )
+    parser.add_argument(
         "--kv-reserve-tokens",
         type=int,
         default=ServerArgs.kv_reserve_tokens,
