@@ -100,6 +100,21 @@ static __global__ void dequantize_block(const void* __restrict__ vx, dst_t* __re
   y[iybs + iqs + y_offset] = convert_from_half<dst_t>(v.y);
 }
 
+// FreeToken addition: Q2_0 packs 4 values/byte sequentially (not the split-half nibble
+// layout the generic dequantize_block<qk,qr,fn> template assumes), so it gets its own
+// one-thread-per-element kernel like the K-quants above.
+template <typename dst_t>
+static __global__ void dequantize_block_q2_0(const void* __restrict__ vx, dst_t* __restrict__ yy) {
+  const auto i = blockIdx.x;
+  const block_q2_0* x = (const block_q2_0*)vx;
+
+  const auto tid = threadIdx.x;  // 0..63, one thread per output element
+  const uint8_t q = (x[i].qs[tid / 4] >> (2 * (tid % 4))) & 0x03;
+
+  dst_t* y = yy + i * QK2_0;
+  y[tid] = convert_from_half<dst_t>(__hmul(x[i].d, __int2half_rn((int)q - 1)));
+}
+
 template <typename dst_t>
 static __global__ void dequantize_block_q2_K(const void* __restrict__ vx, dst_t* __restrict__ yy) {
   const auto i = blockIdx.x;
@@ -453,6 +468,12 @@ dequantize_block_cuda(const void* __restrict__ vx, dst_t* __restrict__ y, const 
 }
 
 template <typename dst_t>
+static void dequantize_row_q2_0_cuda(const void* vx, dst_t* y, const int k, cudaStream_t stream) {
+  const int nb = k / QK2_0;
+  dequantize_block_q2_0<<<nb, QK2_0, 0, stream>>>(vx, y);
+}
+
+template <typename dst_t>
 static void dequantize_row_q2_K_cuda(const void* vx, dst_t* y, const int k, cudaStream_t stream) {
   const int nb = k / QK_K;
   dequantize_block_q2_K<<<nb, 64, 0, stream>>>(vx, y);
@@ -539,6 +560,8 @@ static void dequantize_row_iq4_xs_cuda(const void* vx, dst_t* y, const int k, cu
 template <typename dst_t>
 static to_cuda_ggml_t<dst_t> ggml_get_to_cuda(int64_t type) {
   switch (type) {
+    case 42:
+      return dequantize_row_q2_0_cuda;
     case 2:
       return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
     case 3:

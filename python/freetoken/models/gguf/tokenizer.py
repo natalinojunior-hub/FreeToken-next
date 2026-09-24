@@ -51,7 +51,7 @@ _STOP_TOKENS: dict[str, tuple[str, ...]] = {
 
 
 def load_gguf_tokenizer(model_path: str):
-    from transformers import PreTrainedTokenizerFast
+    from transformers import AddedToken, PreTrainedTokenizerFast
     from transformers.integrations.ggml import convert_gguf_tokenizer
 
     meta = load_gguf_metadata(model_path)
@@ -83,6 +83,17 @@ def load_gguf_tokenizer(model_path: str):
         eos_token=turn_end or tok_for("eos_token_id", "<eos>"),
         unk_token=tok_for("unknown_token_id", "<unk>"),
         pad_token=tok_for("padding_token_id", "<pad>"),
+    )
+    # CONTROL (3) and USER_DEFINED (4) vocab entries (<think>, <tool_call>, <|vision_start|>,
+    # ...) must tokenize atomically, as llama.cpp parses them; otherwise a rendered chat
+    # prompt splits them into plain text pieces. They already have ids, so nothing is appended.
+    types = tok_dict.get("token_type") or ()
+    tokenizer.add_tokens(
+        [
+            AddedToken(tokens[i], special=t == 3, normalized=False)
+            for i, t in enumerate(types)
+            if t in (3, 4)
+        ]
     )
     chat_template = meta.get("tokenizer.chat_template")
     if chat_template:

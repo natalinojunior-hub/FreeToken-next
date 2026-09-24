@@ -535,6 +535,51 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
 #endif
 }
 
+// FreeToken addition: Q2_0 MMVQ dot product. block_q2_0 is QK2_0(=64)-wide, twice the
+// width of one q8_1(=32) activation block, so `bq8_1` here points at the first of a
+// *pair* of consecutive q8_1 blocks (mirrors how q4_K/q5_K index into a multi-q8_1
+// array via bq8_1[...]). iqs is a plain int-index into qs (0..QI2_0-1); each unit steps
+// 4 bytes (16 packed 2-bit values). A scalar loop is used instead of the dp4a-packed
+// SIMD tricks the split-half types use above -- q2_0's 4-values/byte layout does not
+// share their nibble structure, and this keeps the (CUDA-unverified in this change)
+// math easy to check by inspection against dequantize_row_q2_0.
+#define VDR_Q2_0_Q8_1_MMVQ 1
+
+static __device__ __forceinline__ float
+vec_dot_q2_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
+  const block_q2_0* bq2_0 = (const block_q2_0*)vbq;
+
+  // iqs*4 is the byte offset into qs; that spans elements [iqs*16, iqs*16+16), which is
+  // wholly inside q8_1 sub-block (iqs/2), at local offset (iqs%2)*16 within it.
+  const int sub_block = iqs / 2;
+  const int local0 = (iqs % 2) * 16;
+
+  const uint8_t* qs = bq2_0->qs + iqs * 4;
+  const int8_t* y = bq8_1[sub_block].qs + local0;
+
+  int sumi = 0;
+  int ysum = 0;
+#pragma unroll
+  for (int b = 0; b < 4; ++b) {
+    const uint8_t byte = qs[b];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const int q = (byte >> (2 * k)) & 0x03;
+      const int yi = y[b * 4 + k];
+      sumi += q * yi;
+      ysum += yi;
+    }
+  }
+
+  const float d2_0 = __half2float(bq2_0->d);
+  const float d8 = __low2float(bq8_1[sub_block].ds);
+
+  // q2_0 values are (q - 1) * d2_0; sumi*d8 is dot(q, y*d8) and ysum*d8 is the exact
+  // (per-chunk, not block-wide) offset correction -- no need for q8_1's precomputed
+  // block sum (ds.y) since y[] is already in hand.
+  return d2_0 * d8 * (sumi - ysum);
+}
+
 static __device__ __forceinline__ float
 vec_dot_q4_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
   const block_q4_0* bq4_0 = (const block_q4_0*)vbq;

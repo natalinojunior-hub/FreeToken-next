@@ -77,6 +77,18 @@ static void launch_mul_mat_vec_q(
 }
 
 template <typename scalar_t>
+static void mul_mat_vec_q2_0_q8_1_cuda(
+    const void* vx,
+    const void* vy,
+    scalar_t* dst,
+    const int ncols,
+    const int nrows,
+    const int nvecs,
+    cudaStream_t stream) {
+  launch_mul_mat_vec_q<scalar_t, QK2_0, QI2_0, block_q2_0, VDR_Q2_0_Q8_1_MMVQ, vec_dot_q2_0_q8_1>(vx, vy, dst, ncols, nrows, nvecs, stream);
+}
+
+template <typename scalar_t>
 static void mul_mat_vec_q4_0_q8_1_cuda(
     const void* vx,
     const void* vy,

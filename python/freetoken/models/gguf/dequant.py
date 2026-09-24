@@ -9,11 +9,11 @@ This module serves two purposes:
 
 2. **Pure-torch reference dequantizers** (CPU/test path): The :func:`dequantize` function
    and helper ``dequant_*`` routines materialize F32/F16 tensors at load (norms, scales,
-   router) and cross-check CUDA kernels in tests. These implement only Q4_0 and Q6_K;
-   the missing types are handled by the CUDA kernels in production.
+   router) and cross-check CUDA kernels in tests. These implement only Q2_0, Q4_0, and
+   Q6_K; the missing types are handled by the CUDA kernels in production.
 
-``BLOCK_SHAPE`` covers all 21 types (F32, F16, BF16, STD_K, IQ); ``dequantize()`` and
-``_DEQUANT`` cover Q4_0 and Q6_K only.
+``BLOCK_SHAPE`` covers all 22 types (F32, F16, BF16, STD_K, IQ, Q2_0); ``dequantize()``
+and ``_DEQUANT`` cover Q2_0, Q4_0, and Q6_K only.
 
 Each ``dequant_*`` takes raw little-endian bytes as a ``uint8`` tensor whose final axis
 spans whole blocks, and returns values in *storage order* (ggml's fastest axis first);
@@ -27,6 +27,7 @@ import torch
 # ggml_type enum values. Mirrors the ggml.h enum in llama.cpp.
 GGML_F32 = 0
 GGML_F16 = 1
+GGML_Q2_0 = 42
 GGML_Q4_0 = 2
 GGML_Q4_1 = 3
 GGML_Q5_0 = 6
@@ -53,6 +54,7 @@ GGML_BF16 = 30
 BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_F32: (1, 4),
     GGML_F16: (1, 2),
+    GGML_Q2_0: (64, 18),
     GGML_Q4_0: (32, 18),
     GGML_Q4_1: (32, 20),
     GGML_Q5_0: (32, 22),
@@ -78,6 +80,7 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
 GGML_NAME = {
     GGML_F32: "F32",
     GGML_F16: "F16",
+    GGML_Q2_0: "Q2_0",
     GGML_Q4_0: "Q4_0",
     GGML_Q4_1: "Q4_1",
     GGML_Q5_0: "Q5_0",
@@ -104,6 +107,7 @@ GGML_NAME = {
 # Mirrors switch (type) in ggml_get_to_cuda (dequantize.cuh:541)
 DEQUANT_TYPES = frozenset(
     {
+        GGML_Q2_0,
         GGML_Q4_0,
         GGML_Q4_1,
         GGML_Q5_0,
@@ -129,6 +133,7 @@ DEQUANT_TYPES = frozenset(
 # Mirrors switch (type) in ggml_mul_mat_vec_a8 (gguf_kernel.cu:116)
 MMVQ_TYPES = frozenset(
     {
+        GGML_Q2_0,
         GGML_Q4_0,
         GGML_Q4_1,
         GGML_Q5_0,
@@ -171,6 +176,7 @@ MMQ_TYPES = frozenset(
 # Mirrors switch (type) in ggml_moe_a8_vec (gguf_kernel.cu:577)
 MOE_VEC_TYPES = frozenset(
     {
+        GGML_Q2_0,
         GGML_Q4_0,
         GGML_Q4_1,
         GGML_Q5_0,
@@ -247,6 +253,20 @@ def dequant_q4_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     return ((q - 8.0) * d).reshape(-1).to(out_dtype)
 
 
+def dequant_q2_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q2_0: per 64-elem block = fp16 scale ``d`` + 16 bytes of 2-bit codes;
+    ``w = (q - 1) * d`` (00=-1, 01=0, 10=+1, 11=+2). Sequential packing: byte
+    ``j//4`` holds element ``j`` in bits ``[2*(j%4) : 2*(j%4)+2]``.
+    """
+    raw = raw.reshape(-1, 18)
+    d = _f16_scales(raw, 0, 2)  # [N,1]
+    qs = raw[:, 2:18]  # [N,16] uint8
+    q = torch.empty((raw.shape[0], 64), dtype=torch.float32, device=raw.device)
+    for k in range(4):
+        q[:, k::4] = ((qs >> (2 * k)) & 0x03).to(torch.float32)
+    return ((q - 1.0) * d).reshape(-1).to(out_dtype)
+
+
 def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """Q6_K: 256-elem super-block = 128B low nibbles + 64B high 2-bits + 16 int8
     sub-scales + fp16 ``d``. Direct vectorization of ggml's two-half loop."""
@@ -284,13 +304,14 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
 
 
 _DEQUANT = {
+    GGML_Q2_0: dequant_q2_0,
     GGML_Q4_0: dequant_q4_0,
     GGML_Q6_K: dequant_q6_k,
 }
 
 
 def dequantize(raw: torch.Tensor, ggml_type: int, out_dtype: torch.dtype) -> torch.Tensor:
-    """Dequantize ``raw`` (uint8) in pure torch (Q4_0, Q6_K, F32/F16/BF16 only).
+    """Dequantize ``raw`` (uint8) in pure torch (Q2_0, Q4_0, Q6_K, F32/F16/BF16 only).
 
     This is the CPU reference path for loading norms and scales. The packed GPU path
     (GGUFLinear, GGUFEmbedding, expert banks) dequantizes all 21 types via CUDA kernels;
@@ -306,7 +327,7 @@ def dequantize(raw: torch.Tensor, ggml_type: int, out_dtype: torch.dtype) -> tor
     if fn is None:
         raise NotImplementedError(
             f"pure-torch dequant for ggml type {GGML_NAME.get(ggml_type, ggml_type)} "
-            f"not implemented (only Q4_0 and Q6_K supported in CPU path; "
+            f"not implemented (only Q2_0, Q4_0, and Q6_K supported in CPU path; "
             f"other types use CUDA kernels via GGUFLinear)"
         )
     return fn(raw, out_dtype)
@@ -315,6 +336,7 @@ def dequantize(raw: torch.Tensor, ggml_type: int, out_dtype: torch.dtype) -> tor
 __all__ = [
     "GGML_F32",
     "GGML_F16",
+    "GGML_Q2_0",
     "GGML_Q4_0",
     "GGML_Q4_1",
     "GGML_Q5_0",
@@ -344,6 +366,7 @@ __all__ = [
     "MOE_MMQ_TYPES",
     "GGML_UNQUANTIZED",
     "row_bytes",
+    "dequant_q2_0",
     "dequant_q4_0",
     "dequant_q6_k",
     "dequantize",

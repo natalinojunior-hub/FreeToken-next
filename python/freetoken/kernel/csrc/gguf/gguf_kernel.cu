@@ -89,7 +89,7 @@ torch::Tensor ggml_dequantize(
     auto to_cuda = ggml_get_to_cuda<scalar_t>(type);
     TORCH_CHECK(to_cuda != nullptr,
                 "ggml_dequantize: unsupported GGUF quant type ", type,
-                " (dequant kernels exist for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K-Q6_K/IQ2_XXS/"
+                " (dequant kernels exist for Q2_0/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K-Q6_K/IQ2_XXS/"
                 "IQ2_XS/IQ3_XXS/IQ1_S/IQ4_NL/IQ3_S/IQ2_S/IQ4_XS/IQ1_M)");
     to_cuda((void*)W.data_ptr(), (scalar_t*)DW.data_ptr(), m * n, stream);
   });
@@ -114,6 +114,10 @@ torch::Tensor ggml_mul_mat_vec_a8(
   DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_mul_mat_vec_a8", [&] {
     quantize_row_q8_1_cuda<scalar_t>((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, vecs, stream);
     switch (type) {
+      case 42:
+        mul_mat_vec_q2_0_q8_1_cuda<scalar_t>(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+        break;
       case 2:
         mul_mat_vec_q4_0_q8_1_cuda<scalar_t>(
             (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
@@ -192,7 +196,7 @@ torch::Tensor ggml_mul_mat_vec_a8(
         break;
       default:
         TORCH_CHECK(false, "ggml_mul_mat_vec_a8: unsupported GGUF quant type ", type,
-                    " (MMVQ kernels exist for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K-Q6_K/IQ2_XXS/IQ2_XS/"
+                    " (MMVQ kernels exist for Q2_0/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K-Q6_K/IQ2_XXS/IQ2_XS/"
                     "IQ3_XXS/IQ1_S/IQ4_NL/IQ3_S/IQ2_S/IQ4_XS/IQ1_M)");
     }
   });
@@ -575,6 +579,19 @@ torch::Tensor ggml_moe_a8_vec(
   DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_vec_a8", [&] {
     quantize_row_q8_1_cuda<scalar_t>((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream);
     switch (type) {
+      case 42:
+        moe_vec_q2_0_q8_1_cuda<scalar_t>(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)topk_ids.data_ptr(),
+            top_k,
+            tokens,
+            col,
+            row,
+            quant_X.stride(0),
+            stream);
+        break;
       case 2:
         moe_vec_q4_0_q8_1_cuda<scalar_t>(
             (void*)W.data_ptr(),
@@ -824,7 +841,7 @@ torch::Tensor ggml_moe_a8_vec(
         break;
       default:
         TORCH_CHECK(false, "ggml_moe_a8_vec: unsupported GGUF quant type ", type,
-                    " (MMVQ kernels exist for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K-Q6_K/IQ2_XXS/IQ2_XS/"
+                    " (MMVQ kernels exist for Q2_0/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K-Q6_K/IQ2_XXS/IQ2_XS/"
                     "IQ3_XXS/IQ1_S/IQ4_NL/IQ3_S/IQ2_S/IQ4_XS/IQ1_M)");
     }
   });

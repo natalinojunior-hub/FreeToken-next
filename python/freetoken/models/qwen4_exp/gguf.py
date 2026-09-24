@@ -220,12 +220,30 @@ def _ungroup_packed_cols(t, num_k_heads: int, num_v_per_k: int, head_dim: int) -
     if head_dim % block:
         raise NotImplementedError(
             f"{t.name}: V head of {head_dim} columns straddles {block}-element "
-            f"ggml type {t.ggml_type} blocks; un-tiling it needs a dense out_proj"
+            f"ggml type {t.ggml_type} blocks; use _tiled_input_perm instead"
         )
     head_bytes = head_dim // block * type_size
     packed = t.packed()
     rows = packed.reshape(t.rows, -1)
     return _ungroup_v(rows, 1, num_k_heads, num_v_per_k, head_bytes).reshape(packed.shape)
+
+
+def _straddles_blocks(ggml_type: int, head_dim: int) -> bool:
+    """A V head is not a whole number of ``ggml_type`` blocks (e.g. 128 in 256-wide K/I-quants)."""
+    from freetoken.models.gguf.dequant import BLOCK_SHAPE
+
+    return head_dim % BLOCK_SHAPE[int(ggml_type)][0] != 0
+
+
+def _tiled_input_perm(num_k_heads: int, num_v_per_k: int, head_dim: int) -> torch.Tensor:
+    """Index that reorders a grouped V activation into llama.cpp's tiled column order.
+
+    When the packed ``ssm_out`` cannot be un-tiled in place (``_straddles_blocks``), the weight
+    stays tiled and its input is permuted instead: ``W_tiled @ x[perm] == W_grouped @ x``.
+    """
+    n = num_k_heads * num_v_per_k * head_dim
+    grouped_to_tiled = _ungroup_v(torch.arange(n), 0, num_k_heads, num_v_per_k, head_dim)
+    return torch.argsort(grouped_to_tiled)
 
 
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
@@ -466,6 +484,12 @@ def convert_qwen4exp_to_gguf(model, config: ModelConfig, *, model_path: str) -> 
                 ],
             )
             swap_linear(layer.linear_attn, "out_proj", qt(layer_id, "ssm_out.weight"))
+            gdn = layer.linear_attn
+            if gdn.num_k_heads != gdn.num_v_heads and _straddles_blocks(
+                qt(layer_id, "ssm_out.weight"), gdn.head_v_dim
+            ):
+                # iter_gguf_weights keeps this out_proj tiled and supplies the input order
+                gdn.out_proj_in_perm = torch.empty(gdn.value_dim, dtype=torch.int64)
 
         layer.mlp.shared_expert.gate_up_proj = gguf_merged_or_plain(
             config.hidden_size,
@@ -684,6 +708,11 @@ def iter_gguf_weights(
             yield f"{base}.linear_attn.norm.weight", _to_bf16(t)
             continue
         if suffix == "ssm_out.weight":
+            if untile and _straddles_blocks(t.ggml_type, vD):
+                yield f"{base}.linear_attn.out_proj.qweight", t.packed()
+                perm = _tiled_input_perm(vK, vR, vD).to(device)
+                yield f"{base}.linear_attn.out_proj_in_perm", perm
+                continue
             w = _ungroup_packed_cols(t, vK, vR, vD) if untile else t.packed()
             yield f"{base}.linear_attn.out_proj.qweight", w
             continue
@@ -822,21 +851,18 @@ def load_ple_table_from_gguf(
     pin: bool = False,
 ):
     """Map the GGUF per_layer_token_embd.weight table directly via mmap without blowing host RAM."""
-    from freetoken.models.gguf.reader import _reader, gguf_shards
+    from freetoken.models.gguf.reader import find_gguf_tensor
     from .ple import GgufUVATable
 
-    shards = gguf_shards(model_path)
-    for shard_path in shards:
-        reader = _reader(shard_path)
-        for t in reader.tensors:
-            if t.name == "per_layer_token_embd.weight":
-                weight_t = torch.from_numpy(t.data)
-                return GgufUVATable(
-                    weight_t,
-                    quant_type=int(t.tensor_type),
-                    embed_dim=qwen4_args.ngram_head_dim,
-                )
-    raise ValueError(f"per_layer_token_embd.weight not found in GGUF shards for {model_path}")
+    found = find_gguf_tensor(model_path, "per_layer_token_embd.weight")
+    if found is None:
+        raise ValueError(f"per_layer_token_embd.weight not found in GGUF files for {model_path}")
+    t = found[1]
+    return GgufUVATable(
+        torch.from_numpy(t.data),
+        quant_type=int(t.tensor_type),
+        embed_dim=qwen4_args.ngram_head_dim,
+    )
 
 
 def iter_gguf_mtp_weights(
@@ -882,7 +908,12 @@ def iter_gguf_mtp_weights(
                 raw = _to_bf16(t, device=device)
                 hidden_dim = raw.shape[0]
                 yield "mtp.fc_embedding.weight", raw[:, :hidden_dim]
-                yield "mtp.fc_hidden.weight", raw[:, hidden_dim:]
+                # A split export stores the hidden half as its own nextn.fc_hidden tensor.
+                if raw.shape[1] > hidden_dim:
+                    yield "mtp.fc_hidden.weight", raw[:, hidden_dim:]
+                continue
+            if nextn_suffix == "fc_hidden.weight":
+                yield "mtp.fc_hidden.weight", _to_bf16(t, device=device)
                 continue
             if nextn_suffix == "enorm.weight":
                 yield "mtp.pre_fc_norm_embedding.weight", _plus_one_norm(t, device=device)

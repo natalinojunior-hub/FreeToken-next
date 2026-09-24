@@ -23,6 +23,16 @@ typedef struct {
   uint8_t qs[QK4_0 / 2];  // nibbles / quants
 } block_q4_0;
 
+// FreeToken addition: ggml GGML_TYPE_Q2_0 (id 42), added upstream after b2899.
+// 2.25 bpw: fp16 delta + 16 bytes of sequential 2-bit codes (4 values/byte).
+#define QK2_0 64
+#define QR2_0 4
+#define QI2_0 (QK2_0 / (4 * QR2_0))
+typedef struct {
+  half d;                 // delta
+  uint8_t qs[QK2_0 / 4];  // 2-bit quants, 4 per byte
+} block_q2_0;
+
 #define QK4_1 32
 #define QR4_1 2
 #define QI4_1 (QK4_1 / (4 * QR4_1))

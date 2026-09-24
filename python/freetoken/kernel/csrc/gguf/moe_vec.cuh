@@ -98,6 +98,22 @@ static void moe_vec_launch(
 }
 
 template <typename scalar_t>
+static void moe_vec_q2_0_q8_1_cuda(
+    const void* vx,
+    const void* vy,
+    scalar_t* dst,
+    const int* topk_ids,
+    const int top_k,
+    const int tokens,
+    const int ncols,
+    const int nrows,
+    const int token_stride,
+    cudaStream_t stream) {
+  moe_vec_launch<scalar_t, QK2_0, QI2_0, block_q2_0, VDR_Q2_0_Q8_1_MMVQ, vec_dot_q2_0_q8_1>(
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+}
+
+template <typename scalar_t>
 static void moe_vec_q4_0_q8_1_cuda(
     const void* vx,
     const void* vy,

@@ -25,11 +25,11 @@ to the GEMM because all parts read the same input: ``cat([x @ W1.T, x @ W2.T]) =
 2. **Small-batch quantized (batch <= 6, MMVQ types)**: GEMV kernel via ``ggml_mul_mat_vec_a8``.
 3. **Large-batch standard quants (MMQ types: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, K-quants)**: MMQ kernel
    via ``ggml_mul_mat_a8``.
-4. **Large-batch I-quants (IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, IQ1_M)**:
-   I-quants have MMVQ and dequant kernels but NO MMQ kernel. Prefill therefore falls back to
-   ``ggml_dequantize`` + plain torch matmul. This materializes a transient BF16 copy of the weight
-   (cost: ``out_features * in_features * 2 bytes``), which is a real tradeoff for memory-bound
-   prefill on large I-quant weights.
+4. **Large-batch I-quants and Q2_0 (IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS,
+   IQ1_M, Q2_0)**: these types have MMVQ and dequant kernels but NO MMQ kernel. Prefill therefore
+   falls back to ``ggml_dequantize`` + plain torch matmul. This materializes a transient BF16 copy
+   of the weight (cost: ``out_features * in_features * 2 bytes``), which is a real tradeoff for
+   memory-bound prefill on large weights of these types.
 
 TP is assumed to be 1 (the gemma4 GGUF path restricts to TP=1, like the HF path).
 """

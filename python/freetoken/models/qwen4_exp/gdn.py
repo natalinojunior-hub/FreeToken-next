@@ -106,6 +106,9 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
+        # Set by a loader whose out_proj columns stay in a different head order: the input is
+        # gathered through it first (see qwen4_exp.gguf._tiled_input_perm). None = identity.
+        self.out_proj_in_perm: torch.Tensor | None = None
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
         beta = b.sigmoid()
@@ -348,6 +351,8 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         out = self.norm.forward(core_out, z).reshape(total, -1)
+        if self.out_proj_in_perm is not None:
+            out = out.index_select(-1, self.out_proj_in_perm)
         return self.out_proj.forward(out)
 
 

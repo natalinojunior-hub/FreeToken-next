@@ -106,30 +106,28 @@ def source_from_safetensors(folder: str) -> PleRowSource:
 def source_from_gguf(path: str) -> PleRowSource:
     """Map the checkpoint's GGUF ``per_layer_token_embd.weight`` tensor in place."""
     from freetoken.models.gguf.dequant import row_bytes as calc_row_bytes
-    from freetoken.models.gguf.reader import _reader, gguf_shards
+    from freetoken.models.gguf.reader import find_gguf_tensor
 
-    shards = gguf_shards(path)
-    for shard_path in shards:
-        reader = _reader(shard_path)
-        for t in reader.tensors:
-            if t.name == "per_layer_token_embd.weight":
-                ne = [int(s) for s in t.shape]
-                embed_dim = ne[0]
-                rows = int(ne[1]) if len(ne) > 1 else 1
-                qtype = int(t.tensor_type)
-                r_bytes = calc_row_bytes(embed_dim, qtype)
-                return PleRowSource(
-                    paths=[shard_path],
-                    extent_file=[0],
-                    extent_base=[int(t.data_offset)],
-                    rows_per_extent=rows,
-                    row_bytes=r_bytes,
-                    row_stride=r_bytes,
-                    scale=1.0,
-                    quant_type=qtype,
-                    embed_dim=embed_dim,
-                )
-    raise ValueError(f"No 'per_layer_token_embd.weight' found in GGUF shards for {path}")
+    found = find_gguf_tensor(path, "per_layer_token_embd.weight")
+    if found is None:
+        raise ValueError(f"No 'per_layer_token_embd.weight' found in GGUF files for {path}")
+    shard_path, t = found
+    ne = [int(s) for s in t.shape]
+    embed_dim = ne[0]
+    rows = int(ne[1]) if len(ne) > 1 else 1
+    qtype = int(t.tensor_type)
+    r_bytes = calc_row_bytes(embed_dim, qtype)
+    return PleRowSource(
+        paths=[shard_path],
+        extent_file=[0],
+        extent_base=[int(t.data_offset)],
+        rows_per_extent=rows,
+        row_bytes=r_bytes,
+        row_stride=r_bytes,
+        scale=1.0,
+        quant_type=qtype,
+        embed_dim=embed_dim,
+    )
 
 
 def resolve_row_source(folder: str) -> PleRowSource:

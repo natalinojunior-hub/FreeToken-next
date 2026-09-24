@@ -50,6 +50,35 @@ import numpy as np
 import torch
 
 
+@functools.cache
+def _gguf_module():
+    """Import gguf-py, patching it to recognize GGML_TYPE_Q2_0 (id 42) if missing.
+
+    The installed gguf-py release predates ggml's Q2_0 type: ``GGUFReader`` eagerly
+    calls ``GGMLQuantizationType(raw_dtype)`` while parsing every tensor's info record
+    (see ``gguf_reader.py``), so a file merely *containing* a Q2_0 tensor fails to open
+    at all with a bare ``ValueError``, before any of our code sees a tensor type. Extend
+    the enum and its block-size table in place rather than vendoring/patching gguf-py,
+    or forcing a newer pin (Q1_0/Q2_0 are recent upstream additions).
+    """
+    import gguf
+    from gguf import constants as gguf_constants
+
+    if 42 not in {int(v) for v in gguf_constants.GGML_QUANT_SIZES}:
+        import enum
+
+        members = {e.name: int(e.value) for e in gguf_constants.GGMLQuantizationType}
+        members["Q2_0"] = 42
+        patched = enum.IntEnum("GGMLQuantizationType", members)
+        gguf_constants.GGMLQuantizationType = patched
+        gguf.GGMLQuantizationType = patched
+        gguf.gguf_reader.GGMLQuantizationType = patched
+        # (block_size, type_size): QK2_0=64 elements per block, 18 bytes/block (2-byte
+        # fp16 delta + 16 bytes of 2-bit codes) -- mirrors ggml-common.h block_q2_0.
+        gguf_constants.GGML_QUANT_SIZES[patched.Q2_0] = (64, 18)
+    return gguf
+
+
 def gguf_shards(path: str) -> list[str]:
     r"""Return the ordered list of shard paths given any shard's path (or a plain .gguf).
 
@@ -219,7 +248,7 @@ def write_metadata_gguf(source_gguf: str, dest_path: str) -> None:
     Validates by re-parsing: the copy must list zero tensors and expose the identical KV
     key set (the KV *bytes* are copied verbatim, so identical keys imply identical values).
     """
-    import gguf
+    gguf = _gguf_module()
 
     reader = gguf.GGUFReader(source_gguf)
     assert reader.tensors, f"{source_gguf}: no tensors to bound the KV section"
@@ -273,6 +302,33 @@ def _field_value(reader, name: str) -> Any:
     return field.contents()
 
 
+def find_gguf_tensor(model_path: str, name: str):
+    """``(shard_path, ReaderTensor)`` holding tensor ``name``, else ``None``.
+
+    Searches the model's own shards first, then sibling ``.gguf`` files in the same
+    directory: some exports ship a large table (e.g. a per-layer n-gram embedding) as a
+    separate sidecar file. Siblings are matched by the tensor they contain, not by name.
+    """
+    shards = gguf_shards(model_path)
+    first = resolve_gguf_path(model_path) or shards[0]
+    siblings = sorted(
+        p
+        for p in glob.glob(os.path.join(os.path.dirname(first), "*.gguf"))
+        if p not in shards and not os.path.basename(p).startswith(".")
+    )
+    for path in [*shards, *siblings]:
+        try:
+            reader = _reader(path)
+        except Exception:  # noqa: BLE001 -- an unrelated sibling must not break the load
+            if path in shards:
+                raise
+            continue
+        for t in reader.tensors:
+            if t.name == name:
+                return path, t
+    return None
+
+
 @functools.cache
 def _reader(model_path: str):
     """Get or create a GGUFReader for the given path, with shard validation.
@@ -284,7 +340,7 @@ def _reader(model_path: str):
 
     Uses mmap mode ('r') to avoid loading tensor data into RAM.
     """
-    import gguf
+    gguf = _gguf_module()
 
     # Use mmap mode to avoid loading tensor data into memory
     reader = gguf.GGUFReader(model_path, mode="r")
@@ -367,7 +423,7 @@ def iter_gguf_tensors(
     For multi-shard files, yields tensors from shard 1, then shard 2, ..., in order.
     Single-shard files take exactly the same code path (gguf_shards returns [path]).
     """
-    import gguf
+    gguf = _gguf_module()
 
     shard1_path = resolve_gguf_path(model_path)
     if shard1_path is None:
