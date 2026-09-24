@@ -1,13 +1,25 @@
 # State — 2026-09-23
 
-Doing: nothing (stopped by operator). Evidence: /models/desenvolvimento/ft-campaign2/{RELATORIO.md,LEDGER.md} (Campaigns 3-4).
-Done:
-- Block 1 (e42ac55): turbo3 KL 0.97 @4098 = cuBLAS bf16 M=1 vs M>=2 only; no state defect.
-- Block 2: hit/miss copy overlap NO-GO (gathers 19.3 ms vs routed GEMV 4.0 ms per k1 cycle).
-- Block 3 (841e8fa, 815f1eb): QSA replan bug fixed; MTP draft graph ON by default for qwen4_exp MTP k1 + verify graph (FREETOKEN_DRAFT_GRAPH=0 disables); +2.9% k1 TG (4K 41.65, 15.7K 44.60), identical output.
-- Tuning fixes: af2651d (default first on ties), f90a5e2 (paired prompts), 14e0478 (profiles written with current schema). 16K turbo3 profile = k1 + draft graph; restart without --spec-mtp uses it.
-- make ci 2103 passed at 14e0478.
-Decisions: tune profile schema 2 (old draft_graph=0 profiles invalid). Expert tracer (ft-campaign2/e1) archived unreviewed, not in tree.
-Next:
-1. Review/commit e1 tracer; one 4K cold trace (graphs off, not timed); e1/cachesim.py LRU vs byte-Belady vs candidates before coding any policy.
-2. >100 tok/s not met: cycle is PCIe-bound (~1 GB missed expert bytes per k1 cycle).
+Doing: activation complete; expert-cache policy NO-GO. Evidence: Campaign 5
+ledger and expert pool analysis under `/models/desenvolvimento/ft-campaign2/e1/`.
+
+- The final 16K GGUF/turbo3 schema-2 profile `3528c0705928df183b3d878c` selects
+  MTP k1 and the draft graph: 41.04 committed tok/s, cold PP 2077 tok/s.
+  A normal restart without `--spec-mtp` loaded k1 and captured verify/draft
+  graphs. `FREETOKEN_DRAFT_GRAPH=0` disables draft capture. Three schema-1
+  profiles with graph disabled remain invalid.
+- Commits `a96d22a` and `f75f717` add opt-in eager expert tracing and repair
+  the server readiness gate. Tracing is diagnostic, not a TG benchmark.
+- Actual 2,886-slot LRU misses: 137.57 GB over 149 cycles at 4K and 129.46 GB
+  over 145 cycles near 16K. Replay matches within 0.04%; hindsight Belady
+  saves 38-42% bytes but requires future routing. Fixed-budget pool shifts
+  increased 4K misses. No cache-policy change or production A/B followed.
+- Residual bottleneck: 0.89-0.92 GB expert misses and 17.8-18.4 ms copy per
+  k1 cycle. The optimistic Belady cost model reaches only about 50/55 tok/s
+  at 4K/16K; the >100 committed tok/s goal remains unmet.
+- Final integrated CI command: `TMPDIR=/models/desenvolvimento/tmp make ci`.
+  Its result is stored in `/models/desenvolvimento/ft-campaign2/e1/ci-final.log`.
+
+Next: evaluate a routing-compatible way to lower target-pool expert bytes per
+committed token. Use a 4K cost model before any implementation or GPU A/B.
+Do not retry unchanged LFU/ghost, CPU hybrid, or copy/compute overlap.
