@@ -1,5 +1,11 @@
 # State — 2026-09-23
 
+## Critical-path MoE profiling — 2026-09-24
+
+HEAD `f83ee23`. Prompt file SHA256 `645f46bf134e597f1f70697d699ea70a83bf9cbe615681dad2b5eca67fbbfcf`. Matched cold 4096-token, 32-token-output, eager (`--no-graph`) runs used separate fresh servers, identical flags and zero prefix reuse. Uninstrumented: k0 PP 1465.5, TG 38.48, VRAM 14.75 GiB, output `9b6cb430f2f6`; k1 PP 1466.5, TG 21.82, VRAM 14.72 GiB, output `28e97bbdceb2`.
+
+Opt-in `FREETOKEN_MOE_EVENTS` recorded CUDA events around the two existing decode `ggml_moe_a8_vec` calls without per-layer synchronization; one final collection occurred on termination. k0: 1488 gate/up + 1488 down samples, interval unions gate/up 34.860 ms and down 33.579 ms, record overhead 54.313 ms. k1: 1221 + 1221 samples, unions 59.887 ms and 58.992 ms, overhead 47.987 ms. Event totals are about 8.5% of k0 and 11.0% of k1 diagnostic decode wall time, with substantial injected overhead; they are attribution evidence only. The measured region is not the dominant end-to-end bottleneck. Existing current-head miss evidence remains about 0.847 GB per k1 cycle; no new cache policy was tested. Decision: NO-GO for kernel changes. Next action: add outer eager verify/draft/replay events or close the path; do not optimize MoE GEMV from this profile.
+
 ## Current-head MTP bank audit — 2026-09-24
 
 At HEAD `ab7fe76`, Gate A is closed with no production change. CPU/metadata proof found the IQ4_XS MTP shard contains `blk.48.ffn_{gate,up,down}_exps.weight` (512 experts, GGML type 8). `qwen4_exp/gguf.py` derives block 48, appends it after target banks 0–47, and `ModelConfig.num_moe_layers=49` with `mtp_expert_bank=True`; `Qwen4ExpMTP` routes its MoE layer to bank 48. Focused proof: `tests/models/qwen4_exp/test_config.py` 23 passed. The old claim that MTP aliases target layer 0 is false on current HEAD. `weight.py` still has a stale explanatory comment saying draft expert tensors are skipped; the separate expert-source loader is the actual path.

@@ -17,12 +17,80 @@ moe/expert_banks.py level.
 
 from __future__ import annotations
 
+import atexit
+import json
+import os
+import signal
+import time
+
 import torch
 
 from freetoken.layers.activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 from freetoken.models.gguf.dequant import GGML_Q4_0, MOE_VEC_TYPES
 
 _ACT = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
+
+
+class _MoeEvents:
+    """Opt-in CUDA event collector; one synchronization occurs at process exit."""
+
+    def __init__(self) -> None:
+        self.path = os.environ.get("FREETOKEN_MOE_EVENTS")
+        self.limit = int(os.environ.get("FREETOKEN_MOE_EVENTS_MAX", "4096"))
+        self.items: list[tuple[str, object, object]] = []
+        self.anchor = None
+        self.record_ns = 0
+
+    def record(self, label: str, fn: object) -> object:
+        if not self.path or len(self.items) >= self.limit or not torch.cuda.is_available():
+            return fn()
+        t0 = time.perf_counter_ns()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        if self.anchor is None:
+            self.anchor = torch.cuda.Event(enable_timing=True)
+            self.anchor.record()
+        start.record()
+        value = fn()
+        end.record()
+        self.record_ns += time.perf_counter_ns() - t0
+        self.items.append((label, start, end))
+        return value
+
+    def flush(self) -> None:
+        if not self.path or not self.items:
+            return
+        try:
+            torch.cuda.synchronize()
+            intervals = [
+                {"label": label, "start_ms": self.anchor.elapsed_time(start), "end_ms": self.anchor.elapsed_time(end)}
+                for label, start, end in self.items
+            ]
+            with open(self.path, "w", encoding="utf-8") as stream:
+                json.dump(
+                    {
+                        "event_count": len(intervals),
+                        "record_overhead_ms": self.record_ns / 1e6,
+                        "intervals": intervals,
+                    },
+                    stream,
+                )
+        except Exception:
+            return
+
+
+_MOE_EVENTS = _MoeEvents()
+atexit.register(_MOE_EVENTS.flush)
+
+
+def _flush_moe_events_on_term(signum: int, _frame: object) -> None:
+    _MOE_EVENTS.flush()
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+if _MOE_EVENTS.path:
+    signal.signal(signal.SIGTERM, _flush_moe_events_on_term)
 
 
 # From this many tokens (measured crossover, 512 experts x top-10) the GEMV kernel, which re-reads each expert's weights per routed
@@ -166,10 +234,20 @@ def fused_experts_gguf(
         )
 
     # gate_up: [num_tokens*top_k, 2I] -> activation -> [num_tokens*top_k, I]
-    gate_up = ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens)
+    if _MOE_EVENTS.path:
+        gate_up = _MOE_EVENTS.record(
+            "gate_up", lambda: ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens)
+        )
+    else:
+        gate_up = ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens)
     inter = act_fn(gate_up)
     # down: each of the num_tokens*top_k intermediate rows uses its own expert id.
-    out = ggml_moe_a8_vec(inter, down_q, topk_ids, 1, int(down_quant_type), h, num_tokens * top_k)
+    if _MOE_EVENTS.path:
+        out = _MOE_EVENTS.record(
+            "down", lambda: ggml_moe_a8_vec(inter, down_q, topk_ids, 1, int(down_quant_type), h, num_tokens * top_k)
+        )
+    else:
+        out = ggml_moe_a8_vec(inter, down_q, topk_ids, 1, int(down_quant_type), h, num_tokens * top_k)
     out = out.reshape(num_tokens, top_k, h) * topk_weights.reshape(num_tokens, top_k, 1).to(
         out.dtype
     )

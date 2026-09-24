@@ -1,5 +1,11 @@
 # PERFORMANCE — freetoken-next
 
+## 2026-09-24 critical-path attribution (HEAD `f83ee23`)
+
+Prompt SHA256: `645f46bf134e597f1f70697d699ea70a83bf9cbe615681dad2b5eca67fbbfcf`. Cold 4K/32-token eager pair, fresh server per arm, identical prompt and flags: k0 PP 1465.5/TG 38.48/VRAM 14.75 GiB; k1 PP 1466.5/TG 21.82/VRAM 14.72 GiB. Output hashes were stable per arm (`9b6cb430f2f6`, `28e97bbdceb2`).
+
+CUDA events around decode MoE gate/up and down recorded without per-layer synchronization. k0 unions: 34.860 ms gate/up, 33.579 ms down; 2976 events, 54.313 ms record overhead. k1 unions: 59.887 ms gate/up, 58.992 ms down; 2442 events, 47.987 ms overhead. The union totals are approximately 8.5% and 11.0% of their diagnostic decode wall times, respectively, and instrumentation materially changes timing. This does not support a >5% end-to-end MoE kernel optimization. Fetch/cache misses remain the measured residual (about 0.847 GB per k1 cycle from current trace evidence); no new policy was tested. Decision: NO-GO.
+
 ## 2026-09-24 current-head MTP-bank audit
 
 No performance result or production change. CPU metadata proof confirms the IQ4_XS draft bank is `blk.48`, loaded as bank 48 after target banks 0–47; focused config proof passed 23 tests. Gate B optimization is deferred pending interval-union CUDA events for matched cold 4K k0/k1. Existing source uses two inline `ggml_moe_a8_vec` calls per decode MoE layer; prefill dequant reuse is already present. Do not infer a TG gain from this source observation.
