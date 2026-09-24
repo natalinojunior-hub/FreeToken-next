@@ -1,10 +1,9 @@
-# State — 2026-09-24 (campaign 9 closed; prior full state at `git show 2ab0db9:docs/dev/STATE.md`)
+# State — 2026-09-24 (campaign 10 closed; campaign 9 state at `git show ee0283c:docs/dev/STATE.md`)
 
-Done: campaign 9 k1 economics closed NO-GO. Evidence `/models/desenvolvimento/ft-campaign2/campaign9/LEDGER.md`, PERFORMANCE.md last entry.
-Done: cold 4K/256 k1 traced run: hash `91e6de9c85b2`, 90/165 accepted; draft top-1 prob strongly predicts acceptance (<0.3: 23%, ≥0.9: 100%).
-Decision: confidence gate at p=0: oracle +4.8%, best realistic −1.3% vs k0 → NO-GO.
-Decision: per-segment k0/k1 switch oracle W=4 +5.1% with future knowledge, zero switch cost → NO-GO.
-Decision: +5% would need verify −4.5 ms (−14%); all remaining MoE/replay levers are recorded no-gos. k0 stays default.
-Decision: the `_adaptive_mtp_controller` gate in `spec.py` is dead (never instantiated) and unsafe (early return skips QSA/PLE/linear/residual restore). Left untouched because no gate ships.
-Uncommitted: opt-in token trace (`python/freetoken/debug/`, scheduler/spec hooks, bench `--token-trace`) + trace-only `draft_prob`; `make ci` not rerun.
-Next: k1 pays only with ≈68% acceptance → needs a better MTP head or a cheaper 2-row verify mechanism not yet on the no-go list.
+Done: Gate A — commit `9a640ef` removed dead unsafe `_adaptive_mtp_controller` branch in `spec.py`, landed opt-in token trace + bench `--token-trace`/`--fresh-server-each-repeat`, added `freetoken/debug/__init__.py`. `make ci` 2111 passed.
+Done: cold graph-on k0 4096/256 control: PP 1466.7, TG 47.28, VRAM 14.70 GiB, RSS 80.31 GiB, hash `3af3056b98c0`, slots 3519.
+Done: nsys attribution (TG 46.52, −1.6% overhead): per step 20.24 ms = gather 7.57 (PCIe ceiling ≈52 GB/s) + dense q8_0 5.16 (≈745 GB/s) + routed GEMV 1.79 + cuBLAS 1.23 + host gap 0.84 + rest.
+Decision: Gate C NO-GO — shared-expert/gather overlap ≈1.7% ceiling, host gap 4.1% max, others already no-go. No candidate, no A/B.
+Decision: decode is bus-bound (PCIe for missed experts, VRAM for dense q8_0). k0 stays default.
+Evidence: `/models/desenvolvimento/ft-campaign2/campaign10/ATTRIBUTION.md`, `nsys_decode.py`, `k0-nsys.sqlite`, PERFORMANCE.md last entry.
+Next: +5% needs fewer bytes per token — smaller expert/dense formats (needs authorized conversion) or better hit rate (no deployable policy known). No open engineering lever.
