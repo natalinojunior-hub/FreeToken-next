@@ -1,5 +1,5 @@
-# State — 2026-09-25 (campaign 18 done: 35B keeps KV bf16 in VRAM; triton split-K fix committed)
-DOING: waiting on operator: drop or keep uncommitted MVP zero-copy MHA RAM slab code (recommend drop; ledger keeps results).
+# State — 2026-09-25 (campaign 18 closed: fp8 KV auto for long-context full-attention MoE; campaign 19 prompt ready)
+DOING: nothing; operator runs campaign 19 in a new session: `prompt-campaign19-audit.md` (P0 MTP full test + per-stage optimization + overhead audit).
 DONE campaign 18: RAM tier for 35B measured NO-GO (PCIe-bound: 64K 27.7 vs 110 tok/s, bit-identical output). Turbo VRAM NO-GO for now (256K 31.5/34.8 vs bf16 69.7). Fixed triton decode fixed-8 split-K (`9e63d1d`): turbo 256K x4, triton = FlashInfer. Ledger `ft-campaign2/campaign18/LEDGER.md`.
 DONE campaign 18 phase 0 (commit `10eb9bc`, docs only): dense full attention reads all KV per decode step. PCIe H2D measured 56 GB/s. fp8 KV/token 10 KiB (35B, 10 KV layers) / 32 KiB (27B, 16 KV layers). Est. RAM tier TG: 35B ~29 vs 89 tok/s @128K, 27B ~13 vs 25 @64K -> NO-GO both, no code. Ledger `ft-campaign2/campaign18/LEDGER.md`; verdict in `docs/dev/KV_RAM_DESIGN.md`.
 DONE campaign 16: KV-in-RAM default `auto` for certified family (qwen4_exp via `ModelConfig.kv_ram_tier_certified`), commit `0288564`; ISTA fp8 RAM tier +3.3% @128K, +21.5% @256K vs VRAM, quality pass.

@@ -224,6 +224,10 @@ def _page_table_width(max_seq_len: int, page_size: int) -> int:
     return align_ceil(align_ceil(max_seq_len, page_size), 32)
 
 
+# Shortest context where fp8 KV measured faster than bf16 for a full-attention MoE (campaign 18).
+_FP8_KV_MIN_CONTEXT = 65536
+
+
 def _required_attn_types(model_config) -> frozenset[AttnType]:
     """Backend-driving attention types of this model, from the group-spec walk
     (single source shared with the pool factory and the KV cost model). getattr
@@ -2284,6 +2288,23 @@ def _adjust_config(config: EngineConfig):
         raise ValueError(
             "--dtype float16 with MXFP8 resident weights is unsupported (the "
             "W8A16 fold is only validated exact in bfloat16); use bfloat16."
+        )
+    specs_fn = getattr(model_config, "kv_cache_group_specs", None)
+    if (
+        getattr(config, "kv_format", "auto") == "auto"
+        and config.attention_backend == "auto"
+        and required_attn_types == frozenset({AttnType.FULL})
+        and getattr(model_config, "num_experts", 0)
+        and config.max_seq_len >= _FP8_KV_MIN_CONTEXT
+        and specs_fn is not None
+        and all(spec.head_dim % 128 == 0 for spec in specs_fn() if not spec.is_swa)
+    ):
+        # Measured (campaign 18, Tiel 35B MoE, dense full attention): fp8 KV reads half the
+        # bytes and frees VRAM for experts -- TG 64K +6%, 256K +30% vs bf16, quality intact
+        # (needle 64K/256K, usage 20/20); at 4K it costs 4%, so short contexts stay bf16.
+        override("kv_format", "fp8")
+        logger.info_rank0(
+            f"KV format auto -> fp8 (context {config.max_seq_len} >= {_FP8_KV_MIN_CONTEXT})"
         )
     if (
         getattr(config, "kv_format", "auto") in ("turbo3", "turbo4", "fp8", "nvfp4")
