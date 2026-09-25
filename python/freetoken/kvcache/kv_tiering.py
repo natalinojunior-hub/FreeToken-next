@@ -114,7 +114,11 @@ class KVPagePool:
         template = pages[0].host
         device = device or (pages[0].device.device if pages[0].device is not None else "cuda")
         for page in pages:
-            if page.host is None or page.host.shape != template.shape or page.host.dtype != template.dtype:
+            if (
+                page.host is None
+                or page.host.shape != template.shape
+                or page.host.dtype != template.dtype
+            ):
                 raise ValueError("KV pages require identical host backing")
             if page.device is not None and page.device.shape != template.shape:
                 raise ValueError("host/device page size mismatch")
@@ -211,6 +215,11 @@ class KVPagePool:
         if not ok:
             self.telemetry.rejected_replays += 1
         return ok
+
+    def can_replay_batch(self, batch: object) -> bool:
+        """Check an explicitly mapped batch; missing mapping fails closed."""
+        page_ids = getattr(batch, "kv_page_ids", None)
+        return page_ids is not None and self.can_replay(page_ids)
 
     def cancel(self, owner: str) -> None:
         for page in list(self.table._pages.values()):

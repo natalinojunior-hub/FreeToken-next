@@ -463,6 +463,10 @@ class GraphRunner:
             return batch.size <= self.max_graph_bs
         return self._is_verify(batch)
 
+    def attach_kv_replay_check(self, check: Callable[[Batch], bool] | None) -> None:
+        """Attach an explicit page-residency gate; ``None`` preserves legacy behavior."""
+        self.kv_replay_check = check
+
     def _replay_verify(self, batch: Batch) -> torch.Tensor:
         v = self.verify_graphs[batch.input_ids.shape[0]]
         v.copy_from(batch)

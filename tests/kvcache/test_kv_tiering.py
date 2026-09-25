@@ -49,6 +49,9 @@ def test_graph_replay_refuses_cold_pages_and_tracks_hits():
     assert pool.can_replay([0])
     assert pool.telemetry.cold_hits == 1
     assert pool.telemetry.rejected_replays == 1
+    batch = type("Batch", (), {"kv_page_ids": [0]})()
+    assert pool.can_replay_batch(batch)
+    assert not pool.can_replay_batch(type("Batch", (), {})())
 
 
 def test_eviction_round_trip_and_duplicate_claim():
