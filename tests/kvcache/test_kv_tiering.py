@@ -30,6 +30,16 @@ def test_pool_backpressure_and_cancel_cleanup():
     assert pool.table.get(1).residency is Residency.RESIDENT
 
 
+def test_close_requires_restart_cleanup():
+    pool = KVPagePool([page(0)], 1)
+    pool.prefetch(0, "r")
+    with pytest.raises(RuntimeError, match="owned pages"):
+        pool.close()
+    pool.evict(0, "r")
+    pool.close()
+    assert pool._free == []
+
+
 def test_wrong_position_or_backing_is_rejected():
     p = page(0)
     p.device = torch.zeros(4)

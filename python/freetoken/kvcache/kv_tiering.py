@@ -226,6 +226,16 @@ class KVPagePool:
             if page.owner == owner:
                 self.evict(page.page_id, owner)
 
+    def close(self) -> None:
+        """Release an idle pool; refuse shutdown while a request still owns a page."""
+        owned = [page.page_id for page in self.table._pages.values() if page.owner is not None]
+        if owned:
+            raise RuntimeError(f"cannot close KV pool with owned pages: {owned}")
+        if any(page.residency is not Residency.COLD for page in self.table._pages.values()):
+            raise RuntimeError("cannot close KV pool before asynchronous transitions finish")
+        self._slots.clear()
+        self._free.clear()
+
 
 class _nullcontext:
     def __enter__(self):
