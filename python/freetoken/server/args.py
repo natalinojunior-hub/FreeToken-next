@@ -717,6 +717,7 @@ def parse_args(
 
     parser.add_argument(
         "--kv-tiering",
+        "--kv-cache-ram",
         choices=("off", "auto", "force"),
         default=ServerArgs.kv_tiering,
         help="KV RAM tiering mode; off keeps the all-VRAM path.",
