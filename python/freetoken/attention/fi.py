@@ -140,6 +140,7 @@ class FlashInferBackend(BaseAttnBackend):
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
         self.graph_wrappers: Dict[int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = {}
+        self._verify_wrappers: Dict[int, object] = {}  # spec-verify window rows -> wrapper
         self.capture: FICaptureData | None = None
         self.last_event = torch.cuda.Event()
         self.last_event.record()
@@ -265,6 +266,7 @@ class FlashInferBackend(BaseAttnBackend):
         # long-lived workspace buffers. Lets init_capture_graph re-run after a cache rebuild.
         super().reset_capture()
         self.graph_wrappers = {}
+        self._verify_wrappers = {}
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
@@ -304,6 +306,34 @@ class FlashInferBackend(BaseAttnBackend):
         assert isinstance(metadata, FIMetadata)
         metadata.wrapper = self.graph_wrappers[bs]
         self._initialize_metadata_once(metadata)
+
+    def stage_verify(self, batch: Batch) -> None:
+        """Point a prepared one-request spec-verify (or MTP draft) window at a CUDA-graph
+        prefill wrapper whose indptr/indices live in static buffers, and plan it now: the
+        captured ``run`` then reads the current window's addressing on every replay."""
+        from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+
+        md = batch.attn_metadata
+        assert isinstance(md, FIMetadata) and len(batch.padded_reqs) == 1
+        rows = batch.input_ids.shape[0]
+        w = self._verify_wrappers.get(rows)
+        if w is None:
+            assert not torch.cuda.is_current_stream_capturing()
+            i32 = {"dtype": torch.int32, "device": self.device}
+            w = BatchPrefillWithPagedKVCacheWrapper(
+                self.float_workspace_buffer,
+                kv_layout="NHD",
+                use_cuda_graph=True,
+                qo_indptr_buf=torch.zeros(2, **i32),
+                paged_kv_indptr_buf=torch.zeros(2, **i32),
+                paged_kv_indices_buf=torch.zeros(get_global_ctx().page_table.shape[1], **i32),
+                paged_kv_last_page_len_buf=torch.ones(1, **i32),
+                backend="fa2",
+            )
+            w._int_workspace_buffer = self.int_workspace_buffer
+            self._verify_wrappers[rows] = w
+        md.wrapper, md.initialized = w, False
+        self._initialize_metadata_once(md)
 
     def prepare_for_replay(self, batch: Batch) -> None:
         metadata, bs = batch.attn_metadata, batch.padded_size
