@@ -273,12 +273,19 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     full_ids = tuple(i for i in range(num_layers) if (i + 1) % interval == 0)
     linear_ids = tuple(i for i in range(num_layers) if i not in set(full_ids))
 
+    # With a vision tower (mmproj), image tokens need 3-axis positions: the checkpoint's
+    # interleaved mrope sections (llama.cpp "imrope"), exactly as the HF path configures them.
+    # Text-only serving keeps plain rope (identical for 1-axis positions).
+    sections = shim.metadata.get("qwen4exp.rope.dimension_sections")
+    mrope = getattr(shim, "vision_config", None) is not None and sections is not None
     full_rotary = RotaryConfig(
         head_dim=head_dim,
         rotary_dim=rotary_dim,
         max_position=max_pos,
         base=rope_base,
         scaling=None,
+        mrope_section=[int(x) for x in sections[:3]] if mrope else None,
+        mrope_layout="interleaved" if mrope else "contiguous",
     )
 
     groups = (
@@ -378,6 +385,8 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         expert_quant="gguf" if moe_enabled else "none",
         gguf_expert_types=(gguf_expert_types(model_path, num_layers) if model_path else None),
         gguf_model_path=model_path,
+        vision_config=getattr(shim, "vision_config", None),
+        image_token_id=getattr(shim, "image_token_id", None),
         slot_states=ple_slot_states(qwen4_args),
         attn_quant="gguf",
         dense_quant="gguf",
@@ -542,6 +551,7 @@ def iter_gguf_weights(
     *,
     include_moe_experts: bool = False,
     include_non_moe: bool = True,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Iterate and yield weights from GGUF for qwen4_exp."""
     from freetoken.models.gguf.reader import iter_gguf_tensors, resolve_gguf_path
@@ -851,6 +861,15 @@ def iter_gguf_weights(
                 f"model.layers.{ple_layer_id}.ple.ple_embedding.ngram_heads_offsets",
                 torch.tensor(offsets, dtype=torch.int64),
             )
+
+    # Vision tower: streamed from the external mmproj GGUF file, named exactly as
+    # iter_vision_weights names the HF checkpoint's visual.* tensors.
+    if include_vision and config.vision_config is not None:
+        from .mmproj import discover_mmproj_path, iter_mmproj_vision_weights
+
+        mmproj_path = discover_mmproj_path(model_path)
+        if mmproj_path is not None:
+            yield from iter_mmproj_vision_weights(mmproj_path, device)
 
 
 def load_ple_table_from_gguf(

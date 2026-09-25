@@ -17,6 +17,22 @@ from freetoken.mm.config import MultimodalConfig
 from freetoken.mm import check_mm_pad_shift
 
 
+def _load_image_processor(model_path: str, mm: MultimodalConfig) -> Any:
+    """The checkpoint's HF image processor; a GGUF checkpoint has none, so an external mmproj
+    (llama.cpp clip) defines it from its own metadata."""
+    from transformers import AutoImageProcessor
+
+    try:
+        return AutoImageProcessor.from_pretrained(model_path)
+    except OSError:
+        from freetoken.models.qwen4_exp.mmproj import discover_mmproj_path, mmproj_image_processor
+
+        mmproj = discover_mmproj_path(model_path, override=getattr(mm, "mmproj_path", None))
+        if mmproj is None:
+            raise
+        return mmproj_image_processor(mmproj)
+
+
 @dataclass
 class PromptReplacement:
     """The token sequence that replaces one placeholder; is_embed marks the positions that take image embeddings (None = all of them)."""
@@ -84,9 +100,7 @@ class MMProcessor(ABC):
         """The checkpoint's image processor, loaded on first use (tokenizer workers share the instance across threads)."""
         with self._image_processor_lock:
             if self._image_processor_instance is None:
-                from transformers import AutoImageProcessor
-
-                self._image_processor_instance = AutoImageProcessor.from_pretrained(self.model_path)
+                self._image_processor_instance = _load_image_processor(self.model_path, self.mm)
             return self._image_processor_instance
 
     def get_mm_processor_kwargs(self, mm: MultimodalConfig) -> dict[str, Any]:

@@ -167,10 +167,16 @@ class EngineConfig:
         hf_config = copy.copy(self.hf_config)
         built = {e.config_key for e in self.active_encoders}
         for key in set(ENCODER_SECTIONS) | {e.config_key for e in self.model_spec.encoders}:
-            # hasattr: a GGUF config shim carries no encoder sections at all, and is a frozen
-            # dataclass, so writing a None it never had would abort the load.
+            # hasattr: a HF config carries no attribute at all for a section its checkpoint
+            # never had, and a GGUF config shim carries no encoder sections at all.
             if key not in built and hasattr(hf_config, key):
                 setattr(hf_config, key, None)
+        # qwen4exp GGUF only: ``--mmproj`` names a specific external vision tower file,
+        # overriding whatever build_gguf_shim auto-discovered next to the model.
+        if "vision_config" in built and hasattr(hf_config, "vision_config") and self.mm.mmproj_path:
+            from freetoken.models.qwen4_exp.mmproj import read_mmproj_vision_config
+
+            hf_config.vision_config = read_mmproj_vision_config(self.mm.mmproj_path)
         spec = self.model_spec
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
