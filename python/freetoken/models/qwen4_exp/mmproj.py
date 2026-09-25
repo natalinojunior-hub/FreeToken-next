@@ -184,3 +184,31 @@ __all__ = [
     "read_mmproj_vision_config",
     "iter_mmproj_vision_weights",
 ]
+
+
+# Qwen3-VL pixel budget for the qwen3vl_merger projector (HF Qwen3VLProcessor defaults); the
+# clip metadata carries patch/merge/normalization but not the resize bounds.
+_QWEN3VL_MIN_PIXELS = 65536
+_QWEN3VL_MAX_PIXELS = 16777216
+
+
+def mmproj_image_processor(mmproj_path: str):
+    """A Qwen2VL-family image processor configured from the mmproj clip metadata."""
+    from transformers import Qwen2VLImageProcessor
+
+    from freetoken.models.gguf.reader import load_gguf_metadata
+
+    meta = load_gguf_metadata(mmproj_path)
+    return Qwen2VLImageProcessor(
+        size={"shortest_edge": _QWEN3VL_MIN_PIXELS, "longest_edge": _QWEN3VL_MAX_PIXELS},
+        patch_size=int(meta["clip.vision.patch_size"]),
+        temporal_patch_size=2,
+        merge_size=int(meta["clip.vision.spatial_merge_size"]),
+        image_mean=_triple(meta["clip.vision.image_mean"]),
+        image_std=_triple(meta["clip.vision.image_std"]),
+    )
+
+
+def _triple(value) -> list[float]:
+    values = [float(x) for x in (value if isinstance(value, (list, tuple)) else [value])]
+    return values * 3 if len(values) == 1 else values
