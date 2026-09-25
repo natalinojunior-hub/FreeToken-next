@@ -1214,31 +1214,43 @@ class MemoryPlanner:
             f"  Solve budget (post-probe): {budget_snapshot}, host tier reserve: {mem_GB(host_reserve_bytes)}"
         )
 
-        chosen_chunk, expert_slots, kv_pages = self.phase_fg_solve_chunk_and_experts(config, budget)
-
-        kv_pool, expert_cache, linear_pool = self.phase_h_construct_final_pools(
-            config, model, expert_slots, kv_pages, prefill_overlap
-        )
-        try:
-            valid, msg = self.phase_i_final_validation(
-                config, model, kv_pool, expert_cache, linear_pool, chosen_chunk
+        # The ledger should price every owner; when validation still OOMs, an owner is unpriced
+        # (e.g. an MTP draft path at long context). Report it and re-solve with a smaller
+        # budget instead of refusing to serve: the plan must never OOM, and experts shrink first.
+        for attempt in range(_VALIDATION_RETRIES + 1):
+            chosen_chunk, expert_slots, kv_pages = self.phase_fg_solve_chunk_and_experts(
+                config, budget
             )
-        finally:
-            # Phase H's pools only prove Phase I's forward fits; engine.py builds
-            # the permanent ones from the returned sizes. Free them first or
-            # the engine double-commits.
-            attach_offload_moe_cache(model, None)
-            del kv_pool, expert_cache, linear_pool
-            gc.collect()
-            torch.cuda.synchronize(self.device)
-            torch.cuda.empty_cache()
-        if not valid:
-            # The ledger promised this fits; failing means an unpriced owner.
-            raise RuntimeError(
-                f"Final validation failed against the solved ledger "
-                f"({self.ledger(config, chosen_chunk, expert_slots, kv_pages)}, "
-                f"budget={budget}): {msg}"
+            kv_pool, expert_cache, linear_pool = self.phase_h_construct_final_pools(
+                config, model, expert_slots, kv_pages, prefill_overlap
             )
+            try:
+                valid, msg = self.phase_i_final_validation(
+                    config, model, kv_pool, expert_cache, linear_pool, chosen_chunk
+                )
+            finally:
+                # Phase H's pools only prove Phase I's forward fits; engine.py builds
+                # the permanent ones from the returned sizes. Free them first or
+                # the engine double-commits.
+                attach_offload_moe_cache(model, None)
+                del kv_pool, expert_cache, linear_pool
+                gc.collect()
+                torch.cuda.synchronize(self.device)
+                torch.cuda.empty_cache()
+            if valid:
+                break
+            ledger_text = self.ledger(config, chosen_chunk, expert_slots, kv_pages)
+            if attempt == _VALIDATION_RETRIES:
+                raise RuntimeError(
+                    f"Final validation failed against the solved ledger "
+                    f"({ledger_text}, budget={budget}): {msg}"
+                )
+            shrink = max(_VALIDATION_SHRINK_BYTES, budget // 20)
+            logger.warning(
+                f"Final validation OOM with an unpriced owner ({msg.splitlines()[0][:160]}); "
+                f"re-solving with {mem_GB(shrink)} less budget (attempt {attempt + 2})"
+            )
+            budget -= shrink
 
         ledger = self.ledger(config, chosen_chunk, expert_slots, kv_pages)
         final_snapshot = take_physical_snapshot(self.device)
@@ -1265,6 +1277,10 @@ class MemoryPlanner:
         logger.info_rank0("=" * 60)
 
         return self.final_plan
+
+
+_VALIDATION_RETRIES = 4
+_VALIDATION_SHRINK_BYTES = 512 << 20
 
 
 def create_memory_planner(
