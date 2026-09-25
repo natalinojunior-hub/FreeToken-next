@@ -232,9 +232,12 @@ def test_mmproj_flag_defaults_to_none():
     assert args.mm.mmproj_path is None
 
 
-def test_mmproj_flag_sets_mm_mmproj_path():
+def test_mmproj_flag_sets_mm_mmproj_path(monkeypatch):
+    monkeypatch.delenv(MMPROJ_PATH_ENV, raising=False)
     with patch("freetoken.utils.cached_load_hf_config", lambda _path: _dummy_hf_config()):
         args, _run_shell = parse_args(
             ["--model", "/models/anon", "--mmproj", "/models/x/mmproj-BF16.gguf"]
         )
     assert args.mm.mmproj_path == "/models/x/mmproj-BF16.gguf"
+    # The GGUF config shim and weight loader discover without the mm config: they must agree.
+    assert os.environ[MMPROJ_PATH_ENV] == "/models/x/mmproj-BF16.gguf"

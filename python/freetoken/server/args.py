@@ -1010,6 +1010,12 @@ def parse_args(
         parser.error(
             f"--image-min-tokens {image_min_tokens} exceeds --image-max-tokens {image_max_tokens}"
         )
+    if kwargs["mmproj"]:
+        # The GGUF config shim and weight loader discover the mmproj without the mm config
+        # (and in worker processes): the env var makes every discovery honor --mmproj.
+        from freetoken.models.qwen4_exp.mmproj import MMPROJ_PATH_ENV
+
+        os.environ[MMPROJ_PATH_ENV] = kwargs["mmproj"]
     kwargs["mm"] = MultimodalConfig(
         disabled_encoders=frozenset(disabled),
         embed_cache_device=kwargs.pop("mm_embed_cache_device"),
