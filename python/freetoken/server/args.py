@@ -516,6 +516,14 @@ def parse_args(
         help="JSON object of extra keyword arguments for the checkpoint's image processor call, "
         "for family-specific knobs; applied after the token budget.",
     )
+    parser.add_argument(
+        "--mmproj",
+        type=str,
+        default=MultimodalConfig.mmproj_path,
+        help="Path to an external mmproj GGUF vision tower file (qwen4exp GGUF checkpoints "
+        "ship it separately from the main model). Default: auto-discover a mmproj*.gguf "
+        "file next to the model, preferring BF16 over F16.",
+    )
 
     parser.add_argument(
         "--mm-embed-cache-device",
@@ -1009,6 +1017,7 @@ def parse_args(
         image_min_tokens=image_min_tokens,
         image_max_tokens=image_max_tokens,
         processor_kwargs=kwargs.pop("mm_processor_kwargs") or {},
+        mmproj_path=kwargs.pop("mmproj"),
     )
     result = ServerArgs(**kwargs)
     logger.info(f"Parsed arguments:\n{result}")

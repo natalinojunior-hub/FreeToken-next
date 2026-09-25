@@ -24,6 +24,8 @@ class MultimodalConfig:
     image_max_tokens: int | None = None
     # extra keyword arguments the family's MMProcessor passes to the image processor call, after the token budget
     processor_kwargs: dict[str, Any] = field(default_factory=dict)
+    # --mmproj: explicit external mmproj GGUF path (qwen4exp GGUF vision tower); None auto-discovers
+    mmproj_path: str | None = None
 
     @property
     def text_model_only(self) -> bool:

@@ -31,7 +31,7 @@ GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
 }
 
 
-@dataclass(frozen=True)
+@dataclass
 class GgufConfigShim:
     architectures: list[str]
     model_path: str
@@ -39,6 +39,14 @@ class GgufConfigShim:
     metadata: dict[str, Any]
     vocab_size: int
     tie_word_embeddings: bool
+    # qwen4exp only: the external mmproj GGUF vision tower, auto-discovered at shim build
+    # time (see freetoken.models.qwen4_exp.mmproj). Mirrors a HF config's vision_config /
+    # image_token_id / text_config so the generic EngineConfig.active_encoders machinery
+    # (which nulls a disabled encoder's config_key via setattr) works unchanged for GGUF
+    # too -- not frozen (unlike a HF PretrainedConfig) so that setattr works here.
+    vision_config: Any | None = None
+    image_token_id: int | None = None
+    text_config: Any | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Minimal HF-config-like dict for trunk code that introspects the config
@@ -92,13 +100,34 @@ def build_gguf_shim(model_path: str) -> GgufConfigShim:
                 "reconvert the checkpoint with the current freetoken.checkpoint.convert"
             )
         tie_word_embeddings = not present
+    vocab_size = _vocab_size(model_path)
+    vision_config = image_token_id = text_config = None
+    if registry_key == "Qwen4ExpGGUFForCausalLM":
+        from types import SimpleNamespace
+
+        from freetoken.models.qwen4_exp.mmproj import (
+            discover_mmproj_path,
+            read_mmproj_vision_config,
+        )
+
+        mmproj_path = discover_mmproj_path(model_path)
+        if mmproj_path is not None:
+            vision_config = read_mmproj_vision_config(mmproj_path)
+            image_token_id = int(metadata.get("qwen4exp.ple.image_token_id", 248056))
+            # QwenVLMMProcessor reads hf_config.text_config.rope_parameters; the GGUF
+            # decode path has no multi-axis (mrope) positions yet, so image tokens fall
+            # back to plain 1-D sequential positions like text.
+            text_config = SimpleNamespace(rope_parameters={}, vocab_size=vocab_size)
     return GgufConfigShim(
         architectures=[registry_key],
         model_path=model_path,
         model_type=arch,
         metadata=metadata,
-        vocab_size=_vocab_size(model_path),
+        vocab_size=vocab_size,
         tie_word_embeddings=tie_word_embeddings,
+        vision_config=vision_config,
+        image_token_id=image_token_id,
+        text_config=text_config,
     )
 
 

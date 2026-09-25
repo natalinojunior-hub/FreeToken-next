@@ -285,11 +285,16 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         iter_weights="iter_gguf_weights",
     ),
     # GGUF qwen4exp (Qwen3.8-Flash-Next UD-IQ4_XS): hybrid GDN + QSA + PLE + MTP.
+    # ForConditionalGeneration (not the plain CausalLM class): it builds a vision tower
+    # only when ModelConfig.vision_config is set, exactly like the HF class -- a bare
+    # text-only GGUF checkpoint (no mmproj found) behaves identically to the CausalLM class.
     "Qwen4ExpGGUFForCausalLM": ModelSpec(
         "freetoken.models.qwen4_exp",
-        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
     ),
     # Dense qwen35 GGUF (Qwen3.8-27B): same package and classes, moe_enabled==False.
     "Qwen35GGUFForCausalLM": ModelSpec(
