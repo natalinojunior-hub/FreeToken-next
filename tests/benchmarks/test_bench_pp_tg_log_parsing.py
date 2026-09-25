@@ -5,6 +5,7 @@ by path since ``benchmarks/`` isn't a package."""
 
 from __future__ import annotations
 
+import pytest
 import importlib.util
 from pathlib import Path
 
@@ -67,3 +68,10 @@ def test_serve_arg_value_parses_space_joined_entry():
     assert bench_pp_tg._serve_arg_value(["--spec-mtp 3"], "--spec-mtp") == "3"
     assert bench_pp_tg._serve_arg_value(["--spec-mtp=3"], "--spec-mtp") == "3"
     assert bench_pp_tg._serve_arg_value(["--other 1"], "--spec-mtp") is None
+
+
+def test_tg_curve_windows():
+    stamps = [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 0.8]  # 3 steps in 0.3 s, then 3 steps in 0.5 s
+    curve = bench_pp_tg.tg_curve(stamps, 3)
+    assert curve == pytest.approx([10.0, 6.0])
+    assert bench_pp_tg.tg_curve([0.0, 0.1, 0.2, 0.3, 0.4], 3) == pytest.approx([10.0, 10.0])

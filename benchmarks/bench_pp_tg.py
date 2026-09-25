@@ -56,6 +56,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--tokens", type=int, default=16384, help="prompt tokens (the context under test)"
     )
     p.add_argument("--decode", type=int, default=128, help="generated tokens per request")
+    p.add_argument(
+        "--tg-curve", type=int, default=0, metavar="N",
+        help="also report decode tok/s per N-token window (e.g. 1024) of the last run",
+    )  # fmt: skip
     p.add_argument("--repeats", type=int, default=3, help="measured requests after warmup")
     p.add_argument("--warmups", type=int, default=2, help="untimed requests at full context")
     p.add_argument(
@@ -445,6 +449,15 @@ def stream_completion(
     return {"t0": t0, "stamps": stamps, "text": "".join(pieces), "usage": usage}
 
 
+def tg_curve(stamps: list[float], window: int) -> list[float]:
+    """Decode tok/s per ``window`` streamed tokens (a trailing partial window included)."""
+    return [
+        (len(w) - 1) / (w[-1] - w[0])
+        for i in range(0, len(stamps) - 1, window)
+        if len(w := stamps[i : i + window + 1]) > 1 and w[-1] > w[0]
+    ]
+
+
 def one_run(origin: str, model_id: str, prompt: str, args: argparse.Namespace, proc) -> dict:
     sampler = GpuSampler()
     sampler.start()
@@ -490,6 +503,7 @@ def one_run(origin: str, model_id: str, prompt: str, args: argparse.Namespace, p
         "mem_available_gib": mem_available_gib(),
         "output_sha1": hashlib.sha1(r["text"].encode()).hexdigest()[:12],
         "output_text": r["text"],
+        "tg_curve": tg_curve(stamps, args.tg_curve) if getattr(args, "tg_curve", 0) else None,
         **gpu,
     }
 
@@ -737,6 +751,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n==== [{args.label}] {summary['prompt_tokens']} tok / {args.decode} gen ====")
         print(f"  PP mean {summary['PP_mean']:9.1f} tok/s (min {summary['PP_min']:.1f})")
         print(f"  TG mean {summary['TG_mean']:9.2f} tok/s (min {summary['TG_min']:.2f})")
+        if args.tg_curve:
+            for i, tps in enumerate(rows[-1].get("tg_curve") or []):
+                lo = i * args.tg_curve
+                print(f"  TG curve [{lo}-{lo + args.tg_curve}): {tps:.2f}")
         print(f"  output hashes: {sorted({r['output_sha1'] for r in rows})}")
         if args.json_out:
             with open(args.json_out, "a", encoding="utf-8") as stream:
@@ -815,6 +833,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n==== [{args.label}] {summary['prompt_tokens']} tok / {args.decode} gen ====")
     print(f"  PP     mean {summary['PP_mean']:9.1f} tok/s   (min {summary['PP_min']:.1f})")
     print(f"  TG     mean {summary['TG_mean']:9.2f} tok/s   (min {summary['TG_min']:.2f})")
+    if args.tg_curve:
+        for i, tps in enumerate(rows[-1].get("tg_curve") or []):
+            lo = i * args.tg_curve
+            print(f"  TG curve [{lo}-{lo + args.tg_curve}): {tps:.2f}")
     print(
         f"  TTFT   mean {summary['TTFT_mean']:9.1f} ms    ITL p50 {summary['itl_p50_mean']:.2f} "
         f"/ p95 {summary['itl_p95_mean']:.2f} ms"
