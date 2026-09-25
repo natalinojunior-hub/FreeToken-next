@@ -546,6 +546,14 @@ class CacheManager:
         end = div_ceil(req.cached_len, self.page_size) * self.page_size
         return self.page_table[req.table_idx, start:end]
 
+    def logical_page_ids(self, reqs: List[Req]) -> list[int]:
+        """Stable request/position identities; physical out locations stay private."""
+        return [
+            (req.table_idx << 32) | page_idx
+            for req in reqs
+            for page_idx in range(div_ceil(req.device_len, self.page_size))
+        ]
+
     def free_spec_reject(self, req: Req, keep_len: int, alloc_len: int) -> None:
         """Return the whole pages a speculative verify window allocated beyond ``keep_len``
         tokens, the ones actually accepted. Never touches the prefix cache: a rejected
