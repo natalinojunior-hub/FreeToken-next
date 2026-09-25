@@ -1,4 +1,5 @@
-# State — 2026-09-25 (campaign 16, session 18: KV-in-RAM default shipped + certified)
+# State — 2026-09-25 (campaign 18: KV RAM tier for 35B/27B = NO-GO by phase-0 math)
+DONE campaign 18 phase 0: dense attention reads all KV per step; PCIe 56 GB/s -> RAM tier est. 35B ~29 vs 89 tok/s @128K, 27B ~13 vs 25 @64K. NO-GO both, no code; KV stays in VRAM. Ledger `ft-campaign2/campaign18/LEDGER.md`.
 DONE: KV-in-RAM by default committed `0288564` on `next` (no push). `kv_tiering` default `auto`; auto tiers cold KV to host RAM (fp8 ladder fp8->turbo4->turbo3) for a **certified** family only, via `ModelConfig.kv_ram_tier_certified` (qwen4_exp sets it; dense 27B / MoE 35B stay all-VRAM until measured); falls back to all-VRAM when RAM can't hold it; `--kv-tiering force` unaffected. `spill_only_if_needed` removed. Unit test added.
 DONE phase D: turbo8/4/3 forced-tier quality all pass (usage 20/20 + needle 128K) -> ladder unchanged; turbo8 stays dominated by fp8.
 DONE phase E (final ISTA default cert, `KV RAM tier dtype: torch.float8_e4m3fn`, 0 tracebacks): k0 TG 16/64/128/256K 56.18/56.40/57.44/52.36; vs all-VRAM +3.3% @128K, +21.5% @256K, parity@16/64K. MTP ladder: 64K k1<k0 (k0 best); 128K/256K best k1 but only ~+0.2..0.9% over k0 (fp8 RAM tier absorbed the MTP edge). needle 64/128/256K PASS, usage 20/20, vision PASS. TG-curve 128K mean 56.27 no cliff.

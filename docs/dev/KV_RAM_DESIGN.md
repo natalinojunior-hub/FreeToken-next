@@ -118,3 +118,10 @@ Kernel tests: `tests/kvcache/test_kv_ram_tier_cuda.py` (25, bit-exact vs all-VRA
 - The auto cold tier narrows to fit RAM by a measured ladder (fp8 -> turbo4 -> turbo3; bf16/turbo8 dropped as dominated), so a certified family keeps KV in RAM at every context instead of only overflowing. ISTA 64/128/256K fp8 beats all-VRAM (see `PERFORMANCE.md`).
 - Host RAM is bound by pinned experts (server RSS 50-70 GiB during load; earlyoom kills at <10% free): >~10 GiB of KV in RAM needs a compressed cold tier or NVMe-streamed cold experts.
 - Not done: compressed cold tier (turbo3/turbo4 host tier now ships in the auto ladder), `ft bench context` advisor, VRAM-side max-context message (RAM-side exists). Certification of families other than qwen4_exp for the KV-in-RAM default is pending measurement (they stay all-VRAM until then).
+
+## Campaign 18 phase 0: MoE 35B and dense 27B — NO-GO (2026-09-25)
+
+Dense full attention reads the whole KV every decode step. Measured PCIe H2D 56 GB/s; fp8 KV per token 10 KiB (35B, 10 KV layers) / 32 KiB (27B, 16 KV layers).
+At 128K that is 1.25 / 4.0 GiB of PCIe per token (24 / 77 ms), versus 11 ms (35B NVFP4) / ~40 ms (27B) for the whole all-VRAM step.
+Estimated RAM-tier TG: 35B ~29 vs 89 tok/s @128K; 27B ~13 vs 25 @64K. Freed VRAM (2.5-5 GiB) cannot repay it. Both families keep KV in VRAM;
+no code added. Math and alternatives: `ft-campaign2/campaign18/LEDGER.md`.
