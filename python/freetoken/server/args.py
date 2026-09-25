@@ -717,10 +717,17 @@ def parse_args(
 
     parser.add_argument(
         "--kv-tiering",
-        "--kv-cache-ram",
         choices=("off", "auto", "force"),
         default=ServerArgs.kv_tiering,
         help="KV RAM tiering mode; off keeps the all-VRAM path.",
+    )
+    parser.add_argument(
+        "--kv-cache-ram",
+        action="store_const",
+        const="force",
+        dest="kv_tiering",
+        default=argparse.SUPPRESS,
+        help="Opt in to KV RAM tiering (fails closed until the CUDA pool is connected).",
     )
     parser.add_argument(
         "--kv-reserve-tokens",
