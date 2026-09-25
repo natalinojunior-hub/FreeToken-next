@@ -50,6 +50,17 @@ def test_stage_checks_layout_and_strides():
         adapter.stage(src.transpose(0, 1), dst, layout)
 
 
+def test_stage_pair_validates_k_and_v_layouts():
+    adapter = KVBackendAdapter("mha")
+    layout = record().layout
+    k = torch.ones(layout.k_shape)
+    v = torch.full(layout.v_shape, 2)
+    out_k = torch.zeros_like(k)
+    out_v = torch.zeros_like(v)
+    adapter.stage_pair(k, v, out_k, out_v, layout)
+    assert torch.equal(k, out_k) and torch.equal(v, out_v)
+
+
 def test_norm_shape_is_strict():
     with pytest.raises(ValueError, match="norm slab mismatch"):
         Turbo4KVAdapter.validate_norms(torch.zeros(2, 3), 2, 3, 1)

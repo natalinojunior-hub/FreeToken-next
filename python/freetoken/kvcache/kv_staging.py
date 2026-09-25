@@ -78,6 +78,25 @@ class KVBackendAdapter:
         self.validate_tensor(destination, layout.k_shape, layout.k_stride)
         destination.copy_(source, non_blocking=destination.is_cuda)
 
+    def stage_pair(
+        self,
+        source_k: torch.Tensor,
+        source_v: torch.Tensor,
+        destination_k: torch.Tensor,
+        destination_v: torch.Tensor,
+        layout: KVLayout,
+    ) -> None:
+        """Stage K and V together, validating each backend layout independently."""
+        layout.validate()
+        if layout.format != self.backend:
+            raise ValueError("layout/backend mismatch")
+        self.validate_tensor(source_k, layout.k_shape, layout.k_stride)
+        self.validate_tensor(destination_k, layout.k_shape, layout.k_stride)
+        self.validate_tensor(source_v, layout.v_shape, layout.v_stride)
+        self.validate_tensor(destination_v, layout.v_shape, layout.v_stride)
+        destination_k.copy_(source_k, non_blocking=destination_k.is_cuda)
+        destination_v.copy_(source_v, non_blocking=destination_v.is_cuda)
+
     @staticmethod
     def validate_norms(norms: torch.Tensor, tokens: int, heads: int, groups: int) -> None:
         """Turbo norm slabs are one fp16 scale per token/head/group."""
