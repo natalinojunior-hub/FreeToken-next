@@ -492,6 +492,12 @@ class QSASparseAttnBackend(BaseAttnBackend):
         host = table[rows, logical.long()].long() - self.kvcache.num_device_pages
         slot = host * self.page_size + safe % self.page_size
         slot = torch.where((indices >= 0) & (host >= 0) & (host < pages), slot, -1).flatten()
+        tokens = pages * self.page_size
+        if slot.numel() > tokens:
+            # Many query rows (prefill) repeat the same tokens: decode each touched token once.
+            hit = torch.zeros(tokens + 1, dtype=torch.bool, device=self.device)
+            hit[torch.where(slot >= 0, slot, tokens)] = True
+            slot = torch.where(hit[:tokens], torch.arange(tokens, device=self.device), -1)
         kc, kn, vc, vn = host_turbo
         book = self.kvcache.host_book
         turbo_slots_to_bf16(kc, kn, cent, rotation, slot, slot, stage_k.flatten(0, 1), book)
