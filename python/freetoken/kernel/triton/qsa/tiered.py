@@ -257,7 +257,7 @@ def scatter_rows(src: torch.Tensor, loc: torch.Tensor, dst: torch.Tensor, base_r
 
 
 @triton.jit
-def _turbo_pages_kernel(
+def _turbo_slots_kernel(
     codes_ptr,
     norm_ptr,
     cent_ptr,
@@ -265,52 +265,54 @@ def _turbo_pages_kernel(
     src_ptr,
     dst_ptr,
     out_ptr,
+    n_slots,
     stride_c_token,
     stride_c_head,
     stride_n_token,
     stride_n_head,
-    stride_o_page,
     stride_o_token,
     stride_o_head,
-    PAGE_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
     GROUPS: tl.constexpr,
     BOOK3: tl.constexpr,
     BOOK8: tl.constexpr,
 ) -> None:
-    entry = tl.program_id(0)
     head = tl.program_id(1)
-    page = tl.load(src_ptr + entry).to(tl.int64)
-    if page >= 0:
-        dst = tl.load(dst_ptr + entry).to(tl.int64)
-        tok = tl.arange(0, PAGE_SIZE)
+    entry = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    src = tl.load(src_ptr + entry, mask=entry < n_slots, other=-1).to(tl.int64)
+    live = src >= 0
+    if tl.max(live.to(tl.int32), 0) > 0:
+        dst = tl.load(dst_ptr + entry, mask=live, other=0).to(tl.int64)
+        slots = tl.where(live, src, 0)
         dim = tl.arange(0, 128)
-        slots = page * PAGE_SIZE + tok
         rot = tl.load(rot_ptr + dim[:, None] * 128 + dim[None, :])
         for g in range(GROUPS):
             base = codes_ptr + slots[:, None] * stride_c_token + head * stride_c_head
             if BOOK3:
-                low = tl.load(base + (g * 48 + dim // 4)[None, :])
-                bit = tl.load(base + (g * 48 + 32 + dim // 8)[None, :])
+                low = tl.load(base + (g * 48 + dim // 4)[None, :], mask=live[:, None], other=0)
+                bit = tl.load(base + (g * 48 + 32 + dim // 8)[None, :], mask=live[:, None], other=0)
                 idx = ((low.to(tl.int32) >> ((dim % 4) * 2)[None, :]) & 3) | (
                     ((bit.to(tl.int32) >> (dim % 8)[None, :]) & 1) << 2
                 )
             elif BOOK8:
-                byte = tl.load(base + (g * 128 + dim)[None, :])
+                byte = tl.load(base + (g * 128 + dim)[None, :], mask=live[:, None], other=0)
                 idx = byte.to(tl.int32)
             else:
-                byte = tl.load(base + (g * 64 + dim // 2)[None, :])
+                byte = tl.load(base + (g * 64 + dim // 2)[None, :], mask=live[:, None], other=0)
                 idx = (byte.to(tl.int32) >> ((dim % 2) * 4)[None, :]) & 0x0F
-            norm = tl.load(norm_ptr + slots * stride_n_token + head * stride_n_head + g)
+            norm = tl.load(
+                norm_ptr + slots * stride_n_token + head * stride_n_head + g, mask=live, other=0.0
+            )
             rotated = tl.load(cent_ptr + idx) * norm.to(tl.float32)[:, None]
             # Undo the per-group randomized Hadamard: one 128x128 product on the tensor cores.
             value = tl.dot(rotated.to(tl.bfloat16), rot)
             tl.store(
                 out_ptr
-                + dst * stride_o_page
-                + tok[:, None] * stride_o_token
+                + dst[:, None] * stride_o_token
                 + head * stride_o_head
                 + (g * 128 + dim)[None, :],
                 value.to(out_ptr.dtype.element_ty),
+                mask=live[:, None],
             )
 
 
@@ -321,6 +323,35 @@ def turbo_inverse_rotation(device: torch.device) -> torch.Tensor:
     s1, s2 = _signs(device)
     had = hadamard(device=device)
     return (s2[:, None] * had * FWHT_SCALE * s1[None, :]).to(torch.bfloat16).contiguous()
+
+
+def turbo_slots_to_bf16(
+    codes: torch.Tensor,
+    norm: torch.Tensor,
+    cent: torch.Tensor,
+    rotation: torch.Tensor,
+    src_slots: torch.Tensor,
+    dst_slots: torch.Tensor,
+    out: torch.Tensor,
+    book: str,
+) -> None:
+    """Decode the turbo token rows ``src_slots`` (``-1`` = skip) of a token-major code/norm slab
+    into the original-domain token rows ``out[dst_slots]`` (``out``: ``[slots, heads, head_dim]``).
+    Fixed shapes, no host sync: graph-capturable."""
+    heads, groups = norm.shape[1], norm.shape[2]
+    if src_slots.shape != dst_slots.shape or out.shape[1:] != (heads, groups * 128):
+        raise ValueError("turbo decode needs matching slot lists and a token-row output")
+    n = src_slots.numel()
+    if not n:
+        return
+    block = 32
+    _turbo_slots_kernel[(triton.cdiv(n, block), heads)](
+        codes, norm, cent, rotation, src_slots, dst_slots, out, n,
+        codes.stride(0), codes.stride(1), norm.stride(0), norm.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK=block, GROUPS=groups, BOOK3=book == "turbo3", BOOK8=book == "turbo8",
+        num_warps=4,
+    )  # fmt: skip
 
 
 def turbo_pages_to_bf16(
@@ -339,15 +370,11 @@ def turbo_pages_to_bf16(
     heads, groups = norm.shape[1], norm.shape[2]
     if src_pages.shape != dst_pages.shape or out.shape[1:] != (page_size, heads, groups * 128):
         raise ValueError("turbo page decode needs matching page lists and a page-shaped output")
-    if not src_pages.shape[0]:
-        return
-    _turbo_pages_kernel[(src_pages.shape[0], heads)](
-        codes, norm, cent, rotation, src_pages, dst_pages, out,
-        codes.stride(0), codes.stride(1), norm.stride(0), norm.stride(1),
-        out.stride(0), out.stride(1), out.stride(2),
-        PAGE_SIZE=page_size, GROUPS=groups, BOOK3=book == "turbo3", BOOK8=book == "turbo8",
-        num_warps=4,
-    )  # fmt: skip
+    tok = torch.arange(page_size, device=src_pages.device)
+    src = src_pages.long()[:, None] * page_size + tok
+    src = torch.where(src_pages[:, None] >= 0, src, -1).flatten()
+    dst = (dst_pages.long()[:, None] * page_size + tok).flatten()
+    turbo_slots_to_bf16(codes, norm, cent, rotation, src, dst, out.flatten(0, 1), book)
 
 
 __all__ = [
@@ -357,5 +384,6 @@ __all__ = [
     "tiered_store_kv",
     "turbo_inverse_rotation",
     "turbo_pages_to_bf16",
+    "turbo_slots_to_bf16",
     "zero_tier",
 ]

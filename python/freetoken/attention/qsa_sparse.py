@@ -468,10 +468,11 @@ class QSASparseAttnBackend(BaseAttnBackend):
         indices: torch.Tensor | None,
         host_turbo: tuple[torch.Tensor, ...],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Decode the turbo RAM pages this layer's selection touches into the staging slab at
-        their own page index, so the unmodified block table addresses them. Fixed shapes (one
-        entry per RAM page, -1 = untouched): no host sync, graph-capturable."""
-        from freetoken.kernel.triton.qsa.tiered import turbo_inverse_rotation, turbo_pages_to_bf16
+        """Decode the turbo RAM tokens this layer's selection reads (not their whole pages: a
+        scattered top-k touches most pages) into the staging slab at their own page index and
+        slot, so the unmodified block table addresses them. Fixed shapes (one entry per
+        selected index, -1 = not in RAM): no host sync, graph-capturable."""
+        from freetoken.kernel.triton.qsa.tiered import turbo_inverse_rotation, turbo_slots_to_bf16
         from freetoken.kernel.triton.turbo_kv import _book
 
         stage_k, stage_v = self.kvcache.host_staging
@@ -482,21 +483,19 @@ class QSASparseAttnBackend(BaseAttnBackend):
             self._turbo_consts = (
                 _book(self.device, self.kvcache.host_book)[0].float(),
                 turbo_inverse_rotation(self.device),
-                torch.arange(pages, dtype=torch.int32, device=self.device),
             )
-        cent, rotation, ids = self._turbo_consts
+        cent, rotation = self._turbo_consts
         table = md.block_table
-        logical = (indices.clamp(min=0) // self.page_size).clamp(max=table.shape[1] - 1)
+        safe = indices.clamp(min=0)
+        logical = (safe // self.page_size).clamp(max=table.shape[1] - 1)
         rows = md.token_to_req.long()[:, None].expand_as(logical)
         host = table[rows, logical.long()].long() - self.kvcache.num_device_pages
-        host = torch.where((indices >= 0) & (host >= 0) & (host < pages), host, pages)
-        mark = torch.zeros(pages + 1, dtype=torch.int32, device=self.device)
-        mark.index_fill_(0, host.flatten(), 1)
-        src = torch.where(mark[:pages] > 0, ids, -1)
+        slot = host * self.page_size + safe % self.page_size
+        slot = torch.where((indices >= 0) & (host >= 0) & (host < pages), slot, -1).flatten()
         kc, kn, vc, vn = host_turbo
         book = self.kvcache.host_book
-        turbo_pages_to_bf16(kc, kn, cent, rotation, src, ids, stage_k, book, self.page_size)
-        turbo_pages_to_bf16(vc, vn, cent, rotation, src, ids, stage_v, book, self.page_size)
+        turbo_slots_to_bf16(kc, kn, cent, rotation, slot, slot, stage_k.flatten(0, 1), book)
+        turbo_slots_to_bf16(vc, vn, cent, rotation, slot, slot, stage_v.flatten(0, 1), book)
         return stage_k, stage_v
 
     def _plan_host_staging(self, md: QSASparseMetadata, rows: int) -> None:

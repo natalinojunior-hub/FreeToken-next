@@ -619,3 +619,29 @@ def test_turbo_ram_tier_store_decode_and_attention_track_reference(book):
         q, pool.k_cache(0), pool.v_cache(0), idx, bt, t2r, host_kv=(stage_k, stage_v)
     )
     assert torch.allclose(got.float(), ref.float(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("book", ["turbo8", "turbo4", "turbo3"])
+def test_turbo_slots_decode_only_listed_rows(book):
+    from freetoken.kernel.triton import turbo_kv as tk
+    from freetoken.kernel.triton.qsa.tiered import turbo_inverse_rotation, turbo_slots_to_bf16
+
+    torch.manual_seed(7)
+    rows, h, d = 200, 2, 256
+    x = torch.randn(rows * h, d, device=DEV, dtype=DTYPE)
+    codes, norm = tk.quantize(x, book)
+    codes, norm = codes.reshape(rows, h, -1), norm.reshape(rows, h, -1)
+    oracle = tk.decode(codes.reshape(rows * h, -1), norm.reshape(rows * h, -1), book)
+    oracle = oracle.reshape(rows, h, d)
+    src = torch.tensor([5, -1, 199, 0, 77, 5], device=DEV, dtype=torch.int64)
+    out = torch.zeros(rows, h, d, device=DEV, dtype=DTYPE)
+    cent = tk._book(torch.device(DEV), book)[0].float()
+    turbo_slots_to_bf16(
+        codes, norm, cent, turbo_inverse_rotation(torch.device(DEV)), src, src, out, book
+    )
+    live = src[src >= 0]
+    rel = (out[live].float() - oracle[live].float()).norm() / oracle[live].float().norm()
+    assert rel < 1e-2
+    untouched = torch.ones(rows, dtype=torch.bool, device=DEV)
+    untouched[live] = False
+    assert out[untouched].abs().max() == 0
