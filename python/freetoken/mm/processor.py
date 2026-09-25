@@ -17,7 +17,6 @@ from freetoken.mm.config import MultimodalConfig
 from freetoken.mm import check_mm_pad_shift
 
 
-@dataclass
 def _load_image_processor(model_path: str, mm: MultimodalConfig) -> Any:
     """The checkpoint's HF image processor; a GGUF checkpoint has none, so an external mmproj
     (llama.cpp clip) defines it from its own metadata."""
@@ -34,6 +33,7 @@ def _load_image_processor(model_path: str, mm: MultimodalConfig) -> Any:
         return mmproj_image_processor(mmproj)
 
 
+@dataclass
 class PromptReplacement:
     """The token sequence that replaces one placeholder; is_embed marks the positions that take image embeddings (None = all of them)."""
 
