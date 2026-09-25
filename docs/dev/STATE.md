@@ -1,9 +1,9 @@
 # State — 2026-09-24 (campaign 13 in progress; campaign 12/11 state at `git show 0e9d00c:docs/dev/STATE.md`)
-## Campaign 14/15 — live KV-RAM (2026-09-25; `next` up to a4a1ca6; vision on branch `vision-mmproj`, worktree ../ft-vision)
-Done: QSA KV RAM tier (bf16/fp8/turbo4/turbo3; auto ladder with safe RAM budget + "máximo possível" refusal), hot floor, heat rebalancer, planner re-solve on validation OOM, ft bench context, ft history, GGUF split-probe stall fix.
-Running: campaign15 queues (cert.py main matrix, cert2.py quality, vision_check) under `flock ft-campaign2/gpu.lock`; results in ft-campaign2/campaign15/{results,quality}.jsonl.
-Speed (TG, forced RAM, hot 8K): UD 64K bf16 41.5 / fp8 47.5 / turbo4 38.2; ISTA 256K bf16 50.5 / fp8 52.4 / turbo4 42.9. UD 256K bf16 refused (RAM), fp8 41.4.
-Next session (own prompt): TurboQuant 8-bit RAM tier ("turbo8"): 256-level Lloyd-Max for N(0,1/128) (existing CENTROIDS_4 == Gaussian Lloyd-Max to 1e-5; CENTROIDS_3 differs slightly), 1 byte/code + fp16 norm = 8.125 bpv, bucketize for indices, decode via tiered.turbo_pages_to_bf16 BOOK8 path; auto ladder turbo8 -> fp8 -> turbo4 -> turbo3.
+## Campaign 14/15 — live KV-RAM (2026-09-25; `next` ≥ 075ed10)
+Done: QSA KV RAM tier (bf16/fp8/turbo4/turbo3, auto ladder, safe RAM budget + "máximo possível" refusal), hot floor, heat rebalancer, planner re-solve on validation OOM, ft bench context, ft history, GGUF split-probe fix, GGUF vision via mmproj (image test pass, usage 20/20, TG unchanged).
+Measured (TG): ISTA k0 64K 57.1 / 128K 55.6 / 256K 43.1, k1 128K 59.1; AD 64K 49.0 / 128K 46.4; fp8 RAM tier > bf16 (UD 64K 47.5 vs 41.5), quality equal (usage 20/20, needle 64K/128K pass, all formats). Data: ft-campaign2/campaign15/{results,quality}.jsonl (queue stopped mid-run).
+Scope from now: ISTA + AD only; single MTP head shared-Q4_K_M; NVFP4/Unsloth to be deleted.
+Next: `prompt-next-session-kvram-finish.md` (turbo8, format ladder, RAM-budget/auto-fallback bugs, TG curve, final ISTA/AD certification).
 
 
 Anchor: UD-IQ4_XS cold graph-on k0 4096/256: PP 1467, TG 47.28, hash `3af3056b98c0` (re-verified after `b5d4243`).
