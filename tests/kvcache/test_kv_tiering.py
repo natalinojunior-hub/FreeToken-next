@@ -1,7 +1,9 @@
 import pytest
 import torch
+from types import SimpleNamespace
 
 from freetoken.kvcache.kv_tiering import KVPage, KVPagePool, Residency, tiering_safe
+from freetoken.engine.config import EngineConfig
 
 
 def page(i):
@@ -47,3 +49,34 @@ def test_graph_replay_refuses_cold_pages_and_tracks_hits():
     assert pool.can_replay([0])
     assert pool.telemetry.cold_hits == 1
     assert pool.telemetry.rejected_replays == 1
+
+
+def test_eviction_round_trip_and_duplicate_claim():
+    p = page(0)
+    pool = KVPagePool([p], 1)
+    pool.prefetch(0, "r")
+    with pytest.raises(RuntimeError):
+        pool.admit(0, "r")
+    p.device.fill_(7)
+    generation = p.generation
+    assert pool.evict(0, "r", generation)
+    assert torch.equal(p.host, torch.full_like(p.host, 7))
+    p.device.zero_()
+    pool.prefetch(0, "r2")
+    assert torch.equal(p.device, p.host)
+    assert not pool.evict(0, "r2", generation)
+
+
+def test_bad_backing_does_not_claim_page():
+    p = page(0)
+    p.device = torch.zeros(4)
+    pool = KVPagePool([p], 1)
+    with pytest.raises(ValueError):
+        pool.prefetch(0, "r")
+    assert p.owner is None
+    assert p.device_slot is None
+
+
+def test_runtime_rejects_unimplemented_tiering():
+    with pytest.raises(NotImplementedError, match="all pages on CUDA"):
+        EngineConfig.__post_init__(SimpleNamespace(kv_tiering="force"))

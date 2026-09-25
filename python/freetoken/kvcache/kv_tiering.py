@@ -44,7 +44,7 @@ class KVPage:
     event: torch.cuda.Event | None = None
 
     def claim(self, owner: str) -> int:
-        if self.owner is not None and self.owner != owner:
+        if self.owner is not None:
             raise RuntimeError(f"page {self.page_id} owned by {self.owner}")
         self.owner = owner
         self.generation += 1
@@ -113,11 +113,14 @@ class KVPagePool:
         return page
 
     def prefetch(self, page_id: int, owner: str, stream: torch.cuda.Stream | None = None) -> KVPage:
-        page = self.admit(page_id, owner)
+        page = self.table.get(page_id)
         if page.host is None or page.device is None:
             raise RuntimeError("KV page requires host and device backing")
         if page.host.numel() != page.device.numel():
             raise ValueError("host/device page size mismatch")
+        if page.device.is_cuda and not page.host.is_pinned():
+            raise RuntimeError("asynchronous KV prefetch requires pinned host backing")
+        page = self.admit(page_id, owner)
         if page.device.is_cuda and page.host.device.type == "cpu":
             with torch.cuda.stream(stream) if stream is not None else _nullcontext():
                 page.device.copy_(page.host, non_blocking=True)
@@ -142,6 +145,8 @@ class KVPagePool:
             return False
         if page.event is not None and not page.event.query():
             return False
+        if page.device is not None and page.host is not None:
+            page.host.copy_(page.device)
         if page.device_slot is not None:
             self._free.append(page.device_slot)
         page.device_slot = None

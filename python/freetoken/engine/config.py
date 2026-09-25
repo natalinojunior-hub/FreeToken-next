@@ -117,6 +117,10 @@ class EngineConfig:
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
+        if self.kv_tiering != "off":
+            raise NotImplementedError(
+                "KV RAM tiering is unavailable: the cache pools still require all pages on CUDA"
+            )
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":
