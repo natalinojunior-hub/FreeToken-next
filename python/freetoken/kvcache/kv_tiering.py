@@ -143,10 +143,17 @@ class KVPagePool:
         page.residency = Residency.PREFETCHING
         return page
 
+    @staticmethod
+    def _checksum(tensor: torch.Tensor) -> int:
+        return int(tensor.detach().float().sum().item())
+
     def prefetch(self, page_id: int, owner: str, stream: torch.cuda.Stream | None = None) -> KVPage:
         page = self.table.get(page_id)
         if page.host is None:
             raise RuntimeError("KV page requires host backing")
+        expected = self._checksum(page.host)
+        if page.checksum is not None and expected != page.checksum:
+            raise RuntimeError(f"stale host backing for page {page_id}")
         if self._slots[0].is_cuda and not page.host.is_pinned():
             raise RuntimeError("asynchronous KV prefetch requires pinned host backing")
         page = self.admit(page_id, owner)
@@ -160,6 +167,7 @@ class KVPagePool:
             page.device.copy_(page.host)
             page.event = None
         page.residency = Residency.RESIDENT
+        page.checksum = expected
         self.telemetry.resident += 1
         self.telemetry.prefetch_bytes += page.device.nbytes
         self.telemetry.queue_depth = max(0, self.telemetry.queue_depth - 1)
@@ -200,6 +208,8 @@ class KVPagePool:
         page.residency = Residency.COLD
         page.event = None
         page.release(owner)
+        if page.host is not None:
+            page.checksum = self._checksum(page.host)
         self.telemetry.eviction_bytes += page.device.nbytes if page.device is not None else 0
         self.telemetry.queue_depth = max(0, self.telemetry.queue_depth - 1)
         self.telemetry.resident = max(0, self.telemetry.resident - 1)

@@ -79,6 +79,16 @@ def test_eviction_round_trip_and_duplicate_claim():
     assert not pool.evict(0, "r2", generation)
 
 
+def test_stale_host_backing_is_rejected_after_first_load():
+    p = page(0)
+    pool = KVPagePool([p], 1)
+    pool.prefetch(0, "r")
+    pool.evict(0, "r")
+    p.host.add_(1)
+    with pytest.raises(RuntimeError, match="stale host backing"):
+        pool.prefetch(0, "r2")
+
+
 def test_bad_backing_does_not_claim_page():
     p = page(0)
     p.device = torch.zeros(4)
