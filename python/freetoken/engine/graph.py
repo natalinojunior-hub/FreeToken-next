@@ -3,7 +3,7 @@ from __future__ import annotations
 import gc
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List
+from typing import TYPE_CHECKING, Callable, Dict, List
 
 import torch
 from freetoken.core import Batch, Req, get_global_ctx
@@ -217,6 +217,7 @@ class GraphRunner:
         moe_offload_cache: OffloadMoeCache | None = None,
         mrope: bool = False,
         verify_tokens: tuple[int, ...] = (),
+        kv_replay_check: Callable[[Batch], bool] | None = None,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -230,6 +231,7 @@ class GraphRunner:
         self.moe_offload_cache = moe_offload_cache
         self.mrope = mrope
         self.stream = stream
+        self.kv_replay_check = kv_replay_check
         self.device = device
         self.verify_graphs: dict[int, VerifyGraph] = {}
         self.draft: DraftGraph | None = None
@@ -454,6 +456,9 @@ class GraphRunner:
         )
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
+        check = getattr(self, "kv_replay_check", None)
+        if check is not None and not check(batch):
+            return False
         if batch.is_decode:
             return batch.size <= self.max_graph_bs
         return self._is_verify(batch)
