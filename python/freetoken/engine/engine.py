@@ -762,6 +762,7 @@ class Engine:
             f"{mem_GB(measured_graph)} measured",
         )
         self._calibrate_vram_ledger()
+        self._restore_vram_headroom()
 
     def _fit_kv_ram_tier(self, config: EngineConfig) -> None:
         """Size the RAM tier against live RAM; auto tiering drops it (KV stays in VRAM) where
@@ -956,6 +957,36 @@ class Engine:
                 "per-layer method tables outside the bank rows (alphas, s2_deltas, block "
                 f"scales); largest holders {tensor_breakdown(cache)}",
             )
+
+    def _restore_vram_headroom(self) -> None:
+        """Close the startup plan when it came out short.
+
+        Consumers that allocate lazily (backend decode scratch, the graph pool) are measured only
+        after the pools are built, so the plan can hand their bytes to experts and KV. When the
+        account then leaves no room for the modelled transient peak (``uncommitted < 0``, the
+        state that OOMs in the first long prefill), the deficit comes back from the expert cache
+        -- the one elastic consumer -- before anything is served. A target below the model's
+        floor is rejected by the rebuild (old cache kept) and fails startup loudly."""
+        from freetoken.utils import div_ceil
+
+        ledger = getattr(self, "vram_ledger", None)
+        cache = self.moe_offload_cache
+        if ledger is None or cache is None:
+            return
+        # Both views must close: the physical one (baseline - held - reserve) and the ceiling
+        # the rebuild fit-check enforces (memory_ratio x baseline).
+        deficit = max(-ledger.uncommitted_bytes(), -ledger.headroom_bytes())
+        if deficit <= 0:
+            return
+        _, per_slot = self._target_moe_and_expert_bytes(None)
+        target = cache.cache_size - div_ceil(deficit, per_slot)
+        logger.info_rank0(
+            f"VRAM account {mem_GB(deficit)} short after startup: expert cache "
+            f"{cache.cache_size} -> {target} slots"
+        )
+        self.rebuild_runtime_cache(moe_cache_size=target)
+        self._charge_expert_cache(cache)
+        self._calibrate_vram_ledger()
 
     def _calibrate_vram_ledger(self) -> None:
         """Print the account next to what the allocator actually holds.
@@ -2255,7 +2286,7 @@ def _adjust_config(config: EngineConfig):
             "W8A16 fold is only validated exact in bfloat16); use bfloat16."
         )
     if (
-        getattr(config, "kv_format", "auto") in ("turbo3", "turbo4")
+        getattr(config, "kv_format", "auto") in ("turbo3", "turbo4", "fp8", "nvfp4")
         and config.attention_backend == "auto"
     ):
         if AttnType.QSA in required_attn_types:
