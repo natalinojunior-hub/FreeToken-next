@@ -886,7 +886,6 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         # overwrites the page_table row that already held the correct, real one (orphaning it).
         if not skip_alloc:
             self.cache_manager.allocate_paged(batch.reqs)
-            batch.kv_page_ids = self.cache_manager.logical_page_ids(batch.reqs)
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
