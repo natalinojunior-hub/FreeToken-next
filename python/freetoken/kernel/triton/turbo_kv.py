@@ -984,7 +984,8 @@ def indices(y: torch.Tensor, book: str) -> torch.Tensor:
     """Nearest centroid by midpoint search; ties take the **higher** index (A8 sec.2 step 7:
     ``val == 0.0`` lands on index 4 for turbo3)."""
     _, mid = _book(y.device, book)
-    return (y.unsqueeze(-1) >= mid).sum(-1).to(torch.uint8)
+    # Binary search, not a [rows, 128, levels] compare: turbo8 has 255 midpoints.
+    return torch.bucketize(y.contiguous(), mid, right=True).to(torch.uint8)
 
 
 def pack(idx: torch.Tensor, book: str) -> torch.Tensor:
