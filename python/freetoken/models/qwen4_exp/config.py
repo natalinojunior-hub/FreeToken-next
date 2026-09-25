@@ -300,6 +300,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         expert_quant=expert_quant,
         qwen4_args=qwen4_args,
         slot_states=ple_slot_states(qwen4_args),
+        kv_ram_tier_certified=True,
     )
 
 

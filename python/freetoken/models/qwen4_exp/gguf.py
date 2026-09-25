@@ -393,6 +393,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         attn_quant="gguf",
         dense_quant="gguf",
         lm_head_quant="gguf",
+        kv_ram_tier_certified=True,
     )
 
 

@@ -106,6 +106,10 @@ def _kv_ram_tier_unsupported(config, pool_cls, device) -> str | None:
     """Why this engine cannot host KV pages in RAM, or None when it can."""
     if pool_cls.__name__ != "QSAKVCache":
         return f"{pool_cls.__name__} KV pool"
+    if not getattr(config.model_config, "kv_ram_tier_certified", False):
+        # Auto RAM tiering is a measured win only for the families that declared it; others stay
+        # all-VRAM until certified on real hardware (--kv-tiering force is unaffected).
+        return "model family not certified for KV in RAM"
     if config.kv_format != "auto":
         return f"kv_format={config.kv_format}"
     if config.tp_info.size != 1:
@@ -142,8 +146,9 @@ _KV_RAM_LADDER = ("native", "fp8", "turbo8", "turbo4", "turbo3")
 # Measured dominance (campaign 15, ISTA 64K/128K/256K forced tier): a key format is dropped
 # from the auto ladder because its value is at least as good (quality: usage 20/20, needle
 # pass) and faster (FP8 vs BF16 TG +5.1/+3.5/+3.8%): the RAM tier is read over PCIe, so
-# fewer bytes per page win while quality holds. Turbo8 (campaign 16, same protocol): equal
-# quality, TG 42.7/40.3/39.2 vs FP8 59.2/57.9/52.4, PP -40%, and not smaller than FP8.
+# fewer bytes per page win while quality holds. Turbo8 (campaign 16, same protocol, after the
+# selected-token decode): equal quality, TG 50.5/50.5/47.5 vs FP8 59.2/57.9/52.4, and not
+# smaller than FP8. Turbo4/turbo3 are also slower but half/less the RAM, so they stay.
 _KV_RAM_DOMINATED_BY = {"native": "fp8", "turbo8": "fp8"}
 
 
@@ -472,11 +477,14 @@ class Engine:
         # silently ignoring --kv-ram-tokens.
         self.host_pages = 0
         self._host_reserve_bytes = 0
-        self._kv_spill_auto = False
+        self._kv_tier_auto = False
         if config.kv_tiering == "auto":
+            # Measured (campaign 16, ISTA k0): RAM-tier KV ties VRAM at 16K and beats it from
+            # 64K (+4..+22%), so auto tiers whenever the family is certified, the pool supports
+            # it, and RAM holds it. Uncertified families fall through to all-VRAM.
             reason = _kv_ram_tier_unsupported(config, self._pool_cls, self.device)
             if reason is None:
-                self._kv_spill_auto = True
+                self._kv_tier_auto = True
                 self.host_pages = -(-config.max_seq_len // config.page_size)
                 self._host_reserve_bytes = self._pool_cls.host_tier_device_bytes(
                     config, self.host_pages * config.page_size
@@ -607,13 +615,8 @@ class Engine:
         # KV RAM tiering charges its device-side overhead (compressed index/rope rows +
         # host_staging, priced over the whole RAM tier) off the top, BEFORE the device page
         # count is solved, so the device pages that fit are the ones actually left over.
-        if self._kv_spill_auto and self.host_pages and config.num_page_override is None:
-            # Without the planner: keep the whole context in VRAM when it fits.
-            context_pages = -(-config.max_seq_len // config.page_size)
-            if self._pool_cls.solve_num_pages(config, available_memory) >= context_pages:
-                self.host_pages = self._host_reserve_bytes = 0
         if self.host_pages:
-            _check_kv_ram_budget(config, self._pool_cls, self.host_pages)
+            self._fit_kv_ram_tier(config)
         available_memory -= self._host_reserve_bytes
         device_pages = self._pool_cls.solve_num_pages(config, available_memory)
         self.num_pages = device_pages + self.host_pages
@@ -759,6 +762,18 @@ class Engine:
             f"{mem_GB(measured_graph)} measured",
         )
         self._calibrate_vram_ledger()
+
+    def _fit_kv_ram_tier(self, config: EngineConfig) -> None:
+        """Size the RAM tier against live RAM; auto tiering drops it (KV stays in VRAM) where
+        force refuses with the largest context that fits."""
+        try:
+            _check_kv_ram_budget(config, self._pool_cls, self.host_pages)
+        except RuntimeError as err:
+            if not self._kv_tier_auto:
+                raise
+            logger.info_rank0(f"KV RAM tier does not fit RAM, KV stays in VRAM: {err}")
+            self.host_pages = self._host_reserve_bytes = 0
+            object.__setattr__(config, "kv_ram_resolved_dtype", None)
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -1212,7 +1227,7 @@ class Engine:
             if self.host_pages:
                 # Phase H builds the real KV pool, RAM tier included: size it against the RAM
                 # left after the weights and expert banks, not the pre-load snapshot.
-                _check_kv_ram_budget(config, self._pool_cls, self.host_pages)
+                self._fit_kv_ram_tier(config)
             plan = planner.plan(
                 config=config,
                 model=self.model,
@@ -1226,10 +1241,7 @@ class Engine:
                 weights_bytes=self._weights_bytes,
                 host_reserve_bytes=self._host_reserve_bytes,
                 host_pages=self.host_pages,
-                spill_only_if_needed=self._kv_spill_auto,
             )
-            if self._kv_spill_auto and not planner.host_pages:
-                self.host_pages = self._host_reserve_bytes = 0
             object.__setattr__(config, "moe_cache_size", plan.expert_slots)
             object.__setattr__(config, "moe_prefill_overlap", plan.prefill_overlap)
             if config.num_page_override is None:

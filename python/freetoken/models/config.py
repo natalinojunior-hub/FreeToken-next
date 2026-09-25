@@ -366,6 +366,11 @@ class ModelConfig:
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
+    # KV-in-RAM auto tiering is a measured win only for the family that declared it (campaign
+    # 15/16, ISTA). Families not yet certified keep the all-VRAM default under --kv-tiering auto;
+    # --kv-tiering force still works for any QSA BF16 pool. Set True by a parse_config after its
+    # TG/quality anchors beat all-VRAM on real hardware.
+    kv_ram_tier_certified: bool = False
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
     slot_states: Tuple[SlotStateSpec, ...] = ()

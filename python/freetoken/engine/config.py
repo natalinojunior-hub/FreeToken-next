@@ -51,8 +51,9 @@ class EngineConfig:
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
-    # Opt-in only; capability checks must keep the all-VRAM path otherwise.
-    kv_tiering: str = "off"
+    # auto: KV in RAM whenever the pool supports it and RAM holds it (measured faster from 64K);
+    # otherwise all-VRAM.
+    kv_tiering: str = "auto"
     # RAM-tier size in tokens (--kv-ram-tokens), consumed only by kv_tiering="force"
     # (rounded up to whole pages by the engine); 0 gives every context token a RAM page.
     # Ignored (no effect) when kv_tiering="off".
@@ -128,8 +129,7 @@ class EngineConfig:
                 raise ValueError("--kv-ram-tokens must be >= 0 (0 = the whole context)")
         elif self.kv_tiering not in ("off", "auto"):
             raise ValueError(f"unknown KV RAM tiering mode {self.kv_tiering!r}")
-        # "off" and "auto" ignore kv_ram_tokens; auto spills the whole context tier only when
-        # the context cannot fit in VRAM.
+        # "off" and "auto" ignore kv_ram_tokens; auto tiers the whole context.
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":

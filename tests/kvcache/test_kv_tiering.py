@@ -231,3 +231,49 @@ def test_cuda_round_trip_fences_eviction():
     torch.cuda.synchronize()
     assert pool.evict(1, "r")
     assert torch.equal(p.host, torch.full_like(p.host, 9))
+
+
+def test_auto_tier_falls_back_to_vram_when_ram_is_short(monkeypatch):
+    from freetoken.engine import engine as eng
+
+    gib = 1 << 30
+    monkeypatch.setattr(eng, "_meminfo", lambda: {"MemTotal": 96 * gib, "MemAvailable": 16 * gib})
+    pool = SimpleNamespace(host_tier_ram_bytes=lambda config, tokens, dtype=None: 5_200 * tokens)
+    config = SimpleNamespace(
+        max_seq_len=1 << 20, page_size=64, dtype=torch.bfloat16, kv_ram_resolved_dtype="turbo3"
+    )
+    engine = SimpleNamespace(_pool_cls=pool, host_pages=(1 << 20) // 64, _host_reserve_bytes=1)
+    engine._kv_tier_auto = True
+    eng.Engine._fit_kv_ram_tier(engine, config)
+    assert engine.host_pages == engine._host_reserve_bytes == 0
+    assert config.kv_ram_resolved_dtype is None
+    engine = SimpleNamespace(_pool_cls=pool, host_pages=(1 << 20) // 64, _kv_tier_auto=False)
+    with pytest.raises(RuntimeError, match="o máximo possível é"):
+        eng.Engine._fit_kv_ram_tier(engine, config)
+    assert eng.EngineConfig.kv_tiering == "auto"
+
+
+def test_auto_kv_ram_tier_requires_certified_family():
+    """The auto default gates on a model-family capability, not a name match: only a certified
+    family (qwen4) tiers KV in RAM by default; others keep all-VRAM until certified."""
+    from freetoken.engine import engine as eng
+
+    qsa_pool = type("QSAKVCache", (), {})
+    device = SimpleNamespace(type="cuda")
+
+    def cfg(certified):
+        return SimpleNamespace(
+            kv_format="auto",
+            tp_info=SimpleNamespace(size=1),
+            model_config=SimpleNamespace(kv_ram_tier_certified=certified),
+        )
+
+    assert eng._kv_ram_tier_unsupported(cfg(True), qsa_pool, device) is None
+    reason = eng._kv_ram_tier_unsupported(cfg(False), qsa_pool, device)
+    assert reason is not None and "certified" in reason
+
+    class DensePool:
+        pass
+
+    assert eng._kv_ram_tier_unsupported(cfg(True), DensePool, device) == "DensePool KV pool"
+
