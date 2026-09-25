@@ -79,6 +79,42 @@ def _gguf_module():
     return gguf
 
 
+def _metadata_shards(path: str) -> list[str] | None:
+    """Discover split shards whose filenames lack the llama.cpp pattern."""
+    if os.path.isfile(path):
+        candidates = sorted(glob.glob(os.path.join(os.path.dirname(path), "*.gguf")))
+    elif os.path.isdir(path):
+        candidates = sorted(glob.glob(os.path.join(path, "*.gguf")))
+    else:
+        return None
+    shards: dict[int, str] = {}
+    count: int | None = None
+    gguf = _gguf_module()
+    for candidate in candidates:
+        try:
+            reader = gguf.GGUFReader(candidate, mode="r")
+            split_no = reader.fields.get("split.no")
+            split_count = reader.fields.get("split.count")
+            if split_no is None or split_count is None:
+                continue
+            no = int(split_no.contents())
+            this_count = int(split_count.contents())
+        except Exception:  # noqa: BLE001 - unrelated sidecars are ignored
+            continue
+        if count is None:
+            count = this_count
+        if this_count != count or no < 0 or no >= count or no in shards:
+            raise ValueError(f"Invalid GGUF split metadata in {candidate}")
+        shards[no] = candidate
+    if count is None:
+        return None
+    expected = set(range(count))
+    if set(shards) != expected:
+        missing = sorted(expected - set(shards))
+        raise ValueError(f"Incomplete GGUF split metadata: missing split.no values {missing}")
+    return [shards[i] for i in range(count)]
+
+
 def gguf_shards(path: str) -> list[str]:
     r"""Return the ordered list of shard paths given any shard's path (or a plain .gguf).
 
@@ -99,14 +135,13 @@ def gguf_shards(path: str) -> list[str]:
                 f"({[os.path.basename(f) for f in first]}); point at one shard instead"
             )
         if not first:
-            return [path]
+            return _metadata_shards(path) or [path]
         path = first[0]
 
     basename = os.path.basename(path)
     match = re.match(r"(?P<base>.+)-(\d{5})-of-(\d{5})\.gguf$", basename)
     if not match:
-        # Not a shard file; return as single-file path.
-        return [path]
+        return _metadata_shards(path) or [path]
 
     base, shard_idx_str, total_shards_str = match.group("base"), match.group(2), match.group(3)
     total_shards = int(total_shards_str)
@@ -159,8 +194,7 @@ def resolve_gguf_path(model_path: str) -> str | None:
     if os.path.isfile(model_path) and model_path.endswith(".gguf"):
         basename = os.path.basename(model_path)
         if not re.match(r".+-\d{5}-of-\d{5}\.gguf$", basename):
-            # Plain .gguf, not a shard
-            return model_path
+            return (_metadata_shards(model_path) or [model_path])[0]
 
     # Case 2: A shard file or a directory
     if os.path.isfile(model_path) and model_path.endswith(".gguf"):
@@ -174,6 +208,9 @@ def resolve_gguf_path(model_path: str) -> str | None:
         candidates = glob.glob(pattern)
         if len(candidates) == 1:
             return candidates[0]
+        metadata_shards = _metadata_shards(model_path)
+        if metadata_shards:
+            return metadata_shards[0]
 
     return None
 

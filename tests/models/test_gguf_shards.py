@@ -31,6 +31,7 @@ from freetoken.models.gguf.reader import (
     is_gguf_path,
     iter_gguf_tensors,
     load_gguf_metadata,
+    resolve_gguf_path,
 )
 
 # GGUF value type tags
@@ -139,6 +140,18 @@ class TestSingleFileUnchanged:
 
 
 class TestShardDiscovery:
+    def test_discovery_from_split_metadata_with_plain_names(self, tmp_path: Path):
+        paths = _make_split(tmp_path, "m", [["a.weight"], ["b.weight"]])
+        plain = [tmp_path / "weights.gguf", tmp_path / "ngram-embeddings.gguf"]
+        for source, target in zip(paths, plain):
+            source.rename(target)
+
+        expected = [str(p) for p in plain]
+        assert gguf_shards(str(plain[0])) == expected
+        assert gguf_shards(str(plain[1])) == expected
+        assert gguf_shards(str(tmp_path)) == expected
+        assert resolve_gguf_path(str(plain[1])) == str(plain[0])
+
     def test_discovery_from_any_shard_or_directory(self, tmp_path: Path):
         paths = _make_split(tmp_path, "m", [["a.weight"], ["b.weight"], ["c.weight"]])
         want = [str(p) for p in paths]

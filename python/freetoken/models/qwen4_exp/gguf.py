@@ -401,7 +401,16 @@ def convert_qwen4exp_to_gguf(model, config: ModelConfig, *, model_path: str) -> 
         config.num_kv_heads * config.head_dim,
         config.num_kv_heads * config.head_dim,
     ]
-    _in_proj_split = [10240, 6144, 48, 48]
+    gdn_group = next(
+        group for group in config.attention_groups if isinstance(group, LinearGatedDeltaGroupConfig)
+    )
+    _in_proj_split = [
+        2 * gdn_group.num_key_heads * gdn_group.key_head_dim
+        + gdn_group.num_value_heads * gdn_group.value_head_dim,
+        gdn_group.num_value_heads * gdn_group.value_head_dim,
+        gdn_group.num_value_heads,
+        gdn_group.num_value_heads,
+    ]
     _index_split = [
         config.qwen4_args.index_n_heads * config.qwen4_args.index_head_dim,
         config.qwen4_args.index_kv_heads * config.qwen4_args.index_head_dim,
