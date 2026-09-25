@@ -292,6 +292,20 @@ class QSAKVCache(BaseKVCachePool):
             per_token += 2 * local_kv_heads * spec.head_dim * config.dtype.itemsize
         return per_token * host_tokens
 
+    @classmethod
+    def host_tier_ram_bytes(cls, config, host_tokens: int) -> int:
+        """Page-locked host bytes of the RAM tier: the BF16 K/V rows of every KV layer."""
+        from freetoken.attention import AttnType
+        from freetoken.utils import div_even
+
+        per_token = 0
+        for spec in config.model_config.kv_cache_group_specs():
+            if spec.is_swa or spec.attn_type is not AttnType.QSA:
+                continue
+            heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
+            per_token += 2 * spec.num_layers * heads * spec.head_dim * config.dtype.itemsize
+        return per_token * host_tokens
+
     def unit_bytes(self) -> tuple[int, int]:
         kv, swa = self._pool.unit_bytes()
         if hasattr(self._pool, "_kv_buffer"):

@@ -106,9 +106,25 @@ def test_bad_backing_does_not_claim_page():
     assert p.device_slot is None
 
 
-def test_runtime_rejects_unimplemented_auto_tiering():
-    with pytest.raises(NotImplementedError, match="only 'off' and 'force'"):
-        EngineConfig.__post_init__(SimpleNamespace(kv_tiering="auto", kv_ram_tokens=0))
+def test_config_accepts_auto_and_rejects_unknown_tiering():
+    EngineConfig.__post_init__(
+        SimpleNamespace(kv_tiering="auto", kv_ram_tokens=0, moe_backend=None)
+    )
+    with pytest.raises(ValueError, match="tiering"):
+        EngineConfig.__post_init__(SimpleNamespace(kv_tiering="swap", kv_ram_tokens=0))
+
+
+def test_kv_ram_budget_refuses_with_max_context(monkeypatch):
+    from freetoken.engine import engine as eng
+
+    gib = 1 << 30
+    monkeypatch.setattr(eng, "_meminfo", lambda: {"MemTotal": 96 * gib, "MemAvailable": 16 * gib})
+    pool = SimpleNamespace(host_tier_ram_bytes=lambda config, tokens: 25_600 * tokens)
+    config = SimpleNamespace(max_seq_len=1 << 20, page_size=64)
+    with pytest.raises(RuntimeError, match="o contexto pedido de 1048576 tokens") as err:
+        eng._check_kv_ram_budget(config, pool, (1 << 20) // 64)
+    assert "o máximo possível é" in str(err.value)
+    eng._check_kv_ram_budget(SimpleNamespace(max_seq_len=65536, page_size=64), pool, 1024)
 
 
 def test_force_tiering_rejects_negative_kv_ram_tokens():

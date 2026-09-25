@@ -124,12 +124,10 @@ class EngineConfig:
         if self.kv_tiering == "force":
             if self.kv_ram_tokens < 0:
                 raise ValueError("--kv-ram-tokens must be >= 0 (0 = the whole context)")
-        elif self.kv_tiering != "off":
-            raise NotImplementedError(
-                f"KV RAM tiering mode {self.kv_tiering!r} is unavailable: only 'off' and "
-                "'force' are wired to the cache pools"
-            )
-        # "off" ignores kv_ram_tokens (no effect); nothing else to validate here.
+        elif self.kv_tiering not in ("off", "auto"):
+            raise ValueError(f"unknown KV RAM tiering mode {self.kv_tiering!r}")
+        # "off" and "auto" ignore kv_ram_tokens; auto spills the whole context tier only when
+        # the context cannot fit in VRAM.
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":
