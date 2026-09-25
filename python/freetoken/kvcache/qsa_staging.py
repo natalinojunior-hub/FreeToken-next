@@ -8,6 +8,8 @@ addresses.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Iterable
+import torch
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,35 @@ class QSAStagingAdapter:
             raise RuntimeError(f"stale QSA page {entry.page_id}")
         if device_slot is not None and entry.device_slot != device_slot:
             raise RuntimeError(f"QSA page {entry.page_id} moved during staging")
+
+    def remap_block_table(
+        self,
+        logical_table: torch.Tensor,
+        entries: Iterable[QSAStageEntry],
+        *,
+        generations: dict[int, int] | None = None,
+    ) -> torch.Tensor:
+        """Materialize a device page table from logical QSA page ids.
+
+        The result is a fresh device tensor, so kernels never receive a host
+        pointer or a mutable view of the scheduler's physical table. ``-1``
+        remains the invalid-page sentinel used by the QSA kernels.
+        """
+        if logical_table.ndim != 2 or logical_table.dtype != torch.int32:
+            raise ValueError("QSA logical block table must be a 2-D int32 tensor")
+        if not logical_table.is_cuda:
+            raise ValueError("QSA staged block table must reside on CUDA")
+        by_id = {entry.page_id: entry for entry in entries}
+        mapped = logical_table.detach().clone()
+        for page_id, entry in by_id.items():
+            if generations is not None:
+                self.validate_generation(entry, generations.get(page_id, -1))
+            mapped[logical_table == page_id] = entry.device_slot
+        unknown = logical_table >= 0
+        for page_id in torch.unique(logical_table[unknown]).tolist():
+            if page_id not in by_id:
+                raise RuntimeError(f"QSA logical page {page_id} has no staged slot")
+        return mapped.contiguous()
 
 
 __all__ = ["QSAStageEntry", "QSAStagingAdapter"]
