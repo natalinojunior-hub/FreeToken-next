@@ -43,6 +43,42 @@ def _e2m1(byte, odd):
 
 
 @triton.jit
+def _e2m1_f32(nib):
+    """e2m1 codes (0..15, one per element) -> fp32 through Blackwell's F2FP.E2M1 unit
+    (cvt.rn.f16x2.e2m1x2). The nibble is isolated by the caller: fed a whole byte under runtime
+    row strides the conversion came back wrong (reproduced; constexpr strides were fine)."""
+    pair = tl.inline_asm_elementwise(
+        "{ .reg .b8 b0, b1, b2, b3; mov.b32 {b0, b1, b2, b3}, $1; cvt.rn.f16x2.e2m1x2 $0, b0; }",
+        "=r,r",
+        [nib],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    # sign-extend the low half so the int16 narrowing is exact
+    return ((pair << 16) >> 16).to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
+
+
+@triton.jit
+def _nvfp4_v(codes_ptr, norm_ptr, row, nrow, mask_n, D: tl.constexpr):
+    """[N, D] NVFP4 tile, fp32; e4m3 block scale and fp16 group norm read once per 16 values.
+    ``row``/``nrow``: [N, 1] code / norm row offsets."""
+    j = tl.arange(0, D)
+    byte = tl.load(
+        codes_ptr + row + ((j // 128) * 72 + (j % 128) // 2)[None, :], mask=mask_n[:, None], other=0
+    )
+    vals = _e2m1_f32((byte.to(tl.int32) >> ((j % 2) * 4)[None, :]) & 15)
+    js = tl.arange(0, D // 16)
+    sc = tl.load(
+        codes_ptr + row + ((js // 8) * 72 + 64 + js % 8)[None, :], mask=mask_n[:, None], other=0
+    )
+    nrm = tl.load(norm_ptr + nrow + (js // 8)[None, :], mask=mask_n[:, None], other=0.0)
+    scale = sc.to(tl.float8e4nv, bitcast=True).to(tl.float32) * nrm.to(tl.float32)  # [N, D/16]
+    N: tl.constexpr = vals.shape[0]
+    return tl.reshape(tl.reshape(vals, (N, D // 16, 16)) * scale[:, :, None], (N, D))
+
+
+@triton.jit
 def turbo_k_tile(
     codes_ptr,  # uint8 [tokens, heads, GROUPS * CODE_BYTES]
     norm_ptr,  # fp16  [tokens, heads, GROUPS]
@@ -63,19 +99,21 @@ def turbo_k_tile(
     ncol = slots[None, :] * stride_nt + kv_head * stride_nh
     grp = offs_d // 128
     jj = offs_d % 128
-    nrm = tl.load(norm_ptr + ncol + grp[:, None], mask=mask_n[None, :], other=0.0).to(tl.float32)
     if BOOK == BOOK_FP8:
         raw = tl.load(codes_ptr + col + (grp * 128 + jj)[:, None], mask=mask_n[None, :], other=0)
-        return (raw.to(tl.float8e4nv, bitcast=True).to(tl.float32) * nrm).to(out_dtype)
+        return raw.to(tl.float8e4nv, bitcast=True).to(out_dtype)  # fp8 norm is always 1
     if BOOK == BOOK_NVFP4:
-        byte = tl.load(
-            codes_ptr + col + (grp * 72 + jj // 2)[:, None], mask=mask_n[None, :], other=0
+        # built row-major and transposed: a [D, N] gather of packed bytes measured 1.9x slower
+        rows = _nvfp4_v(
+            codes_ptr,
+            norm_ptr,
+            slots[:, None] * stride_ct + kv_head * stride_ch,
+            slots[:, None] * stride_nt + kv_head * stride_nh,
+            mask_n,
+            offs_d.shape[0],
         )
-        sc = tl.load(
-            codes_ptr + col + (grp * 72 + 64 + jj // 16)[:, None], mask=mask_n[None, :], other=0
-        )
-        vals = _e2m1(byte, (jj % 2 == 1)[:, None])
-        return (vals * sc.to(tl.float8e4nv, bitcast=True).to(tl.float32) * nrm).to(out_dtype)
+        return tl.trans(rows).to(out_dtype)
+    nrm = tl.load(norm_ptr + ncol + grp[:, None], mask=mask_n[None, :], other=0.0).to(tl.float32)
     if BOOK == BOOK_TURBO3:
         low = tl.load(
             codes_ptr + col + (grp * 48 + jj // 4)[:, None], mask=mask_n[None, :], other=0
@@ -116,19 +154,12 @@ def turbo_v_tile(
     nrow = slots[:, None] * stride_nt + kv_head * stride_nh
     grp = offs_d // 128
     jj = offs_d % 128
-    nrm = tl.load(norm_ptr + nrow + grp[None, :], mask=mask_n[:, None], other=0.0).to(tl.float32)
     if BOOK == BOOK_FP8:
         raw = tl.load(codes_ptr + row + (grp * 128 + jj)[None, :], mask=mask_n[:, None], other=0)
-        return (raw.to(tl.float8e4nv, bitcast=True).to(tl.float32) * nrm).to(out_dtype)
+        return raw.to(tl.float8e4nv, bitcast=True).to(out_dtype)  # fp8 norm is always 1
     if BOOK == BOOK_NVFP4:
-        byte = tl.load(
-            codes_ptr + row + (grp * 72 + jj // 2)[None, :], mask=mask_n[:, None], other=0
-        )
-        sc = tl.load(
-            codes_ptr + row + (grp * 72 + 64 + jj // 16)[None, :], mask=mask_n[:, None], other=0
-        )
-        vals = _e2m1(byte, (jj % 2 == 1)[None, :])
-        return (vals * sc.to(tl.float8e4nv, bitcast=True).to(tl.float32) * nrm).to(out_dtype)
+        return _nvfp4_v(codes_ptr, norm_ptr, row, nrow, mask_n, offs_d.shape[0]).to(out_dtype)
+    nrm = tl.load(norm_ptr + nrow + grp[None, :], mask=mask_n[:, None], other=0.0).to(tl.float32)
     if BOOK == BOOK_TURBO3:
         low = tl.load(
             codes_ptr + row + (grp * 48 + jj // 4)[None, :], mask=mask_n[:, None], other=0
