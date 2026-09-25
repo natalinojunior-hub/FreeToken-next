@@ -111,9 +111,13 @@ def test_runtime_rejects_unimplemented_auto_tiering():
         EngineConfig.__post_init__(SimpleNamespace(kv_tiering="auto", kv_ram_tokens=0))
 
 
-def test_force_tiering_requires_kv_ram_tokens():
+def test_force_tiering_rejects_negative_kv_ram_tokens():
     with pytest.raises(ValueError, match="kv-ram-tokens"):
-        EngineConfig.__post_init__(SimpleNamespace(kv_tiering="force", kv_ram_tokens=0))
+        EngineConfig.__post_init__(SimpleNamespace(kv_tiering="force", kv_ram_tokens=-1))
+    # 0 sizes the RAM tier to the whole context.
+    EngineConfig.__post_init__(
+        SimpleNamespace(kv_tiering="force", kv_ram_tokens=0, moe_backend=None)
+    )
 
 
 def _config(**overrides):

@@ -54,7 +54,8 @@ class EngineConfig:
     # Opt-in only; capability checks must keep the all-VRAM path otherwise.
     kv_tiering: str = "off"
     # RAM-tier size in tokens (--kv-ram-tokens), consumed only by kv_tiering="force"
-    # (rounded up to whole pages by the engine). Ignored (no effect) when kv_tiering="off".
+    # (rounded up to whole pages by the engine); 0 gives every context token a RAM page.
+    # Ignored (no effect) when kv_tiering="off".
     kv_ram_tokens: int = 0
     # Buy the serving context out of the expert cache instead of hand-tuning the floor above:
     # the plan funds max_seq_len of KV and sizes experts from what remains, and refuses with the
@@ -121,8 +122,8 @@ class EngineConfig:
 
     def __post_init__(self):
         if self.kv_tiering == "force":
-            if self.kv_ram_tokens <= 0:
-                raise ValueError("--kv-tiering force needs --kv-ram-tokens > 0")
+            if self.kv_ram_tokens < 0:
+                raise ValueError("--kv-ram-tokens must be >= 0 (0 = the whole context)")
         elif self.kv_tiering != "off":
             raise NotImplementedError(
                 f"KV RAM tiering mode {self.kv_tiering!r} is unavailable: only 'off' and "

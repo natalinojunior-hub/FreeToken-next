@@ -102,6 +102,7 @@ class QSASparseMetadata(BaseAttnMetadata):
     k_rope_cache:     torch.Tensor | None = None  # [T, rotary_dim] float32
     # KV RAM tier, eager multi-row forwards only: RAM pages this forward reads (as tier
     # offsets) and the block table re-pointing them at the device staging slab.
+    phys_loc:         torch.Tensor | None = None  # [T] out_loc through the RAM tier page map
     host_pages:       torch.Tensor | None = None  # [n] int64, sorted page - num_device_pages
     staged_table:     torch.Tensor | None = None  # [bs, W//page_size] int32
     # fmt: on
@@ -244,15 +245,45 @@ class QSASparseAttnBackend(BaseAttnBackend):
         return get_global_ctx().page_table[:, :: self.page_size]
 
     def _block_table(self, table_idx: torch.Tensor) -> torch.Tensor:
-        return (self._block_base_view().index_select(0, table_idx) // self.page_size).to(
-            torch.int32
-        )
+        return self._physical_pages(
+            self._block_base_view().index_select(0, table_idx) // self.page_size
+        ).to(torch.int32)
+
+    def _physical_pages(self, pages: torch.Tensor) -> torch.Tensor:
+        """Scheduler page ids -> where the RAM-tier rebalancer currently holds them."""
+        page_map = getattr(self.kvcache, "page_map", None)
+        if page_map is None:
+            return pages
+        return page_map[pages.long().clamp(0, page_map.shape[0] - 1)]
+
+    def _physical_loc(self, out_loc: torch.Tensor) -> torch.Tensor:
+        if getattr(self.kvcache, "page_map", None) is None:
+            return out_loc
+        loc = out_loc.long()
+        pages = self._physical_pages(loc // self.page_size).long()
+        return (pages * self.page_size + loc % self.page_size).to(out_loc.dtype)
+
+    def _record_heat(self, md: QSASparseMetadata, indices: torch.Tensor) -> None:
+        """Count this layer's selections per physical page (graph-capturable, no sync)."""
+        heat = getattr(self.kvcache, "page_heat", None)
+        if heat is None or indices is None or indices.shape[0] > _ZERO_COPY_MAX_ROWS:
+            return  # decode/verify rows only: they are what zero-copy RAM reads slow down
+        table = md.block_table
+        valid = indices >= 0
+        logical = (indices.clamp(min=0) // self.page_size).clamp(max=table.shape[1] - 1)
+        rows = md.token_to_req.long()[:, None].expand_as(logical)
+        pages = table[rows, logical.long()].long()
+        sink = heat.shape[0] - 1
+        pages = torch.where(valid & (pages >= 0) & (pages < sink), pages, sink)
+        heat.index_add_(0, pages.flatten(), torch.ones_like(pages.flatten(), dtype=heat.dtype))
 
     def _stage_decode(self, md: QSASparseMetadata, bs: int, table_idx: torch.Tensor) -> None:
         """Copy this step's addressing into the static graph buffers and point the metadata
         at them (restage-per-replay, m3/dsa precedent)."""
         self._graph["block_table"][:bs].copy_(
-            self._block_base_view().index_select(0, table_idx) // self.page_size
+            self._physical_pages(
+                self._block_base_view().index_select(0, table_idx) // self.page_size
+            )
         )
         self._graph["kvlen"][:bs].copy_(md.kv_len_cpu.to(self.device, non_blocking=True))
         self._graph["table_idx"][:bs].copy_(table_idx)
@@ -320,11 +351,14 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata)
         slot = self._idx_slot[layer_id]
-        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        new_forward = md.cmp_rows is None or slot <= md.last_slot
+        if new_forward:
+            md.phys_loc = self._physical_loc(batch.out_loc)
+        self.kvcache.store_kv(k, v, md.phys_loc, layer_id)
         mark("store_kv")
         if md.block_table is None:
             self._snapshot_decode(md, batch)
-        if md.cmp_rows is None or slot <= md.last_slot:
+        if new_forward:
             # Rebuilt at the first QSA layer of every forward, not cached on the metadata: a
             # capture batch runs its warmup and its capture through ONE metadata object, and a
             # cached plan would bake the warmup's addresses into the graph. Layers run in
@@ -337,6 +371,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._update_index_cache(index, md, slot)
         mark("index_cache")
         indices = self._select(index, md, slot)
+        self._record_heat(md, indices)
         mark("select")
         compressed = getattr(self.kvcache, "compressed", False) or getattr(
             self.kvcache._pool, "compressed", False
@@ -468,7 +503,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it
         (it is layer-invariant). Pure device arithmetic: no host sync, graph-capturable."""
         md.positions = batch.positions
-        out_loc = batch.out_loc.to(torch.int64)
+        out_loc = md.phys_loc.to(torch.int64)
         positions = batch.positions.to(torch.int64)
         if self._section_table is not None:
             rope_positions = batch.get_attn_positions()

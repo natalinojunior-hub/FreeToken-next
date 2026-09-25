@@ -395,7 +395,8 @@ class Engine:
                 )
             if self.device.type != "cuda":
                 raise NotImplementedError("--kv-tiering force needs a CUDA device")
-            self.host_pages = -(-config.kv_ram_tokens // config.page_size)  # ceil div to pages
+            ram_tokens = config.kv_ram_tokens or config.max_seq_len
+            self.host_pages = -(-ram_tokens // config.page_size)  # ceil div to pages
             self._host_reserve_bytes = self._pool_cls.host_tier_device_bytes(
                 config, self.host_pages * config.page_size
             )
@@ -1089,6 +1090,7 @@ class Engine:
                 page_size=config.page_size,
                 weights_bytes=self._weights_bytes,
                 host_reserve_bytes=self._host_reserve_bytes,
+                host_pages=self.host_pages,
             )
             object.__setattr__(config, "moe_cache_size", plan.expert_slots)
             object.__setattr__(config, "moe_prefill_overlap", plan.prefill_overlap)

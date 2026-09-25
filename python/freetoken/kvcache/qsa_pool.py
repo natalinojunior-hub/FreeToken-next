@@ -214,6 +214,17 @@ class QSAKVCache(BaseKVCachePool):
             if self._mrope
             else None
         )
+        # Hot/cold residency (RAM tier only). The scheduler's page ids are logical: kernels
+        # address page_map[logical], and rebalance() swaps page contents between the tiers
+        # stream-ordered, so the page table, radix tree and free list never see a move.
+        if getattr(self._pool, "_host_pages", 0):
+            ids = torch.arange(num_pages, dtype=torch.int32, device=self.device)
+            self.page_map = ids
+            self._page_owner = ids.clone()
+            # Selections per physical page, halved every rebalance; the last entry sinks misses.
+            self.page_heat = torch.zeros(num_pages + 1, dtype=torch.int32, device=self.device)
+        else:
+            self.page_map = None
 
     def rebuild(self, num_pages: int) -> None:
         # Free the index tiers BEFORE the K/V realloc (super().rebuild frees + syncs +
@@ -352,6 +363,44 @@ class QSAKVCache(BaseKVCachePool):
     def host_kv(self, index: int) -> tuple[torch.Tensor, torch.Tensor] | None:
         host_kv = getattr(self._pool, "host_kv", None)
         return None if host_kv is None else host_kv(index)
+
+    def rebalance(self, max_swaps: int) -> None:
+        """Swap up to ``max_swaps`` of the hottest RAM pages with the coldest device pages.
+
+        Pure device work on the current stream (no host sync): every kernel enqueued after this
+        reads the new placement, every kernel enqueued before it read the old one. A pair swaps
+        only when the RAM page was selected more than twice as often (hysteresis)."""
+        from freetoken.kernel.triton.qsa.tiered import swap_pages
+
+        device_pages = self.num_device_pages
+        total = self.page_map.shape[0]
+        k = min(max_swaps, device_pages, total - device_pages)
+        if k <= 0:
+            return
+        heat = self.page_heat[:total]
+        hot, host = torch.topk(heat[device_pages:], k)
+        cold, dev = torch.topk(heat[:device_pages], k, largest=False)
+        swap = hot > 2 * cold + 1
+        active = swap.to(torch.int32)
+        phys_host = host + device_pages
+        pool = self._pool
+        swap_pages(pool._kv_buffer.flatten(0, 1), pool._kv_host.flatten(0, 1), dev, host, active)
+        per_page = self._page_size // self._index_ratio
+        cmp = self._cmp_k_buffer[:, : total * per_page].unflatten(1, (total, per_page))
+        swap_pages(cmp, cmp, dev, phys_host, active)
+        if self._rope_positions is not None:
+            rope = self._rope_positions.view(1, total, self._page_size, 3)
+            swap_pages(rope, rope, dev, phys_host, active)
+        heat_dev, heat_host = heat[dev], heat[phys_host]
+        heat[dev] = torch.where(swap, heat_host, heat_dev)
+        heat[phys_host] = torch.where(swap, heat_dev, heat_host)
+        owner_dev = self._page_owner[dev].long()
+        owner_host = self._page_owner[phys_host].long()
+        self.page_map[owner_dev] = torch.where(swap, phys_host, dev).to(torch.int32)
+        self.page_map[owner_host] = torch.where(swap, dev, phys_host).to(torch.int32)
+        self._page_owner[dev] = torch.where(swap, owner_host, owner_dev).to(torch.int32)
+        self._page_owner[phys_host] = torch.where(swap, owner_dev, owner_host).to(torch.int32)
+        self.page_heat.bitwise_right_shift_(1)
 
     def cmp_k_cache(self, slot: int) -> torch.Tensor:
         """Compressed index keys of one sparse layer: ``[rows, index_head_dim]``."""

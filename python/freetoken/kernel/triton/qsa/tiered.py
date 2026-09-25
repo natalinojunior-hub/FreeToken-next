@@ -143,4 +143,68 @@ def zero_tier(dst: torch.Tensor) -> None:
         _zero_kernel[(triton.cdiv(n, block),)](dst, n, BLOCK=block, num_warps=4)
 
 
-__all__ = ["gather_pages", "tiered_store_kv", "zero_tier"]
+@triton.jit
+def _swap_pages_kernel(
+    a_ptr,
+    b_ptr,
+    a_idx_ptr,
+    b_idx_ptr,
+    active_ptr,
+    stride_ag,
+    stride_ap,
+    stride_bg,
+    stride_bp,
+    PAGE_ELEMS: tl.constexpr,
+    BLOCK: tl.constexpr,
+) -> None:
+    pair = tl.program_id(0)
+    group = tl.program_id(1).to(tl.int64)
+    chunk = tl.program_id(2)
+    if tl.load(active_ptr + pair) != 0:
+        cols = chunk * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < PAGE_ELEMS
+        a = a_ptr + group * stride_ag + tl.load(a_idx_ptr + pair).to(tl.int64) * stride_ap + cols
+        b = b_ptr + group * stride_bg + tl.load(b_idx_ptr + pair).to(tl.int64) * stride_bp + cols
+        x = tl.load(a, mask=mask)
+        y = tl.load(b, mask=mask)
+        tl.store(a, y, mask=mask)
+        tl.store(b, x, mask=mask)
+
+
+def swap_pages(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_idx: torch.Tensor,
+    b_idx: torch.Tensor,
+    active: torch.Tensor,
+) -> None:
+    """Swap page ``a[g, a_idx[i]]`` with ``b[g, b_idx[i]]`` for every group ``g`` where
+    ``active[i]``; ``a``/``b`` are ``[groups, pages, ...]`` views whose pages are contiguous.
+
+    Pairs must not alias one another (distinct pages on each side, and no page on both)."""
+    if a.shape[0] != b.shape[0] or a.shape[2:] != b.shape[2:] or a.dtype != b.dtype:
+        raise ValueError("swap_pages needs matching [groups, pages, ...] layouts")
+    elems = a[0, 0].numel()
+    for t in (a, b):
+        if t.stride(1) < elems or not t[0, 0].is_contiguous():
+            raise ValueError("swap_pages needs page-contiguous slabs")
+    if not a_idx.shape[0]:
+        return
+    block = min(triton.next_power_of_2(elems), 4096)
+    _swap_pages_kernel[(a_idx.shape[0], a.shape[0], triton.cdiv(elems, block))](
+        a,
+        b,
+        a_idx,
+        b_idx,
+        active,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        PAGE_ELEMS=elems,
+        BLOCK=block,
+        num_warps=4,
+    )
+
+
+__all__ = ["gather_pages", "swap_pages", "tiered_store_kv", "zero_tier"]

@@ -460,3 +460,49 @@ def test_qsa_kv_cache_rejects_host_pages_with_compressed_format():
             host_pages=4,
             kv_format="turbo4",
         )
+
+
+def _logical_contents(pool):
+    """Every logical page's K/V/index rows, read through the rebalancer's page map."""
+    total = pool.page_map.shape[0]
+    kv = torch.cat([pool._pool._kv_buffer, pool._pool._kv_host.to(DEV)], dim=2)
+    per_page = pool._page_size // pool._index_ratio
+    cmp = pool._cmp_k_buffer[:, : total * per_page].unflatten(1, (total, per_page))
+    phys = pool.page_map.long()
+    return kv[:, :, phys].clone(), cmp[:, phys].clone()
+
+
+def test_rebalance_promotes_hot_ram_pages_and_preserves_logical_contents():
+    torch.manual_seed(7)
+    pool = QSAKVCache(
+        num_kv_heads=2,
+        num_layers=2,
+        head_dim=32,
+        num_pages=8,
+        page_size=16,
+        dtype=DTYPE,
+        device=DEV,
+        index_head_dim=16,
+        num_index_layers=2,
+        index_ratio=4,
+        num_req_slots=2,
+        layer_ids=(0, 1),
+        host_pages=4,
+    )
+    pool._pool._kv_buffer.normal_()
+    pool._pool._kv_host.copy_(torch.randn_like(pool._pool._kv_host, dtype=torch.float32))
+    pool._cmp_k_buffer.normal_()
+    before = _logical_contents(pool)
+    pool.page_heat[:8] = torch.tensor([9, 0, 1, 0, 40, 0, 30, 2], device=DEV, dtype=torch.int32)
+    pool.rebalance(4)
+    torch.cuda.synchronize()
+    after = _logical_contents(pool)
+    assert torch.equal(before[0], after[0]) and torch.equal(before[1], after[1])
+    # RAM pages 4 and 6 were hot: they now sit on the device; the cold device pages moved out.
+    assert int(pool.page_map[4]) < 4 and int(pool.page_map[6]) < 4
+    assert int(pool.page_map[0]) == 0  # hot device page stays
+    assert int(pool.page_map[5]) >= 4  # cold RAM page stays
+    assert sorted(pool.page_map.tolist()) == list(range(8))
+    # Second pass with no heat is a no-op for contents.
+    pool.rebalance(4)
+    assert torch.equal(_logical_contents(pool)[0], before[0])

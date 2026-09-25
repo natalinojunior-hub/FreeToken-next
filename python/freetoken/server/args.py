@@ -727,13 +727,13 @@ def parse_args(
         const="force",
         dest="kv_tiering",
         default=argparse.SUPPRESS,
-        help="Opt in to KV RAM tiering; requires --kv-ram-tokens > 0 (BF16 QSA models only).",
+        help="Opt in to KV RAM tiering (BF16 QSA models only); the device keeps a hot KV floor.",
     )
     parser.add_argument(
         "--kv-ram-tokens",
         type=int,
         default=ServerArgs.kv_ram_tokens,
-        help="RAM-tier size in tokens for --kv-tiering force (rounded up to whole pages).",
+        help="RAM-tier size in tokens for --kv-tiering force; 0 (default) covers the whole context.",
     )
     parser.add_argument(
         "--kv-reserve-tokens",

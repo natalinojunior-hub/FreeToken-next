@@ -318,6 +318,29 @@ class MemoryPlanner:
 
     # ======================= Phase A: Hardware Baseline =======================
 
+    _host_pages = 0  # KV RAM tier pages; plan() sets it per run
+
+    def _device_kv_pages(self, config: EngineConfig) -> int:
+        """Device KV pages the context needs. With a KV RAM tier every token already has a RAM
+        page, so the device keeps only the hot floor (``kv_reserve_tokens``); the rest of the
+        budget goes to expert slots."""
+        sm = self.static_model
+        context_pages = sm.kv_pages_for_context(config.max_seq_len)
+        if not self._host_pages:
+            return context_pages
+        hot = sm.kv_pages_for_context(min(config.max_seq_len, config.kv_reserve_tokens))
+        return max(hot, context_pages - self._host_pages)
+
+    def _create_kv_pool(self, config: EngineConfig, device_pages: int) -> BaseKVCachePool:
+        """Planner pools carry the RAM tier too, so full-context probes address real slots."""
+        return create_kv_pool(
+            config,
+            device_pages + self._host_pages,
+            device=self.device,
+            dtype=self.dtype,
+            host_pages=self._host_pages,
+        )
+
     def phase_a_hardware_baseline(self) -> PhysicalMemorySnapshot:
         """Measure physical GPU memory before any model allocation."""
         logger.info_rank0("Phase A: Measuring hardware baseline...")
@@ -491,14 +514,14 @@ class MemoryPlanner:
         min_experts = self.static_model.min_expert_slots
 
         # Minimum KV pages for requested context
-        required_pages = self.static_model.kv_pages_for_context(config.max_seq_len)
+        required_pages = self._device_kv_pages(config)
 
         # Create minimal KV pool
         logger.info_rank0(
             f"  Phase C: required_pages={required_pages} for max_seq_len={config.max_seq_len}"
         )
         meter = _AllocMeter(self.device)
-        kv_pool = create_kv_pool(config, required_pages, device=self.device, dtype=self.dtype)
+        kv_pool = self._create_kv_pool(config, required_pages)
         meter.took("kv")
 
         # Create minimal expert cache
@@ -565,7 +588,7 @@ class MemoryPlanner:
         # closed form, so the measurement replaces the placeholder term.
         sm = self.static_model
         planned = {
-            "kv": sm.kv_bytes_for_context(config.max_seq_len),
+            "kv": sm.kv_bytes_for_context(required_pages * sm.page_tokens),
             "experts": sm.expert_bytes_for_slots(min_experts),
             "gdn": state_pool_bytes(config, 1) * _linear_pool_min_slots(config)
             if linear_group is not None
@@ -783,7 +806,7 @@ class MemoryPlanner:
         """
         logger.info_rank0("Phase F/G: Solving canonical ledger...")
         sm, rc = self.static_model, self.runtime_calibration
-        required_pages = sm.kv_pages_for_context(config.max_seq_len)
+        required_pages = self._device_kv_pages(config)
         min_bytes = sm.expert_bytes_for_slots(sm.min_expert_slots)
 
         def residual(chunk: int) -> int:
@@ -833,7 +856,7 @@ class MemoryPlanner:
             f"Phase H: Constructing final pools (experts={expert_slots}, kv_pages={kv_pages})..."
         )
         meter = _AllocMeter(self.device)
-        kv_pool = create_kv_pool(config, kv_pages, device=self.device, dtype=self.dtype)
+        kv_pool = self._create_kv_pool(config, kv_pages)
         meter.took("kv")
 
         method = self.method
@@ -1085,8 +1108,10 @@ class MemoryPlanner:
         page_size: int,
         weights_bytes: Optional[int] = None,
         host_reserve_bytes: int = 0,
+        host_pages: int = 0,
     ) -> PlanCandidate:
-        """Execute multi-stage planning."""
+        """Execute multi-stage planning. ``host_pages`` is the KV RAM tier (0 = none)."""
+        self._host_pages = host_pages
         logger.info_rank0("=" * 60)
         logger.info_rank0("Starting automatic VRAM planning")
         logger.info_rank0("=" * 60)
@@ -1127,9 +1152,7 @@ class MemoryPlanner:
         # Phase C: Minimal viable config
         # Reject before any pool exists if the context floor alone cannot fit.
         sm = self.static_model
-        floor = self.ledger(
-            config, 0, sm.min_expert_slots, sm.kv_pages_for_context(config.max_seq_len)
-        )
+        floor = self.ledger(config, 0, sm.min_expert_slots, self._device_kv_pages(config))
         if sum(floor.values()) + host_reserve_bytes > baseline_free:
             raise self.infeasible(config, baseline_free, floor)
         self.phase_c_build_minimal_config(config, model)
