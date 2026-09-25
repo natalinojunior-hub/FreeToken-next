@@ -71,7 +71,9 @@ def _probe_tiles(
     tl.store(v_out_ptr + slots[:, None] * D + offs_d[None, :], vt)
 
 
-@pytest.mark.parametrize("book", list(tk.BOOKS))
+# turbo_k_tile/turbo_v_tile only know the BOOK3 flag (turbo3 vs turbo4); turbo8 is RAM-tier only
+# for now (decoded to bf16 before attention, see qsa/tiered.py's turbo_pages_to_bf16).
+@pytest.mark.parametrize("book", ["turbo3", "turbo4"])
 @pytest.mark.parametrize("head_dim", [128, 256])
 def test_tile_readers_reconstruct_exactly_what_the_codec_stored(book, head_dim):
     device = torch.device("cuda")
@@ -112,7 +114,7 @@ def test_tile_readers_reconstruct_exactly_what_the_codec_stored(book, head_dim):
     assert torch.equal(v_out, want), "V tile must equal the stored rotated values"
 
 
-@pytest.mark.parametrize("book", list(tk.BOOKS))
+@pytest.mark.parametrize("book", ["turbo3", "turbo4"])
 def test_masked_lanes_read_zero(book):
     """Padded slots (the dummy page, a split's tail) must contribute 0, not the first row's values:
     an unmasked byte gather would silently attend to a stale slot."""

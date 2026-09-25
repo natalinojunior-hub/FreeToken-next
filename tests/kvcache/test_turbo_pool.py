@@ -194,8 +194,10 @@ def test_geometry_outside_the_supported_band_refuses(head_dim, message):
 
 
 def test_unknown_book_and_bad_layer_ids_refuse():
+    # turbo8 is RAM-tier only (qsa/tiered.py); the device-compressed pool still only knows
+    # turbo3/turbo4, so any other name -- including turbo8 -- must still refuse here.
     with pytest.raises(ValueError, match="unknown turbo book"):
-        _pool(book="turbo8")
+        _pool(book="turbo9")
     with pytest.raises(ValueError, match="outside"):
         TurboMHAKVCache(HEADS, 4, HEAD_DIM, 8, PAGE, torch.bfloat16, DEVICE, layer_ids=[0, 9])
 

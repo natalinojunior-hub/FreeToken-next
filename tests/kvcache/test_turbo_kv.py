@@ -34,9 +34,11 @@ def test_transcribed_constants_are_complete():
     assert sum(tk.SIGNS2) == -12
     assert len(tk.CENTROIDS_3) == 8 and len(tk.MID_3) == 7
     assert len(tk.CENTROIDS_4) == 16 and len(tk.MID_4) == 15
+    assert len(tk.CENTROIDS_8) == 256 and len(tk.MID_8) == 255
     for book, cent, mid in (
         ("turbo3", tk.CENTROIDS_3, tk.MID_3),
         ("turbo4", tk.CENTROIDS_4, tk.MID_4),
+        ("turbo8", tk.CENTROIDS_8, tk.MID_8),
     ):
         assert sorted(cent) == list(cent), book
         assert sorted(mid) == list(mid), book
@@ -134,11 +136,14 @@ def test_multi_group_row_quantizes_and_decodes_elementwise(book):
 @pytest.mark.parametrize("book", BOOKS)
 def test_deduped_norm_costs_the_stated_bytes(book):
     """turbo3 stores one fp16 norm per group where the reference stores four identical copies:
-    that is 6 B/row, and the accounting has to say so."""
-    ref_row = 14 * 4 if book == "turbo3" else 66
+    that is 6 B/row, and the accounting has to say so. turbo8 has no llama-turbo-optimal
+    reference to compare against, so only the byte/BPV bookkeeping is pinned for it."""
+    expected = {"turbo3": 50, "turbo4": 66, "turbo8": 130}
     ours = tk.CODE_BYTES[book] + 2
-    assert ours == (50 if book == "turbo3" else 66)
-    assert ours <= ref_row
+    assert ours == expected[book]
+    if book in ("turbo3", "turbo4"):
+        ref_row = 14 * 4 if book == "turbo3" else 66
+        assert ours <= ref_row
     assert tk.bytes_per_token(book, 8, 128) == 8 * ours
     assert math.isclose(tk.BPV[book], (ours * 8) / 128)
 
@@ -157,11 +162,12 @@ def test_quantize_decode_recovers_the_group_energy(book):
 
 @pytest.mark.parametrize(
     ("book", "bound", "lloyd_max"),
-    [("turbo3", 0.036, 0.0345), ("turbo4", 0.010, 0.0095)],
+    [("turbo3", 0.036, 0.0345), ("turbo4", 0.010, 0.0095), ("turbo8", 0.00006, 0.000022)],
 )
 def test_gaussian_nmse_matches_the_lloyd_max_table(book, bound, lloyd_max):
-    """The books are Lloyd-Max for a Gaussian source at 8 / 16 levels, whose normalized MSE is
-    0.0345 and 0.0095. Measured lands slightly *under* the table because the corrected ``norm``
+    """The books are Lloyd-Max for a Gaussian source at 8 / 16 / 256 levels, whose normalized MSE
+    is 0.0345, 0.0095 and ~2.2e-5 (the 2πe/12 * 2^-2b asymptote). Measured lands slightly *under*
+    the table because the corrected ``norm``
     projects the reconstruction back onto the input's sphere. If this ever regresses past the
     table, the encoder stopped being a nearest-centroid search on the rotated coordinates."""
     x = _groups(16384, seed=17)

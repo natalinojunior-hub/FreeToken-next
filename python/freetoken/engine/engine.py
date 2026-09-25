@@ -130,17 +130,18 @@ def _meminfo() -> dict[str, int]:
 _KV_RAM_DTYPES: dict[str, torch.dtype | str] = {
     "bf16": torch.bfloat16,
     "fp8": torch.float8_e4m3fn,
+    "turbo8": "turbo8",
     "turbo4": "turbo4",
     "turbo3": "turbo3",
 }
 
 
 def _kv_ram_dtype(config, pool_cls, host_pages: int) -> torch.dtype | str | None:
-    """RAM-tier storage format: the widest of KV dtype, FP8, turbo4, turbo3 that fits the safe
-    RAM budget (only the cold tier is narrowed; device KV stays exact). None: nothing fits."""
+    """RAM-tier storage format: the widest of KV dtype, FP8, turbo8, turbo4, turbo3 that fits the
+    safe RAM budget (only the cold tier is narrowed; device KV stays exact). None: nothing fits."""
     choice = getattr(config, "kv_ram_dtype", "auto")
     candidates = (
-        [config.dtype, torch.float8_e4m3fn, "turbo4", "turbo3"]
+        [config.dtype, torch.float8_e4m3fn, "turbo8", "turbo4", "turbo3"]
         if choice == "auto"
         else [_KV_RAM_DTYPES[choice]]
     )

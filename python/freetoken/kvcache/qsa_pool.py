@@ -309,7 +309,7 @@ class QSAKVCache(BaseKVCachePool):
             if spec.is_swa or spec.attn_type is not AttnType.QSA:
                 continue
             heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-            if dtype in ("turbo4", "turbo3"):
+            if dtype in ("turbo8", "turbo4", "turbo3"):
                 from freetoken.kernel.triton.turbo_kv import CODE_BYTES
 
                 groups = spec.head_dim // 128

@@ -119,7 +119,12 @@ def test_kv_ram_budget_refuses_with_max_context(monkeypatch):
 
     gib = 1 << 30
     monkeypatch.setattr(eng, "_meminfo", lambda: {"MemTotal": 96 * gib, "MemAvailable": 16 * gib})
-    per_token = {torch.bfloat16: 25_600, torch.float8_e4m3fn: 12_800, "turbo4": 6_800}
+    per_token = {
+        torch.bfloat16: 25_600,
+        torch.float8_e4m3fn: 12_800,
+        "turbo8": 13_000,
+        "turbo4": 6_800,
+    }
     pool = SimpleNamespace(
         host_tier_ram_bytes=lambda config, tokens, dtype=None: per_token.get(dtype, 5_200) * tokens
     )
