@@ -745,11 +745,11 @@ def parse_args(
     )
     parser.add_argument(
         "--kv-ram-dtype",
-        choices=("auto", "bf16", "fp8", "turbo4", "turbo3"),
+        choices=("auto", "bf16", "fp8", "turbo8", "turbo4", "turbo3"),
         default=ServerArgs.kv_ram_dtype,
         help=(
-            "KV RAM tier storage: auto picks the widest of bf16, fp8, turbo4, turbo3 that fits "
-            "the safe RAM budget."
+            "KV RAM tier storage: auto picks the widest of bf16, fp8, turbo8, turbo4, turbo3 "
+            "that fits the safe RAM budget."
         ),
     )
     parser.add_argument(

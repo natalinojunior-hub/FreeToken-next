@@ -562,7 +562,7 @@ def test_fp8_ram_tier_store_attend_stage_and_swap_track_bf16_reference():
     assert torch.equal(b[0, 1], kd[0].cpu().to(fp8))
 
 
-@pytest.mark.parametrize("book", ["turbo4", "turbo3"])
+@pytest.mark.parametrize("book", ["turbo8", "turbo4", "turbo3"])
 def test_turbo_ram_tier_store_decode_and_attention_track_reference(book):
     from freetoken.kernel.triton import turbo_kv as tk
     from freetoken.kernel.triton.qsa.tiered import turbo_inverse_rotation, turbo_pages_to_bf16

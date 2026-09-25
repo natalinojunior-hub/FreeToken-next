@@ -275,6 +275,7 @@ def _turbo_pages_kernel(
     PAGE_SIZE: tl.constexpr,
     GROUPS: tl.constexpr,
     BOOK3: tl.constexpr,
+    BOOK8: tl.constexpr,
 ) -> None:
     entry = tl.program_id(0)
     head = tl.program_id(1)
@@ -293,6 +294,9 @@ def _turbo_pages_kernel(
                 idx = ((low.to(tl.int32) >> ((dim % 4) * 2)[None, :]) & 3) | (
                     ((bit.to(tl.int32) >> (dim % 8)[None, :]) & 1) << 2
                 )
+            elif BOOK8:
+                byte = tl.load(base + (g * 128 + dim)[None, :])
+                idx = byte.to(tl.int32)
             else:
                 byte = tl.load(base + (g * 64 + dim // 2)[None, :])
                 idx = (byte.to(tl.int32) >> ((dim % 2) * 4)[None, :]) & 0x0F
@@ -341,7 +345,8 @@ def turbo_pages_to_bf16(
         codes, norm, cent, rotation, src_pages, dst_pages, out,
         codes.stride(0), codes.stride(1), norm.stride(0), norm.stride(1),
         out.stride(0), out.stride(1), out.stride(2),
-        PAGE_SIZE=page_size, GROUPS=groups, BOOK3=book == "turbo3", num_warps=4,
+        PAGE_SIZE=page_size, GROUPS=groups, BOOK3=book == "turbo3", BOOK8=book == "turbo8",
+        num_warps=4,
     )  # fmt: skip
 
 

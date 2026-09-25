@@ -23,7 +23,9 @@ def _splits(batch, num_q_heads, max_kv_splits, head_dim, device):
     )
 
 
-@pytest.mark.parametrize("book", list(tk.BOOKS))
+# decode_paged_attention's fused code path only knows the BOOK3 flag (turbo3 vs turbo4); turbo8
+# is RAM-tier only for now (decoded to bf16 before attention, see qsa/tiered.py).
+@pytest.mark.parametrize("book", ["turbo3", "turbo4"])
 @pytest.mark.parametrize(("q_heads", "kv_heads"), [(16, 4), (8, 8)])
 def test_decode_on_codes_matches_decode_on_decoded_kv(book, q_heads, kv_heads):
     from freetoken.kernel.triton.attention import decode_paged_attention
