@@ -618,8 +618,12 @@ class Engine:
             ),
         )
         if self.host_pages:
-            _host_buf = self.kv_cache._pool._kv_host
-            ram_bytes = _host_buf.numel() * _host_buf.element_size()
+            pool = self.kv_cache._pool
+            ram_bytes = sum(
+                t.numel() * t.element_size()
+                for t in (pool._kv_host, pool._host_codes, pool._host_norm)
+                if t is not None
+            )
             logger.info_rank0(
                 f"KV RAM tiering: {device_pages} device pages, {self.host_pages} RAM pages "
                 f"({mem_GB(ram_bytes)} pinned host RAM), "
