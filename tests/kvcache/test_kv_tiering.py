@@ -38,3 +38,12 @@ def test_wrong_position_or_backing_is_rejected():
 def test_capability_gate_keeps_fallback():
     assert tiering_safe(cuda_graph=True, stable_indirection=True, pinned_host=True)
     assert not tiering_safe(cuda_graph=False, stable_indirection=True, pinned_host=True)
+
+
+def test_graph_replay_refuses_cold_pages_and_tracks_hits():
+    pool = KVPagePool([page(0)], 1)
+    assert not pool.can_replay([0])
+    pool.prefetch(0, "r")
+    assert pool.can_replay([0])
+    assert pool.telemetry.cold_hits == 1
+    assert pool.telemetry.rejected_replays == 1

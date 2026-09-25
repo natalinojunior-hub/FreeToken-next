@@ -22,6 +22,15 @@ class Residency(str, Enum):
 
 
 @dataclass
+class PageTelemetry:
+    resident: int = 0
+    cold_hits: int = 0
+    hot_hits: int = 0
+    evictions: int = 0
+    rejected_replays: int = 0
+
+
+@dataclass
 class KVPage:
     page_id: int
     logical_position: int
@@ -87,12 +96,15 @@ class KVPagePool:
             raise ValueError("device_slots must be positive")
         self.table = PageTable(pages)
         self._free = list(range(device_slots))
+        self.telemetry = PageTelemetry()
 
     def admit(self, page_id: int, owner: str) -> KVPage:
         page = self.table.get(page_id)
         page.claim(owner)
         if page.residency is Residency.RESIDENT:
+            self.telemetry.hot_hits += 1
             return page
+        self.telemetry.cold_hits += 1
         if not self._free:
             page.release(owner)
             raise MemoryError("KV device pool exhausted")
@@ -115,6 +127,7 @@ class KVPagePool:
             page.device.copy_(page.host)
             page.event = None
         page.residency = Residency.RESIDENT
+        self.telemetry.resident += 1
         return page
 
     def ready(self, page_id: int) -> bool:
@@ -135,7 +148,19 @@ class KVPagePool:
         page.residency = Residency.COLD
         page.event = None
         page.release(owner)
+        self.telemetry.resident = max(0, self.telemetry.resident - 1)
+        self.telemetry.evictions += 1
         return True
+
+    def can_replay(self, page_ids: Iterable[int]) -> bool:
+        """Graph-safe residency check; false means caller must use eager mode."""
+        ok = all(
+            self.table.get(page_id).residency is Residency.RESIDENT and self.ready(page_id)
+            for page_id in page_ids
+        )
+        if not ok:
+            self.telemetry.rejected_replays += 1
+        return ok
 
     def cancel(self, owner: str) -> None:
         for page in list(self.table._pages.values()):
