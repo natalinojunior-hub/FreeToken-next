@@ -42,6 +42,7 @@ class KVPage:
     host: torch.Tensor | None = None
     device: torch.Tensor | None = None
     event: torch.cuda.Event | None = None
+    eviction_event: torch.cuda.Event | None = None
 
     def claim(self, owner: str) -> int:
         if self.owner is not None:
@@ -146,7 +147,20 @@ class KVPagePool:
         if page.event is not None and not page.event.query():
             return False
         if page.device is not None and page.host is not None:
-            page.host.copy_(page.device)
+            if page.device.is_cuda:
+                if not page.host.is_pinned():
+                    return False
+                if page.eviction_event is None:
+                    page.residency = Residency.EVICTING
+                    page.host.copy_(page.device, non_blocking=True)
+                    page.eviction_event = torch.cuda.Event()
+                    page.eviction_event.record(torch.cuda.current_stream(page.device.device))
+                    return False
+                if not page.eviction_event.query():
+                    return False
+                page.eviction_event = None
+            else:
+                page.host.copy_(page.device)
         if page.device_slot is not None:
             self._free.append(page.device_slot)
         page.device_slot = None
