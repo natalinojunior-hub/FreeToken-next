@@ -273,12 +273,19 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     full_ids = tuple(i for i in range(num_layers) if (i + 1) % interval == 0)
     linear_ids = tuple(i for i in range(num_layers) if i not in set(full_ids))
 
+    # With a vision tower (mmproj), image tokens need 3-axis positions: the checkpoint's
+    # interleaved mrope sections (llama.cpp "imrope"), exactly as the HF path configures them.
+    # Text-only serving keeps plain rope (identical for 1-axis positions).
+    sections = shim.metadata.get("qwen4exp.rope.dimension_sections")
+    mrope = getattr(shim, "vision_config", None) is not None and sections is not None
     full_rotary = RotaryConfig(
         head_dim=head_dim,
         rotary_dim=rotary_dim,
         max_position=max_pos,
         base=rope_base,
         scaling=None,
+        mrope_section=[int(x) for x in sections[:3]] if mrope else None,
+        mrope_layout="interleaved" if mrope else "contiguous",
     )
 
     groups = (
