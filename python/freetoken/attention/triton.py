@@ -90,11 +90,18 @@ class TritonAttentionBackend(BaseAttnBackend):
         self.max_kv_splits = 8
         self.prefill_tile_min_q = 128
         self.num_q_heads = int(getattr(config, "num_qo_heads", 1))
-        kv_groups = getattr(config, "kv_cache_group_specs", lambda: ())()
+        kv_groups = list(getattr(config, "kv_cache_group_specs", lambda: ())())
         self.max_head_dim = max(
             (group.head_dim for group in kv_groups),
             default=int(getattr(config, "head_dim", 1)),
         )
+        # Split-K decode must fill the GPU at batch 1: the grid is kv-head blocks x splits, so
+        # 8 fixed splits left 16 CTAs on an 84-SM card walking 32K tokens each at 256K. Two
+        # waves over the SMs per kv head; short sequences leave the extra splits empty.
+        if self.device.type == "cuda":
+            sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+            kv_heads = min((g.num_kv_heads for g in kv_groups), default=1)
+            self.max_kv_splits = max(self.max_kv_splits, 2 * sms // max(1, kv_heads))
 
     def _ensure_decode_scratch(
         self,
