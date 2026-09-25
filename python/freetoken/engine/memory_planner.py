@@ -1164,6 +1164,7 @@ class MemoryPlanner:
         # Phase C: Minimal viable config
         # Reject before any pool exists if the context floor alone cannot fit.
         sm = self.static_model
+        spill_reserve_bytes = host_reserve_bytes
         if spill_only_if_needed and host_pages:
             # KV in RAM costs TG at every measured context; spill only when the all-VRAM floor
             # cannot fit.
@@ -1218,9 +1219,21 @@ class MemoryPlanner:
         # (e.g. an MTP draft path at long context). Report it and re-solve with a smaller
         # budget instead of refusing to serve: the plan must never OOM, and experts shrink first.
         for attempt in range(_VALIDATION_RETRIES + 1):
-            chosen_chunk, expert_slots, kv_pages = self.phase_fg_solve_chunk_and_experts(
-                config, budget
-            )
+            try:
+                chosen_chunk, expert_slots, kv_pages = self.phase_fg_solve_chunk_and_experts(
+                    config, budget
+                )
+            except RuntimeError:
+                # Phase C's all-VRAM floor ignores the prefill transient and probe overhead,
+                # so it can pass while the real solve cannot fund it: spill instead of refusing.
+                if self._host_pages or not (spill_only_if_needed and host_pages):
+                    raise
+                self._host_pages = self.host_pages = host_pages
+                budget -= spill_reserve_bytes
+                logger.info_rank0("All-VRAM KV does not fit the solve budget; spilling to RAM")
+                chosen_chunk, expert_slots, kv_pages = self.phase_fg_solve_chunk_and_experts(
+                    config, budget
+                )
             kv_pool, expert_cache, linear_pool = self.phase_h_construct_final_pools(
                 config, model, expert_slots, kv_pages, prefill_overlap
             )
