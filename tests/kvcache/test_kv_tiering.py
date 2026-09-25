@@ -81,7 +81,7 @@ def test_eviction_round_trip_and_duplicate_claim():
 
 def test_stale_host_backing_is_rejected_after_first_load():
     p = page(0)
-    pool = KVPagePool([p], 1)
+    pool = KVPagePool([p], 1, verify_checksums=True)
     pool.prefetch(0, "r")
     pool.evict(0, "r")
     p.host.add_(1)

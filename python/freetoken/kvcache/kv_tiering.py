@@ -14,6 +14,26 @@ from typing import Iterable
 import torch
 
 
+@dataclass(frozen=True)
+class KVLayout:
+    """Format metadata required to stage one logical KV page safely."""
+
+    format: str
+    k_shape: tuple[int, ...]
+    v_shape: tuple[int, ...]
+    k_stride: tuple[int, ...]
+    v_stride: tuple[int, ...]
+    position: int
+
+    def validate(self) -> None:
+        if self.format not in {"mha", "qsa", "turbo3", "turbo4"}:
+            raise ValueError(f"unsupported KV format {self.format!r}")
+        if self.position < 0 or not self.k_shape or not self.v_shape:
+            raise ValueError("KV layout requires a non-negative position and non-empty shapes")
+        if len(self.k_shape) != len(self.k_stride) or len(self.v_shape) != len(self.v_stride):
+            raise ValueError("KV layout shape/stride rank mismatch")
+
+
 class Residency(str, Enum):
     COLD = "cold"
     PREFETCHING = "prefetching"
@@ -104,7 +124,11 @@ class KVPagePool:
     """
 
     def __init__(
-        self, pages: Iterable[KVPage], device_slots: int, device: torch.device | str | None = None
+        self,
+        pages: Iterable[KVPage],
+        device_slots: int,
+        device: torch.device | str | None = None,
+        verify_checksums: bool = False,
     ) -> None:
         if device_slots < 1:
             raise ValueError("device_slots must be positive")
@@ -127,6 +151,7 @@ class KVPagePool:
         self.table = PageTable(pages)
         self._free = list(range(device_slots))
         self.telemetry = PageTelemetry()
+        self.verify_checksums = verify_checksums
 
     def admit(self, page_id: int, owner: str) -> KVPage:
         page = self.table.get(page_id)
@@ -151,8 +176,8 @@ class KVPagePool:
         page = self.table.get(page_id)
         if page.host is None:
             raise RuntimeError("KV page requires host backing")
-        expected = self._checksum(page.host)
-        if page.checksum is not None and expected != page.checksum:
+        expected = self._checksum(page.host) if self.verify_checksums else None
+        if self.verify_checksums and page.checksum is not None and expected != page.checksum:
             raise RuntimeError(f"stale host backing for page {page_id}")
         if self._slots[0].is_cuda and not page.host.is_pinned():
             raise RuntimeError("asynchronous KV prefetch requires pinned host backing")
@@ -177,16 +202,26 @@ class KVPagePool:
         event = self.table.get(page_id).event
         return event is None or event.query()
 
+    def wait_ready(self, page_id: int, stream: torch.cuda.Stream) -> None:
+        event = self.table.get(page_id).event
+        if event is not None:
+            stream.wait_event(event)
+
     def evict(self, page_id: int, owner: str, generation: int | None = None) -> bool:
         page = self.table.get(page_id)
         if generation is not None and generation != page.generation:
             return False
         if page.owner != owner:
             return False
+        eviction_done = page.residency is Residency.EVICTING
+        if eviction_done:
+            if page.eviction_event is None or not page.eviction_event.query():
+                return False
+            page.eviction_event = None
         if page.event is not None and not page.event.query():
             return False
         if page.device is not None and page.host is not None:
-            if page.device.is_cuda:
+            if page.device.is_cuda and not eviction_done:
                 if not page.host.is_pinned():
                     return False
                 if page.eviction_event is None:
@@ -215,6 +250,16 @@ class KVPagePool:
         self.telemetry.resident = max(0, self.telemetry.resident - 1)
         self.telemetry.evictions += 1
         return True
+
+    def progress(self, page_id: int, owner: str, generation: int | None = None) -> bool:
+        page = self.table.get(page_id)
+        if page.owner != owner or page.residency is not Residency.EVICTING:
+            return False
+        if generation is not None and generation != page.generation:
+            return False
+        if page.eviction_event is None or not page.eviction_event.query():
+            return False
+        return self.evict(page_id, owner, generation)
 
     def can_replay(self, page_ids: Iterable[int]) -> bool:
         """Graph-safe residency check; false means caller must use eager mode."""
