@@ -28,6 +28,9 @@ class PageTelemetry:
     hot_hits: int = 0
     evictions: int = 0
     rejected_replays: int = 0
+    prefetch_bytes: int = 0
+    eviction_bytes: int = 0
+    queue_depth: int = 0
 
 
 @dataclass
@@ -43,6 +46,12 @@ class KVPage:
     device: torch.Tensor | None = None
     event: torch.cuda.Event | None = None
     eviction_event: torch.cuda.Event | None = None
+
+    @staticmethod
+    def pinned(shape: tuple[int, ...], dtype: torch.dtype, page_id: int, logical_position: int) -> "KVPage":
+        """Create a page with pinned host backing; fail before admission if unavailable."""
+        host = torch.empty(shape, dtype=dtype, pin_memory=True)
+        return KVPage(page_id, logical_position, host=host, device=torch.empty_like(host, device="cuda"))
 
     def claim(self, owner: str) -> int:
         if self.owner is not None:
@@ -132,6 +141,8 @@ class KVPagePool:
             page.event = None
         page.residency = Residency.RESIDENT
         self.telemetry.resident += 1
+        self.telemetry.prefetch_bytes += page.device.nbytes
+        self.telemetry.queue_depth = max(0, self.telemetry.queue_depth - 1)
         return page
 
     def ready(self, page_id: int) -> bool:
@@ -152,6 +163,7 @@ class KVPagePool:
                     return False
                 if page.eviction_event is None:
                     page.residency = Residency.EVICTING
+                    self.telemetry.queue_depth += 1
                     page.host.copy_(page.device, non_blocking=True)
                     page.eviction_event = torch.cuda.Event()
                     page.eviction_event.record(torch.cuda.current_stream(page.device.device))
@@ -167,6 +179,8 @@ class KVPagePool:
         page.residency = Residency.COLD
         page.event = None
         page.release(owner)
+        self.telemetry.eviction_bytes += page.device.nbytes if page.device is not None else 0
+        self.telemetry.queue_depth = max(0, self.telemetry.queue_depth - 1)
         self.telemetry.resident = max(0, self.telemetry.resident - 1)
         self.telemetry.evictions += 1
         return True
