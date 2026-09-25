@@ -48,10 +48,12 @@ class KVPage:
     eviction_event: torch.cuda.Event | None = None
 
     @staticmethod
-    def pinned(shape: tuple[int, ...], dtype: torch.dtype, page_id: int, logical_position: int) -> "KVPage":
+    def pinned(
+        shape: tuple[int, ...], dtype: torch.dtype, page_id: int, logical_position: int
+    ) -> "KVPage":
         """Create a page with pinned host backing; fail before admission if unavailable."""
         host = torch.empty(shape, dtype=dtype, pin_memory=True)
-        return KVPage(page_id, logical_position, host=host, device=torch.empty_like(host, device="cuda"))
+        return KVPage(page_id, logical_position, host=host)
 
     def claim(self, owner: str) -> int:
         if self.owner is not None:
@@ -101,9 +103,23 @@ class KVPagePool:
     when available; a consumer must call ``ready`` before graph/eager use.
     """
 
-    def __init__(self, pages: Iterable[KVPage], device_slots: int) -> None:
+    def __init__(
+        self, pages: Iterable[KVPage], device_slots: int, device: torch.device | str | None = None
+    ) -> None:
         if device_slots < 1:
             raise ValueError("device_slots must be positive")
+        pages = list(pages)
+        if not pages or pages[0].host is None:
+            raise ValueError("KV pages require host backing")
+        template = pages[0].host
+        device = device or (pages[0].device.device if pages[0].device is not None else "cuda")
+        for page in pages:
+            if page.host is None or page.host.shape != template.shape or page.host.dtype != template.dtype:
+                raise ValueError("KV pages require identical host backing")
+            if page.device is not None and page.device.shape != template.shape:
+                raise ValueError("host/device page size mismatch")
+            page.device = None
+        self._slots = [torch.empty_like(template, device=device) for _ in range(device_slots)]
         self.table = PageTable(pages)
         self._free = list(range(device_slots))
         self.telemetry = PageTelemetry()
@@ -119,18 +135,18 @@ class KVPagePool:
             page.release(owner)
             raise MemoryError("KV device pool exhausted")
         page.device_slot = self._free.pop()
+        page.device = self._slots[page.device_slot]
         page.residency = Residency.PREFETCHING
         return page
 
     def prefetch(self, page_id: int, owner: str, stream: torch.cuda.Stream | None = None) -> KVPage:
         page = self.table.get(page_id)
-        if page.host is None or page.device is None:
-            raise RuntimeError("KV page requires host and device backing")
-        if page.host.numel() != page.device.numel():
-            raise ValueError("host/device page size mismatch")
-        if page.device.is_cuda and not page.host.is_pinned():
+        if page.host is None:
+            raise RuntimeError("KV page requires host backing")
+        if self._slots[0].is_cuda and not page.host.is_pinned():
             raise RuntimeError("asynchronous KV prefetch requires pinned host backing")
         page = self.admit(page_id, owner)
+        assert page.device is not None
         if page.device.is_cuda and page.host.device.type == "cpu":
             with torch.cuda.stream(stream) if stream is not None else _nullcontext():
                 page.device.copy_(page.host, non_blocking=True)
@@ -176,6 +192,7 @@ class KVPagePool:
         if page.device_slot is not None:
             self._free.append(page.device_slot)
         page.device_slot = None
+        page.device = None
         page.residency = Residency.COLD
         page.event = None
         page.release(owner)

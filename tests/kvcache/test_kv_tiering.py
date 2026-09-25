@@ -61,7 +61,6 @@ def test_eviction_round_trip_and_duplicate_claim():
     generation = p.generation
     assert pool.evict(0, "r", generation)
     assert torch.equal(p.host, torch.full_like(p.host, 7))
-    p.device.zero_()
     pool.prefetch(0, "r2")
     assert torch.equal(p.device, p.host)
     assert not pool.evict(0, "r2", generation)
@@ -70,9 +69,8 @@ def test_eviction_round_trip_and_duplicate_claim():
 def test_bad_backing_does_not_claim_page():
     p = page(0)
     p.device = torch.zeros(4)
-    pool = KVPagePool([p], 1)
     with pytest.raises(ValueError):
-        pool.prefetch(0, "r")
+        KVPagePool([p], 1)
     assert p.owner is None
     assert p.device_slot is None
 
@@ -80,3 +78,18 @@ def test_bad_backing_does_not_claim_page():
 def test_runtime_rejects_unimplemented_tiering():
     with pytest.raises(NotImplementedError, match="all pages on CUDA"):
         EngineConfig.__post_init__(SimpleNamespace(kv_tiering="force"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_round_trip_fences_eviction():
+    p = KVPage.pinned((16,), torch.float32, 1, 0)
+    pool = KVPagePool([p], 1, device="cuda")
+    p.host.fill_(3)
+    pool.prefetch(1, "r")
+    torch.cuda.synchronize()
+    assert torch.equal(p.device.cpu(), p.host)
+    p.device.fill_(9)
+    assert not pool.evict(1, "r")
+    torch.cuda.synchronize()
+    assert pool.evict(1, "r")
+    assert torch.equal(p.host, torch.full_like(p.host, 9))
