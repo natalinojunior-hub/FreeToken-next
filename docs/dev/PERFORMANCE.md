@@ -447,3 +447,14 @@ Model `/models/Qwen3.8-Flash-Next-ISTA-IQ3_XXS/IQ3_XXS`. New default = `--kv-tie
 MTP ladder (drop a context's k when TG < that k0): 64K -> k0 best (k1 51.40 < 56.40); 128K/256K -> best k1 but only +0.9%/+0.2% over k0 — the fp8 RAM tier absorbs most of the decode bandwidth MTP used to buy. Accept: k1 64K 202/306, k1 128K 216/292, k1 256K 222/288. TG-curve 128K (`--decode 8192`) mean 56.27, no cliff. Quality: needle 64/128/256K PASS, usage 20/20, vision PASS. Forced-tier turbo speed/quality (reserve 8192): turbo8/4/3 all usage 20/20 + needle 128K pass; fp8 (59.16/57.86/52.43) dominates turbo8; turbo4/3 kept as RAM-fit fallbacks. Detail in the campaign-16 ledger under `ft-campaign2/campaign16/`.
 
 Verdict: **PASS** — KV-in-RAM default certified for the qwen4 (Qwen3.8 Flash Next) family. Dense 27B and MoE 35B remain all-VRAM under `auto` until separately measured.
+
+## Campaign 18 (2026-09-25): MoE 35B (Tiel UD-IQ4_XS) KV placement, k0
+
+| ctx | bf16 VRAM (fi) TG | RAM zero-copy bf16 TG | turbo4 VRAM TG (split fix `9e63d1d`) |
+|---|---|---|---|
+| 4K | 133.01 | 107.10 | 100.53 |
+| 16K | 129.52 | 69.98 | 92.74 |
+| 64K | 110.21 | 27.72 | 65.42 |
+| 256K | 69.68 (4432 expert slots) | - | 31.51 (turbo3 34.81) |
+
+Verdict: bf16 in VRAM stays the default for dense-attention 35B. Triton backend bf16 after the split fix: 4K/16K/64K 131.25/126.90/110.16 (FlashInfer parity). Ledger: `ft-campaign2/campaign18/LEDGER.md`.
