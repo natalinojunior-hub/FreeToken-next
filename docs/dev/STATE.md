@@ -2,8 +2,8 @@
 ## Campaign 14/15 — live KV-RAM (2026-09-25; `next` ≥ 075ed10)
 Done: QSA KV RAM tier (bf16/fp8/turbo4/turbo3, auto ladder, safe RAM budget + "máximo possível" refusal), hot floor, heat rebalancer, planner re-solve on validation OOM, ft bench context, ft history, GGUF split-probe fix, GGUF vision via mmproj (image test pass, usage 20/20, TG unchanged).
 Measured (TG): ISTA k0 64K 57.1 / 128K 55.6 / 256K 43.1, k1 128K 59.1; AD 64K 49.0 / 128K 46.4; fp8 RAM tier > bf16 (UD 64K 47.5 vs 41.5), quality equal (usage 20/20, needle 64K/128K pass, all formats). Data: ft-campaign2/campaign15/{results,quality}.jsonl (queue stopped mid-run).
-Scope from now: ISTA + AD only; single MTP head shared-Q4_K_M; NVFP4/Unsloth to be deleted.
-Next: `prompt-next-session-kvram-finish.md` (turbo8, format ladder, RAM-budget/auto-fallback bugs, TG curve, final ISTA/AD certification).
+Scope from now: ISTA only (AD kept as history, no new tests); single MTP head shared-Q4_K_M; NVFP4/Unsloth to be deleted.
+Next: `prompt-next-session-kvram-finish.md` (turbo8, format ladder, RAM-budget/auto-fallback bugs, TG curve, final ISTA certification).
 
 
 Anchor: UD-IQ4_XS cold graph-on k0 4096/256: PP 1467, TG 47.28, hash `3af3056b98c0` (re-verified after `b5d4243`).
