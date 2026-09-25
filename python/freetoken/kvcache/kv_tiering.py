@@ -14,6 +14,13 @@ from typing import Iterable
 import torch
 
 
+class Residency(str, Enum):
+    COLD = "cold"
+    PREFETCHING = "prefetching"
+    RESIDENT = "resident"
+    EVICTING = "evicting"
+
+
 @dataclass(frozen=True)
 class KVLayout:
     """Format metadata required to stage one logical KV page safely."""
@@ -34,11 +41,32 @@ class KVLayout:
             raise ValueError("KV layout shape/stride rank mismatch")
 
 
-class Residency(str, Enum):
-    COLD = "cold"
-    PREFETCHING = "prefetching"
-    RESIDENT = "resident"
-    EVICTING = "evicting"
+@dataclass(frozen=True)
+class KVPageRecord:
+    """Canonical logical page metadata shared by backend staging adapters."""
+
+    request_id: int
+    sequence_id: int
+    logical_position: int
+    generation: int
+    layout: KVLayout
+    head_mapping: tuple[int, ...]
+    group_size: int
+    rope_position: int | None = None
+    qsa_group: int | None = None
+    dirty: bool = False
+    residency: Residency = Residency.COLD
+
+    def validate(self) -> None:
+        self.layout.validate()
+        if self.request_id < 0 or self.sequence_id < 0 or self.logical_position < 0:
+            raise ValueError("KV page identity must be non-negative")
+        if self.generation < 0 or self.group_size < 1 or not self.head_mapping:
+            raise ValueError("KV page mapping is incomplete")
+        if self.rope_position is not None and self.rope_position < 0:
+            raise ValueError("RoPE position must be non-negative")
+        if self.qsa_group is not None and self.qsa_group < 0:
+            raise ValueError("QSA group must be non-negative")
 
 
 @dataclass

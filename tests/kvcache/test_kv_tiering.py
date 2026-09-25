@@ -2,7 +2,7 @@ import pytest
 import torch
 from types import SimpleNamespace
 
-from freetoken.kvcache.kv_tiering import KVPage, KVPagePool, Residency, tiering_safe
+from freetoken.kvcache.kv_tiering import KVLayout, KVPage, KVPagePool, KVPageRecord, Residency, tiering_safe
 from freetoken.engine.config import EngineConfig
 
 
@@ -101,6 +101,21 @@ def test_bad_backing_does_not_claim_page():
 def test_runtime_rejects_unimplemented_tiering():
     with pytest.raises(NotImplementedError, match="all pages on CUDA"):
         EngineConfig.__post_init__(SimpleNamespace(kv_tiering="force"))
+
+
+def test_canonical_page_record_validates_backend_layout():
+    record = KVPageRecord(
+        request_id=1,
+        sequence_id=2,
+        logical_position=64,
+        generation=3,
+        layout=KVLayout("qsa", (64, 8), (64, 8), (8, 1), (8, 1), 64),
+        head_mapping=(0, 1),
+        group_size=8,
+        rope_position=64,
+        qsa_group=8,
+    )
+    record.validate()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
