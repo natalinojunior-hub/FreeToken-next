@@ -147,7 +147,11 @@ class TritonAttentionBackend(BaseAttnBackend):
         attn_spec: AttentionSpec | None = None,
     ) -> torch.Tensor:
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
-        if not getattr(self.kvcache, "compressed", False):
+        from freetoken.kernel.triton import turbo_kv
+
+        if not getattr(self.kvcache, "compressed", False) or not turbo_kv.is_rotated(
+            self.kvcache.book
+        ):
             return self._forward(q, k, v, layer_id, batch, attn_spec)
         # The slab holds rotated codes, so what enters the kernel rotates in and the accumulated
         # output rotates out. rotate is orthogonal, which makes that exact bookkeeping rather than
@@ -184,13 +188,15 @@ class TritonAttentionBackend(BaseAttnBackend):
 
         turbo = None
         if getattr(self.kvcache, "compressed", False):
+            from freetoken.kernel.triton.turbo_attn import BOOK_CODE
+
             k_raw, k_norm = self.kvcache.k_slab(layer_id)
             v_raw, v_norm = self.kvcache.v_slab(layer_id)
             turbo = {
                 "k_norm": k_norm,
                 "v_norm": v_norm,
                 "cent": self.kvcache.cent_tensor,
-                "book3": self.kvcache.book3,
+                "book": BOOK_CODE[self.kvcache.book],
             }
             kv_heads, head_dim = k_raw.shape[1], self.kvcache.head_dim
             k_cache, v_cache = k_raw, v_raw  # element strides are the codes', not a bf16 slab's

@@ -16,7 +16,7 @@ import torch
 from freetoken.kernel.triton import turbo_kv as tk
 
 DEVICE = torch.device("cpu")
-BOOKS = list(tk.BOOKS)
+BOOKS = [b for b in tk.BOOKS if b not in tk.ELEMENT_BOOKS]  # codebook formats only
 
 
 def _groups(n: int = 512, seed: int = 0) -> torch.Tensor:
@@ -298,3 +298,9 @@ def test_rejects_a_head_dim_that_is_not_a_group_multiple():
         tk.quantize(torch.randn(4, 96, device=DEVICE), "turbo4")
     with pytest.raises(ValueError, match="unknown turbo book"):
         tk.quantize(torch.randn(4, 128, device=DEVICE), "turbo9")
+
+
+def test_e2m1_rounds_half_to_even_and_saturates():
+    mag = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 0.3, 5.1, 9.0])
+    got = [tk.E2M1[i] for i in tk.e2m1_round(mag).tolist()]
+    assert got == [0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0, 0.5, 6.0, 6.0]

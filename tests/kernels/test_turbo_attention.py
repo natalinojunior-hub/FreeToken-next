@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from freetoken.kernel.triton import turbo_kv as tk
+from freetoken.kernel.triton.turbo_attn import BOOK_CODE
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 
@@ -25,7 +26,7 @@ def _splits(batch, num_q_heads, max_kv_splits, head_dim, device):
 
 # decode_paged_attention's fused code path only knows the BOOK3 flag (turbo3 vs turbo4); turbo8
 # is RAM-tier only for now (decoded to bf16 before attention, see qsa/tiered.py).
-@pytest.mark.parametrize("book", ["turbo3", "turbo4"])
+@pytest.mark.parametrize("book", ["turbo3", "turbo4", "fp8", "nvfp4"])
 @pytest.mark.parametrize(("q_heads", "kv_heads"), [(16, 4), (8, 8)])
 def test_decode_on_codes_matches_decode_on_decoded_kv(book, q_heads, kv_heads):
     from freetoken.kernel.triton.attention import decode_paged_attention
@@ -69,13 +70,17 @@ def test_decode_on_codes_matches_decode_on_decoded_kv(book, q_heads, kv_heads):
     )
 
     # same values, reached the fused way: codes + norm, Q pre-rotated, output rotated back once
-    q_rot = tk.rotate(q.reshape(-1, head_dim)).reshape(q.shape).to(torch.bfloat16)
+    rotated = tk.is_rotated(book)
+    q_rot = tk.rotate(q.reshape(-1, head_dim)) if rotated else q.reshape(-1, head_dim)
+    q_rot = q_rot.reshape(q.shape).to(torch.bfloat16)
     codes_k = kc.reshape(total, kv_heads, -1).contiguous()
     codes_v = vc.reshape(total, kv_heads, -1).contiguous()
     norm_k = kn.reshape(total, kv_heads, 1).contiguous()
     norm_v = vn.reshape(total, kv_heads, 1).contiguous()
     cent = torch.tensor(
-        tk.CENTROIDS_3 if book == "turbo3" else tk.CENTROIDS_4, device=device, dtype=torch.float32
+        tk.CENTROIDS_3 if book == "turbo3" else tk.CENTROIDS_4,
+        device=device,
+        dtype=torch.float32,
     )
     logits2, lse2, splits2 = _splits(batch, q_heads, max_kv_splits, head_dim, device)
     got_rot = decode_paged_attention(
@@ -90,9 +95,10 @@ def test_decode_on_codes_matches_decode_on_decoded_kv(book, q_heads, kv_heads):
         splits2,
         max_kv_splits,
         sm_scale,
-        turbo={"k_norm": norm_k, "v_norm": norm_v, "cent": cent, "book3": book == "turbo3"},
+        turbo={"k_norm": norm_k, "v_norm": norm_v, "cent": cent, "book": BOOK_CODE[book]},
     )
-    got = tk.inv_rotate(got_rot.reshape(-1, head_dim)).reshape(got_rot.shape).to(torch.bfloat16)
+    got = got_rot.reshape(-1, head_dim)
+    got = (tk.inv_rotate(got) if rotated else got).reshape(got_rot.shape).to(torch.bfloat16)
 
     assert torch.isfinite(got.float()).all()
     diff = (got.float() - want.float()).abs()
@@ -178,7 +184,7 @@ def test_extend_on_codes_matches_extend_on_decoded_kv():
             "k_norm": kn.reshape(total, kv_heads, 1).contiguous(),
             "v_norm": vn.reshape(total, kv_heads, 1).contiguous(),
             "cent": torch.tensor(tk.CENTROIDS_4, device=device, dtype=torch.float32),
-            "book3": False,
+            "book": 0,
         },
     )
     got = tk.inv_rotate(got_rot.reshape(-1, head_dim)).reshape(got_rot.shape).to(torch.bfloat16)
@@ -206,3 +212,29 @@ def test_bf16_extend_is_untouched_by_the_branch():
     a = extend_paged_attention(q, k, v, qo, qo, idx, pre, 3, head_dim**-0.5)
     b = extend_paged_attention(q, k, v, qo, qo, idx, pre, 3, head_dim**-0.5)
     assert torch.equal(a, b)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="needs Blackwell (hardware e2m1 conversion)",
+)
+def test_nvfp4_tile_uses_the_hardware_e2m1_unit():
+    """The NVFP4 read path must be the Blackwell F2FP.E2M1 conversion, not a lookup table."""
+    import triton
+    import triton.language as tl
+
+    from freetoken.kernel.triton.turbo_attn import _e2m1
+
+    @triton.jit
+    def probe(x_ptr, o_ptr, N: tl.constexpr):
+        offs = tl.arange(0, N // 2)
+        b = tl.load(x_ptr + offs)
+        tl.store(o_ptr + offs * 2, _e2m1(b, offs < 0))
+        tl.store(o_ptr + offs * 2 + 1, _e2m1(b, offs >= 0))
+
+    x = torch.arange(256, dtype=torch.uint8, device="cuda")
+    out = torch.empty(512, dtype=torch.float32, device="cuda")
+    handle = probe[(1,)](x, out, N=512)
+    ref = torch.tensor([[tk.E2M1[i & 15], tk.E2M1[i >> 4]] for i in range(256)]).flatten()
+    assert torch.equal(out.cpu(), ref)
+    assert "cvt.rn.f16x2.e2m1x2" in handle.asm["ptx"]

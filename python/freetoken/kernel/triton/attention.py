@@ -208,7 +208,7 @@ def _decode_grouped_stage1_kernel(
     DV: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     COMPRESSED: tl.constexpr = False,
-    BOOK3: tl.constexpr = False,
+    BOOK: tl.constexpr = 0,
 ):
     batch_id = tl.program_id(0)
     head_block_id = tl.program_id(1)
@@ -276,7 +276,7 @@ def _decode_grouped_stage1_kernel(
                     stride_knh,
                     offs_d,
                     mask_n,
-                    BOOK3,
+                    BOOK,
                     q.dtype,
                 )
             else:
@@ -301,7 +301,7 @@ def _decode_grouped_stage1_kernel(
                     stride_vnh,
                     offs_dv,
                     mask_n,
-                    BOOK3,
+                    BOOK,
                     q.dtype,
                 )
             else:
@@ -428,7 +428,7 @@ def decode_paged_attention(
     """SGLang-style split-k grouped decode attention for one query per request.
 
     ``turbo`` switches the KV tiles to the coded slabs: pass the *code* tensors as ``k_cache`` /
-    ``v_cache`` and ``{"k_norm", "v_norm", "cent", "book3"}`` alongside. Q must already be rotated
+    ``v_cache`` and ``{"k_norm", "v_norm", "cent", "book"}`` (``book`` = ``BOOK_CODE[name]``) alongside. Q must already be rotated
     and the result comes back rotated (see ``kernel/triton/turbo_attn.py``).
     """
 
@@ -511,7 +511,7 @@ def decode_paged_attention(
         DV=head_dim,
         SLIDING_WINDOW=sliding_window or 0,
         COMPRESSED=compressed,
-        BOOK3=bool(turbo["book3"]) if compressed else False,
+        BOOK=turbo["book"] if compressed else 0,
         num_warps=4,
         num_stages=2,
     )
@@ -581,7 +581,7 @@ def _extend_attention_kernel(
     HAS_SINKS: tl.constexpr,
     HAS_BLOCKS: tl.constexpr,
     COMPRESSED: tl.constexpr = False,
-    BOOK3: tl.constexpr = False,
+    BOOK: tl.constexpr = 0,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -654,7 +654,7 @@ def _extend_attention_kernel(
                     stride_knh,
                     offs_d,
                     mask_n,
-                    BOOK3,
+                    BOOK,
                     tl.bfloat16,
                 )
             else:
@@ -685,7 +685,7 @@ def _extend_attention_kernel(
                     stride_vnh,
                     offs_dv,
                     mask_n,
-                    BOOK3,
+                    BOOK,
                     tl.bfloat16,
                 )
             else:
@@ -750,7 +750,7 @@ def _extend_attention_split_kernel(
     HAS_SINKS: tl.constexpr,
     HAS_BLOCKS: tl.constexpr,
     COMPRESSED: tl.constexpr = False,
-    BOOK3: tl.constexpr = False,
+    BOOK: tl.constexpr = 0,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -814,7 +814,7 @@ def _extend_attention_split_kernel(
                     stride_knh,
                     offs_d,
                     mask_n,
-                    BOOK3,
+                    BOOK,
                     tl.bfloat16,
                 )
             else:
@@ -848,7 +848,7 @@ def _extend_attention_split_kernel(
                     stride_vnh,
                     offs_dv,
                     mask_n,
-                    BOOK3,
+                    BOOK,
                     tl.bfloat16,
                 )
             else:
@@ -977,7 +977,7 @@ def extend_paged_attention(
     cent_ptr = turbo["cent"] if compressed else k_cache
     turbo_kw = {
         "COMPRESSED": compressed,
-        "BOOK3": bool(turbo["book3"]) if compressed else False,
+        "BOOK": turbo["book"] if compressed else 0,
     }
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)

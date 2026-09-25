@@ -26,7 +26,7 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     ``index_ratio`` > 1 (QSA) stores one index key per token group, not per token; that slab's
     ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
     fmt = getattr(config, "kv_format", "auto")
-    if fmt in ["turbo3", "turbo4"]:
+    if fmt in ["turbo3", "turbo4", "fp8", "nvfp4"]:
         from .turbo_pool import packed_bytes_per_token
 
         per_token = (

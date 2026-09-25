@@ -17,6 +17,30 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
+# ``BOOK`` constexpr of the tile readers; ``cent`` is the centroid book (unused by fp8/nvfp4).
+BOOK_TURBO4 = tl.constexpr(0)
+BOOK_TURBO3 = tl.constexpr(1)
+BOOK_FP8 = tl.constexpr(2)
+BOOK_NVFP4 = tl.constexpr(3)
+BOOK_CODE = {"turbo4": 0, "turbo3": 1, "fp8": 2, "nvfp4": 3}
+
+
+@triton.jit
+def _e2m1(byte, odd):
+    """The e2m1 nibble of ``byte`` picked by ``odd`` (high nibble), as fp32. Decoded by Blackwell's
+    F2FP.E2M1 unit (cvt.rn.f16x2.e2m1x2); the nibble is isolated first, so only the low half of the
+    f16x2 result is used."""
+    nib = (byte.to(tl.int32) >> (odd.to(tl.int32) * 4)) & 15
+    pair = tl.inline_asm_elementwise(
+        "{ .reg .b8 b0, b1, b2, b3; mov.b32 {b0, b1, b2, b3}, $1; cvt.rn.f16x2.e2m1x2 $0, b0; }",
+        "=r,r",
+        [nib],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    return (pair & 0xFFFF).to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
+
 
 @triton.jit
 def turbo_k_tile(
@@ -31,7 +55,7 @@ def turbo_k_tile(
     stride_nh,
     offs_d,  # int32 [D] element index inside one head row
     mask_n,  # bool  [N]
-    BOOK3: tl.constexpr,
+    BOOK: tl.constexpr,
     out_dtype: tl.constexpr,
 ):
     """K tile [D, N], rotated domain: ``centroid[idx] * norm``."""
@@ -39,7 +63,20 @@ def turbo_k_tile(
     ncol = slots[None, :] * stride_nt + kv_head * stride_nh
     grp = offs_d // 128
     jj = offs_d % 128
-    if BOOK3:
+    nrm = tl.load(norm_ptr + ncol + grp[:, None], mask=mask_n[None, :], other=0.0).to(tl.float32)
+    if BOOK == BOOK_FP8:
+        raw = tl.load(codes_ptr + col + (grp * 128 + jj)[:, None], mask=mask_n[None, :], other=0)
+        return (raw.to(tl.float8e4nv, bitcast=True).to(tl.float32) * nrm).to(out_dtype)
+    if BOOK == BOOK_NVFP4:
+        byte = tl.load(
+            codes_ptr + col + (grp * 72 + jj // 2)[:, None], mask=mask_n[None, :], other=0
+        )
+        sc = tl.load(
+            codes_ptr + col + (grp * 72 + 64 + jj // 16)[:, None], mask=mask_n[None, :], other=0
+        )
+        vals = _e2m1(byte, (jj % 2 == 1)[:, None])
+        return (vals * sc.to(tl.float8e4nv, bitcast=True).to(tl.float32) * nrm).to(out_dtype)
+    if BOOK == BOOK_TURBO3:
         low = tl.load(
             codes_ptr + col + (grp * 48 + jj // 4)[:, None], mask=mask_n[None, :], other=0
         )
@@ -55,7 +92,6 @@ def turbo_k_tile(
         )
         idx = (byte.to(tl.int32) >> ((jj % 2) * 4)[:, None]) & 15
     vals = tl.load(cent_ptr + idx)
-    nrm = tl.load(norm_ptr + ncol + grp[:, None], mask=mask_n[None, :], other=0.0).to(tl.float32)
     return (vals * nrm).to(out_dtype)
 
 
@@ -72,7 +108,7 @@ def turbo_v_tile(
     stride_nh,
     offs_d,  # int32 [DV]
     mask_n,  # bool  [N]
-    BOOK3: tl.constexpr,
+    BOOK: tl.constexpr,
     out_dtype: tl.constexpr,
 ):
     """V tile [N, D], rotated domain, so ``tl.dot(p, v)`` needs no transpose."""
@@ -80,7 +116,20 @@ def turbo_v_tile(
     nrow = slots[:, None] * stride_nt + kv_head * stride_nh
     grp = offs_d // 128
     jj = offs_d % 128
-    if BOOK3:
+    nrm = tl.load(norm_ptr + nrow + grp[None, :], mask=mask_n[:, None], other=0.0).to(tl.float32)
+    if BOOK == BOOK_FP8:
+        raw = tl.load(codes_ptr + row + (grp * 128 + jj)[None, :], mask=mask_n[:, None], other=0)
+        return (raw.to(tl.float8e4nv, bitcast=True).to(tl.float32) * nrm).to(out_dtype)
+    if BOOK == BOOK_NVFP4:
+        byte = tl.load(
+            codes_ptr + row + (grp * 72 + jj // 2)[None, :], mask=mask_n[:, None], other=0
+        )
+        sc = tl.load(
+            codes_ptr + row + (grp * 72 + 64 + jj // 16)[None, :], mask=mask_n[:, None], other=0
+        )
+        vals = _e2m1(byte, (jj % 2 == 1)[None, :])
+        return (vals * sc.to(tl.float8e4nv, bitcast=True).to(tl.float32) * nrm).to(out_dtype)
+    if BOOK == BOOK_TURBO3:
         low = tl.load(
             codes_ptr + row + (grp * 48 + jj // 4)[None, :], mask=mask_n[:, None], other=0
         )
@@ -96,5 +145,4 @@ def turbo_v_tile(
         )
         idx = (byte.to(tl.int32) >> ((jj % 2) * 4)[None, :]) & 15
     vals = tl.load(cent_ptr + idx)
-    nrm = tl.load(norm_ptr + nrow + grp[None, :], mask=mask_n[:, None], other=0.0).to(tl.float32)
     return (vals * nrm).to(out_dtype)

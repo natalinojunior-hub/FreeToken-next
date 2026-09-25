@@ -83,6 +83,13 @@ class TurboMHAKVCache(BaseKVCachePool):
             raise ValueError(f"turbo KV supports head_dim <= 512, got {head_dim}")
         if dtype not in (torch.bfloat16, torch.float16):
             raise ValueError(f"turbo KV quantizes {dtype} activations; expected bf16/fp16")
+        if book == "nvfp4" and (
+            device.type != "cuda" or torch.cuda.get_device_capability(device)[0] < 10
+        ):
+            raise ValueError(
+                "--kv-format nvfp4 needs a Blackwell GPU (sm_100+/sm_120): the attention kernel "
+                "decodes e2m1 with the hardware F2FP.E2M1 conversion"
+            )
         self.book = "turbo4" if book in ("vbr", "tcq") else book
         self.policy = policy
         self._dtype = dtype
@@ -268,7 +275,7 @@ class TurboMHAKVCache(BaseKVCachePool):
     @classmethod
     def kv_cost(cls, config, **kwargs) -> tuple[int, int, int, int]:
         book = kwargs.get("book") or getattr(config, "kv_format", "auto")
-        if book not in ("turbo3", "turbo4"):
+        if book not in ("turbo3", "turbo4", "fp8", "nvfp4"):
             raise ValueError(f"TurboMHAKVCache priced with book {book!r}")
         per_token = 0
         for spec in config.model_config.kv_cache_group_specs():

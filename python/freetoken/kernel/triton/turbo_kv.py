@@ -854,9 +854,9 @@ MID_8 = (
 )
 
 # Packed payload bytes per 128-element group, excluding the fp16 norm.
-CODE_BYTES = {"turbo3": 48, "turbo4": 64, "turbo8": 128}
+CODE_BYTES = {"turbo3": 48, "turbo4": 64, "turbo8": 128, "fp8": 128, "nvfp4": 72}
 # bits per value including the deduped norm: (48*8 + 16) / 128, (64*8 + 16) / 128, (128*8 + 16) / 128
-BPV = {"turbo3": 3.125, "turbo4": 4.125, "turbo8": 8.125}
+BPV = {"turbo3": 3.125, "turbo4": 4.125, "turbo8": 8.125, "fp8": 8.125, "nvfp4": 4.625}
 BOOKS = tuple(CODE_BYTES)
 
 _CENT_TABLE = {"turbo3": CENTROIDS_3, "turbo4": CENTROIDS_4, "turbo8": CENTROIDS_8}
@@ -1059,6 +1059,8 @@ def quantize(x: torch.Tensor, book: str) -> tuple[torch.Tensor, torch.Tensor]:
         raise ValueError(f"unknown turbo book {book!r}")
     if x.shape[-1] % QK_TURBO:
         raise ValueError(f"head_dim {x.shape[-1]} is not a multiple of {QK_TURBO}")
+    if book in ELEMENT_BOOKS:
+        return _element_quantize(x, book)
     rows = x.reshape(-1, QK_TURBO)
     normed, grp_norm = _normalize(rows)
     y = rotate(normed)
@@ -1074,6 +1076,8 @@ def quantize(x: torch.Tensor, book: str) -> tuple[torch.Tensor, torch.Tensor]:
 
 def decode_rotated(codes: torch.Tensor, norm: torch.Tensor, book: str) -> torch.Tensor:
     """Values in the rotated domain, ``centroid[idx] * norm`` -- what attention consumes."""
+    if book in ELEMENT_BOOKS:
+        return _element_decode(codes, norm, book)
     cent, _ = _book(codes.device, book)
     idx = unpack(codes, book)  # [rows, groups * 128]
     groups = idx.shape[1] // QK_TURBO
@@ -1086,10 +1090,78 @@ def decode(codes: torch.Tensor, norm: torch.Tensor, book: str) -> torch.Tensor:
     fused attention path never calls this."""
     groups = codes.shape[1] // CODE_BYTES[book]
     y = decode_rotated(codes, norm, book).reshape(-1, QK_TURBO)
-    return inv_rotate(y).reshape(codes.shape[0], groups * QK_TURBO)
+    if is_rotated(book):
+        y = inv_rotate(y)
+    return y.reshape(codes.shape[0], groups * QK_TURBO)
 
 
 def bytes_per_token(book: str, num_kv_heads: int, head_dim: int) -> int:
     """Packed bytes for one token, one KV head, one layer -- the number the ledger charges."""
     groups = head_dim // QK_TURBO
     return num_kv_heads * groups * (CODE_BYTES[book] + 2)
+
+
+# ---- element formats: FP8 e4m3 and NVFP4, in the turbo slab layout ------------------------------
+# FP8: 128 e4m3 bytes per group of 128, a plain saturating cast of the KV values (no rotation, unit
+# ``norm``). Measured against a rotated + per-group-scaled variant (campaign 18, Tiel 35B): same
+# quality (usage 20/20 vs 19/20, needle 64K/256K pass) and faster at every context (TG 4K/64K/256K
+# 128.3/101.6/84.7 vs 106.7/96.6/74.4), so the simple cast is the format.
+# NVFP4 (NVIDIA's format, as the vLLM/FlashInfer KV caches store it -- no rotation): e2m1 values,
+# one e4m3 scale per 16, and a second-level scale; a group of 128 is 64 bytes of nibble pairs (low
+# nibble = even element) + 8 e4m3 block scales. The second level is the fp16 ``norm`` per group of
+# 128 (amax/(6*448), computed online) instead of a calibrated per-tensor fp32 scale. The attention
+# kernel decodes e2m1 with Blackwell's F2FP.E2M1 unit (cvt.rn.f16x2.e2m1x2), see turbo_attn.py.
+ELEMENT_BOOKS = ("fp8", "nvfp4")
+E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+_E2M1_MID = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+_E4M3_MAX = 448.0
+_MID_CACHE: dict[str, torch.Tensor] = {}
+
+
+def is_rotated(book: str) -> bool:
+    """Whether ``book`` stores the rotated domain (the backend then rotates q/k/v and the output)."""
+    return book not in ELEMENT_BOOKS
+
+
+def e2m1_round(mag: torch.Tensor) -> torch.Tensor:
+    """E2M1 magnitude code of ``mag`` (>= 0): round-half-to-even, saturating at 6."""
+    key = str(mag.device)
+    mid = _MID_CACHE.get(key)
+    if mid is None:  # built once per device, never inside a CUDA graph capture
+        mid = _MID_CACHE[key] = torch.tensor(_E2M1_MID, device=mag.device)
+    idx = torch.bucketize(mag.contiguous(), mid)  # a tie lands on the lower code
+    tie = (idx < len(_E2M1_MID)) & (mag == mid[idx.clamp(max=len(_E2M1_MID) - 1)])
+    return torch.where(tie & (idx % 2 == 1), idx + 1, idx)  # odd mantissa bit -> round up
+
+
+def _element_quantize(x: torch.Tensor, book: str) -> tuple[torch.Tensor, torch.Tensor]:
+    rows = x.shape[0]
+    y = x.reshape(-1, QK_TURBO).float()
+    if book == "fp8":
+        codes = y.clamp(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn)
+        norm = torch.ones(y.shape[0], device=x.device, dtype=torch.float16)
+        return codes.view(torch.uint8).reshape(rows, -1), norm.reshape(rows, -1)
+    blocks = y.reshape(-1, 8, 16)
+    amax = blocks.abs().amax(-1)  # [n, 8]
+    norm = (amax.amax(-1) / (6.0 * _E4M3_MAX)).to(torch.float16)
+    g = norm.float().clamp_min(1e-30)
+    bscale = (amax / (6.0 * g[:, None])).clamp(max=_E4M3_MAX).to(torch.float8_e4m3fn)
+    q = blocks / (bscale.float() * g[:, None]).clamp_min(1e-30)[..., None]
+    code = (e2m1_round(q.abs()) | ((q < 0).to(torch.int64) << 3)).reshape(-1, QK_TURBO)
+    code = code.to(torch.uint8)
+    packed = code[:, 0::2] | (code[:, 1::2] << 4)
+    codes = torch.cat([packed, bscale.view(torch.uint8)], dim=-1)
+    return codes.reshape(rows, -1), norm.reshape(rows, -1)
+
+
+def _element_decode(codes: torch.Tensor, norm: torch.Tensor, book: str) -> torch.Tensor:
+    rows = codes.shape[0]
+    grp = codes.reshape(-1, CODE_BYTES[book])
+    g = norm.reshape(-1, 1).float()
+    if book == "fp8":
+        return (grp.view(torch.float8_e4m3fn).float() * g).reshape(rows, -1)
+    nib = torch.stack([grp[:, :64] & 15, grp[:, :64] >> 4], dim=-1).reshape(-1, QK_TURBO)
+    vals = torch.tensor(E2M1, device=codes.device)[nib.long()]
+    bscale = grp[:, 64:].contiguous().view(torch.float8_e4m3fn).float()  # [n, 8]
+    vals = vals.reshape(-1, 8, 16) * bscale[..., None] * g[..., None]
+    return vals.reshape(rows, -1)
