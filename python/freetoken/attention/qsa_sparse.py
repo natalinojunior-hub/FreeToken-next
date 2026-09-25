@@ -155,6 +155,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             ).to(self.device)
 
         self._block_topk_kernel = _resolve_block_topk()
+        self._turbo_consts: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         # decode staging (static buffers under CUDA graphs; eager decode snapshots per step)
         self._graph: dict[str, torch.Tensor] = {}
         # static addressing for the spec-verify graph (stage_verify), keyed by window length
@@ -444,7 +445,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             k_cache = self.kvcache.k_cache(layer_id)
             v_cache = self.kvcache.v_cache(layer_id)
 
-        host_kv, block_table = self._host_tier(layer_id, md)
+        host_kv, block_table = self._host_tier(layer_id, md, indices)
         out = qsa_sparse_paged_attention(
             q_in,
             k_cache,
@@ -461,6 +462,43 @@ class QSASparseAttnBackend(BaseAttnBackend):
             mark("inverse_rotate")
         return out
 
+    def _decode_turbo_tier(
+        self,
+        md: QSASparseMetadata,
+        indices: torch.Tensor | None,
+        host_turbo: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Decode the turbo RAM pages this layer's selection touches into the staging slab at
+        their own page index, so the unmodified block table addresses them. Fixed shapes (one
+        entry per RAM page, -1 = untouched): no host sync, graph-capturable."""
+        from freetoken.kernel.triton.qsa.tiered import turbo_inverse_rotation, turbo_pages_to_bf16
+        from freetoken.kernel.triton.turbo_kv import _book
+
+        stage_k, stage_v = self.kvcache.host_staging
+        pages = stage_k.shape[0]
+        if indices is None:
+            return stage_k, stage_v
+        if self._turbo_consts is None:
+            self._turbo_consts = (
+                _book(self.device, self.kvcache.host_book)[0].float(),
+                turbo_inverse_rotation(self.device),
+                torch.arange(pages, dtype=torch.int32, device=self.device),
+            )
+        cent, rotation, ids = self._turbo_consts
+        table = md.block_table
+        logical = (indices.clamp(min=0) // self.page_size).clamp(max=table.shape[1] - 1)
+        rows = md.token_to_req.long()[:, None].expand_as(logical)
+        host = table[rows, logical.long()].long() - self.kvcache.num_device_pages
+        host = torch.where((indices >= 0) & (host >= 0) & (host < pages), host, pages)
+        mark = torch.zeros(pages + 1, dtype=torch.int32, device=self.device)
+        mark.index_fill_(0, host.flatten(), 1)
+        src = torch.where(mark[:pages] > 0, ids, -1)
+        kc, kn, vc, vn = host_turbo
+        book = self.kvcache.host_book
+        turbo_pages_to_bf16(kc, kn, cent, rotation, src, ids, stage_k, book, self.page_size)
+        turbo_pages_to_bf16(vc, vn, cent, rotation, src, ids, stage_v, book, self.page_size)
+        return stage_k, stage_v
+
     def _plan_host_staging(self, md: QSASparseMetadata, rows: int) -> None:
         """Eager multi-row forwards (prefill) re-read every selected token once per query row;
         zero-copy RAM reads would cross PCIe per row, so the RAM pages this forward touches are
@@ -468,7 +506,12 @@ class QSASparseAttnBackend(BaseAttnBackend):
         graph-bound read the RAM tier zero-copy: one pass, fixed addresses, no host sync."""
         md.host_pages = md.staged_table = None
         stage = getattr(self.kvcache, "host_staging", None)
-        if stage is None or rows <= _ZERO_COPY_MAX_ROWS or torch.cuda.is_current_stream_capturing():
+        if (
+            stage is None
+            or getattr(self.kvcache, "host_book", None) is not None  # turbo decodes per layer
+            or rows <= _ZERO_COPY_MAX_ROWS
+            or torch.cuda.is_current_stream_capturing()
+        ):
             return
         device_pages = self.kvcache.num_device_pages
         table = md.block_table
@@ -483,9 +526,14 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md.host_pages = (pages - device_pages).to(torch.int64)
 
     def _host_tier(
-        self, layer_id: int, md: QSASparseMetadata
+        self, layer_id: int, md: QSASparseMetadata, indices: torch.Tensor | None = None
     ) -> tuple[tuple[torch.Tensor, torch.Tensor] | None, torch.Tensor]:
         """The RAM tier view this layer's attention reads, and the block table addressing it."""
+        host_turbo = (
+            self.kvcache.host_turbo(layer_id) if hasattr(self.kvcache, "host_turbo") else None
+        )
+        if host_turbo is not None:
+            return self._decode_turbo_tier(md, indices, host_turbo), md.block_table
         host_kv = self.kvcache.host_kv(layer_id) if hasattr(self.kvcache, "host_kv") else None
         if host_kv is None or md.host_pages is None:
             return host_kv, md.block_table

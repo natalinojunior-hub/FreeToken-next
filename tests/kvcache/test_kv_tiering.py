@@ -119,10 +119,9 @@ def test_kv_ram_budget_refuses_with_max_context(monkeypatch):
 
     gib = 1 << 30
     monkeypatch.setattr(eng, "_meminfo", lambda: {"MemTotal": 96 * gib, "MemAvailable": 16 * gib})
+    per_token = {torch.bfloat16: 25_600, torch.float8_e4m3fn: 12_800, "turbo4": 6_800}
     pool = SimpleNamespace(
-        host_tier_ram_bytes=lambda config, tokens, dtype=None: (
-            (25_600 if dtype in (None, torch.bfloat16) else 12_800) * tokens
-        )
+        host_tier_ram_bytes=lambda config, tokens, dtype=None: per_token.get(dtype, 5_200) * tokens
     )
     config = SimpleNamespace(max_seq_len=1 << 20, page_size=64, dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match="o contexto pedido de 1048576 tokens") as err:
@@ -134,6 +133,10 @@ def test_kv_ram_budget_refuses_with_max_context(monkeypatch):
     # 256K: BF16 needs 6.25 GiB > 4.4 GiB budget, FP8 (3.1 GiB) fits.
     mid = SimpleNamespace(max_seq_len=1 << 18, page_size=64, dtype=torch.bfloat16)
     assert eng._kv_ram_dtype(mid, pool, (1 << 18) // 64) is torch.float8_e4m3fn
+    # 512K: FP8 needs 6.25 GiB, turbo4 (3.3 GiB) fits; 768K: turbo4 5.0 GiB, turbo3 3.8 GiB.
+    big = SimpleNamespace(max_seq_len=1 << 19, page_size=64, dtype=torch.bfloat16)
+    assert eng._kv_ram_dtype(big, pool, (1 << 19) // 64) == "turbo4"
+    assert eng._kv_ram_dtype(big, pool, 768 * 1024 // 64) == "turbo3"
 
 
 def test_force_tiering_rejects_negative_kv_ram_tokens():

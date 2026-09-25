@@ -48,7 +48,7 @@ class MHAKVCache(BaseKVCachePool):
         device: torch.device,
         layer_ids: Sequence[int] | None = None,
         host_pages: int = 0,
-        host_dtype: torch.dtype | None = None,
+        host_dtype: torch.dtype | str | None = None,
     ) -> None:
         """``host_pages`` of the ``num_pages`` physical pages (the highest ids) live in the
         page-locked RAM tier (in ``host_dtype``, default the KV dtype; FP8 halves it); the
@@ -78,14 +78,25 @@ class MHAKVCache(BaseKVCachePool):
         )
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
-        self._kv_host = (
-            registered_host_empty(
-                (2, num_storage_layers, host_pages, page_size, local_kv_heads, head_dim),
-                host_dtype or dtype,
+        # RAM tier: element-wise (BF16/FP8, read in place) or turbo codes + norms (decoded page
+        # by page into device staging before attention reads them).
+        self.host_book = host_dtype if host_dtype in ("turbo4", "turbo3") else None
+        self._kv_host = self._host_codes = self._host_norm = None
+        if host_pages and self.host_book is not None:
+            from freetoken.kernel.triton.turbo_kv import CODE_BYTES
+
+            groups = head_dim // 128
+            rows = (2, num_storage_layers, host_pages * page_size, local_kv_heads)
+            self._host_codes = registered_host_empty(
+                (*rows, groups * CODE_BYTES[self.host_book]), torch.uint8
             )
-            if host_pages
-            else None
-        )
+            self._host_norm = registered_host_empty((*rows, groups), torch.float16)
+        elif host_pages:
+            self._kv_host = registered_host_empty(
+                (2, num_storage_layers, host_pages, page_size, local_kv_heads, head_dim),
+                host_dtype if isinstance(host_dtype, torch.dtype) else dtype,
+            )
+        self._host_pages_count = host_pages
         self._device = device
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
 
@@ -155,6 +166,38 @@ class MHAKVCache(BaseKVCachePool):
     def v_cache(self, index: int) -> torch.Tensor:
         return self._v_buffer[self._dense(index)]
 
+    def host_turbo(self, index: int) -> tuple[torch.Tensor, ...] | None:
+        """One layer's turbo RAM tier: ``(k_codes, k_norm, v_codes, v_norm)``, token-major."""
+        if self.host_book is None:
+            return None
+        dense = self._dense(index)
+        return (
+            self._host_codes[0, dense],
+            self._host_norm[0, dense],
+            self._host_codes[1, dense],
+            self._host_norm[1, dense],
+        )
+
+    def _store_turbo_tier(
+        self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, dense: int
+    ) -> None:
+        """Device slots take BF16 rows; RAM slots take turbo codes of the same rows (quantized
+        for every row, fixed shapes, so the path stays graph-capturable)."""
+        from freetoken.kernel.triton.qsa.tiered import scatter_rows, tiered_store_kv
+        from freetoken.kernel.triton.turbo_kv import quantize
+
+        k_dev, v_dev = self._k_buffer[dense], self._v_buffer[dense]
+        tiered_store_kv(k, v, out_loc, (k_dev, v_dev), (k_dev[:0], v_dev[:0]))
+        rows = out_loc.shape[0]
+        heads, dim = k_dev.shape[2], k_dev.shape[3]
+        base = self.num_device_pages * k_dev.shape[1]
+        for side, x in enumerate((k, v)):
+            codes, norm = quantize(x.reshape(rows * heads, dim), self.host_book)
+            scatter_rows(
+                codes.reshape(rows, heads, -1), out_loc, self._host_codes[side, dense], base
+            )
+            scatter_rows(norm.reshape(rows, heads, -1), out_loc, self._host_norm[side, dense], base)
+
     @property
     def num_device_pages(self) -> int:
         return int(self._kv_buffer.shape[2])
@@ -176,6 +219,9 @@ class MHAKVCache(BaseKVCachePool):
         from freetoken.kernel import store_cache
 
         dense = self._dense(layer_id)
+        if self.host_book is not None:
+            self._store_turbo_tier(k, v, out_loc, dense)
+            return
         if self._kv_host is not None:
             from freetoken.kernel.triton.qsa.tiered import tiered_store_kv
 

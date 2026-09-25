@@ -167,7 +167,7 @@ def create_kvcache_pool(
     kv_format: str = "auto",
     num_speculative_tokens: int = 0,
     host_pages: int = 0,
-    host_dtype: torch.dtype | None = None,
+    host_dtype: torch.dtype | str | None = None,
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache

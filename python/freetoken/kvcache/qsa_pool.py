@@ -73,7 +73,7 @@ class QSAKVCache(BaseKVCachePool):
         mtp_layer_id: int | None = None,
         tcq_policy=None,
         host_pages: int = 0,
-        host_dtype: torch.dtype | None = None,
+        host_dtype: torch.dtype | str | None = None,
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -182,8 +182,9 @@ class QSAKVCache(BaseKVCachePool):
     def _zero_kv_slabs(self) -> None:
         if hasattr(self._pool, "_kv_buffer"):
             self._pool._kv_buffer.zero_()
-        if getattr(self._pool, "_kv_host", None) is not None:
-            self._pool._kv_host.zero_()
+        for host in ("_kv_host", "_host_codes", "_host_norm"):
+            if getattr(self._pool, host, None) is not None:
+                getattr(self._pool, host).zero_()
         if hasattr(self._pool, "_k_codes"):
             self._pool._k_codes.zero_()
             self._pool._k_norm.zero_()
@@ -295,8 +296,11 @@ class QSAKVCache(BaseKVCachePool):
         return per_token * host_tokens
 
     @classmethod
-    def host_tier_ram_bytes(cls, config, host_tokens: int, dtype: torch.dtype | None = None) -> int:
-        """Page-locked host bytes of the RAM tier: the K/V rows of every KV layer."""
+    def host_tier_ram_bytes(
+        cls, config, host_tokens: int, dtype: torch.dtype | str | None = None
+    ) -> int:
+        """Page-locked host bytes of the RAM tier: the K/V rows of every KV layer, element-wise
+        (BF16/FP8) or as turbo codes + fp16 group norms."""
         from freetoken.attention import AttnType
         from freetoken.utils import div_even
 
@@ -305,8 +309,15 @@ class QSAKVCache(BaseKVCachePool):
             if spec.is_swa or spec.attn_type is not AttnType.QSA:
                 continue
             heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-            itemsize = (dtype or config.dtype).itemsize
-            per_token += 2 * spec.num_layers * heads * spec.head_dim * itemsize
+            if dtype in ("turbo4", "turbo3"):
+                from freetoken.kernel.triton.turbo_kv import CODE_BYTES
+
+                groups = spec.head_dim // 128
+                per_head = groups * (CODE_BYTES[dtype] + 2)
+            else:
+                itemsize = (dtype if isinstance(dtype, torch.dtype) else config.dtype).itemsize
+                per_head = spec.head_dim * itemsize
+            per_token += 2 * spec.num_layers * heads * per_head
         return per_token * host_tokens
 
     def unit_bytes(self) -> tuple[int, int]:
@@ -381,6 +392,14 @@ class QSAKVCache(BaseKVCachePool):
         host_kv = getattr(self._pool, "host_kv", None)
         return None if host_kv is None else host_kv(index)
 
+    def host_turbo(self, index: int) -> tuple[torch.Tensor, ...] | None:
+        host_turbo = getattr(self._pool, "host_turbo", None)
+        return None if host_turbo is None else host_turbo(index)
+
+    @property
+    def host_book(self) -> str | None:
+        return getattr(self._pool, "host_book", None)
+
     def rebalance(self, max_swaps: int) -> None:
         """Swap up to ``max_swaps`` of the hottest RAM pages with the coldest device pages.
 
@@ -389,6 +408,10 @@ class QSAKVCache(BaseKVCachePool):
         only when the RAM page was selected more than twice as often (hysteresis)."""
         from freetoken.kernel.triton.qsa.tiered import swap_pages
 
+        if getattr(self._pool, "host_book", None) is not None:
+            # ponytail: turbo RAM pages stay put (no BF16<->turbo swap yet); the device hot
+            # floor still serves the newest pages first. Add a quantizing swap if TG needs it.
+            return
         device_pages = self.num_device_pages
         total = self.page_map.shape[0]
         k = min(max_swaps, device_pages, total - device_pages)
@@ -471,11 +494,13 @@ class QSAKVCache(BaseKVCachePool):
             self._pool._v_norm[slot].zero_()
         elif hasattr(self._pool, "_kv_buffer") and self._pool._kv_buffer is not None:
             self._pool._kv_buffer[:, slot].zero_()
-            if getattr(self._pool, "_kv_host", None) is not None:
-                from freetoken.kernel.triton.qsa.tiered import zero_tier
+            from freetoken.kernel.triton.qsa.tiered import zero_tier
 
-                zero_tier(self._pool._kv_host[0, slot])
-                zero_tier(self._pool._kv_host[1, slot])
+            for host in ("_kv_host", "_host_codes", "_host_norm"):
+                tier = getattr(self._pool, host, None)
+                if tier is not None:
+                    zero_tier(tier[0, slot])
+                    zero_tier(tier[1, slot])
 
     def free_req(self, table_idx: int) -> None:
         """Zero the per-request pending ring and scratch cmp buffer when table_idx is released."""

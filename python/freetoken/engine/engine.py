@@ -125,15 +125,24 @@ def _meminfo() -> dict[str, int]:
         return {k: int(v.split()[0]) * 1024 for k, v in (line.split(":", 1) for line in f)}
 
 
-_KV_RAM_DTYPES = {"bf16": torch.bfloat16, "fp8": torch.float8_e4m3fn}
+# Narrowing ladder of the RAM tier: element-wise formats are read in place; turbo formats are
+# decoded page by page into device staging (lossy, turbo3 is the floor).
+_KV_RAM_DTYPES: dict[str, torch.dtype | str] = {
+    "bf16": torch.bfloat16,
+    "fp8": torch.float8_e4m3fn,
+    "turbo4": "turbo4",
+    "turbo3": "turbo3",
+}
 
 
-def _kv_ram_dtype(config, pool_cls, host_pages: int) -> torch.dtype | None:
-    """RAM-tier storage dtype: the KV dtype when it fits the safe RAM budget, else FP8 (half
-    the bytes; only the cold tier is narrowed, device KV stays exact). None: nothing fits."""
+def _kv_ram_dtype(config, pool_cls, host_pages: int) -> torch.dtype | str | None:
+    """RAM-tier storage format: the widest of KV dtype, FP8, turbo4, turbo3 that fits the safe
+    RAM budget (only the cold tier is narrowed; device KV stays exact). None: nothing fits."""
     choice = getattr(config, "kv_ram_dtype", "auto")
     candidates = (
-        [config.dtype, torch.float8_e4m3fn] if choice == "auto" else [_KV_RAM_DTYPES[choice]]
+        [config.dtype, torch.float8_e4m3fn, "turbo4", "turbo3"]
+        if choice == "auto"
+        else [_KV_RAM_DTYPES[choice]]
     )
     info = _meminfo()
     budget = info["MemAvailable"] - int(info["MemTotal"] * _RAM_KILL_MARGIN) - _RAM_SAFETY_BYTES
@@ -151,7 +160,7 @@ def _check_kv_ram_budget(config, pool_cls, host_pages: int) -> None:
     info = _meminfo()
     budget = info["MemAvailable"] - int(info["MemTotal"] * _RAM_KILL_MARGIN) - _RAM_SAFETY_BYTES
     choice = getattr(config, "kv_ram_dtype", "auto")
-    narrowest = torch.float8_e4m3fn if choice == "auto" else _KV_RAM_DTYPES[choice]
+    narrowest = "turbo3" if choice == "auto" else _KV_RAM_DTYPES[choice]
     per_token = pool_cls.host_tier_ram_bytes(config, 1, narrowest)
     need = per_token * host_pages * config.page_size
     ram_tokens = max(0, budget) // per_token

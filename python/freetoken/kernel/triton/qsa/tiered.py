@@ -218,4 +218,139 @@ def swap_pages(
     )
 
 
-__all__ = ["gather_pages", "swap_pages", "tiered_store_kv", "zero_tier"]
+@triton.jit
+def _scatter_rows_kernel(
+    src_ptr,
+    loc_ptr,
+    dst_ptr,
+    stride_src,
+    base_row,
+    dst_rows,
+    ROW: tl.constexpr,
+    BLOCK: tl.constexpr,
+) -> None:
+    token = tl.program_id(0).to(tl.int64)
+    row = tl.load(loc_ptr + token).to(tl.int64) - base_row
+    if (row >= 0) & (row < dst_rows):
+        for start in range(0, ROW, BLOCK):
+            cols = start + tl.arange(0, BLOCK)
+            mask = cols < ROW
+            x = tl.load(src_ptr + token * stride_src + cols, mask=mask)
+            tl.store(dst_ptr + row * ROW + cols, x, mask=mask)
+
+
+def scatter_rows(src: torch.Tensor, loc: torch.Tensor, dst: torch.Tensor, base_row: int) -> None:
+    """``dst[loc[i] - base_row] = src[i]`` for rows landing inside ``dst``; others are dropped.
+
+    ``src`` is ``[T, ...]`` with contiguous rows, ``dst`` ``[N, ...]`` contiguous and the same
+    row layout; any dtype (turbo codes, norms)."""
+    tokens = loc.shape[0]
+    row = dst[0].numel()
+    src = src.reshape(tokens, row)
+    if src.stride(1) != 1 or not dst.is_contiguous() or src.dtype != dst.dtype:
+        raise ValueError("scatter_rows needs contiguous rows of one dtype")
+    if tokens:
+        _scatter_rows_kernel[(tokens,)](
+            src, loc, dst, src.stride(0), base_row, dst.shape[0],
+            ROW=row, BLOCK=min(triton.next_power_of_2(row), 1024), num_warps=4,
+        )  # fmt: skip
+
+
+@triton.jit
+def _turbo_pages_kernel(
+    codes_ptr,
+    norm_ptr,
+    cent_ptr,
+    rot_ptr,
+    src_ptr,
+    dst_ptr,
+    out_ptr,
+    stride_c_token,
+    stride_c_head,
+    stride_n_token,
+    stride_n_head,
+    stride_o_page,
+    stride_o_token,
+    stride_o_head,
+    PAGE_SIZE: tl.constexpr,
+    GROUPS: tl.constexpr,
+    BOOK3: tl.constexpr,
+) -> None:
+    entry = tl.program_id(0)
+    head = tl.program_id(1)
+    page = tl.load(src_ptr + entry).to(tl.int64)
+    if page >= 0:
+        dst = tl.load(dst_ptr + entry).to(tl.int64)
+        tok = tl.arange(0, PAGE_SIZE)
+        dim = tl.arange(0, 128)
+        slots = page * PAGE_SIZE + tok
+        rot = tl.load(rot_ptr + dim[:, None] * 128 + dim[None, :])
+        for g in range(GROUPS):
+            base = codes_ptr + slots[:, None] * stride_c_token + head * stride_c_head
+            if BOOK3:
+                low = tl.load(base + (g * 48 + dim // 4)[None, :])
+                bit = tl.load(base + (g * 48 + 32 + dim // 8)[None, :])
+                idx = ((low.to(tl.int32) >> ((dim % 4) * 2)[None, :]) & 3) | (
+                    ((bit.to(tl.int32) >> (dim % 8)[None, :]) & 1) << 2
+                )
+            else:
+                byte = tl.load(base + (g * 64 + dim // 2)[None, :])
+                idx = (byte.to(tl.int32) >> ((dim % 2) * 4)[None, :]) & 0x0F
+            norm = tl.load(norm_ptr + slots * stride_n_token + head * stride_n_head + g)
+            rotated = tl.load(cent_ptr + idx) * norm.to(tl.float32)[:, None]
+            # Undo the per-group randomized Hadamard: one 128x128 product on the tensor cores.
+            value = tl.dot(rotated.to(tl.bfloat16), rot)
+            tl.store(
+                out_ptr
+                + dst * stride_o_page
+                + tok[:, None] * stride_o_token
+                + head * stride_o_head
+                + (g * 128 + dim)[None, :],
+                value.to(out_ptr.dtype.element_ty),
+            )
+
+
+def turbo_inverse_rotation(device: torch.device) -> torch.Tensor:
+    """``M[i, j] = s2[i] * H[i, j] * s1[j] / sqrt(128)``: ``y @ M`` is ``turbo_kv.inv_rotate(y)``."""
+    from freetoken.kernel.triton.turbo_kv import FWHT_SCALE, _signs, hadamard
+
+    s1, s2 = _signs(device)
+    had = hadamard(device=device)
+    return (s2[:, None] * had * FWHT_SCALE * s1[None, :]).to(torch.bfloat16).contiguous()
+
+
+def turbo_pages_to_bf16(
+    codes: torch.Tensor,
+    norm: torch.Tensor,
+    cent: torch.Tensor,
+    rotation: torch.Tensor,
+    src_pages: torch.Tensor,
+    dst_pages: torch.Tensor,
+    out: torch.Tensor,
+    book: str,
+    page_size: int,
+) -> None:
+    """Decode turbo pages ``src_pages`` (``-1`` = skip) of a token-major code/norm slab into the
+    original-domain page slab ``out[dst_pages]`` (``[pages, page_size, heads, head_dim]``)."""
+    heads, groups = norm.shape[1], norm.shape[2]
+    if src_pages.shape != dst_pages.shape or out.shape[1:] != (page_size, heads, groups * 128):
+        raise ValueError("turbo page decode needs matching page lists and a page-shaped output")
+    if not src_pages.shape[0]:
+        return
+    _turbo_pages_kernel[(src_pages.shape[0], heads)](
+        codes, norm, cent, rotation, src_pages, dst_pages, out,
+        codes.stride(0), codes.stride(1), norm.stride(0), norm.stride(1),
+        out.stride(0), out.stride(1), out.stride(2),
+        PAGE_SIZE=page_size, GROUPS=groups, BOOK3=book == "turbo3", num_warps=4,
+    )  # fmt: skip
+
+
+__all__ = [
+    "gather_pages",
+    "scatter_rows",
+    "swap_pages",
+    "tiered_store_kv",
+    "turbo_inverse_rotation",
+    "turbo_pages_to_bf16",
+    "zero_tier",
+]

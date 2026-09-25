@@ -560,3 +560,62 @@ def test_fp8_ram_tier_store_attend_stage_and_swap_track_bf16_reference():
     torch.cuda.synchronize()
     assert torch.equal(a[0, 0], kh[1].to(DEV).to(DTYPE))
     assert torch.equal(b[0, 1], kd[0].cpu().to(fp8))
+
+
+@pytest.mark.parametrize("book", ["turbo4", "turbo3"])
+def test_turbo_ram_tier_store_decode_and_attention_track_reference(book):
+    from freetoken.kernel.triton import turbo_kv as tk
+    from freetoken.kernel.triton.qsa.tiered import turbo_inverse_rotation, turbo_pages_to_bf16
+
+    torch.manual_seed(5)
+    ps, h, d, hq = 64, 2, 256, 24
+    pool = MHAKVCache(
+        num_kv_heads=h,
+        num_layers=1,
+        head_dim=d,
+        num_pages=8,
+        page_size=ps,
+        dtype=DTYPE,
+        device=DEV,
+        host_pages=4,
+        host_dtype=book,
+    )
+    tokens = 8 * ps
+    k = torch.randn(tokens, h * d, device=DEV, dtype=DTYPE)
+    v = torch.randn_like(k)
+    loc = torch.arange(tokens, device=DEV, dtype=torch.int32)
+    pool.store_kv(k, v, loc, 0)
+    torch.cuda.synchronize()
+    kc, kn, vc, vn = pool.host_turbo(0)
+    ref_codes, ref_norm = tk.quantize(k[4 * ps :].reshape(-1, d), book)
+    assert torch.equal(kc.reshape(-1, kc.shape[-1]).to(DEV), ref_codes)
+    assert torch.equal(pool.k_cache(0).reshape(4 * ps, -1), k[: 4 * ps])
+    stage_k = torch.zeros(4, ps, h, d, device=DEV, dtype=DTYPE)
+    stage_v = torch.zeros_like(stage_k)
+    cent = tk._book(torch.device(DEV), book)[0].float()
+    rot = turbo_inverse_rotation(torch.device(DEV))
+    ids = torch.arange(4, device=DEV, dtype=torch.int32)
+    turbo_pages_to_bf16(kc, kn, cent, rot, ids, ids, stage_k, book, ps)
+    turbo_pages_to_bf16(vc, vn, cent, rot, ids, ids, stage_v, book, ps)
+    oracle = tk.decode(ref_codes, ref_norm, book).reshape(4, ps, h, d)
+    rel = (stage_k.float() - oracle.float()).norm() / oracle.float().norm()
+    assert rel < 1e-2
+    q = torch.randn(3, hq, d, device=DEV, dtype=DTYPE)
+    idx = torch.stack([torch.randperm(tokens, device=DEV)[:1024] for _ in range(3)])
+    idx = idx.to(torch.int32).contiguous()
+    bt = torch.arange(8, device=DEV, dtype=torch.int32)[None, :].contiguous()
+    t2r = torch.zeros(3, dtype=torch.int32, device=DEV)
+    full_k = torch.cat([pool.k_cache(0), oracle.to(DTYPE)])
+    full_v = torch.cat(
+        [
+            pool.v_cache(0),
+            tk.decode(*tk.quantize(v[4 * ps :].reshape(-1, d), book), book)
+            .reshape(4, ps, h, d)
+            .to(DTYPE),
+        ]
+    )
+    ref = qsa_sparse_paged_attention(q, full_k, full_v, idx, bt, t2r)
+    got = qsa_sparse_paged_attention(
+        q, pool.k_cache(0), pool.v_cache(0), idx, bt, t2r, host_kv=(stage_k, stage_v)
+    )
+    assert torch.allclose(got.float(), ref.float(), atol=3e-2, rtol=3e-2)
