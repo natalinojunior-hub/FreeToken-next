@@ -153,9 +153,15 @@ def _kv_ram_dtype(config, pool_cls, host_pages: int) -> torch.dtype | str | None
 
 
 def _check_kv_ram_budget(config, pool_cls, host_pages: int) -> None:
-    """Refuse to start when even the narrowest allowed RAM tier would push the host into the
-    OOM killer, naming the largest context that would fit."""
-    if _kv_ram_dtype(config, pool_cls, host_pages) is not None:
+    """Re-resolve the RAM-tier format against live RAM, now that weights and host-resident
+    experts are loaded (the startup pick predates them), or refuse to start when even the
+    narrowest allowed format would push the host into the OOM killer, naming the largest
+    context that would fit."""
+    dtype = _kv_ram_dtype(config, pool_cls, host_pages)
+    if dtype is not None:
+        if dtype != config.kv_ram_resolved_dtype:
+            logger.info_rank0(f"KV RAM tier dtype after model load: {dtype}")
+        object.__setattr__(config, "kv_ram_resolved_dtype", dtype)
         return
     info = _meminfo()
     budget = info["MemAvailable"] - int(info["MemTotal"] * _RAM_KILL_MARGIN) - _RAM_SAFETY_BYTES
@@ -1186,6 +1192,10 @@ class Engine:
                 banks=banks,
                 method=method,
             )
+            if self.host_pages:
+                # Phase H builds the real KV pool, RAM tier included: size it against the RAM
+                # left after the weights and expert banks, not the pre-load snapshot.
+                _check_kv_ram_budget(config, self._pool_cls, self.host_pages)
             plan = planner.plan(
                 config=config,
                 model=self.model,
