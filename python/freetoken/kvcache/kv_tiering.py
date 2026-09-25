@@ -221,10 +221,13 @@ class KVPagePool:
         page_ids = getattr(batch, "kv_page_ids", None)
         return page_ids is not None and self.can_replay(page_ids)
 
-    def cancel(self, owner: str) -> None:
+    def cancel(self, owner: str) -> bool:
+        """Begin cleanup and report whether every owned page is released."""
+        pending = False
         for page in list(self.table._pages.values()):
-            if page.owner == owner:
-                self.evict(page.page_id, owner)
+            if page.owner == owner and not self.evict(page.page_id, owner):
+                pending = True
+        return not pending and all(page.owner != owner for page in self.table._pages.values())
 
     def close(self) -> None:
         """Release an idle pool; refuse shutdown while a request still owns a page."""

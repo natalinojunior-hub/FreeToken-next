@@ -25,7 +25,7 @@ def test_pool_backpressure_and_cancel_cleanup():
     pool.prefetch(0, "r1")
     with pytest.raises(MemoryError):
         pool.admit(1, "r2")
-    pool.cancel("r1")
+    assert pool.cancel("r1")
     pool.prefetch(1, "r2")
     assert pool.table.get(1).residency is Residency.RESIDENT
 
