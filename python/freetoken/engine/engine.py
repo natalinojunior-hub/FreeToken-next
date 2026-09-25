@@ -607,6 +607,13 @@ class Engine:
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
+        requested = getattr(config, "max_seq_len_override", None)
+        if requested is not None and requested > num_tokens:
+            # An explicit context the pools cannot hold is refused, never silently truncated.
+            raise RuntimeError(
+                f"o contexto pedido de {requested} tokens não é possível nesse hardware, "
+                f"o máximo possível é {num_tokens // 1024 * 1024} tokens"
+            )
         self.max_seq_len = min(config.max_seq_len, num_tokens)
         aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
         self.ctx.page_table = self.page_table = torch.zeros(  # + 1 for dummy request

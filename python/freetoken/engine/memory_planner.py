@@ -782,10 +782,19 @@ class MemoryPlanner:
 
     def infeasible(self, config: EngineConfig, budget: int, ledger: Dict[str, int]) -> RuntimeError:
         required = sum(ledger.values())
+        # Largest context the same ledger funds: every non-KV term fixed, KV pages from what
+        # remains (the RAM tier, when active, still covers its share of the context).
+        sm = self.static_model
+        spare = budget - (required - ledger.get("kv", 0)) - sm.kv_fixed_bytes
+        device_pages = max(0, spare // sm.kv_bytes_per_page - 1)  # -1: the dummy page
+        most = min(config.max_seq_len, (device_pages + self._host_pages) * sm.page_tokens)
+        most = most // 1024 * 1024
         owners = ", ".join(
             f"{k}={mem_GB(v)}" for k, v in sorted(ledger.items(), key=lambda kv: -kv[1])[:5]
         )
         return RuntimeError(
+            f"o contexto pedido de {config.max_seq_len} tokens não é possível nesse hardware, "
+            f"o máximo possível é {most} tokens. "
             f"VRAM plan infeasible for max_seq_len={config.max_seq_len}: "
             f"required={required} bytes ({mem_GB(required)}), available={budget} bytes "
             f"({mem_GB(budget)}), shortfall={required - budget} bytes "

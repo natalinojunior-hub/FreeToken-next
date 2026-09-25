@@ -115,6 +115,9 @@ def test_infeasible_reports_required_available_shortfall_and_owners():
     msg = str(e.value)
     for word in ("required=", "available=", "shortfall=", "largest owners", "experts="):
         assert word in msg
+    assert "o contexto pedido de" in msg and "o máximo possível é" in msg
+    most = int(msg.split("o máximo possível é ")[1].split()[0])
+    assert 0 <= most < _Cfg.max_seq_len and most % 1024 == 0
 
 
 def test_kv_term_prices_dummy_page_and_fixed_tiers():
