@@ -95,6 +95,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
                 None,
             )
             or getattr(self.engine.kv_cache, "sliding_window_size", None),
+            host_pages=self.engine.host_pages,
         )
         self.decode_manager = DecodeManager(config.page_size)
         self._bidirectional_mm = any(

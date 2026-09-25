@@ -226,6 +226,24 @@ def test_kv_cost_widens_the_ring_for_spec_mtp():
     assert QSAKVCache.ring_capacity_for(4, 2) > QSAKVCache.ring_capacity_for(4, 0)
 
 
+def test_host_tier_device_bytes_prices_index_rope_and_staging():
+    spec = _spec()
+    config = _config(spec)
+    config.model_config.model_is_mrope = True
+    host_tokens = 128
+    index_bytes = spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
+    rope_bytes = 12  # _ROPE_POS_BYTES = 3 * 4
+    staging_bytes = 2 * spec.num_kv_heads * spec.head_dim * config.dtype.itemsize
+    expected = host_tokens * (index_bytes + rope_bytes + staging_bytes)
+    assert QSAKVCache.host_tier_device_bytes(config, host_tokens) == expected
+
+
+def test_host_tier_device_bytes_is_zero_without_host_tokens():
+    spec = _spec()
+    config = _config(spec)
+    assert QSAKVCache.host_tier_device_bytes(config, 0) == 0
+
+
 def test_unit_bytes_matches_the_cost_model():
     spec = _spec()
     config = _config(spec)
@@ -262,6 +280,16 @@ def test_resolve_pool_class_and_factory():
 
     with pytest.raises(ValueError, match="num_req_slots"):
         create_kvcache_pool(mc, num_pages=4, page_size=64, dtype=torch.bfloat16, device=DEV)
+
+
+def test_create_kv_pool_fails_closed_for_non_qsa_host_tier():
+    from freetoken.kvcache import create_kv_pool
+
+    # No kv_cache_group_specs / dsv4_args -> resolve_pool_class falls back to MHAKVCache.
+    mc = SimpleNamespace(dsv4_args=None, has_swa_attention=False, has_linear_attention=False)
+    config = SimpleNamespace(model_config=mc, kv_format="auto")
+    with pytest.raises(NotImplementedError, match="QSA BF16 KV pool"):
+        create_kv_pool(config, num_pages=4, device=DEV, dtype=torch.bfloat16, host_pages=2)
 
 
 def test_free_req_clears_pending_ring_and_scratch():

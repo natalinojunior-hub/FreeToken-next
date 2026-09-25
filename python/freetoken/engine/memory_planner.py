@@ -1084,6 +1084,7 @@ class MemoryPlanner:
         max_seq_len: int,
         page_size: int,
         weights_bytes: Optional[int] = None,
+        host_reserve_bytes: int = 0,
     ) -> PlanCandidate:
         """Execute multi-stage planning."""
         logger.info_rank0("=" * 60)
@@ -1129,7 +1130,7 @@ class MemoryPlanner:
         floor = self.ledger(
             config, 0, sm.min_expert_slots, sm.kv_pages_for_context(config.max_seq_len)
         )
-        if sum(floor.values()) > baseline_free:
+        if sum(floor.values()) + host_reserve_bytes > baseline_free:
             raise self.infeasible(config, baseline_free, floor)
         self.phase_c_build_minimal_config(config, model)
 
@@ -1160,7 +1161,13 @@ class MemoryPlanner:
         self._cleanup_probe_artifacts()
         budget_snapshot = take_physical_snapshot(self.device)
         budget = budget_snapshot.driver_free
-        logger.info_rank0(f"  Solve budget (post-probe): {budget_snapshot}")
+        # KV RAM tiering's device-side overhead (compressed index/rope rows + host_staging)
+        # is not a pool the solve below ever builds, so take it off the top before solving
+        # expert slots / device KV pages, same as engine.py's non-planner startup path.
+        budget -= host_reserve_bytes
+        logger.info_rank0(
+            f"  Solve budget (post-probe): {budget_snapshot}, host tier reserve: {mem_GB(host_reserve_bytes)}"
+        )
 
         chosen_chunk, expert_slots, kv_pages = self.phase_fg_solve_chunk_and_experts(config, budget)
 

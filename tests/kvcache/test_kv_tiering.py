@@ -2,8 +2,16 @@ import pytest
 import torch
 from types import SimpleNamespace
 
-from freetoken.kvcache.kv_tiering import KVLayout, KVPage, KVPagePool, KVPageRecord, Residency, tiering_safe
+from freetoken.kvcache.kv_tiering import (
+    KVLayout,
+    KVPage,
+    KVPagePool,
+    KVPageRecord,
+    Residency,
+    tiering_safe,
+)
 from freetoken.engine.config import EngineConfig
+from freetoken.distributed import DistributedInfo
 
 
 def page(i):
@@ -98,9 +106,35 @@ def test_bad_backing_does_not_claim_page():
     assert p.device_slot is None
 
 
-def test_runtime_rejects_unimplemented_tiering():
-    with pytest.raises(NotImplementedError, match="all pages on CUDA"):
-        EngineConfig.__post_init__(SimpleNamespace(kv_tiering="force"))
+def test_runtime_rejects_unimplemented_auto_tiering():
+    with pytest.raises(NotImplementedError, match="only 'off' and 'force'"):
+        EngineConfig.__post_init__(SimpleNamespace(kv_tiering="auto", kv_ram_tokens=0))
+
+
+def test_force_tiering_requires_kv_ram_tokens():
+    with pytest.raises(ValueError, match="kv-ram-tokens"):
+        EngineConfig.__post_init__(SimpleNamespace(kv_tiering="force", kv_ram_tokens=0))
+
+
+def _config(**overrides):
+    kwargs = dict(
+        model_path="/tmp/freetoken-test-model",
+        tp_info=DistributedInfo(rank=0, size=1),
+        dtype=torch.float16,
+    )
+    kwargs.update(overrides)
+    return EngineConfig(**kwargs)
+
+
+def test_off_tiering_ignores_kv_ram_tokens():
+    config = _config(kv_tiering="off", kv_ram_tokens=4096)
+    assert config.kv_tiering == "off"
+    assert config.kv_ram_tokens == 4096  # stored but has no effect (off keeps the all-VRAM path)
+
+
+def test_force_tiering_accepts_positive_kv_ram_tokens():
+    config = _config(kv_tiering="force", kv_ram_tokens=4096)
+    assert config.kv_ram_tokens == 4096
 
 
 def test_canonical_page_record_validates_backend_layout():

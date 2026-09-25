@@ -57,6 +57,11 @@ TORCH_TOPK_ENV = "FREETOKEN_QSA_TORCH_TOPK"
 QSA_TIMING_ENV = "FREETOKEN_DEBUG_QSA_TIMING"
 
 
+# Up to this many query rows read the RAM tier zero-copy (decode, MTP verify, short spec
+# windows); longer eager forwards stage it (see _plan_host_staging).
+_ZERO_COPY_MAX_ROWS = 8
+
+
 def _resolve_block_topk() -> Callable | None:
     """The in-repo Triton block top-k, or None to fall back on torch.topk."""
     if os.getenv(TORCH_TOPK_ENV, "0") == "1":
@@ -95,6 +100,10 @@ class QSASparseMetadata(BaseAttnMetadata):
     rope_rows:        torch.Tensor | None = None  # [T] int32 arange
     q_rope_cache:     torch.Tensor | None = None  # [T, rotary_dim] float32
     k_rope_cache:     torch.Tensor | None = None  # [T, rotary_dim] float32
+    # KV RAM tier, eager multi-row forwards only: RAM pages this forward reads (as tier
+    # offsets) and the block table re-pointing them at the device staging slab.
+    host_pages:       torch.Tensor | None = None  # [n] int64, sorted page - num_device_pages
+    staged_table:     torch.Tensor | None = None  # [bs, W//page_size] int32
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -322,6 +331,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             # ascending slot order, so a slot at or below the last one seen starts a new forward
             # (the draft graph's single MTP layer sits at a non-zero slot).
             self._plan_index_writes(md, batch)
+            self._plan_host_staging(md, q.shape[0])
 
         md.last_slot = slot
         self._update_index_cache(index, md, slot)
@@ -399,20 +409,60 @@ class QSASparseAttnBackend(BaseAttnBackend):
             k_cache = self.kvcache.k_cache(layer_id)
             v_cache = self.kvcache.v_cache(layer_id)
 
+        host_kv, block_table = self._host_tier(layer_id, md)
         out = qsa_sparse_paged_attention(
             q_in,
             k_cache,
             v_cache,
             indices,
-            md.block_table,
+            block_table,
             md.token_to_req,
             torch.empty_like(q),
+            host_kv=host_kv,
         )
         mark("attention")
         if compressed:
             out = inv_rotate(out.reshape(-1, self.head_dim)).reshape(out.shape)
             mark("inverse_rotate")
         return out
+
+    def _plan_host_staging(self, md: QSASparseMetadata, rows: int) -> None:
+        """Eager multi-row forwards (prefill) re-read every selected token once per query row;
+        zero-copy RAM reads would cross PCIe per row, so the RAM pages this forward touches are
+        copied once per layer into the device staging slab instead. Decode, verify and anything
+        graph-bound read the RAM tier zero-copy: one pass, fixed addresses, no host sync."""
+        md.host_pages = md.staged_table = None
+        stage = getattr(self.kvcache, "host_staging", None)
+        if stage is None or rows <= _ZERO_COPY_MAX_ROWS or torch.cuda.is_current_stream_capturing():
+            return
+        device_pages = self.kvcache.num_device_pages
+        table = md.block_table
+        pages = torch.unique(table[table >= device_pages])  # sorted; host sync, eager only
+        if pages.numel() > stage[0].shape[0]:
+            return  # zero-copy stays correct, only slower
+        if pages.numel() == 0:
+            md.host_pages = pages  # nothing in RAM: the plain device kernel serves this forward
+            return
+        rank = torch.searchsorted(pages, table).to(torch.int32)
+        md.staged_table = torch.where(table >= device_pages, device_pages + rank, table)
+        md.host_pages = (pages - device_pages).to(torch.int64)
+
+    def _host_tier(
+        self, layer_id: int, md: QSASparseMetadata
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor] | None, torch.Tensor]:
+        """The RAM tier view this layer's attention reads, and the block table addressing it."""
+        host_kv = self.kvcache.host_kv(layer_id) if hasattr(self.kvcache, "host_kv") else None
+        if host_kv is None or md.host_pages is None:
+            return host_kv, md.block_table
+        from freetoken.kernel.triton.qsa.tiered import gather_pages
+
+        n = md.host_pages.shape[0]
+        if n == 0:
+            return None, md.block_table
+        stage_k, stage_v = (t[:n] for t in self.kvcache.host_staging)
+        gather_pages(host_kv[0], md.host_pages, stage_k)
+        gather_pages(host_kv[1], md.host_pages, stage_v)
+        return (stage_k, stage_v), md.staged_table
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it

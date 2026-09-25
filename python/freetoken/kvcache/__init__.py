@@ -95,15 +95,28 @@ def resolve_pool_class(model_config: ModelConfig, kv_format: str = "auto") -> ty
     return MHAKVCache
 
 
-def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dtype):
+def create_kv_pool(
+    config, num_pages: int, device: torch.device, dtype: torch.dtype, host_pages: int = 0
+):
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
-    the pool). Single factory entry for all pool families, DSV4 included."""
+    the pool). Single factory entry for all pool families, DSV4 included.
+
+    ``host_pages`` is the highest-id slice of ``num_pages`` that lives in pinned host RAM
+    instead of CUDA (KV RAM tiering, opt-in via --kv-tiering force). Only the QSA BF16 pool
+    wires it through; every other family fails closed."""
     from .dsv4_cost_model import _dsv4_pool_sizes
     from .hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens
     from .dsv4_paged_pool import DSV4PagedKVCache
+    from .qsa_pool import QSAKVCache
 
     model_config = config.model_config
+    kv_format = getattr(config, "kv_format", "auto")
+    if host_pages and resolve_pool_class(model_config, kv_format) is not QSAKVCache:
+        raise NotImplementedError(
+            "KV RAM tiering needs a QSA BF16 KV pool; this model resolves to "
+            f"{resolve_pool_class(model_config, kv_format).__name__}"
+        )
     if resolve_pool_class(model_config) is DSV4PagedKVCache:
         # DSV4 is driven by the generic CacheManager over the shared page table; the pool is
         # the only DSV4-specific piece (the swa_pool plug-in: window tier + cmp/idx/state
@@ -138,6 +151,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
         kv_format=getattr(config, "kv_format", "auto"),
         num_speculative_tokens=getattr(config, "spec_mtp", 0),
+        host_pages=host_pages,
     )
 
 
@@ -151,6 +165,7 @@ def create_kvcache_pool(
     num_req_slots: int | None = None,
     kv_format: str = "auto",
     num_speculative_tokens: int = 0,
+    host_pages: int = 0,
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -236,6 +251,7 @@ def create_kvcache_pool(
             kv_format=kv_format,
             mtp_layer_id=mtp_layer_id,
             tcq_policy=getattr(model_config, "tcq_policy", None),
+            host_pages=host_pages,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:
