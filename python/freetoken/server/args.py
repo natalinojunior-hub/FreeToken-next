@@ -521,8 +521,15 @@ def parse_args(
         type=str,
         default=MultimodalConfig.mmproj_path,
         help="Path to an external mmproj GGUF vision tower file (qwen4exp GGUF checkpoints "
-        "ship it separately from the main model). Default: auto-discover a mmproj*.gguf "
-        "file next to the model, preferring BF16 over F16.",
+        "ship it separately from the main model). Default: <model>-mmproj.gguf next to the "
+        "model, else a mmproj*.gguf file there, preferring BF16 over F16.",
+    )
+    parser.add_argument(
+        "--mtp",
+        type=str,
+        default=None,
+        help="Path to an external MTP draft-head GGUF file. Default: <model>-mtp.gguf next to "
+        "the model, else the GGUF in an MTP/ directory beside it.",
     )
 
     parser.add_argument(
@@ -1010,6 +1017,10 @@ def parse_args(
         parser.error(
             f"--image-min-tokens {image_min_tokens} exceeds --image-max-tokens {image_max_tokens}"
         )
+    if mtp := kwargs.pop("mtp"):
+        from freetoken.models.qwen4_exp.gguf import MTP_PATH_ENV
+
+        os.environ[MTP_PATH_ENV] = mtp
     if kwargs["mmproj"]:
         # The GGUF config shim and weight loader discover the mmproj without the mm config
         # (and in worker processes): the env var makes every discovery honor --mmproj.

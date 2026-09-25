@@ -175,6 +175,33 @@ def test_discovery_prefers_bf16_over_f16(tmp_path, monkeypatch):
     assert discover_mmproj_path(str(model_dir)) == str(bf16)
 
 
+def test_discovery_prefers_model_named_companions(tmp_path, monkeypatch):
+    """``<model>-mmproj.gguf`` / ``<model>-mtp.gguf`` next to the main model win; the
+    ``--mtp`` override wins over both."""
+    from freetoken.models.qwen4_exp.gguf import MTP_PATH_ENV, _find_mtp_gguf_path
+
+    monkeypatch.delenv(MMPROJ_PATH_ENV, raising=False)
+    monkeypatch.delenv(MTP_PATH_ENV, raising=False)
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    for name in ("m-00001-of-00002.gguf", "m-00002-of-00002.gguf", "mmproj-BF16.gguf"):
+        (model_dir / name).touch()
+    (model_dir / "MTP").mkdir()
+    (model_dir / "MTP" / "other-head.gguf").touch()
+    shard2 = str(model_dir / "m-00002-of-00002.gguf")
+    _fake_clip_arch(monkeypatch, {str(model_dir / "mmproj-BF16.gguf"): "clip"})
+    assert discover_mmproj_path(shard2) == str(model_dir / "mmproj-BF16.gguf")
+    assert _find_mtp_gguf_path(shard2) == str(model_dir / "MTP" / "other-head.gguf")
+
+    (model_dir / "m-mmproj.gguf").touch()
+    (model_dir / "m-mtp.gguf").touch()
+    assert discover_mmproj_path(str(model_dir)) == str(model_dir / "m-mmproj.gguf")
+    assert _find_mtp_gguf_path(shard2) == str(model_dir / "m-mtp.gguf")
+
+    monkeypatch.setenv(MTP_PATH_ENV, str(model_dir / "MTP" / "other-head.gguf"))
+    assert _find_mtp_gguf_path(shard2) == str(model_dir / "MTP" / "other-head.gguf")
+
+
 def test_discovery_falls_back_to_any_clip_file(tmp_path, monkeypatch):
     model_dir = tmp_path / "model"
     model_dir.mkdir()
@@ -241,3 +268,12 @@ def test_mmproj_flag_sets_mm_mmproj_path(monkeypatch):
     assert args.mm.mmproj_path == "/models/x/mmproj-BF16.gguf"
     # The GGUF config shim and weight loader discover without the mm config: they must agree.
     assert os.environ[MMPROJ_PATH_ENV] == "/models/x/mmproj-BF16.gguf"
+
+
+def test_mtp_flag_sets_env(monkeypatch):
+    from freetoken.models.qwen4_exp.gguf import MTP_PATH_ENV
+
+    monkeypatch.delenv(MTP_PATH_ENV, raising=False)
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: _dummy_hf_config()):
+        parse_args(["--model", "/models/anon", "--mtp", "/models/x/m-mtp.gguf"])
+    assert os.environ[MTP_PATH_ENV] == "/models/x/m-mtp.gguf"

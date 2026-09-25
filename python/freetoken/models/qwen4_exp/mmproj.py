@@ -50,10 +50,15 @@ def discover_mmproj_path(model_path: str, *, override: str | None = None) -> str
     """The mmproj GGUF file to use, or ``None`` when none is found/configured.
 
     ``override`` (``--mmproj`` / ``FREETOKEN_MMPROJ_PATH``) is validated and returned as-is.
-    Otherwise, candidates are ``mmproj*.gguf`` in the model file's own directory and its
-    parent, filtered to GGUF arch ``"clip"``, preferring BF16 over F16 over any other file.
+    Otherwise ``<model>-mmproj.gguf`` next to the main model file; else candidates are
+    ``mmproj*.gguf`` in the model file's own directory and its parent, filtered to GGUF arch
+    ``"clip"``, preferring BF16 over F16 over any other file.
     """
-    from freetoken.models.gguf.reader import gguf_architecture, resolve_gguf_path
+    from freetoken.models.gguf.reader import (
+        gguf_architecture,
+        gguf_companion_path,
+        resolve_gguf_path,
+    )
 
     if override is None:
         override = os.environ.get(MMPROJ_PATH_ENV) or None
@@ -62,6 +67,8 @@ def discover_mmproj_path(model_path: str, *, override: str | None = None) -> str
             raise ValueError(f"--mmproj {override!r} is not a clip (mmproj) GGUF file")
         return override
 
+    if found := gguf_companion_path(model_path, "mmproj"):
+        return found
     main_path = resolve_gguf_path(model_path)
     if main_path is None:
         return None

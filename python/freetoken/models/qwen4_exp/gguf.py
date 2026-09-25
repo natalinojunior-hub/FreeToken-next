@@ -41,27 +41,29 @@ def _kv(shim: "GgufConfigShim", suffix: str, default=None):
     raise KeyError(f"GGUF metadata missing key {key!r} (and {key_gen!r})")
 
 
-def _find_mtp_gguf_path(model_path: str) -> str | None:
-    """Find the MTP GGUF directory relative to the main model path."""
-    from freetoken.models.gguf.reader import resolve_gguf_path
+MTP_PATH_ENV = "FREETOKEN_MTP_PATH"
 
+
+def _find_mtp_gguf_path(model_path: str) -> str | None:
+    """The MTP head GGUF: ``--mtp`` / ``FREETOKEN_MTP_PATH``, else ``<model>-mtp.gguf`` next to
+    the main model, else the first GGUF in an ``MTP/`` dir beside it or its parent."""
+    from freetoken.models.gguf.reader import gguf_companion_path, resolve_gguf_path
+
+    if override := os.environ.get(MTP_PATH_ENV):
+        if not os.path.isfile(override):
+            raise FileNotFoundError(f"--mtp {override!r} does not exist")
+        return override
+    if found := gguf_companion_path(model_path, "mtp"):
+        return found
     main_path = resolve_gguf_path(model_path)
     if main_path is None:
         return None
     main_dir = os.path.dirname(main_path)
-    # Check current dir, parent dir, and sibling MTP dirs
-    candidates = [
-        os.path.join(main_dir, "MTP"),
-        os.path.join(os.path.dirname(main_dir), "MTP"),
-    ]
-    for mtp_dir in candidates:
+    for mtp_dir in (os.path.join(main_dir, "MTP"), os.path.join(os.path.dirname(main_dir), "MTP")):
         if os.path.isdir(mtp_dir):
             files = sorted(
                 f for f in os.listdir(mtp_dir) if f.endswith(".gguf") and not f.startswith(".")
             )
-            preferred = [f for f in files if "shared-Q8_0" in f]
-            if preferred:
-                return os.path.join(mtp_dir, preferred[0])
             if files:
                 return os.path.join(mtp_dir, files[0])
     return None

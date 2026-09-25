@@ -279,6 +279,17 @@ def resolve_gguf_path(model_path: str) -> str | None:
     return None
 
 
+def gguf_companion_path(model_path: str, suffix: str) -> str | None:
+    """``<model>-<suffix>.gguf`` next to the main model file (shard number stripped): the
+    naming convention for files a checkpoint ships separately (``-mtp``, ``-mmproj``)."""
+    main_path = resolve_gguf_path(model_path)
+    if main_path is None:
+        return None
+    stem = re.sub(r"-\d{5}-of-\d{5}$", "", os.path.basename(main_path)[: -len(".gguf")])
+    path = os.path.join(os.path.dirname(main_path), f"{stem}-{suffix}.gguf")
+    return path if os.path.isfile(path) else None
+
+
 def is_gguf_path(model_path: str) -> bool:
     """A ``.gguf`` file or directory, supporting single files and multi-shard layouts.
 
