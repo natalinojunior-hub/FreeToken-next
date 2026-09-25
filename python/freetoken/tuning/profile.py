@@ -94,6 +94,25 @@ def _model_identity(model_path: str) -> str:
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
+def _base_fingerprint(*, gpu_uuid: str, model_path: str) -> dict[str, Any]:
+    """The hardware+model+build identity shared by every fingerprint in this package:
+    GPU (bandwidth/VRAM), model (weights + geometry), the FreeToken version, and a
+    kernel-source content fingerprint (a rebuilt kernel can change the numerics/timing a
+    candidate was measured under). Callers add their own extra axes (e.g. kv_format,
+    context bucket) before hashing.
+    """
+    return {
+        "gpu_uuid": gpu_uuid,
+        "model_id": _model_identity(model_path),
+        "freetoken_version": __version__,
+        "kernel_fingerprint": _kernel_source_fingerprint(),
+    }
+
+
+def _hash_fingerprint(fingerprint: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()[:24]
+
+
 def compute_key(
     *,
     gpu_uuid: str,
@@ -103,23 +122,18 @@ def compute_key(
 ) -> str:
     """The profile lookup key: everything that can change which candidate wins.
 
-    GPU (bandwidth/VRAM), model (weights + geometry), kv_format (attention backend/memory
-    shape), a context-length bucket (ceil pow2 -- exact length doesn't matter, only which
-    power-of-two regime), the FreeToken version, and a kernel-source content
-    fingerprint (a rebuilt kernel can change the numerics/timing a candidate was measured
-    under). Any change to any of these invalidates the entry (a fresh key -> no file ->
-    caller falls back to its own default).
+    ``_base_fingerprint`` plus kv_format (attention backend/memory shape) and a
+    context-length bucket (ceil pow2 -- exact length doesn't matter, only which
+    power-of-two regime). Any change to any of these invalidates the entry (a fresh key
+    -> no file -> caller falls back to its own default).
     """
     fingerprint = {
         "schema": SCHEMA_VERSION,
-        "gpu_uuid": gpu_uuid,
-        "model_id": _model_identity(model_path),
+        **_base_fingerprint(gpu_uuid=gpu_uuid, model_path=model_path),
         "kv_format": kv_format,
         "ctx_bucket": _ceil_pow2(max(1, max_seq_len)),
-        "freetoken_version": __version__,
-        "kernel_fingerprint": _kernel_source_fingerprint(),
     }
-    return hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()[:24]
+    return _hash_fingerprint(fingerprint)
 
 
 @dataclass

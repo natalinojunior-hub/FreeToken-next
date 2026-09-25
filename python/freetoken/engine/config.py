@@ -53,6 +53,10 @@ class EngineConfig:
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
     # Opt-in only; capability checks must keep the all-VRAM path otherwise.
     kv_tiering: str = "off"
+    # RAM-tier size in tokens (--kv-ram-tokens), consumed only by kv_tiering="force"
+    # (rounded up to whole pages by the engine); 0 gives every context token a RAM page.
+    # Ignored (no effect) when kv_tiering="off".
+    kv_ram_tokens: int = 0
     # Buy the serving context out of the expert cache instead of hand-tuning the floor above:
     # the plan funds max_seq_len of KV and sizes experts from what remains, and refuses with the
     # shortfall when that context is not affordable. Opt-in, because it trades decode speed for
@@ -117,10 +121,13 @@ class EngineConfig:
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
-        if self.kv_tiering != "off":
-            raise NotImplementedError(
-                "KV RAM tiering is unavailable: the cache pools still require all pages on CUDA"
-            )
+        if self.kv_tiering == "force":
+            if self.kv_ram_tokens < 0:
+                raise ValueError("--kv-ram-tokens must be >= 0 (0 = the whole context)")
+        elif self.kv_tiering not in ("off", "auto"):
+            raise ValueError(f"unknown KV RAM tiering mode {self.kv_tiering!r}")
+        # "off" and "auto" ignore kv_ram_tokens; auto spills the whole context tier only when
+        # the context cannot fit in VRAM.
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":

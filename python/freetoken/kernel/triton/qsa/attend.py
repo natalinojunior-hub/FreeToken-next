@@ -15,6 +15,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    k_host_ptr,
+    v_host_ptr,
     indices_ptr,
     block_table_ptr,
     token_to_req_ptr,
@@ -35,7 +37,9 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     stride_output_head,
     num_rows,
     num_cache_blocks,
+    num_host_blocks,
     num_requests,
+    TIERED: tl.constexpr,
     TOPK: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     PAGE_TABLE_WIDTH: tl.constexpr,
@@ -98,27 +102,59 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid,
             other=-1,
         )
-        valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
-        # physical_page * block stride can overflow int32 for large caches.
-        safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        keys = tl.load(
-            k_cache_ptr
-            + safe_page[None, :] * stride_k_block
-            + page_offset[None, :] * stride_k_token
-            + kv_head * stride_k_head
-            + dim_offsets[:, None],
-            mask=valid[None, :],
-            other=0.0,
-        )
-        values = tl.load(
-            v_cache_ptr
-            + safe_page[:, None] * stride_v_block
-            + page_offset[:, None] * stride_v_token
-            + kv_head * stride_v_head
-            + dim_offsets[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        )
+        if TIERED:
+            # Pages past the device slab live in the host tier (pinned zero-copy memory, or a
+            # device staging copy of it); both tiers share one page layout and stride set.
+            valid &= (physical_page >= 0) & (physical_page < num_cache_blocks + num_host_blocks)
+            on_device = physical_page < num_cache_blocks
+            safe_page = tl.where(on_device, physical_page, physical_page - num_cache_blocks)
+            safe_page = tl.maximum(safe_page, 0).to(tl.int64)
+            key_offsets = (
+                safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None]
+            )
+            value_offsets = (
+                safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :]
+            )
+            # One load through a per-lane base pointer: two masked loads would double the
+            # pipelined shared-memory footprint and overflow it on 100 KB/SM parts.
+            keys = tl.load(
+                tl.where(on_device[None, :], k_cache_ptr, k_host_ptr) + key_offsets,
+                mask=valid[None, :],
+                other=0.0,
+            )
+            values = tl.load(
+                tl.where(on_device[:, None], v_cache_ptr, v_host_ptr) + value_offsets,
+                mask=valid[:, None],
+                other=0.0,
+            )
+        else:
+            valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
+            # physical_page * block stride can overflow int32 for large caches.
+            safe_page = tl.maximum(physical_page, 0).to(tl.int64)
+            keys = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            values = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
@@ -230,8 +266,14 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    host_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged BF16 K/V caches.
+
+    ``host_kv`` is the RAM tier: physical pages ``>= k_cache.shape[0]`` address it at
+    ``page - k_cache.shape[0]``. It is pinned host memory read zero-copy, or a device staging
+    copy of it; either way it must share the device slab's page layout.
+    """
 
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -254,6 +296,16 @@ def qsa_sparse_paged_attention(
     if out is None:
         out = torch.empty_like(q)
     assert out.shape == q.shape and out.dtype == q.dtype and out.stride(2) == 1
+    if host_kv is None:
+        k_host, v_host, num_host_blocks = k_cache, v_cache, 0
+    else:
+        k_host, v_host = host_kv
+        if k_host.shape[1:] != k_cache.shape[1:] or v_host.shape != k_host.shape:
+            raise ValueError("QSA host KV tier must share the device page layout")
+        if k_host.stride() != k_cache.stride() or v_host.stride() != v_cache.stride():
+            raise ValueError("QSA host KV tier must share the device page strides")
+        assert k_host.dtype == v_host.dtype == k_cache.dtype
+        num_host_blocks = k_host.shape[0]
     if not q.shape[0]:
         return out
 
@@ -299,6 +351,8 @@ def qsa_sparse_paged_attention(
         q,
         k_cache,
         v_cache,
+        k_host,
+        v_host,
         logical_indices,
         block_table,
         token_to_req,
@@ -319,7 +373,9 @@ def qsa_sparse_paged_attention(
         out.stride(1),
         q.shape[0],
         k_cache.shape[0],
+        num_host_blocks,
         block_table.shape[0],
+        TIERED=host_kv is not None,
         TOPK=logical_indices.shape[1],
         PAGE_SIZE=k_cache.shape[1],
         PAGE_TABLE_WIDTH=block_table.shape[1],
@@ -331,7 +387,9 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         num_warps=partial_warps,
-        num_stages=2,
+        # The tiered gather cannot use the async-copy pipeline; two stages of it overflow
+        # 100 KB/SM shared memory on the wide prefill tiles.
+        num_stages=1 if host_kv is not None and block_n > 16 else 2,
     )
     if num_splits == 1:
         return out

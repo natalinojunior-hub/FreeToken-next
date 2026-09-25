@@ -95,6 +95,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
                 None,
             )
             or getattr(self.engine.kv_cache, "sliding_window_size", None),
+            host_pages=self.engine.host_pages,
         )
         self.decode_manager = DecodeManager(config.page_size)
         self._bidirectional_mm = any(
@@ -281,6 +282,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         # still-pending output write -- corrupting tokens (e.g. dropping an image
         # placeholder, which the multimodal merge then rejects).
         self.stream.wait_stream(self.engine.stream)
+        self._rebalance_kv_tiers()
         forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
@@ -722,6 +724,19 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
                 )
             ]
         )
+
+    def _rebalance_kv_tiers(self) -> None:
+        """Promote hot RAM-tier KV pages into the device slab. Runs on the scheduling stream after
+        it waited for every prior forward and before this step's metadata, so placement changes
+        between forwards only."""
+        # ponytail: fixed cadence of one swap wave per 16 steps, 1/16 of the device slab per
+        # wave; derive both from measured PCIe cost vs selection misses if this shows in TG.
+        pool = self.engine.kv_cache
+        if getattr(pool, "page_map", None) is None:
+            return
+        self._kv_steps = getattr(self, "_kv_steps", 0) + 1
+        if self._kv_steps % 16 == 0:
+            pool.rebalance(max(1, pool.num_device_pages // 16))
 
     def _execute_pending_rebuild(self) -> None:
         from freetoken.engine.engine import CacheRebuildRejected

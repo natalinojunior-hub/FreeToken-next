@@ -40,11 +40,16 @@ class CacheManager:
         linear_state_pool=None,
         swa_pool=None,
         sliding_window_size=None,
+        host_pages: int = 0,
     ):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
         self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
+        # KV RAM tiering: the highest page ids are the (slower) host RAM tier, so allocation
+        # must prefer the lowest ids (device pages) first. Kept off (byte-identical free_slots
+        # order) when there is no RAM tier.
+        self._prefer_device_pages = host_pages > 0
         # Hybrid GDN models drive a second currency (GDN state snapshots in LinearStatePool)
         # through a HybridRadixCache; SWA models drive a second currency (swa-pool KV slots in
         # the HybridSWAKVCache global-paged mode) through a SWARadixCache; non-hybrid models keep
@@ -671,6 +676,8 @@ class CacheManager:
                 evicted = self.prefix_cache.evict(need)
             self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
             assert len(self.free_slots) >= needed_pages, "Eviction did not free enough space."
+        if self._prefer_device_pages:
+            self.free_slots, _ = torch.sort(self.free_slots)
         allocated = self.free_slots[:needed_pages]
         self.free_slots = self.free_slots[needed_pages:]
         return allocated

@@ -102,6 +102,47 @@ def _sgl_flash_attn_available() -> bool:
     return True
 
 
+def _kv_ram_tier_unsupported(config, pool_cls, device) -> str | None:
+    """Why this engine cannot host KV pages in RAM, or None when it can."""
+    if pool_cls.__name__ != "QSAKVCache":
+        return f"{pool_cls.__name__} KV pool"
+    if config.kv_format != "auto":
+        return f"kv_format={config.kv_format}"
+    if config.tp_info.size != 1:
+        return "tensor parallelism"
+    if device.type != "cuda":
+        return "non-CUDA device"
+    return None
+
+
+# earlyoom (and the kernel) start killing near 10% free RAM; stay clear of that line.
+_RAM_KILL_MARGIN = 0.10
+_RAM_SAFETY_BYTES = 2 << 30
+
+
+def _meminfo() -> dict[str, int]:
+    with open("/proc/meminfo") as f:
+        return {k: int(v.split()[0]) * 1024 for k, v in (line.split(":", 1) for line in f)}
+
+
+def _check_kv_ram_budget(config, pool_cls, host_pages: int) -> None:
+    """Refuse to start when the RAM tier would push the host into the OOM killer."""
+    info = _meminfo()
+    budget = info["MemAvailable"] - int(info["MemTotal"] * _RAM_KILL_MARGIN) - _RAM_SAFETY_BYTES
+    per_token = pool_cls.host_tier_ram_bytes(config, 1)
+    need = per_token * host_pages * config.page_size
+    if need <= budget:
+        return
+    ram_tokens = max(0, budget) // per_token
+    device_tokens = config.max_seq_len - host_pages * config.page_size
+    most = (device_tokens + ram_tokens) // 1024 * 1024
+    raise RuntimeError(
+        f"o contexto pedido de {config.max_seq_len} tokens não é possível nesse hardware, "
+        f"o máximo possível é {most} tokens (KV em RAM precisaria de {need / (1 << 30):.1f} GiB, "
+        f"livres com margem de segurança: {max(0, budget) / (1 << 30):.1f} GiB)"
+    )
+
+
 def _startup_kv_budget(
     memory_ratio: float,
     init_free_memory: int,
@@ -373,6 +414,44 @@ class Engine:
                     "tiles are read by our own kernels, and every other backend takes a bf16 KV "
                     f"slab (backend is {config.attention_backend!r})."
                 )
+        # KV RAM tiering (--kv-tiering force): opt-in, and only the QSA BF16 pool wires the
+        # host-RAM tier through its kernels -- everything else fails closed here rather than
+        # silently ignoring --kv-ram-tokens.
+        self.host_pages = 0
+        self._host_reserve_bytes = 0
+        self._kv_spill_auto = False
+        if config.kv_tiering == "auto":
+            reason = _kv_ram_tier_unsupported(config, self._pool_cls, self.device)
+            if reason is None:
+                self._kv_spill_auto = True
+                self.host_pages = -(-config.max_seq_len // config.page_size)
+                self._host_reserve_bytes = self._pool_cls.host_tier_device_bytes(
+                    config, self.host_pages * config.page_size
+                )
+            else:
+                logger.info_rank0(f"KV RAM tier unavailable ({reason}); KV stays in VRAM")
+        elif config.kv_tiering == "force":
+            if self._pool_cls.__name__ != "QSAKVCache":
+                raise NotImplementedError(
+                    "--kv-tiering force needs a QSA BF16 KV pool; this model resolves to "
+                    f"{self._pool_cls.__name__}"
+                )
+            if config.kv_format != "auto":
+                raise NotImplementedError(
+                    f"--kv-tiering force needs BF16 QSA KV (--kv-format auto); got "
+                    f"{config.kv_format!r}"
+                )
+            if config.tp_info.size != 1:
+                raise NotImplementedError(
+                    "--kv-tiering force is not supported under tensor parallelism"
+                )
+            if self.device.type != "cuda":
+                raise NotImplementedError("--kv-tiering force needs a CUDA device")
+            ram_tokens = config.kv_ram_tokens or config.max_seq_len
+            self.host_pages = -(-ram_tokens // config.page_size)  # ceil div to pages
+            self._host_reserve_bytes = self._pool_cls.host_tier_device_bytes(
+                config, self.host_pages * config.page_size
+            )
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 
@@ -464,22 +543,50 @@ class Engine:
         # if those bytes were free, which is how a plan that "fit" still OOMed at 0.9.
         available_memory -= state_pool_bytes(config)
         available_memory -= self.vram_ledger.engine_overhead_bytes()
-        self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
+        # KV RAM tiering charges its device-side overhead (compressed index/rope rows +
+        # host_staging, priced over the whole RAM tier) off the top, BEFORE the device page
+        # count is solved, so the device pages that fit are the ones actually left over.
+        if self._kv_spill_auto and self.host_pages and config.num_page_override is None:
+            # Without the planner: keep the whole context in VRAM when it fits.
+            context_pages = -(-config.max_seq_len // config.page_size)
+            if self._pool_cls.solve_num_pages(config, available_memory) >= context_pages:
+                self.host_pages = self._host_reserve_bytes = 0
+        if self.host_pages:
+            _check_kv_ram_budget(config, self._pool_cls, self.host_pages)
+        available_memory -= self._host_reserve_bytes
+        device_pages = self._pool_cls.solve_num_pages(config, available_memory)
+        self.num_pages = device_pages + self.host_pages
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=self.device, dtype=self.dtype
+            config, self.num_pages, device=self.device, dtype=self.dtype, host_pages=self.host_pages
         )
         # Price what the pool actually allocated (usable pages + its dummy page + its fixed
         # tiers) rather than what the solver was handed, so a pool whose unit_bytes drifts
-        # from its own cost model shows up as a wrong account instead of a silent OOM.
+        # from its own cost model shows up as a wrong account instead of a silent OOM. Device
+        # pages (incl. the dummy) carry the full per-page cost; RAM-tier pages only carry the
+        # reserve already charged above (index/rope rows + staging, no raw KV slab on device).
         _per_page, _fixed, _page_tokens, _ = self._pool_cls.kv_cost(config)
         self.vram_ledger.charge(
             "cache:kv",
-            pool_pages(self.num_pages) * _per_page + _fixed,
+            pool_pages(device_pages) * _per_page + _fixed + self._host_reserve_bytes,
             Kind.PERSISTENT,
-            f"{self.num_pages} usable pages x {_page_tokens} tokens (+1 dummy page), "
-            f"{_per_page / (1 << 20):.2f} MiB per page",
+            f"{device_pages} device pages + {self.host_pages} RAM pages "
+            f"({self.host_pages * config.page_size} RAM tokens) x {_page_tokens} tokens/page "
+            f"(+1 dummy page), {_per_page / (1 << 20):.2f} MiB per device page"
+            + (
+                f", {self._host_reserve_bytes / (1 << 20):.2f} MiB RAM-tier device overhead"
+                if self.host_pages
+                else ""
+            ),
         )
+        if self.host_pages:
+            _host_buf = self.kv_cache._pool._kv_host
+            ram_bytes = _host_buf.numel() * _host_buf.element_size()
+            logger.info_rank0(
+                f"KV RAM tiering: {device_pages} device pages, {self.host_pages} RAM pages "
+                f"({mem_GB(ram_bytes)} pinned host RAM), "
+                f"{self._host_reserve_bytes / (1 << 20):.2f} MiB extra device overhead"
+            )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
@@ -1041,7 +1148,12 @@ class Engine:
                 max_seq_len=config.max_seq_len,
                 page_size=config.page_size,
                 weights_bytes=self._weights_bytes,
+                host_reserve_bytes=self._host_reserve_bytes,
+                host_pages=self.host_pages,
+                spill_only_if_needed=self._kv_spill_auto,
             )
+            if self._kv_spill_auto and not planner.host_pages:
+                self.host_pages = self._host_reserve_bytes = 0
             object.__setattr__(config, "moe_cache_size", plan.expert_slots)
             object.__setattr__(config, "moe_prefill_overlap", plan.prefill_overlap)
             if config.num_page_override is None:

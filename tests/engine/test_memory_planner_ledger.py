@@ -147,3 +147,20 @@ def test_gdn_slots_budgeted_at_built_pool_size():
 
     # 1 request: 4 working + max(4, 2) snapshot + 1 padding
     assert _linear_pool_num_slots(C) == 9 > _linear_pool_min_slots(C)
+
+
+def test_ram_tier_keeps_only_the_hot_floor_on_device():
+    from types import SimpleNamespace
+
+    from freetoken.engine.memory_planner import MemoryPlanner
+
+    planner = MemoryPlanner.__new__(MemoryPlanner)
+    planner.static_model = SimpleNamespace(kv_pages_for_context=lambda t: -(-t // 64))
+    config = SimpleNamespace(max_seq_len=262144, kv_reserve_tokens=8192)
+    assert planner._device_kv_pages(config) == 4096
+    planner._host_pages = 4096  # whole context has a RAM page
+    assert planner._device_kv_pages(config) == 128
+    planner._host_pages = 1024  # RAM covers part: the device holds the remainder
+    assert planner._device_kv_pages(config) == 3072
+    short = SimpleNamespace(max_seq_len=4096, kv_reserve_tokens=8192)
+    assert planner._device_kv_pages(short) == 64

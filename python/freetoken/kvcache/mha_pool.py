@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import weakref
 from typing import Sequence
 
 import torch
@@ -7,6 +8,20 @@ from freetoken.distributed import get_tp_info
 from freetoken.utils import div_even
 
 from .base import BaseKVCachePool
+
+
+def registered_host_empty(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """Page-locked host tensor the GPU reads zero-copy through its host address (UVA).
+
+    ``pin_memory=True`` rounds to power-of-two blocks (a 5 GiB tier would pin 8 GiB), so the
+    storage is a plain allocation registered for the tensor's lifetime instead."""
+    host = torch.empty(shape, dtype=dtype)
+    cudart = torch.cuda.cudart()
+    err = cudart.cudaHostRegister(host.data_ptr(), host.numel() * host.element_size(), 2)
+    if err != cudart.cudaError.success:
+        raise MemoryError(f"cannot page-lock {host.nbytes} bytes for the KV RAM tier: {err}")
+    weakref.finalize(host, cudart.cudaHostUnregister, host.data_ptr())
+    return host
 
 
 class MHAKVCache(BaseKVCachePool):
@@ -32,7 +47,12 @@ class MHAKVCache(BaseKVCachePool):
         dtype: torch.dtype,
         device: torch.device,
         layer_ids: Sequence[int] | None = None,
+        host_pages: int = 0,
     ) -> None:
+        """``host_pages`` of the ``num_pages`` physical pages (the highest ids) live in the
+        page-locked RAM tier; the rest form the device slab."""
+        if not 0 <= host_pages < num_pages:
+            raise ValueError(f"host_pages ({host_pages}) must leave device pages of {num_pages}")
         tp_info = get_tp_info()
         local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
         self._num_layers = num_layers
@@ -47,6 +67,8 @@ class MHAKVCache(BaseKVCachePool):
                     raise ValueError(f"KV layer id {global_id} outside [0, {num_layers})")
                 layer_map[global_id] = dense
             self._layer_map = layer_map
+        self._host_pages = host_pages
+        num_pages -= host_pages
         self._kv_buffer = torch.empty(
             (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
             device=device,
@@ -54,6 +76,13 @@ class MHAKVCache(BaseKVCachePool):
         )
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
+        self._kv_host = (
+            registered_host_empty(
+                (2, num_storage_layers, host_pages, page_size, local_kv_heads, head_dim), dtype
+            )
+            if host_pages
+            else None
+        )
         self._device = device
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
 
@@ -63,7 +92,11 @@ class MHAKVCache(BaseKVCachePool):
         Geometry (storage layers, page_size, kv heads, head_dim) is taken from the
         existing buffer; only the page count changes. Views and ``_storage_shape`` are
         refreshed. Object identity is preserved so cached backend references stay valid.
+        ``num_pages`` counts the RAM tier too; the tier itself keeps its size.
         """
+        if num_pages <= self._host_pages:
+            raise ValueError(f"num_pages ({num_pages}) must exceed the RAM tier")
+        num_pages -= self._host_pages
         _, num_storage_layers, _old_pages, page_size, local_kv_heads, head_dim = (
             self._kv_buffer.shape
         )
@@ -119,6 +152,17 @@ class MHAKVCache(BaseKVCachePool):
     def v_cache(self, index: int) -> torch.Tensor:
         return self._v_buffer[self._dense(index)]
 
+    @property
+    def num_device_pages(self) -> int:
+        return int(self._kv_buffer.shape[2])
+
+    def host_kv(self, index: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """One layer's RAM-tier K/V pages, addressed as ``page - num_device_pages``."""
+        if self._kv_host is None:
+            return None
+        dense = self._dense(index)
+        return self._kv_host[0, dense], self._kv_host[1, dense]
+
     def store_kv(
         self,
         k: torch.Tensor,
@@ -129,6 +173,17 @@ class MHAKVCache(BaseKVCachePool):
         from freetoken.kernel import store_cache
 
         dense = self._dense(layer_id)
+        if self._kv_host is not None:
+            from freetoken.kernel.triton.qsa.tiered import tiered_store_kv
+
+            tiered_store_kv(
+                k,
+                v,
+                out_loc,
+                (self._k_buffer[dense], self._v_buffer[dense]),
+                (self._kv_host[0, dense], self._kv_host[1, dense]),
+            )
+            return
         store_cache(
             k_cache=self._k_buffer[dense].view(self._storage_shape),
             v_cache=self._v_buffer[dense].view(self._storage_shape),

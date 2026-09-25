@@ -31,6 +31,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -108,6 +109,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="max seconds before first token; default scales with prompt length",
     )
     p.add_argument("--json", dest="json_out", default=None, help="append result rows here")
+    p.add_argument(
+        "--no-history",
+        action="store_true",
+        help="skip appending this run's summary to the per-model run-history log",
+    )
     p.add_argument(
         "--keep-alive", action="store_true", help="leave the server running (manual probing)"
     )
@@ -493,6 +499,85 @@ def mean(rows: list[dict], key: str) -> float:
     return sum(vals) / len(vals) if vals else 0.0
 
 
+def _serve_arg_value(serve_args: list[str], flag: str) -> str | None:
+    """The value following ``flag`` among ``--serve-arg`` entries (each entry may itself
+    be a space-joined ``"--spec-mtp 3"``, matching how ``serve_cmd`` expands them)."""
+    tokens = [tok for entry in serve_args for tok in entry.split()]
+    for i, a in enumerate(tokens):
+        if a == flag and i + 1 < len(tokens):
+            return tokens[i + 1]
+        if a.startswith(flag + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+# Planner's `str(Plan)` ("PLANNING COMPLETE: Plan(chunk=1024, experts=32, kv_pages=512 (...)
+# ..."), engine/memory_planner.py Plan.__str__; and the KV-RAM-tiering line, engine/engine.py
+# ("KV RAM tiering: 400 device pages, 112 RAM pages (...)"), only printed when tiering is on.
+_PLAN_RE = re.compile(r"experts=(\d+).*?kv_pages=(\d+)")
+_KV_TIERING_RE = re.compile(r"KV RAM tiering: (\d+) device pages, (\d+) RAM pages")
+
+
+def parse_engine_log(text: str) -> dict[str, int | None]:
+    """``expert_slots``/``kv_pages`` from the planner's final ``Plan(...)`` line, and
+    ``kv_device_pages``/``kv_ram_pages`` from the KV-RAM-tiering line (``None`` for both
+    when tiering never logged, i.e. KV stayed device-only). Takes the last match of each --
+    only the final planning decision and boot-time tiering line matter."""
+    out: dict[str, int | None] = {
+        "expert_slots": None,
+        "kv_pages": None,
+        "kv_device_pages": None,
+        "kv_ram_pages": None,
+    }
+    plan_matches = _PLAN_RE.findall(text)
+    if plan_matches:
+        experts, kv_pages = plan_matches[-1]
+        out["expert_slots"] = int(experts)
+        out["kv_pages"] = int(kv_pages)
+    tiering_matches = _KV_TIERING_RE.findall(text)
+    if tiering_matches:
+        device_pages, ram_pages = tiering_matches[-1]
+        out["kv_device_pages"] = int(device_pages)
+        out["kv_ram_pages"] = int(ram_pages)
+    return out
+
+
+def append_history(args: argparse.Namespace, summary: dict, log_path: str | None = None) -> None:
+    """Record this run's summary into the per-model history log (skipped on
+    ``--no-history``). Never lets a history-write failure, or a missing/unreadable server
+    log, affect the bench run's own exit code -- ``history.append_run`` already swallows
+    I/O errors, and a log read failure here just leaves the KV/expert fields unset."""
+    if args.no_history:
+        return
+    from freetoken.tuning import history
+
+    record = {
+        "label": summary.get("label"),
+        "tokens": summary.get("prompt_tokens"),
+        "decode_tokens": args.decode,
+        "spec_mtp": _serve_arg_value(args.serve_args, "--spec-mtp"),
+        "serve_args": list(args.serve_args),
+        "pp_tok_s_mean": summary.get("PP_mean"),
+        "pp_tok_s_min": summary.get("PP_min"),
+        "tg_tok_s_mean": summary.get("TG_mean"),
+        "tg_tok_s_min": summary.get("TG_min"),
+        "output_sha1": summary.get("output_sha1"),
+        "kv_total_pages": summary.get("kv_total_pages"),
+        "vram_gib_mean": summary.get("vram_gib_mean"),
+        "server_rss_gib_mean": summary.get("server_rss_gib_mean"),
+        "expert_slots": None,
+        "kv_pages": None,
+        "kv_device_pages": None,
+        "kv_ram_pages": None,
+    }
+    if log_path:
+        try:
+            record.update(parse_engine_log(Path(log_path).read_text(errors="replace")))
+        except OSError as e:
+            print(f"[bench] history: could not read server log {log_path}: {e}", flush=True)
+    history.append_run(args.model, record)
+
+
 def die_with_log(msg: str, log_path: str) -> None:
     tail = "".join(Path(log_path).read_text().splitlines(keepends=True)[-40:])
     sys.exit(f"[bench] {msg}\n[bench] server log tail ({log_path}):\n{tail}")
@@ -593,6 +678,7 @@ def run_cold_repeats(args: argparse.Namespace, prompt: str) -> list[dict]:
                 wait_ready(origin, proc, log_path, args.server_timeout)
                 model_id = get_json(f"{origin}/v1/models")["data"][0]["id"]
                 row = one_run(origin, model_id, prompt, args, proc)
+                row["log_path"] = log_path
                 rows.append(row)
                 print(
                     f"[bench] cold repeat {index + 1}/{args.repeats}: "
@@ -655,6 +741,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.json_out:
             with open(args.json_out, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps(summary) + "\n")
+        append_history(args, summary, log_path=rows[-1].get("log_path"))
         return 0
     port = free_port()
     origin = f"http://127.0.0.1:{port}"
@@ -740,6 +827,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.json_out:
         with open(args.json_out, "a") as f:
             f.write(json.dumps(summary) + "\n")
+    append_history(args, summary, log_path=log_path)
     return 0
 
 
