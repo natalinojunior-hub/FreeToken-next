@@ -1,9 +1,9 @@
 # State — 2026-09-24 (campaign 13 in progress; campaign 12/11 state at `git show 0e9d00c:docs/dev/STATE.md`)
-## Campaign 14 — live KV-RAM (2026-09-25, worktree `../ft-kvram-live`, branch `kvram-live`: faccdc8, d7f22fa, 8b094e9, e453a98; not merged into `next`)
-Done: QSA BF16 KV RAM tier read by the real kernels (zero-copy decode/graph, staged prefill), hot floor funds experts, heat rebalancer, `--kv-tiering auto` (spill only when context does not fit, RAM budget refusal with max context), per-model run history + `ft history`.
-Proof: every tiered run hash-identical to all-VRAM (UD 4K/16K, UD-sq4 k1 16K, ISTA 4K); anchor 1464.9/47.30/`3af3056b98c0`; CI 2200 passed/206 skipped, ruff+mypy clean.
-Finding: 4K/16K tier costs TG 1-5% -> auto spills only overflow. Host RAM bound by pinned experts; earlyoom kills at <10% free.
-Next: merge kvram-live into next (operator), `ft bench context` advisor, turbo/compressed cold tier, NVMe cold experts, then 128K/256K certification (derive spill threshold X per model).
+## Campaign 14/15 — live KV-RAM (2026-09-25; `next` up to a4a1ca6; vision on branch `vision-mmproj`, worktree ../ft-vision)
+Done: QSA KV RAM tier (bf16/fp8/turbo4/turbo3; auto ladder with safe RAM budget + "máximo possível" refusal), hot floor, heat rebalancer, planner re-solve on validation OOM, ft bench context, ft history, GGUF split-probe stall fix.
+Running: campaign15 queues (cert.py main matrix, cert2.py quality, vision_check) under `flock ft-campaign2/gpu.lock`; results in ft-campaign2/campaign15/{results,quality}.jsonl.
+Speed (TG, forced RAM, hot 8K): UD 64K bf16 41.5 / fp8 47.5 / turbo4 38.2; ISTA 256K bf16 50.5 / fp8 52.4 / turbo4 42.9. UD 256K bf16 refused (RAM), fp8 41.4.
+Next session (own prompt): TurboQuant 8-bit RAM tier ("turbo8"): 256-level Lloyd-Max for N(0,1/128) (existing CENTROIDS_4 == Gaussian Lloyd-Max to 1e-5; CENTROIDS_3 differs slightly), 1 byte/code + fp16 norm = 8.125 bpv, bucketize for indices, decode via tiered.turbo_pages_to_bf16 BOOK8 path; auto ladder turbo8 -> fp8 -> turbo4 -> turbo3.
 
 
 Anchor: UD-IQ4_XS cold graph-on k0 4096/256: PP 1467, TG 47.28, hash `3af3056b98c0` (re-verified after `b5d4243`).
