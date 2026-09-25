@@ -136,12 +136,27 @@ _KV_RAM_DTYPES: dict[str, torch.dtype | str] = {
 }
 
 
+# Auto RAM-tier ladder, widest first ("native" = the KV dtype); a narrower step is only taken
+# when RAM requires it.
+_KV_RAM_LADDER = ("native", "fp8", "turbo8", "turbo4", "turbo3")
+# Measured dominance (campaign 15, ISTA 64K/128K/256K forced tier): a key format is dropped
+# from the auto ladder because its value is at least as good (quality: usage 20/20, needle
+# pass) and faster (FP8 vs BF16 TG +5.1/+3.5/+3.8%): the RAM tier is read over PCIe, so
+# fewer bytes per page win while quality holds.
+_KV_RAM_DOMINATED_BY = {"native": "fp8"}
+
+
 def _kv_ram_dtype(config, pool_cls, host_pages: int) -> torch.dtype | str | None:
-    """RAM-tier storage format: the widest of KV dtype, FP8, turbo8, turbo4, turbo3 that fits the
-    safe RAM budget (only the cold tier is narrowed; device KV stays exact). None: nothing fits."""
+    """RAM-tier storage format: the widest non-dominated step of the auto ladder that fits the
+    safe RAM budget (only the cold tier is narrowed; device KV stays exact), or the explicit
+    --kv-ram-dtype. None: nothing fits."""
     choice = getattr(config, "kv_ram_dtype", "auto")
     candidates = (
-        [config.dtype, torch.float8_e4m3fn, "turbo8", "turbo4", "turbo3"]
+        [
+            config.dtype if f == "native" else _KV_RAM_DTYPES[f]
+            for f in _KV_RAM_LADDER
+            if f not in _KV_RAM_DOMINATED_BY
+        ]
         if choice == "auto"
         else [_KV_RAM_DTYPES[choice]]
     )
