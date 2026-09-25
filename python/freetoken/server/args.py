@@ -736,6 +736,12 @@ def parse_args(
         help="RAM-tier size in tokens for --kv-tiering force; 0 (default) covers the whole context.",
     )
     parser.add_argument(
+        "--kv-ram-dtype",
+        choices=("auto", "bf16", "fp8"),
+        default=ServerArgs.kv_ram_dtype,
+        help="KV RAM tier storage: auto picks BF16 when it fits the RAM budget, else FP8.",
+    )
+    parser.add_argument(
         "--kv-reserve-tokens",
         type=int,
         default=ServerArgs.kv_reserve_tokens,

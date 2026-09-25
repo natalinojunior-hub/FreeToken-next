@@ -57,6 +57,8 @@ class EngineConfig:
     # (rounded up to whole pages by the engine); 0 gives every context token a RAM page.
     # Ignored (no effect) when kv_tiering="off".
     kv_ram_tokens: int = 0
+    # RAM-tier element type: auto = the KV dtype when it fits the safe RAM budget, else FP8.
+    kv_ram_dtype: str = "auto"
     # Buy the serving context out of the expert cache instead of hand-tuning the floor above:
     # the plan funds max_seq_len of KV and sizes experts from what remains, and refuses with the
     # shortfall when that context is not affordable. Opt-in, because it trades decode speed for

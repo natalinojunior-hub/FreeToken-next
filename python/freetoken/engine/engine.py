@@ -125,14 +125,35 @@ def _meminfo() -> dict[str, int]:
         return {k: int(v.split()[0]) * 1024 for k, v in (line.split(":", 1) for line in f)}
 
 
-def _check_kv_ram_budget(config, pool_cls, host_pages: int) -> None:
-    """Refuse to start when the RAM tier would push the host into the OOM killer."""
+_KV_RAM_DTYPES = {"bf16": torch.bfloat16, "fp8": torch.float8_e4m3fn}
+
+
+def _kv_ram_dtype(config, pool_cls, host_pages: int) -> torch.dtype | None:
+    """RAM-tier storage dtype: the KV dtype when it fits the safe RAM budget, else FP8 (half
+    the bytes; only the cold tier is narrowed, device KV stays exact). None: nothing fits."""
+    choice = getattr(config, "kv_ram_dtype", "auto")
+    candidates = (
+        [config.dtype, torch.float8_e4m3fn] if choice == "auto" else [_KV_RAM_DTYPES[choice]]
+    )
     info = _meminfo()
     budget = info["MemAvailable"] - int(info["MemTotal"] * _RAM_KILL_MARGIN) - _RAM_SAFETY_BYTES
-    per_token = pool_cls.host_tier_ram_bytes(config, 1)
-    need = per_token * host_pages * config.page_size
-    if need <= budget:
+    for dtype in candidates:
+        if pool_cls.host_tier_ram_bytes(config, host_pages * config.page_size, dtype) <= budget:
+            return dtype
+    return None
+
+
+def _check_kv_ram_budget(config, pool_cls, host_pages: int) -> None:
+    """Refuse to start when even the narrowest allowed RAM tier would push the host into the
+    OOM killer, naming the largest context that would fit."""
+    if _kv_ram_dtype(config, pool_cls, host_pages) is not None:
         return
+    info = _meminfo()
+    budget = info["MemAvailable"] - int(info["MemTotal"] * _RAM_KILL_MARGIN) - _RAM_SAFETY_BYTES
+    choice = getattr(config, "kv_ram_dtype", "auto")
+    narrowest = torch.float8_e4m3fn if choice == "auto" else _KV_RAM_DTYPES[choice]
+    per_token = pool_cls.host_tier_ram_bytes(config, 1, narrowest)
+    need = per_token * host_pages * config.page_size
     ram_tokens = max(0, budget) // per_token
     device_tokens = config.max_seq_len - host_pages * config.page_size
     most = (device_tokens + ram_tokens) // 1024 * 1024
@@ -452,6 +473,14 @@ class Engine:
             self._host_reserve_bytes = self._pool_cls.host_tier_device_bytes(
                 config, self.host_pages * config.page_size
             )
+        # RAM-tier element type, fixed before any pool (planner probes included) is built.
+        object.__setattr__(
+            config,
+            "kv_ram_resolved_dtype",
+            _kv_ram_dtype(config, self._pool_cls, self.host_pages) if self.host_pages else None,
+        )
+        if self.host_pages:
+            logger.info_rank0(f"KV RAM tier dtype: {config.kv_ram_resolved_dtype}")
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 

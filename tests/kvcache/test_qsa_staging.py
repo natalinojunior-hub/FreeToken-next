@@ -50,14 +50,10 @@ def test_qsa_pages_start_on_boundary(position):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_remap_block_table_is_device_resident_and_rejects_missing_page():
     adapter = QSAStagingAdapter(64, 8, 8)
-    entry = adapter.entry(
-        page_id=7, request_id=0, logical_position=0, generation=2, device_slot=3
-    )
+    entry = adapter.entry(page_id=7, request_id=0, logical_position=0, generation=2, device_slot=3)
     logical = torch.tensor([[7, -1]], dtype=torch.int32, device="cuda")
     mapped = adapter.remap_block_table(logical, [entry], generations={7: 2})
     assert mapped.device.type == "cuda"
     assert mapped.tolist() == [[3, -1]]
     with pytest.raises(RuntimeError, match="no staged slot"):
-        adapter.remap_block_table(
-            torch.tensor([[8]], dtype=torch.int32, device="cuda"), [entry]
-        )
+        adapter.remap_block_table(torch.tensor([[8]], dtype=torch.int32, device="cuda"), [entry])

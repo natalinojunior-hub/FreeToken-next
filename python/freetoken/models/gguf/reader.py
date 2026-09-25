@@ -81,7 +81,78 @@ def _gguf_module():
 
 def _metadata_shards(path: str) -> list[str] | None:
     """Discover split shards whose filenames lack the llama.cpp pattern."""
+    found = _metadata_shards_cached(os.path.abspath(path))
+    return list(found) if found is not None else None
+
+
+# GGUF value type id -> struct format of a scalar (strings and arrays handled apart).
+_GGUF_SCALARS = {
+    0: "B",
+    1: "b",
+    2: "H",
+    3: "h",
+    4: "I",
+    5: "i",
+    6: "f",
+    7: "?",
+    10: "Q",
+    11: "q",
+    12: "d",
+}
+
+
+def _split_info(path: str) -> tuple[int, int] | None:
+    """``(split.no, split.count)`` read from the GGUF key/value header alone.
+
+    ``GGUFReader`` maps and parses every tensor record (seconds per multi-GB file); the split
+    keys live in the header, so stop as soon as both are seen."""
+    found: dict[str, int] = {}
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return None
+            f.read(4)  # version
+            _tensors, n_kv = struct.unpack("<QQ", f.read(16))
+
+            def read_str() -> bytes:
+                (n,) = struct.unpack("<Q", f.read(8))
+                return f.read(n)
+
+            def skip(vtype: int) -> int | None:
+                if vtype == 8:
+                    read_str()
+                    return None
+                if vtype == 9:
+                    etype, count = struct.unpack("<IQ", f.read(12))
+                    if etype in _GGUF_SCALARS:
+                        f.seek(count * struct.calcsize(_GGUF_SCALARS[etype]), os.SEEK_CUR)
+                    else:
+                        for _ in range(count):
+                            skip(etype)
+                    return None
+                fmt = "<" + _GGUF_SCALARS[vtype]
+                return struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
+
+            for _ in range(n_kv):
+                key = read_str().decode(errors="replace")
+                (vtype,) = struct.unpack("<I", f.read(4))
+                value = skip(vtype)
+                if key in ("split.no", "split.count"):
+                    found[key] = int(value or 0)
+                    if len(found) == 2:
+                        return found["split.no"], found["split.count"]
+    except (OSError, struct.error, KeyError):
+        return None
+    return None
+
+
+@functools.lru_cache(maxsize=64)
+def _metadata_shards_cached(path: str) -> tuple[str, ...] | None:
+    # Only a file that declares itself part of a multi-file split pulls in its siblings.
     if os.path.isfile(path):
+        own = _split_info(path)
+        if own is None or own[1] <= 1:
+            return None
         candidates = sorted(glob.glob(os.path.join(os.path.dirname(path), "*.gguf")))
     elif os.path.isdir(path):
         candidates = sorted(glob.glob(os.path.join(path, "*.gguf")))
@@ -89,18 +160,11 @@ def _metadata_shards(path: str) -> list[str] | None:
         return None
     shards: dict[int, str] = {}
     count: int | None = None
-    gguf = _gguf_module()
     for candidate in candidates:
-        try:
-            reader = gguf.GGUFReader(candidate, mode="r")
-            split_no = reader.fields.get("split.no")
-            split_count = reader.fields.get("split.count")
-            if split_no is None or split_count is None:
-                continue
-            no = int(split_no.contents())
-            this_count = int(split_count.contents())
-        except Exception:  # noqa: BLE001 - unrelated sidecars are ignored
+        info = _split_info(candidate)
+        if info is None:
             continue
+        no, this_count = info
         if count is None:
             count = this_count
         if this_count != count or no < 0 or no >= count or no in shards:
@@ -112,7 +176,7 @@ def _metadata_shards(path: str) -> list[str] | None:
     if set(shards) != expected:
         missing = sorted(expected - set(shards))
         raise ValueError(f"Incomplete GGUF split metadata: missing split.no values {missing}")
-    return [shards[i] for i in range(count)]
+    return tuple(shards[i] for i in range(count))
 
 
 def gguf_shards(path: str) -> list[str]:

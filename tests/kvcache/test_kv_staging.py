@@ -31,6 +31,8 @@ def test_staging_binding_rejects_duplicate_or_mismatched_updates():
         binding.update([0, 0], [1, 2], [1, 1])
     with pytest.raises(ValueError, match="equal length"):
         binding.update([0], [1], [])
+
+
 from freetoken.kvcache.kv_tiering import KVLayout, KVPageRecord, Residency
 
 

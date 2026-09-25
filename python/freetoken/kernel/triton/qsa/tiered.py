@@ -42,8 +42,17 @@ def _tiered_store_kernel(
         v = tl.load(v_ptr + token * stride_src + cols, mask=mask)
         tl.store(k_dev_ptr + row * ROW + cols, k, mask=mask & on_device)
         tl.store(v_dev_ptr + row * ROW + cols, v, mask=mask & on_device)
-        tl.store(k_host_ptr + row * ROW + cols, k, mask=mask & on_host)
-        tl.store(v_host_ptr + row * ROW + cols, v, mask=mask & on_host)
+        # The RAM tier may be narrower (FP8): the store casts to its element type.
+        tl.store(
+            k_host_ptr + row * ROW + cols,
+            k.to(k_host_ptr.dtype.element_ty),
+            mask=mask & on_host,
+        )
+        tl.store(
+            v_host_ptr + row * ROW + cols,
+            v.to(v_host_ptr.dtype.element_ty),
+            mask=mask & on_host,
+        )
 
 
 def tiered_store_kv(
@@ -63,8 +72,10 @@ def tiered_store_kv(
     row = k_dev[0].numel() // k_dev.shape[1]
     tokens = out_loc.shape[0]
     for t in (k_dev, v_dev, k_host, v_host):
-        if not t.is_contiguous() or t.dtype != k.dtype:
-            raise ValueError("tiered KV slabs must be contiguous and match the K/V dtype")
+        if not t.is_contiguous():
+            raise ValueError("tiered KV slabs must be contiguous")
+    if k_dev.dtype != k.dtype or v_dev.dtype != k.dtype or k_host.dtype != v_host.dtype:
+        raise ValueError("device slabs must match the K/V dtype; RAM K/V must share one dtype")
     k = k.reshape(tokens, row)
     v = v.reshape(tokens, row)
     if k.stride(1) != 1 or v.stride() != k.stride():
@@ -105,7 +116,7 @@ def _page_gather_kernel(
     mask = cols < PAGE_ELEMS
     tl.store(
         dst_ptr + i * PAGE_ELEMS + cols,
-        tl.load(src_ptr + page * PAGE_ELEMS + cols, mask=mask),
+        tl.load(src_ptr + page * PAGE_ELEMS + cols, mask=mask).to(dst_ptr.dtype.element_ty),
         mask=mask,
     )
 
@@ -167,8 +178,8 @@ def _swap_pages_kernel(
         b = b_ptr + group * stride_bg + tl.load(b_idx_ptr + pair).to(tl.int64) * stride_bp + cols
         x = tl.load(a, mask=mask)
         y = tl.load(b, mask=mask)
-        tl.store(a, y, mask=mask)
-        tl.store(b, x, mask=mask)
+        tl.store(a, y.to(a_ptr.dtype.element_ty), mask=mask)
+        tl.store(b, x.to(b_ptr.dtype.element_ty), mask=mask)
 
 
 def swap_pages(
@@ -182,7 +193,7 @@ def swap_pages(
     ``active[i]``; ``a``/``b`` are ``[groups, pages, ...]`` views whose pages are contiguous.
 
     Pairs must not alias one another (distinct pages on each side, and no page on both)."""
-    if a.shape[0] != b.shape[0] or a.shape[2:] != b.shape[2:] or a.dtype != b.dtype:
+    if a.shape[0] != b.shape[0] or a.shape[2:] != b.shape[2:]:
         raise ValueError("swap_pages needs matching [groups, pages, ...] layouts")
     elems = a[0, 0].numel()
     for t in (a, b):

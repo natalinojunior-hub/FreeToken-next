@@ -125,7 +125,9 @@ class KVStagingBinding:
     def device(self) -> torch.device:
         return self.table.device
 
-    def update(self, page_ids: Iterable[int], slots: Iterable[int], generations: Iterable[int]) -> None:
+    def update(
+        self, page_ids: Iterable[int], slots: Iterable[int], generations: Iterable[int]
+    ) -> None:
         ids = tuple(int(v) for v in page_ids)
         physical = tuple(int(v) for v in slots)
         versions = tuple(int(v) for v in generations)
@@ -139,8 +141,12 @@ class KVStagingBinding:
             raise ValueError("physical slots and generations must be non-negative")
         if ids:
             index = torch.tensor(ids, dtype=torch.long, device=self.device)
-            self.table.index_copy_(0, index, torch.tensor(physical, dtype=torch.int32, device=self.device))
-            self._generation.index_copy_(0, index, torch.tensor(versions, dtype=torch.int64, device=self.device))
+            self.table.index_copy_(
+                0, index, torch.tensor(physical, dtype=torch.int32, device=self.device)
+            )
+            self._generation.index_copy_(
+                0, index, torch.tensor(versions, dtype=torch.int64, device=self.device)
+            )
 
     def clear(self, page_ids: Iterable[int]) -> None:
         ids = tuple(int(v) for v in page_ids)
@@ -162,7 +168,9 @@ class KVStagingBinding:
             index = torch.tensor(ids, dtype=torch.long, device=self.device)
             slots = self.table.index_select(0, index)
             current = self._generation.index_select(0, index)
-            if bool((slots < 0).any()) or bool((current != torch.tensor(versions, dtype=torch.int64, device=self.device)).any()):
+            if bool((slots < 0).any()) or bool(
+                (current != torch.tensor(versions, dtype=torch.int64, device=self.device)).any()
+            ):
                 raise RuntimeError("staging table contains cold or stale KV page")
 
     @staticmethod

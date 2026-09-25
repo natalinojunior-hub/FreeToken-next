@@ -48,9 +48,11 @@ class MHAKVCache(BaseKVCachePool):
         device: torch.device,
         layer_ids: Sequence[int] | None = None,
         host_pages: int = 0,
+        host_dtype: torch.dtype | None = None,
     ) -> None:
         """``host_pages`` of the ``num_pages`` physical pages (the highest ids) live in the
-        page-locked RAM tier; the rest form the device slab."""
+        page-locked RAM tier (in ``host_dtype``, default the KV dtype; FP8 halves it); the
+        rest form the device slab."""
         if not 0 <= host_pages < num_pages:
             raise ValueError(f"host_pages ({host_pages}) must leave device pages of {num_pages}")
         tp_info = get_tp_info()
@@ -78,7 +80,8 @@ class MHAKVCache(BaseKVCachePool):
         self._v_buffer = self._kv_buffer[1]
         self._kv_host = (
             registered_host_empty(
-                (2, num_storage_layers, host_pages, page_size, local_kv_heads, head_dim), dtype
+                (2, num_storage_layers, host_pages, page_size, local_kv_heads, head_dim),
+                host_dtype or dtype,
             )
             if host_pages
             else None

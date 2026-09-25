@@ -119,12 +119,21 @@ def test_kv_ram_budget_refuses_with_max_context(monkeypatch):
 
     gib = 1 << 30
     monkeypatch.setattr(eng, "_meminfo", lambda: {"MemTotal": 96 * gib, "MemAvailable": 16 * gib})
-    pool = SimpleNamespace(host_tier_ram_bytes=lambda config, tokens: 25_600 * tokens)
-    config = SimpleNamespace(max_seq_len=1 << 20, page_size=64)
+    pool = SimpleNamespace(
+        host_tier_ram_bytes=lambda config, tokens, dtype=None: (
+            (25_600 if dtype in (None, torch.bfloat16) else 12_800) * tokens
+        )
+    )
+    config = SimpleNamespace(max_seq_len=1 << 20, page_size=64, dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match="o contexto pedido de 1048576 tokens") as err:
         eng._check_kv_ram_budget(config, pool, (1 << 20) // 64)
     assert "o máximo possível é" in str(err.value)
-    eng._check_kv_ram_budget(SimpleNamespace(max_seq_len=65536, page_size=64), pool, 1024)
+    small = SimpleNamespace(max_seq_len=65536, page_size=64, dtype=torch.bfloat16)
+    eng._check_kv_ram_budget(small, pool, 1024)
+    assert eng._kv_ram_dtype(small, pool, 1024) is torch.bfloat16
+    # 256K: BF16 needs 6.25 GiB > 4.4 GiB budget, FP8 (3.1 GiB) fits.
+    mid = SimpleNamespace(max_seq_len=1 << 18, page_size=64, dtype=torch.bfloat16)
+    assert eng._kv_ram_dtype(mid, pool, (1 << 18) // 64) is torch.float8_e4m3fn
 
 
 def test_force_tiering_rejects_negative_kv_ram_tokens():

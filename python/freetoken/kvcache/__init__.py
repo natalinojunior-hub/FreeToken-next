@@ -152,6 +152,7 @@ def create_kv_pool(
         kv_format=getattr(config, "kv_format", "auto"),
         num_speculative_tokens=getattr(config, "spec_mtp", 0),
         host_pages=host_pages,
+        host_dtype=getattr(config, "kv_ram_resolved_dtype", None),
     )
 
 
@@ -166,6 +167,7 @@ def create_kvcache_pool(
     kv_format: str = "auto",
     num_speculative_tokens: int = 0,
     host_pages: int = 0,
+    host_dtype: torch.dtype | None = None,
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -252,6 +254,7 @@ def create_kvcache_pool(
             mtp_layer_id=mtp_layer_id,
             tcq_policy=getattr(model_config, "tcq_policy", None),
             host_pages=host_pages,
+            host_dtype=host_dtype,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:

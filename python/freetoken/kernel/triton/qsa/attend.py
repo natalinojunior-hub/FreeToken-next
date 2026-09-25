@@ -40,6 +40,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     num_host_blocks,
     num_requests,
     TIERED: tl.constexpr,
+    HOST_CAST: tl.constexpr,
     TOPK: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     PAGE_TABLE_WIDTH: tl.constexpr,
@@ -121,18 +122,33 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 + kv_head * stride_v_head
                 + dim_offsets[None, :]
             )
-            # One load through a per-lane base pointer: two masked loads would double the
-            # pipelined shared-memory footprint and overflow it on 100 KB/SM parts.
-            keys = tl.load(
-                tl.where(on_device[None, :], k_cache_ptr, k_host_ptr) + key_offsets,
-                mask=valid[None, :],
-                other=0.0,
-            )
-            values = tl.load(
-                tl.where(on_device[:, None], v_cache_ptr, v_host_ptr) + value_offsets,
-                mask=valid[:, None],
-                other=0.0,
-            )
+            if HOST_CAST:
+                # Narrower RAM tier (FP8): two masked loads, the host one widened.
+                keys = tl.load(
+                    k_cache_ptr + key_offsets, mask=(valid & on_device)[None, :], other=0.0
+                )
+                keys += tl.load(
+                    k_host_ptr + key_offsets, mask=(valid & ~on_device)[None, :], other=0.0
+                ).to(keys.dtype)
+                values = tl.load(
+                    v_cache_ptr + value_offsets, mask=(valid & on_device)[:, None], other=0.0
+                )
+                values += tl.load(
+                    v_host_ptr + value_offsets, mask=(valid & ~on_device)[:, None], other=0.0
+                ).to(values.dtype)
+            else:
+                # One load through a per-lane base pointer: two masked loads would double the
+                # pipelined shared-memory footprint and overflow it on 100 KB/SM parts.
+                keys = tl.load(
+                    tl.where(on_device[None, :], k_cache_ptr, k_host_ptr) + key_offsets,
+                    mask=valid[None, :],
+                    other=0.0,
+                )
+                values = tl.load(
+                    tl.where(on_device[:, None], v_cache_ptr, v_host_ptr) + value_offsets,
+                    mask=valid[:, None],
+                    other=0.0,
+                )
         else:
             valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
             # physical_page * block stride can overflow int32 for large caches.
@@ -304,7 +320,8 @@ def qsa_sparse_paged_attention(
             raise ValueError("QSA host KV tier must share the device page layout")
         if k_host.stride() != k_cache.stride() or v_host.stride() != v_cache.stride():
             raise ValueError("QSA host KV tier must share the device page strides")
-        assert k_host.dtype == v_host.dtype == k_cache.dtype
+        assert k_host.dtype == v_host.dtype
+        assert k_host.dtype in (k_cache.dtype, torch.float8_e4m3fn)
         num_host_blocks = k_host.shape[0]
     if not q.shape[0]:
         return out
@@ -376,6 +393,7 @@ def qsa_sparse_paged_attention(
         num_host_blocks,
         block_table.shape[0],
         TIERED=host_kv is not None,
+        HOST_CAST=k_host.dtype != k_cache.dtype,
         TOPK=logical_indices.shape[1],
         PAGE_SIZE=k_cache.shape[1],
         PAGE_TABLE_WIDTH=block_table.shape[1],

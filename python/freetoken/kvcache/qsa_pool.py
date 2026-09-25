@@ -73,6 +73,7 @@ class QSAKVCache(BaseKVCachePool):
         mtp_layer_id: int | None = None,
         tcq_policy=None,
         host_pages: int = 0,
+        host_dtype: torch.dtype | None = None,
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -148,6 +149,7 @@ class QSAKVCache(BaseKVCachePool):
                 device=device,
                 layer_ids=layer_ids,
                 host_pages=host_pages,
+                host_dtype=host_dtype,
             )
         self.kv_format = kv_format
         self._mtp_slot: int | None = None
@@ -293,8 +295,8 @@ class QSAKVCache(BaseKVCachePool):
         return per_token * host_tokens
 
     @classmethod
-    def host_tier_ram_bytes(cls, config, host_tokens: int) -> int:
-        """Page-locked host bytes of the RAM tier: the BF16 K/V rows of every KV layer."""
+    def host_tier_ram_bytes(cls, config, host_tokens: int, dtype: torch.dtype | None = None) -> int:
+        """Page-locked host bytes of the RAM tier: the K/V rows of every KV layer."""
         from freetoken.attention import AttnType
         from freetoken.utils import div_even
 
@@ -303,7 +305,8 @@ class QSAKVCache(BaseKVCachePool):
             if spec.is_swa or spec.attn_type is not AttnType.QSA:
                 continue
             heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-            per_token += 2 * spec.num_layers * heads * spec.head_dim * config.dtype.itemsize
+            itemsize = (dtype or config.dtype).itemsize
+            per_token += 2 * spec.num_layers * heads * spec.head_dim * itemsize
         return per_token * host_tokens
 
     def unit_bytes(self) -> tuple[int, int]:

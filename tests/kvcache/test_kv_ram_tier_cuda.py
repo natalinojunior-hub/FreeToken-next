@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from freetoken.kernel.triton.qsa.attend import qsa_sparse_paged_attention
-from freetoken.kernel.triton.qsa.tiered import gather_pages, tiered_store_kv, zero_tier
+from freetoken.kernel.triton.qsa.tiered import gather_pages, swap_pages, tiered_store_kv, zero_tier
 from freetoken.kvcache.mha_pool import registered_host_empty
 from freetoken.kvcache.qsa_pool import QSAKVCache
 from freetoken.kvcache.mha_pool import MHAKVCache
@@ -506,3 +506,57 @@ def test_rebalance_promotes_hot_ram_pages_and_preserves_logical_contents():
     # Second pass with no heat is a no-op for contents.
     pool.rebalance(4)
     assert torch.equal(_logical_contents(pool)[0], before[0])
+
+
+def test_fp8_ram_tier_store_attend_stage_and_swap_track_bf16_reference():
+    torch.manual_seed(11)
+    ps, h, d, hq, n_dev, n_host = 64, 2, 256, 24, 8, 8
+    tokens = (n_dev + n_host) * ps
+    k = torch.randn(tokens, h * d, device=DEV, dtype=DTYPE)
+    v = torch.randn_like(k)
+    page_table = torch.randperm(n_dev + n_host, device=DEV).to(torch.int32)
+    slots = (page_table.long()[:, None] * ps + torch.arange(ps, device=DEV)).reshape(-1)
+    ref_k = torch.zeros(n_dev + n_host, ps, h, d, device=DEV, dtype=DTYPE)
+    ref_v = torch.zeros_like(ref_k)
+    ref_k.view(tokens, -1)[slots] = k
+    ref_v.view(tokens, -1)[slots] = v
+    kd = torch.zeros(n_dev, ps, h, d, device=DEV, dtype=DTYPE)
+    vd = torch.zeros_like(kd)
+    fp8 = torch.float8_e4m3fn
+    kh = registered_host_empty((n_host, ps, h, d), fp8)
+    vh = registered_host_empty((n_host, ps, h, d), fp8)
+    tiered_store_kv(k, v, slots.to(torch.int32), (kd, vd), (kh, vh))
+    torch.cuda.synchronize()
+    assert torch.equal(kh.to(DTYPE), ref_k[n_dev:].cpu().to(fp8).to(DTYPE))
+    rows = 4
+    q = torch.randn(rows, hq, d, device=DEV, dtype=DTYPE)
+    idx = torch.stack([torch.randperm(tokens, device=DEV)[:2048] for _ in range(rows)])
+    idx = idx.to(torch.int32).contiguous()
+    bt = page_table[None, :].contiguous()
+    t2r = torch.zeros(rows, dtype=torch.int32, device=DEV)
+    ref = qsa_sparse_paged_attention(q, ref_k, ref_v, idx, bt, t2r)
+    got = qsa_sparse_paged_attention(q, kd, vd, idx, bt, t2r, host_kv=(kh, vh))
+    assert torch.allclose(got.float(), ref.float(), atol=5e-2, rtol=5e-2)
+    # Staged (prefill) path widens FP8 into the BF16 staging slab: the same values reach the
+    # dot, but through a differently compiled tile, so compare numerically.
+    pages = torch.arange(n_host, device=DEV)
+    sk = torch.empty(n_host, ps, h, d, device=DEV, dtype=DTYPE)
+    sv = torch.empty_like(sk)
+    gather_pages(kh, pages, sk)
+    gather_pages(vh, pages, sv)
+    staged = qsa_sparse_paged_attention(q, kd, vd, idx, bt, t2r, host_kv=(sk, sv))
+    assert torch.allclose(staged.float(), got.float(), atol=1e-2, rtol=1e-2)
+    # A BF16 <-> FP8 swap moves each page to the other tier with the right cast.
+    a = kd.clone().unsqueeze(0)
+    b = registered_host_empty((1, n_host, ps, h, d), fp8)
+    b.copy_(kh.unsqueeze(0))
+    swap_pages(
+        a,
+        b,
+        torch.tensor([0], device=DEV),
+        torch.tensor([1], device=DEV),
+        torch.ones(1, dtype=torch.int32, device=DEV),
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(a[0, 0], kh[1].to(DEV).to(DTYPE))
+    assert torch.equal(b[0, 1], kd[0].cpu().to(fp8))
