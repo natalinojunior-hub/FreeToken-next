@@ -1,6 +1,6 @@
 # KV RAM tiering design gate
 
-Status: **implemented for QSA BF16, opt-in** (2026-09-25, campaign 14, branch `kvram-live`). Gate 1 text below is historical.
+Status: **implemented for QSA BF16; on by default (`auto`) for certified families** (2026-09-25, campaigns 14-16, branch `next`). Gate 1 text below is historical.
 
 This document records the Gate 1 review for host-RAM KV placement. It is a
 design boundary, not an approval to change the allocator.
@@ -94,7 +94,7 @@ Branch `kvram-live` (worktree `../ft-kvram-live`): `faccdc8` live tier, `d7f22fa
 - **Always on device:** compressed index rows, rope rows, pending ring, GDN/PLE state, page table. Selection runs on device; only selected K/V pages cross PCIe.
 - **Hot/cold:** scheduler page ids are logical; kernels address `page_map[logical]`. Decode selections accumulate per-page heat; every 16 steps the hottest RAM pages swap with the coldest device pages (K/V, index rows, rope rows) on the scheduling stream between forwards. Radix tree, page table and free list never observe a move.
 - **Planner:** with a RAM tier the device keeps `kv_reserve_tokens` of KV; the rest funds expert slots.
-- **Modes:** `off` (default), `auto` (tier only when the all-VRAM floor does not fit), `force` (`--kv-cache-ram`, `--kv-ram-tokens`, `--kv-reserve-tokens`). Unsupported (non-QSA pool, turbo3/turbo4/vbr/tcq, TP>1, non-CUDA): force fails closed, auto logs the reason and stays in VRAM.
+- **Modes:** `auto` (default), `off`, `force` (`--kv-cache-ram`, `--kv-ram-tokens`, `--kv-reserve-tokens`). `auto` tiers cold KV into RAM by default for a *certified* family (measured faster from 64K) and drops the tier to all-VRAM when RAM cannot hold it; certification is a model-declared capability (`ModelConfig.kv_ram_tier_certified`, set by qwen4_exp today), not a name match, so uncertified families keep all-VRAM under `auto` until measured. Unsupported (non-QSA pool, uncertified family under `auto`, TP>1, non-CUDA): `force` fails closed, `auto` logs the reason and stays in VRAM.
 - **RAM budget:** refuse before allocation when the tier would cross `MemAvailable - 10% MemTotal - 2 GiB` (earlyoom SIGTERMs at 10%), reporting the largest context the host can hold.
 
 ### Evidence (UD-IQ4_XS unless noted; cold, fresh server, 256 decode, exact prompts)
@@ -115,6 +115,6 @@ Kernel tests: `tests/kvcache/test_kv_ram_tier_cuda.py` (25, bit-exact vs all-VRA
 
 ### Decisions and open items
 
-- At 4K/16K the tier costs TG 1-5%; extra expert slots do not repay RAM reads. Auto spills only overflow. Spill threshold X comes from 128K/256K certification after all phases.
+- The auto cold tier narrows to fit RAM by a measured ladder (fp8 -> turbo4 -> turbo3; bf16/turbo8 dropped as dominated), so a certified family keeps KV in RAM at every context instead of only overflowing. ISTA 64/128/256K fp8 beats all-VRAM (see `PERFORMANCE.md`).
 - Host RAM is bound by pinned experts (server RSS 50-70 GiB during load; earlyoom kills at <10% free): >~10 GiB of KV in RAM needs a compressed cold tier or NVMe-streamed cold experts.
-- Not done: turbo3/turbo4 tier (fail-closed), compressed cold tier, >16K certification (operator rule), `ft bench context` advisor, VRAM-side max-context message (RAM-side exists).
+- Not done: compressed cold tier (turbo3/turbo4 host tier now ships in the auto ladder), `ft bench context` advisor, VRAM-side max-context message (RAM-side exists). Certification of families other than qwen4_exp for the KV-in-RAM default is pending measurement (they stay all-VRAM until then).

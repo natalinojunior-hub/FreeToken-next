@@ -428,6 +428,22 @@ MTP heads (campaign 13, cold graph-on): ISTA k1 16K sq8 TG 63.65 vs k0 58.49 (+8
 | UD k1 16K | CONDITIONAL | TG 49.10-49.27, acceptance 84.8%; 4K rerun timed out before summary |
 | AD k1 | NO-GO | 70.5% acceptance at 16K; 59.4% at 4K |
 | NVFP4 k1-k3 | NO-GO | k1 45.7% acceptance; k2/k3 reproducible traceback/OOM |
-| KV tiering 64K-256K | NOT CERTIFIED | No address-stable arena alias/eviction path; >16K tests remain prohibited by campaign gate |
+| KV tiering 64K-256K | **PASS (campaign 16, qwen4_exp only)** | ISTA IQ3_XXS default `auto` fp8 RAM tier: 0 traceback, needle 64/128/256K + usage 20/20 + vision pass, TG +3.3% @128K / +21.5% @256K vs all-VRAM. Gated by `kv_ram_tier_certified`; other families stay all-VRAM. See "Campaign 16" below and the campaign-16 ledger under `ft-campaign2/campaign16/` |
 
 The release gate is **NO-GO** until KV placement is implemented with graph/eager parity, rollback, and fresh 64K-256K evidence. k0 remains the only global default.
+
+## Campaign 16 (2026-09-25): ISTA IQ3_XXS — KV-in-RAM as the certified default (HEAD `0288564`)
+
+Model `/models/Qwen3.8-Flash-Next-ISTA-IQ3_XXS/IQ3_XXS`. New default = `--kv-tiering auto` on a certified family resolves to the fp8 host-RAM KV tier (server log: `KV RAM tier dtype: torch.float8_e4m3fn`), 0 tracebacks. Cold, fresh server, `--decode 256 --repeats 1`. k0 serve empty; k1/k2 add only `--spec-mtp`.
+
+| TG tok/s | 16K (test-only) | 64K | 128K | 256K |
+|---|---|---|---|---|
+| default k0 (fp8 RAM) | 56.18 | 56.40 | 57.44 | 52.36 |
+| all-VRAM k0 (c15) | 56.93 | 57.11 | 55.61 | 43.11 |
+| Δ k0 | -1.3% | -1.2% | **+3.3%** | **+21.5%** |
+| k1 | – | 51.40 | 57.95 | 52.47 |
+| k2 | – | – | 43.14 | 33.87 |
+
+MTP ladder (drop a context's k when TG < that k0): 64K -> k0 best (k1 51.40 < 56.40); 128K/256K -> best k1 but only +0.9%/+0.2% over k0 — the fp8 RAM tier absorbs most of the decode bandwidth MTP used to buy. Accept: k1 64K 202/306, k1 128K 216/292, k1 256K 222/288. TG-curve 128K (`--decode 8192`) mean 56.27, no cliff. Quality: needle 64/128/256K PASS, usage 20/20, vision PASS. Forced-tier turbo speed/quality (reserve 8192): turbo8/4/3 all usage 20/20 + needle 128K pass; fp8 (59.16/57.86/52.43) dominates turbo8; turbo4/3 kept as RAM-fit fallbacks. Detail in the campaign-16 ledger under `ft-campaign2/campaign16/`.
+
+Verdict: **PASS** — KV-in-RAM default certified for the qwen4 (Qwen3.8 Flash Next) family. Dense 27B and MoE 35B remain all-VRAM under `auto` until separately measured.
