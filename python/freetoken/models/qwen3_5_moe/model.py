@@ -8,6 +8,7 @@ from freetoken.layers import (
     BaseOP,
     GemmaRMSNorm,
     OPList,
+    LinearReplicated,
     ParallelLMHead,
     VocabParallelEmbedding,
 )
@@ -89,6 +90,8 @@ class Qwen3_5Model(BaseOP):
             ]
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self._capture_mtp_residual = config.mtp_layer_id is not None
+        self._last_residual: torch.Tensor | None = None
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = embed_input_ids(self.embed_tokens, input_ids, get_global_ctx().batch)
@@ -96,7 +99,39 @@ class Qwen3_5Model(BaseOP):
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
         x, _ = self.norm.forward_add_residual(x, residual)
+        if self._capture_mtp_residual:
+            self._last_residual = x  # the NextN draft seeds from the post-norm hidden
         return x
+
+
+class Qwen3_5MTP(BaseOP):
+    """The checkpoint's NextN draft block (llama.cpp ``graph_mtp`` for qwen35/qwen35moe):
+    ``eh_proj(enorm(embed(next)) ++ hnorm(h))`` -> one full-attention decoder layer ->
+    ``shared_head_norm``. ``forward`` returns that normed hidden, which both seeds the next
+    draft step and feeds the shared LM head (``to_head`` is the identity)."""
+
+    def __init__(self, config: ModelConfig, layer_id: int, *, embedding: BaseOP) -> None:
+        if config.mtp_layer_id != layer_id or layer_id != config.num_layers:
+            raise ValueError("register the MTP layer with with_mtp_layer before construction")
+        hidden = config.hidden_size
+        self._embed_ref = embedding
+        self.enorm = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
+        self.hnorm = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
+        self.eh_proj = LinearReplicated(
+            2 * hidden, hidden, has_bias=False, quant_config=config.quant, prefix="mtp.eh_proj"
+        )
+        self.layers = OPList([Qwen3_5DecoderLayer(config, layer_id, prefix="mtp.layers.0")])
+        self.shared_head_norm = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
+
+    def forward(self, residual: torch.Tensor, next_ids: torch.Tensor, batch) -> torch.Tensor:
+        e = self.enorm.forward(self._embed_ref.forward(next_ids).to(residual.dtype))
+        x = self.eh_proj.forward(torch.cat([e, self.hnorm.forward(residual)], dim=-1))
+        x, res = self.layers.op_list[0].forward(x, None)
+        x, _ = self.shared_head_norm.forward_add_residual(x, res)
+        return x
+
+    def to_head(self, residual: torch.Tensor) -> torch.Tensor:
+        return residual
 
 
 class Qwen3_5ForCausalLM(BaseLLMModel):
@@ -109,6 +144,11 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             quant_config=config.quant,
             prefix="lm_head",
+        )
+        self.mtp = (
+            Qwen3_5MTP(config, config.mtp_layer_id, embedding=self.model.embed_tokens)
+            if config.mtp_layer_id is not None
+            else None
         )
         super().__init__()
 

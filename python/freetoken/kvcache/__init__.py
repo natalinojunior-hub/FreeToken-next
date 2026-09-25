@@ -174,12 +174,16 @@ def create_kvcache_pool(
     host_pages: int = 0,
     host_dtype: torch.dtype | str | None = None,
 ) -> BaseKVCachePool:
+    # The registered MTP layer (with_mtp_layer) sits one past the target stack and rides
+    # the full-attention group's layer_ids; every pool's dense-slot remap needs it in range.
+    mtp_layer_id = getattr(model_config, "mtp_layer_id", None)
+    num_layers = max(model_config.num_layers, (mtp_layer_id or -1) + 1)
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
 
         return HybridSWAKVCache(
             groups=model_config.kv_cache_group_specs(),
-            num_layers=model_config.num_layers,
+            num_layers=num_layers,
             num_full_pages=num_pages,
             page_size=page_size,
             num_swa_tokens=num_swa_tokens,
@@ -216,7 +220,7 @@ def create_kvcache_pool(
         assert layer_ids is None, "hybrid-linear x BSA has no pool support yet"
         return BSAKVCache(
             num_kv_heads=spec.num_kv_heads,
-            num_layers=model_config.num_layers,
+            num_layers=num_layers,
             head_dim=spec.head_dim,
             num_pages=num_pages,
             page_size=page_size,
@@ -236,10 +240,6 @@ def create_kvcache_pool(
         spec = kv_specs[0]
         if num_req_slots is None:
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
-        # The registered MTP layer (with_mtp_layer) sits one past the target stack and rides
-        # this same full-attention group's layer_ids; the dense-slot remap needs its id in range.
-        mtp_layer_id = getattr(model_config, "mtp_layer_id", None)
-        num_layers = max(model_config.num_layers, (mtp_layer_id or -1) + 1)
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
             num_layers=num_layers,
@@ -307,7 +307,7 @@ def create_kvcache_pool(
     if resolve_pool_class(model_config, kv_format) is TurboMHAKVCache:
         return TurboMHAKVCache(
             num_kv_heads=heads,
-            num_layers=model_config.num_layers,
+            num_layers=num_layers,
             head_dim=dim,
             num_pages=num_pages,
             page_size=page_size,
@@ -320,7 +320,7 @@ def create_kvcache_pool(
         num_kv_heads=heads,
         num_pages=num_pages,
         page_size=page_size,
-        num_layers=model_config.num_layers,
+        num_layers=num_layers,
         head_dim=dim,
         device=device,
         dtype=dtype,

@@ -363,6 +363,10 @@ class ModelConfig:
     # The draft layer owns a routed-expert bank, appended after the target's banks (so it
     # is MoE bank ``num_moe_layers - 1``); False = it reuses a target bank.
     mtp_expert_bank: bool = False
+    # In-file NextN/MTP draft blocks (GGUF ``nextn_predict_layers``) a non-qwen4 family can
+    # serve with --spec-mtp; the expert types then cover the draft's own bank too.
+    native_mtp_layers: int = 0
+    native_mtp_expert_types: tuple[int, int] | list[tuple[int, int]] | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1

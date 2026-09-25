@@ -184,6 +184,17 @@ class EngineConfig:
         model_config = replace(model_config, quant=quant)
         if self.spec_mtp > 0:
             mtp = getattr(getattr(model_config, "qwen4_args", None), "mtp", None)
+            if (mtp is None or not mtp.enabled) and model_config.native_mtp_layers == 1:
+                from freetoken.models.config import with_mtp_layer
+
+                model_config = with_mtp_layer(model_config, model_config.num_layers)
+                if model_config.native_mtp_expert_types is not None:
+                    model_config = replace(
+                        model_config,
+                        mtp_expert_bank=True,
+                        gguf_expert_types=model_config.native_mtp_expert_types,
+                    )
+                return model_config
             if mtp is None or not mtp.enabled:
                 raise ValueError(
                     "--spec-mtp > 0 requires a checkpoint that carries native MTP metadata "

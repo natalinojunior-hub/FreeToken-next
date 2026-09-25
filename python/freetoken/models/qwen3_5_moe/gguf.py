@@ -201,6 +201,10 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         gguf_expert_types=(
             _uniform_expert_types(shim.model_path, num_layers) if moe_enabled else None
         ),
+        native_mtp_layers=nextn,
+        native_mtp_expert_types=(
+            _uniform_expert_types(shim.model_path, block_count) if moe_enabled and nextn else None
+        ),
         gguf_model_path=shim.model_path,
         weight_block_size=None,
         attn_quant="gguf",
@@ -451,6 +455,7 @@ def iter_gguf_weights(
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    mtp_only: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield (param_name, tensor) for every non-expert qwen35moe param.
 
@@ -486,6 +491,8 @@ def iter_gguf_weights(
         for lid in range(config.num_layers)
         if isinstance(config.attention_group_for_layer(lid), FullAttentionGroupConfig)
     }
+    if mtp_only:  # ``mtp_only`` yields just the NextN block (GGUF block num_layers) as mtp.*
+        full_layer_ids.add(config.num_layers)
 
     # Get GDN group to extract attn_qkv_size and conv_kernel for conv1d reshape.
     gdn_group = None
@@ -525,6 +532,18 @@ def iter_gguf_weights(
     for t in iter_gguf_tensors(model_path):
         name = t.name
         layer = layer_of(name) if name.startswith("blk.") else None
+        if mtp_only:
+            if layer != config.num_layers:
+                continue
+            nextn = name.split(".", 2)[2]
+            if nextn == "nextn.eh_proj.weight":
+                yield "mtp.eh_proj.qweight", t.packed()
+                continue
+            if nextn in ("nextn.enorm.weight", "nextn.hnorm.weight", "nextn.shared_head_norm.weight"):
+                yield f"mtp.{nextn[6:]}", _to_bf16(t)
+                continue
+            if nextn.startswith("nextn."):
+                raise ValueError(f"{name}: unsupported NextN tensor (own embedding/head)")
 
         # Global tensors
         if name == "token_embd.weight":
@@ -546,7 +565,7 @@ def iter_gguf_weights(
 
         # Drop the NextN/MTP draft block (trailing blk.* and any nextn.* tensor): the
         # served model is ``config.num_layers`` deep and this path never speculates.
-        if layer >= config.num_layers or "nextn." in name:
+        if not mtp_only and (layer >= config.num_layers or "nextn." in name):
             warn_dropped_tensors(
                 model_path,
                 "nextn",
@@ -561,7 +580,7 @@ def iter_gguf_weights(
             continue
 
         suffix = name.split(".", 2)[2]  # after "blk.N."
-        base = f"model.layers.{layer}"
+        base = "mtp.layers.0" if mtp_only else f"model.layers.{layer}"
 
         # Scalar/norm tensors: dequant to bf16 or stay F32.
         # norms, mlp.gate, shared_expert_gate -> bf16
@@ -894,8 +913,8 @@ def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> No
     )
     inner.embed_tokens = embed
 
-    for layer_idx, layer in enumerate(inner.layers.op_list):
-        if layer_idx in full_layer_ids:
+    def swap_layer(layer_idx: int, layer, full: bool) -> None:
+        if full:
             # qkv_proj: q | k | v. Mixed in every Ornith quant level (v is a K-quant while
             # q/k are I-quants), so this is normally the GGUFMergedLinear path.
             layer.self_attn.qkv_proj = gguf_merged_or_plain(
@@ -939,7 +958,7 @@ def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> No
                 has_bias=False,
             )
             swap_linear(layer.mlp, "down_proj", qt(layer_idx, "ffn_down.weight"))
-            continue
+            return
 
         # Shared expert: gate|up fuse when they share a type (they do in every quant level
         # seen so far); down is independent and does vary (Q4_K on IQ3_M's first layers).
@@ -951,6 +970,14 @@ def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> No
             has_bias=False,
         )
         swap_linear(layer.mlp.shared_expert, "down_proj", qt(layer_idx, "ffn_down_shexp.weight"))
+
+    for layer_idx, layer in enumerate(inner.layers.op_list):
+        swap_layer(layer_idx, layer, layer_idx in full_layer_ids)
+    mtp = getattr(model, "mtp", None)
+    if mtp is not None:  # the NextN block is GGUF block ``num_layers``, a full-attention layer
+        swap_layer(config.num_layers, mtp.layers.op_list[0], True)
+        swap_linear(mtp, "eh_proj", qt(config.num_layers, "nextn.eh_proj.weight"))
+        mtp._embed_ref = embed
 
     if config.tie_word_embeddings:
         from freetoken.models.gemma4.gguf import GGUFTiedLMHead
@@ -971,7 +998,15 @@ def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> No
         )
 
 
+def iter_gguf_mtp_weights(model_path: str, device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The NextN draft block's non-expert weights (its routed experts are the extra bank)."""
+    return iter_gguf_weights(
+        model_path, device, include_moe_experts=False, include_non_moe=True, mtp_only=True
+    )
+
+
 __all__ = [
+    "iter_gguf_mtp_weights",
     "parse_gguf_config",
     "gguf_name_to_freetoken",
     "iter_gguf_weights",

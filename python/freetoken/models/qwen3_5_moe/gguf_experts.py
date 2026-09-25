@@ -178,6 +178,9 @@ def load_gguf_expert_sources(
     """
     from freetoken.models.gguf.reader import iter_gguf_tensors
 
+    if not extra_banks and config.mtp_expert_bank:
+        # the in-file NextN block (GGUF block num_layers) owns the draft's routed bank
+        extra_banks = ((model_path, config.num_layers),)
     types = gguf_expert_types(model_path, config.num_layers, extra_banks)
 
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
