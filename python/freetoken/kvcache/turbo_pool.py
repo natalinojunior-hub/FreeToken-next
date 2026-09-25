@@ -232,6 +232,17 @@ class TurboMHAKVCache(BaseKVCachePool):
             0, slots, vn.reshape(rows, self._num_kv_heads, self._groups)
         )
 
+    def attach_staging(self, binding: object) -> None:
+        """Attach stable logical-page indirection for opt-in tiered launches."""
+        if getattr(binding, "device", self._device) != self._device:
+            raise ValueError("staging binding must use the KV pool device")
+        self._kv_staging = binding
+
+    def staging_table(self) -> torch.Tensor | None:
+        """Return the graph-stable logical-to-physical table, when attached."""
+        binding = getattr(self, "_kv_staging", None)
+        return None if binding is None else binding.table
+
     def decode_rows(self, layer_id: int, which: str = "k") -> torch.Tensor:
         """Materialize the whole slab. Only for tests and the measurement arm that quantifies how
         much the fused path saves -- never on a serving hot path."""

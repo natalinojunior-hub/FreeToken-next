@@ -5,10 +5,32 @@ import torch
 
 from freetoken.kvcache.kv_staging import (
     KVBackendAdapter,
+    KVStagingBinding,
     MHAKVAdapter,
     Turbo3KVAdapter,
     Turbo4KVAdapter,
 )
+
+
+def test_staging_binding_updates_in_place_and_rejects_stale_generation():
+    binding = KVStagingBinding(4, torch.device("cpu"))
+    address = binding.table.data_ptr()
+    binding.update([1, 2], [7, 8], [3, 4])
+    assert binding.table.data_ptr() == address
+    binding.validate([1, 2], [3, 4])
+    with pytest.raises(RuntimeError, match="stale"):
+        binding.validate([1], [9])
+    binding.clear([1])
+    with pytest.raises(RuntimeError, match="cold"):
+        binding.validate([1], [3])
+
+
+def test_staging_binding_rejects_duplicate_or_mismatched_updates():
+    binding = KVStagingBinding(2, torch.device("cpu"))
+    with pytest.raises(ValueError, match="duplicate"):
+        binding.update([0, 0], [1, 2], [1, 1])
+    with pytest.raises(ValueError, match="equal length"):
+        binding.update([0], [1], [])
 from freetoken.kvcache.kv_tiering import KVLayout, KVPageRecord, Residency
 
 

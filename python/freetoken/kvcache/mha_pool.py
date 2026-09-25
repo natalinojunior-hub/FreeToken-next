@@ -137,6 +137,17 @@ class MHAKVCache(BaseKVCachePool):
             v=v,
         )
 
+    def attach_staging(self, binding: object) -> None:
+        """Attach stable logical-page indirection for opt-in tiered launches."""
+        if getattr(binding, "device", self._device) != self._device:
+            raise ValueError("staging binding must use the KV pool device")
+        self._kv_staging = binding
+
+    def staging_table(self) -> torch.Tensor | None:
+        """Return the graph-stable logical-to-physical table, when attached."""
+        binding = getattr(self, "_kv_staging", None)
+        return None if binding is None else binding.table
+
     @property
     def device(self) -> torch.device:
         return self._device

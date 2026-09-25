@@ -8,6 +8,7 @@ module when a page has already passed the ``KVPagePool`` residency checks.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Iterable
 
 import torch
 
@@ -96,6 +97,73 @@ class KVBackendAdapter:
         self.validate_tensor(destination_v, layout.v_shape, layout.v_stride)
         destination_k.copy_(source_k, non_blocking=destination_k.is_cuda)
         destination_v.copy_(source_v, non_blocking=destination_v.is_cuda)
+
+    @staticmethod
+    def validate_norms(norms: torch.Tensor, tokens: int, heads: int, groups: int) -> None:
+        """Turbo norm slabs have one fp16 scale per token/head/group."""
+        expected = (tokens, heads, groups)
+        if tuple(norms.shape) != expected:
+            raise ValueError(f"norm slab mismatch: shape={tuple(norms.shape)} expected={expected}")
+
+
+class KVStagingBinding:
+    """Stable device indirection consumed by live attention launchers.
+
+    The logical page id remains owned by the scheduler.  Kernels receive this
+    preallocated device table, whose entries are physical pool slots.  Updating
+    entries in place keeps CUDA graph addresses stable; callers must update it
+    only before the corresponding graph replay or eager launch.
+    """
+
+    def __init__(self, capacity: int, device: torch.device) -> None:
+        if capacity <= 0:
+            raise ValueError("staging table capacity must be positive")
+        self.table = torch.full((capacity,), -1, dtype=torch.int32, device=device)
+        self._generation = torch.full((capacity,), -1, dtype=torch.int64, device=device)
+
+    @property
+    def device(self) -> torch.device:
+        return self.table.device
+
+    def update(self, page_ids: Iterable[int], slots: Iterable[int], generations: Iterable[int]) -> None:
+        ids = tuple(int(v) for v in page_ids)
+        physical = tuple(int(v) for v in slots)
+        versions = tuple(int(v) for v in generations)
+        if not (len(ids) == len(physical) == len(versions)):
+            raise ValueError("staging update vectors must have equal length")
+        if len(set(ids)) != len(ids):
+            raise ValueError("duplicate logical page id in staging update")
+        if any(i < 0 or i >= self.table.numel() for i in ids):
+            raise IndexError("logical page id outside staging table")
+        if any(s < 0 for s in physical) or any(g < 0 for g in versions):
+            raise ValueError("physical slots and generations must be non-negative")
+        if ids:
+            index = torch.tensor(ids, dtype=torch.long, device=self.device)
+            self.table.index_copy_(0, index, torch.tensor(physical, dtype=torch.int32, device=self.device))
+            self._generation.index_copy_(0, index, torch.tensor(versions, dtype=torch.int64, device=self.device))
+
+    def clear(self, page_ids: Iterable[int]) -> None:
+        ids = tuple(int(v) for v in page_ids)
+        if any(i < 0 or i >= self.table.numel() for i in ids):
+            raise IndexError("logical page id outside staging table")
+        if ids:
+            index = torch.tensor(ids, dtype=torch.long, device=self.device)
+            self.table.index_fill_(0, index, -1)
+            self._generation.index_fill_(0, index, -1)
+
+    def validate(self, page_ids: Iterable[int], generations: Iterable[int]) -> None:
+        ids = tuple(int(v) for v in page_ids)
+        versions = tuple(int(v) for v in generations)
+        if len(ids) != len(versions):
+            raise ValueError("validation vectors must have equal length")
+        if any(i < 0 or i >= self.table.numel() for i in ids):
+            raise IndexError("logical page id outside staging table")
+        if ids:
+            index = torch.tensor(ids, dtype=torch.long, device=self.device)
+            slots = self.table.index_select(0, index)
+            current = self._generation.index_select(0, index)
+            if bool((slots < 0).any()) or bool((current != torch.tensor(versions, dtype=torch.int64, device=self.device)).any()):
+                raise RuntimeError("staging table contains cold or stale KV page")
 
     @staticmethod
     def validate_norms(norms: torch.Tensor, tokens: int, heads: int, groups: int) -> None:
