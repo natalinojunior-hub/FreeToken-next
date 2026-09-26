@@ -448,7 +448,7 @@ class SchedulerSpecMixin:
         pool = self.engine.linear_state_pool
         # Zero-replay: the draft never touches the linear state (a full-attention NextN
         # head) and the verify records every row's state, so no snapshot, no replay.
-        zero_replay = pool is not None and pool.spec_states is not None
+        zero_replay = getattr(pool, "spec_states", None) is not None
         snap_slot = None
         if pool is not None and not zero_replay:
             snap_slot = self._spec_snapshot_slot(req)
@@ -557,7 +557,10 @@ class SchedulerSpecMixin:
 
         if finished:
             self.free_spec_snapshot_slot(req)
-            self.decode_manager.filter_reqs([req])
+            # _commit_spec_tokens already removed and freed it (table_idx -1): filter_reqs([req])
+            # would re-admit it whenever can_decode still holds (an EOS finish before
+            # max_tokens), and the next spec step would verify a freed request.
+            self.decode_manager.filter_reqs([])
             return True
 
         # Update _last_residual to last committed token for next draft chain

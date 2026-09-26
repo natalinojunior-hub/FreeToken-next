@@ -103,6 +103,9 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
+        # (num_k_heads, v_per_k, head_v_dim) when out_proj keeps llama.cpp's V-head-tiled
+        # column order (packed GGUF): the activation is tiled to match instead of the weight.
+        self._v_tile: tuple[int, int, int] | None = None
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
         beta = b.sigmoid()
@@ -216,7 +219,8 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             # decode kernels: the conv rolls row by row (tiny), then ONE fused recurrence
             # over all rows loads/stores the state once. With the pool's zero-replay buffers
             # it also records every row's state + conv input (see commit_spec_row).
-            keep = pool.spec_states is not None and total <= pool.spec_states.shape[1]
+            spec_states = getattr(pool, "spec_states", None)
+            keep = spec_states is not None and total <= spec_states.shape[1]
             if keep:
                 pool.spec_conv_pre[li].copy_(
                     pool.conv_states[li].index_select(0, fla.cache_indices)[0]
@@ -278,6 +282,8 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         out = self.norm.forward(core_out, z).reshape(total, -1)
+        if self._v_tile is not None:
+            out = out.view(total, *self._v_tile).transpose(1, 2).reshape(total, -1)
         return self.out_proj.forward(out)
 
 

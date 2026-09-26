@@ -773,10 +773,8 @@ def iter_gguf_weights(
                 # is dequantized to dense bf16. Cost: out*in*2 bytes per GDN layer
                 # (2048*4096*2 = 16 MiB, ~503 MiB over 30 layers). convert_qwen35_to_gguf
                 # therefore leaves linear_attn.out_proj as a dense Linear.
-                w = _dequant_any(t)
-                if _untile:
-                    w = _ungroup_v(w, 1, _vK, _vR, _vD)
-                yield f"{base}.linear_attn.out_proj.weight", w
+                # Kept packed: gdn.py tiles the activation into the file's column order.
+                yield f"{base}.linear_attn.out_proj.qweight", t.packed()
             else:
                 continue  # unmapped for GDN layers
 
@@ -942,10 +940,16 @@ def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> No
                 ],
                 has_bias=False,
             )
-            # linear_attn.out_proj is deliberately NOT swapped: its columns index the
-            # V-head dimension, which llama.cpp tiled, and un-tiling columns needs dense
-            # values (a 128-wide head straddles the quant blocks). iter_gguf_weights yields
-            # it as dense bf16 ".weight", so the constructed Linear must stay dense.
+            # out_proj's columns keep llama.cpp's V-head tiling (a 128-wide head straddles
+            # the quant blocks, so the packed weight cannot be un-tiled); the GDN tiles its
+            # activation to match instead.
+            swap_linear(layer.linear_attn, "out_proj", qt(layer_idx, "ssm_out.weight"))
+            if _g.num_key_heads != _g.num_value_heads:
+                layer.linear_attn._v_tile = (
+                    _g.num_key_heads,
+                    _g.num_value_heads // _g.num_key_heads,
+                    _g.value_head_dim,
+                )
 
         if not config.moe_enabled:
             # Dense qwen35: one SwiGLU MLP per layer (Qwen3_5DenseMLP), no routed experts

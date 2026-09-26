@@ -1573,22 +1573,36 @@ class Engine:
             if num_mamba_slots is not None
             else (self.linear_state_pool.num_slots if self.linear_state_pool is not None else None)
         )
-        self.kv_cache.validate_rebuild(
-            config,
-            num_pages=num_pages,
-            num_swa_pages=num_swa_pages,
-            target_moe=target_moe,
-            per_expert_bytes=per_expert_bytes,
-            baseline_free=self._baseline_free,
-            weights_bytes=self._weights_bytes,
-            current_num_pages=self.num_pages,
-            reserve_bytes=self._ledger_reserve_bytes(),
-            extra_fixed_bytes=(
-                state_pool_bytes(config, target_mamba) if target_mamba is not None else 0
-            )
-            + self._ledger_overhead_bytes(),
-            extra_note=(f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""),
+        # A pure shrink (fewer expert slots, no KV/SWA/mamba growth) can only free memory, so
+        # it always fits whatever the budget model says: _restore_vram_headroom's deficit
+        # repair must not be refused by an account that disagrees with the startup plan's.
+        cache = self.moe_offload_cache
+        shrink_only = (
+            cache is not None
+            and target_moe <= cache.cache_size
+            and (num_pages is None or num_pages <= self.num_pages)
+            and num_swa_pages is None
+            and num_mamba_slots is None
         )
+        if not shrink_only:
+            self.kv_cache.validate_rebuild(
+                config,
+                num_pages=num_pages,
+                num_swa_pages=num_swa_pages,
+                target_moe=target_moe,
+                per_expert_bytes=per_expert_bytes,
+                baseline_free=self._baseline_free,
+                weights_bytes=self._weights_bytes,
+                current_num_pages=self.num_pages,
+                reserve_bytes=self._ledger_reserve_bytes(),
+                extra_fixed_bytes=(
+                    state_pool_bytes(config, target_mamba) if target_mamba is not None else 0
+                )
+                + self._ledger_overhead_bytes(),
+                extra_note=(
+                    f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
+                ),
+            )
 
         torch.cuda.synchronize(self.device)
         # Preserve the CUDA-graph batch-size set resolved at startup. The auto heuristic keys
