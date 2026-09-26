@@ -175,10 +175,6 @@ class Batch:
     # step whose extend_len > 1 makes the usual "last row of each request" derivation wrong.
     # None (the default) keeps every existing prefill/decode path byte-identical.
     spec_logits_indices: torch.Tensor | None = field(default=None, init=False)
-    # GDN state checkpoints for zero-replay speculative verification.
-    # List of (recurrent_states, conv_states) per step when spec_logits_indices is set.
-    # Each element is a tuple of tensors cloned from the linear_state_pool at that step.
-    gdn_checkpoints: list | None = field(default=None, init=False)
     # Host copy of a spec-decode verify window's input tokens. The drafts live only in the
     # device token pool (req.input_ids holds committed tokens), so host-side consumers such
     # as the disk PLE fill read the window from here.

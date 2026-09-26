@@ -286,9 +286,9 @@ def test_decode_prefill_gdn_kernel_inequivalence():
 
 
 def test_spec_verify_graph_matches_eager():
-    """The 2-token spec-verify window (step-by-step decode kernel) captured once replays
+    """The 2-token spec-verify window (fused multi-row recurrence) captured once replays
     bitwise-equal to the eager verify -- output and the slot's conv/recurrent state -- over
-    changing windows and slots. The capture takes no checkpoints; eager still does."""
+    changing windows and slots."""
     from freetoken.attention.linear import FLAMetadata
 
     op, _ = _make_layer(3, seed=3)
@@ -319,7 +319,6 @@ def test_spec_verify_graph_matches_eager():
     capture = verify_batch(reqs[0], static_fla)
     with ctx.forward_batch(capture), torch.cuda.graph(graph):
         captured = op.forward(static_x)
-    assert capture.gdn_checkpoints is None
 
     gen = torch.Generator(device=DEV).manual_seed(5)
     for step, req in enumerate([reqs[0], reqs[1], reqs[0], reqs[0], reqs[1]]):
@@ -330,7 +329,6 @@ def test_spec_verify_graph_matches_eager():
         eager_batch = verify_batch(req, fla(slot))
         with ctx.forward_batch(eager_batch):
             eager = op.forward(x)
-        assert sorted(eager_batch.gdn_checkpoints) == [0, 1]
         expect = [t.clone() for t in state]
         for t, b in zip(state, before):
             t.copy_(b)

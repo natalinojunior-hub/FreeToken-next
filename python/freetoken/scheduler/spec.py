@@ -204,7 +204,6 @@ class SchedulerSpecMixin:
         expect.append(model._last_residual.clone())
         for t, b in zip(state, before):
             t.copy_(b)
-        vb.gdn_checkpoints = None
         if n % 8 == 4 and engine.moe_offload_cache is not None:
             engine.moe_offload_cache.reset()
         out = engine.forward_batch(vb, sample_args)

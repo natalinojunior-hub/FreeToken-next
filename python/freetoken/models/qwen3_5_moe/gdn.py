@@ -37,6 +37,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         conv_kernel_size,
         rms_norm_eps,
         layer_id,
+        output_gate: str = "silu",
         *,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
@@ -95,7 +96,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         # *.A_log / *.dt_bias from the model-dtype downcast.
         self.dt_bias = torch.empty(num_v_heads, dtype=torch.float32)
         self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
-        self.norm = GatedRMSNorm(head_v_dim, eps=rms_norm_eps)
+        self.norm = GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=output_gate)
         self.out_proj = LinearReplicated(
             self.value_dim,
             hidden_size,
@@ -282,9 +283,12 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         out = self.norm.forward(core_out, z).reshape(total, -1)
+        return self.out_proj.forward(self._out_proj_input(out))
+
+    def _out_proj_input(self, out: torch.Tensor) -> torch.Tensor:
         if self._v_tile is not None:
-            out = out.view(total, *self._v_tile).transpose(1, 2).reshape(total, -1)
-        return self.out_proj.forward(out)
+            out = out.view(out.shape[0], *self._v_tile).transpose(1, 2).reshape(out.shape[0], -1)
+        return out
 
 
 __all__ = ["Qwen3_5GatedDeltaNet"]
