@@ -238,3 +238,82 @@ def test_nvfp4_tile_uses_the_hardware_e2m1_unit():
     ref = torch.tensor([[tk.E2M1[i & 15], tk.E2M1[i >> 4]] for i in range(256)]).flatten()
     assert torch.equal(out.cpu(), ref)
     assert "cvt.rn.f16x2.e2m1x2" in handle.asm["ptx"]
+
+
+@pytest.mark.parametrize("book", ["nvfp4", "turbo4", "turbo3"])
+def test_dequant_rows_matches_decode_rotated(book):
+    """The prefix gather for the FlashInfer prefill: slots in any order, into a head-strided
+    view of a wider scratch (runtime strides), bit-equal to the torch decode."""
+    from freetoken.kernel.triton.turbo_attn import dequant_rows
+
+    device = torch.device("cuda")
+    torch.manual_seed(7)
+    total, kv_heads, head_dim = 300, 2, 256
+    x = torch.randn(total * kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    codes, norm = tk.quantize(x, book)
+    want = tk.decode_rotated(codes, norm, book).reshape(total, kv_heads, head_dim)
+    codes = codes.reshape(total, kv_heads, -1).contiguous()
+    norm = norm.reshape(total, kv_heads, -1).contiguous()
+    cent = torch.tensor(tk._CENT_TABLE.get(book, (0.0,)), device=device, dtype=torch.float32)
+    slots = torch.randperm(total, device=device)[:257].to(torch.int32)
+    scratch = torch.zeros(400, kv_heads + 1, head_dim, device=device, dtype=torch.bfloat16)
+    out = scratch[:257, :kv_heads]
+    dequant_rows(codes, norm, cent, slots, BOOK_CODE[book], out)
+    torch.testing.assert_close(out.float(), want[slots.long()].to(torch.bfloat16).float(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("book", ["nvfp4", "turbo4"])
+def test_segmented_fi_prefill_matches_extend_on_codes(book):
+    """FlashInfer over dequantized prefix segments (several per request) + the causal chunk,
+    merged by LSE == the triton extend kernel reading the codes."""
+    from types import SimpleNamespace
+
+    from freetoken.attention.triton import TritonAttentionBackend
+    from freetoken.kernel.triton.attention import extend_paged_attention
+
+    device = torch.device("cuda")
+    torch.manual_seed(11)
+    head_dim, q_heads, kv_heads = 256, 8, 2
+    q_lens, prefix_lens = [37, 5], [50, 0]
+    seq_lens = [p + q for p, q in zip(prefix_lens, q_lens)]
+    total, num_q = sum(seq_lens), sum(q_lens)
+    rotated = tk.is_rotated(book)
+    rot = (lambda t: tk.rotate(t.reshape(-1, head_dim)).reshape(t.shape).to(torch.bfloat16)) if rotated else (lambda t: t)
+    q = rot(torch.randn(num_q, q_heads, head_dim, device=device, dtype=torch.bfloat16))
+    kv = rot(torch.randn(2, total, kv_heads, head_dim, device=device, dtype=torch.bfloat16))
+    slots = torch.randperm(total, device=device).to(torch.int32)  # scattered pages
+    codes, norms = [], []
+    for t in kv:
+        c, n = tk.quantize(t.reshape(-1, head_dim), book) if not rotated else _quantize_rotated(t, book)
+        codes.append(c.reshape(total, kv_heads, -1).contiguous())
+        norms.append(n.reshape(total, kv_heads, -1).contiguous())
+    # cache row slots[i] holds logical token i
+    kc, vc = (torch.empty_like(c).index_copy_(0, slots.long(), c) for c in codes)
+    kn, vn = (torch.empty_like(n).index_copy_(0, slots.long(), n) for n in norms)
+    starts = [0, seq_lens[0]]
+    new = lambda t: torch.cat([t[a + p : a + s] for a, p, s in zip(starts, prefix_lens, seq_lens)])
+    k_ext, v_ext = new(kv[0]), new(kv[1])
+    cumsum = lambda xs: torch.tensor([0] + xs, dtype=torch.int32, device=device).cumsum(0).to(torch.int32)
+    turbo = {
+        "k_norm": kn, "v_norm": vn, "book": BOOK_CODE[book],
+        "cent": torch.tensor(tk._CENT_TABLE.get(book, (0.0,)), device=device, dtype=torch.float32),
+    }  # fmt: skip
+    scale = head_dim**-0.5
+    want = extend_paged_attention(
+        q, kc, vc, cumsum(q_lens), cumsum(seq_lens), slots,
+        torch.tensor(prefix_lens, dtype=torch.int32, device=device), max(q_lens), scale,
+        k_extend=k_ext, v_extend=v_ext, turbo=turbo,
+    )  # fmt: skip
+    be = TritonAttentionBackend.__new__(TritonAttentionBackend)
+    shape = (16, kv_heads, head_dim)  # 16-row scratch -> 4 prefix segments for the first request
+    be._seg_kv = tuple(torch.empty(shape, device=device, dtype=torch.bfloat16) for _ in range(2))
+    meta = SimpleNamespace(seg_lens=(q_lens, prefix_lens, seq_lens), indices=slots)
+    got = be._segmented_prefill(q, k_ext, v_ext, turbo, kc, vc, meta, scale)
+    cos = torch.nn.functional.cosine_similarity(got.float().flatten(), want.float().flatten(), dim=0)
+    assert cos.item() > 0.9999, cos
+    assert (got.float() - want.float()).abs().max().item() < 2e-2
+
+
+def _quantize_rotated(t, book):
+    """Codes of values already in the rotated domain (the pool stores rotate(x))."""
+    return tk.quantize(tk.inv_rotate(t.reshape(-1, tk.QK_TURBO).float()).to(torch.bfloat16), book)

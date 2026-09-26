@@ -71,11 +71,11 @@ def _e2m1_arith(nib, SCALED: tl.constexpr = True):
 
 
 @triton.jit
-def _nvfp4_v(codes_ptr, norm_ptr, row, nrow, mask_n, D: tl.constexpr):
-    """[N, D] NVFP4 tile, fp32; e4m3 block scale and fp16 group norm read once per 16 values.
-    ``row``/``nrow``: [N, 1] code / norm row offsets. Each code byte is loaded once and split
-    into its two values (the per-element version loaded every byte twice and ran one PTX
-    conversion per value, holding the tile to ~22% of DRAM bandwidth)."""
+def nvfp4_halves(codes_ptr, norm_ptr, row, nrow, mask_n, D: tl.constexpr):
+    """([N, D/2], [N, D/2]) fp32 NVFP4 values at the even / odd elements (low / high nibble of
+    each code byte), block scale and group norm applied. ``row``/``nrow``: [N, 1] code / norm
+    row offsets. Each byte is loaded once; consumers that split their dot into even and odd
+    halves never interleave the two (a register shuffle per element)."""
     j2 = tl.arange(0, D // 2)
     byte = tl.load(
         codes_ptr + row + ((j2 // 64) * 72 + j2 % 64)[None, :], mask=mask_n[:, None], other=0
@@ -83,14 +83,23 @@ def _nvfp4_v(codes_ptr, norm_ptr, row, nrow, mask_n, D: tl.constexpr):
     lo = _e2m1_arith(byte & 15, False)
     hi = _e2m1_arith((byte >> 4) & 15, False)
     N: tl.constexpr = lo.shape[0]
-    vals = tl.reshape(tl.join(lo, hi), (N, D))  # element 2i = low nibble of byte i
     js = tl.arange(0, D // 16)
     sc = tl.load(
         codes_ptr + row + ((js // 8) * 72 + 64 + js % 8)[None, :], mask=mask_n[:, None], other=0
     )
     nrm = tl.load(norm_ptr + nrow + (js // 8)[None, :], mask=mask_n[:, None], other=0.0)
     scale = sc.to(tl.float8e4nv, bitcast=True).to(tl.float32) * (nrm.to(tl.float32) * 16384.0)
-    return tl.reshape(tl.reshape(vals, (N, D // 16, 16)) * scale[:, :, None], (N, D))
+    lo = tl.reshape(tl.reshape(lo, (N, D // 16, 8)) * scale[:, :, None], (N, D // 2))
+    hi = tl.reshape(tl.reshape(hi, (N, D // 16, 8)) * scale[:, :, None], (N, D // 2))
+    return lo, hi
+
+
+@triton.jit
+def _nvfp4_v(codes_ptr, norm_ptr, row, nrow, mask_n, D: tl.constexpr):
+    """[N, D] NVFP4 tile, fp32 (element 2i = low nibble of byte i)."""
+    lo, hi = nvfp4_halves(codes_ptr, norm_ptr, row, nrow, mask_n, D)
+    N: tl.constexpr = lo.shape[0]
+    return tl.reshape(tl.join(lo, hi), (N, D))
 
 
 @triton.jit
@@ -192,3 +201,71 @@ def turbo_v_tile(
         idx = (byte.to(tl.int32) >> ((jj % 2) * 4)[None, :]) & 15
     vals = tl.load(cent_ptr + idx)
     return (vals * nrm).to(out_dtype)
+
+
+@triton.jit
+def _dequant_rows_kernel(
+    codes_ptr,
+    norm_ptr,
+    cent_ptr,
+    slots_ptr,
+    out_ptr,
+    n,
+    stride_ct,
+    stride_ch,
+    stride_nt,
+    stride_nh,
+    stride_ot,
+    stride_oh,
+    D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BOOK: tl.constexpr,
+):
+    offs_n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    head = tl.program_id(1)
+    mask_n = offs_n < n
+    slots = tl.load(slots_ptr + offs_n, mask=mask_n, other=0).to(tl.int64)
+    offs_d = tl.arange(0, D)
+    rows = turbo_v_tile(
+        codes_ptr,
+        norm_ptr,
+        cent_ptr,
+        slots,
+        head,
+        stride_ct,
+        stride_ch,
+        stride_nt,
+        stride_nh,
+        offs_d,
+        mask_n,
+        BOOK,
+        tl.bfloat16,
+    )
+    dst = out_ptr + offs_n[:, None].to(tl.int64) * stride_ot + head * stride_oh + offs_d[None, :]
+    tl.store(dst, rows, mask=mask_n[:, None])
+
+
+def dequant_rows(codes, norm, cent, slots, book: int, out) -> None:
+    """``out[i] = decode(codes[slots[i]])`` for every kv head, bf16, in the slab's (rotated)
+    domain: the KV rows of a paged prefix gathered dense for a bf16 attention kernel."""
+    n, heads, dim = slots.numel(), out.shape[1], out.shape[2]
+    if n == 0:
+        return
+    block_n = 32
+    _dequant_rows_kernel[(triton.cdiv(n, block_n), heads)](
+        codes,
+        norm,
+        cent,
+        slots,
+        out,
+        n,
+        codes.stride(0),
+        codes.stride(1),
+        norm.stride(0),
+        norm.stride(1),
+        out.stride(0),
+        out.stride(1),
+        D=dim,
+        BLOCK_N=block_n,
+        BOOK=book,
+    )

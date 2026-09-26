@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from freetoken.kernel.triton.turbo_attn import turbo_k_tile, turbo_v_tile
+from freetoken.kernel.triton.turbo_attn import BOOK_NVFP4, nvfp4_halves, turbo_k_tile, turbo_v_tile
 
 
 _MAX_KV_SPLITS = 8
@@ -250,7 +250,59 @@ def _decode_grouped_stage1_kernel(
     k_base_offsets = kv_head * stride_kh + offs_d[:, None]
     v_base_offsets = kv_head * stride_vh + offs_dv[None, :]
 
-    if split_end > split_start:
+    if split_end > split_start and COMPRESSED and BOOK == BOOK_NVFP4:
+        # NVFP4: the dot splits into even / odd elements (low / high code nibbles), so the
+        # tile is never interleaved; V accumulates the two halves and they are stored strided.
+        j2 = tl.arange(0, BLOCK_D // 2)
+        q_row = q_ptr + batch_id * stride_qt + q_heads[:, None] * stride_qh
+        q_lo = tl.load(q_row + (2 * j2)[None, :], mask=mask_h[:, None], other=0.0)
+        q_hi = tl.load(q_row + (2 * j2 + 1)[None, :], mask=mask_h[:, None], other=0.0)
+        acc_lo = tl.zeros((BLOCK_H, BLOCK_D // 2), dtype=tl.float32)
+        acc_hi = tl.zeros((BLOCK_H, BLOCK_D // 2), dtype=tl.float32)
+        for rel_start in tl.range(split_start, split_end, BLOCK_N):
+            rel_offs = rel_start + tl.arange(0, BLOCK_N)
+            mask_n = rel_offs < split_end
+            slots = tl.load(
+                indices_ptr + kv_start + effective_start + rel_offs, mask=mask_n, other=0
+            )
+            k_lo, k_hi = nvfp4_halves(
+                k_ptr,
+                kn_ptr,
+                slots[:, None] * stride_ks + kv_head * stride_kh,
+                slots[:, None] * stride_knt + kv_head * stride_knh,
+                mask_n,
+                D,
+            )
+            scores = tl.dot(q_lo, tl.trans(k_lo.to(q_lo.dtype)))
+            scores = (tl.dot(q_hi, tl.trans(k_hi.to(q_hi.dtype)), scores)) * sm_scale
+            scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
+            v_lo, v_hi = nvfp4_halves(
+                v_ptr,
+                vn_ptr,
+                slots[:, None] * stride_vs + kv_head * stride_vh,
+                slots[:, None] * stride_vnt + kv_head * stride_vnh,
+                mask_n,
+                D,
+            )
+            m_new = tl.maximum(tl.max(scores, axis=1), m_i)
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new[:, None])
+            pb = p.to(q_lo.dtype)
+            acc_lo = tl.dot(pb, v_lo.to(q_lo.dtype), acc_lo * alpha[:, None])
+            acc_hi = tl.dot(pb, v_hi.to(q_lo.dtype), acc_hi * alpha[:, None])
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            m_i = m_new
+        mid_row = (
+            mid_o_ptr
+            + batch_id * stride_mid_ob
+            + q_heads[:, None] * stride_mid_oh
+            + split_id * stride_mid_os
+        )
+        tl.store(mid_row + (2 * j2)[None, :], acc_lo / l_i[:, None], mask=mask_h[:, None])
+        tl.store(mid_row + (2 * j2 + 1)[None, :], acc_hi / l_i[:, None], mask=mask_h[:, None])
+        lse_offsets = batch_id * stride_lse_b + q_heads * stride_lse_h + split_id * stride_lse_s
+        tl.store(mid_lse_ptr + lse_offsets, m_i + tl.log(l_i), mask=mask_h)
+    elif split_end > split_start:
         q = tl.load(q_ptr + q_offsets, mask=mask_h[:, None] & mask_d[None, :], other=0.0)
         if not COMPRESSED:
             q = q.to(k_ptr.dtype.element_ty)

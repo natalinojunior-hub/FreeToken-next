@@ -75,9 +75,20 @@ class TritonMetadata(BaseAttnMetadata):
     fi_prefill: bool = False  # planned on the FlashInfer fp8 prefill wrapper
     num_kv_splits: torch.Tensor | None = None
     swa_indices: torch.Tensor | None = None
+    # (q lens, prefix lens, kv lens) per request on the host: the segmented FlashInfer prefill
+    seg_lens: tuple[list[int], list[int], list[int]] | None = None
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q_gpu[1 : 1 + bs] - 1
+
+
+def _merge_lse(o1, lse1, o2, lse2):
+    """Merge two attention partials over disjoint keys (FlashInfer's base-2 LSE), in fp32."""
+    m = torch.maximum(lse1, lse2)
+    w1, w2 = torch.exp2(lse1 - m), torch.exp2(lse2 - m)
+    den = w1 + w2
+    o = (o1.float() * (w1 / den).unsqueeze(-1) + o2.float() * (w2 / den).unsqueeze(-1)).to(o1.dtype)
+    return o, m + torch.log2(den)
 
 
 class TritonAttentionBackend(BaseAttnBackend):
@@ -106,6 +117,7 @@ class TritonAttentionBackend(BaseAttnBackend):
             self.max_kv_splits = max(self.max_kv_splits, 2 * sms // max(1, kv_heads))
         self._fi_kv_heads = min((g.num_kv_heads for g in kv_groups), default=1)
         self._fi_prefill = self._make_fi_fp8_prefill(kv_groups)
+        self._seg_kv = self._make_segment_scratch(kv_groups)
 
     def _ensure_decode_scratch(
         self,
@@ -252,6 +264,16 @@ class TritonAttentionBackend(BaseAttnBackend):
             v8 = v_cache.view(torch.float8_e4m3fn).view(-1, 1, kv_heads, head_dim)
             return self._fi_prefill.run(q, (k8, v8))
         if (
+            metadata.seg_lens is not None
+            and turbo is not None
+            and q.dtype == torch.bfloat16
+            and spec.sliding_window is None
+            and spec.sinks is None
+            and spec.sm_scale is None
+            and block_ends is None
+        ):
+            return self._segmented_prefill(q, k, v, turbo, k_cache, v_cache, metadata, scale)
+        if (
             (not metadata.is_decode)
             and q.dtype in (torch.float16, torch.bfloat16)
             and (q.shape[-1] <= 256 or metadata.max_q_len >= self.prefill_tile_min_q)
@@ -379,6 +401,71 @@ class TritonAttentionBackend(BaseAttnBackend):
         ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=self.device)
         return BatchPrefillWithPagedKVCacheWrapper(ws, kv_layout="NHD", backend="fa2")
 
+    # Bytes of the bf16 K+V scratch one prefix segment is dequantized into.
+    _SEGMENT_SCRATCH_BYTES = 64 << 20
+
+    def _make_segment_scratch(self, kv_groups):
+        """Prefill over a coded (nvfp4 / turbo) prefix: each segment of it is dequantized into
+        this bounded bf16 scratch and attended by FlashInfer, the chunk itself causally, and the
+        partial outputs merge by log-sum-exp. Built with the backend, so it is in the startup
+        VRAM account. The triton extend kernel it replaces ran at ~20% of tensor peak."""
+        book = getattr(self.kvcache, "book", None)
+        if (
+            self.device.type != "cuda"
+            or not getattr(self.kvcache, "compressed", False)
+            or book in (None, "fp8")
+            or getattr(self.kvcache, "swa_paged", False)
+            or self.max_head_dim not in (64, 128, 256)
+            or len({g.head_dim for g in kv_groups}) > 1
+        ):
+            return None
+        try:
+            import flashinfer  # noqa: F401
+        except ImportError:
+            return None
+        heads = max(g.num_kv_heads for g in kv_groups)
+        per_token = 2 * heads * self.max_head_dim * 2
+        rows = max(1024, self._SEGMENT_SCRATCH_BYTES // per_token // 1024 * 1024)
+        shape = (rows, heads, self.max_head_dim)
+        return (
+            torch.empty(shape, dtype=torch.bfloat16, device=self.device),
+            torch.empty(shape, dtype=torch.bfloat16, device=self.device),
+        )
+
+    def _segmented_prefill(self, q, k, v, turbo, k_raw, v_raw, metadata, scale):
+        from flashinfer import single_prefill_with_kv_cache
+
+        from freetoken.kernel.triton.turbo_attn import dequant_rows
+
+        seg_k, seg_v = self._seg_kv
+        rows = seg_k.shape[0]
+        heads, dim = k_raw.shape[1], q.shape[-1]
+        k = k.view(q.shape[0], heads, dim)
+        v = v.view(q.shape[0], heads, dim)
+        out = torch.empty_like(q)
+        q0 = kv0 = 0
+        for q_len, prefix, kv_len in zip(*metadata.seg_lens):
+            if q_len:
+                qr = q[q0 : q0 + q_len]
+                o, lse = single_prefill_with_kv_cache(
+                    qr, k[q0 : q0 + q_len], v[q0 : q0 + q_len],
+                    causal=True, sm_scale=scale, return_lse=True,
+                )  # fmt: skip
+                for s0 in range(0, prefix, rows):
+                    n = min(rows, prefix - s0)
+                    slots = metadata.indices[kv0 + s0 : kv0 + s0 + n]
+                    sk, sv = seg_k[:n, :heads], seg_v[:n, :heads]
+                    dequant_rows(k_raw, turbo["k_norm"], turbo["cent"], slots, turbo["book"], sk)
+                    dequant_rows(v_raw, turbo["v_norm"], turbo["cent"], slots, turbo["book"], sv)
+                    o2, lse2 = single_prefill_with_kv_cache(
+                        qr, sk, sv, causal=False, sm_scale=scale, return_lse=True
+                    )
+                    o, lse = _merge_lse(o, lse, o2, lse2)
+                out[q0 : q0 + q_len] = o
+            q0 += q_len
+            kv0 += kv_len
+        return out
+
     def reset_capture(self) -> None:
         super().reset_capture()
         self._verify = {}
@@ -445,6 +532,9 @@ class TritonAttentionBackend(BaseAttnBackend):
                 kv_data_type=torch.float8_e4m3fn,
             )
             fi_prefill = True
+        seg_lens = None
+        if self._seg_kv is not None and not is_decode and swa_indices is None:
+            seg_lens = (seqlens_q, cached_lens, seqlens_k)
         batch.attn_metadata = TritonMetadata(
             fi_prefill=fi_prefill,
             cu_seqlens_q_gpu=cu_seqlens_q_gpu,
@@ -456,6 +546,7 @@ class TritonAttentionBackend(BaseAttnBackend):
             prefix_lens=prefix_lens,
             max_q_len=max(seqlens_q),
             swa_indices=swa_indices,
+            seg_lens=seg_lens,
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
