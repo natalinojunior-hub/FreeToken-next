@@ -393,6 +393,29 @@ class SchedulerSpecMixin:
                 )
         return out
 
+    def _fill_mtp_kv(self, req: Req) -> None:
+        """Write the NextN layer's KV for the committed positions the draft chain skipped
+        (see run_spec_step's commit); logits are not needed."""
+        rows = getattr(self, "_mtp_kv_rows", None)
+        self._mtp_kv_rows = None
+        if rows is None or rows[0] != req.uid:
+            return
+        _, pos0, residual, tokens = rows
+        n = residual.shape[0]
+        saved = req.cached_len, req.device_len
+        req.cached_len, req.device_len = pos0, pos0 + n
+        fb = Batch(reqs=[req], phase="prefill")
+        fb.padded_reqs = [req]
+        fb.positions = torch.arange(pos0, pos0 + n, dtype=torch.int32, device=self.device)
+        if self._model_is_mrope:
+            fb.mrope_positions = _spec_mrope_positions(req, pos0, pos0 + n, self.device)
+        fb.out_loc = self.engine.page_table[req.table_idx, pos0 : pos0 + n]
+        fb.input_ids = tokens
+        self.engine.attn_backend.prepare_metadata(fb)
+        with self.engine.ctx.forward_batch(fb):
+            self.engine.model.mtp.forward(residual, tokens, fb)
+        req.cached_len, req.device_len = saved
+
     def run_spec_step(self) -> bool:
         """Run one speculative decode step for the single eligible request. Returns True if
         it ran (the caller should skip its own _schedule_next_batch/_forward this iteration)."""
@@ -454,6 +477,8 @@ class SchedulerSpecMixin:
             snap_slot = self._spec_snapshot_slot(req)
             pool.copy_from(self._linear_slot(req), snap_slot)
         residual_snapshot = model.model._last_residual[-1:].clone()
+
+        self._fill_mtp_kv(req)
 
         # ---- draft chain: k autoregressive steps through the draft head's own QSA slot ----
         r_prev = model.model._last_residual[-1:].clone()
@@ -567,6 +592,17 @@ class SchedulerSpecMixin:
         # (verify_forward overwrites it; we need the residual of the last accepted token)
         last_res = getattr(model.model, "_last_residual", None)
         if last_res is not None and last_res.shape[0] >= p + committed:
+            if committed > 1:
+                # The draft chain only wrote the NextN layer's KV at its own positions, from
+                # draft hiddens; positions d .. d+committed-2 need it from the target's hidden
+                # (row j = h_{d-1+j}) and the committed token there, or later drafts attend
+                # to holes / draft-state KV. Filled before the next chain (_fill_mtp_kv).
+                self._mtp_kv_rows = (
+                    req.uid,
+                    d,
+                    last_res[p : p + committed - 1].clone(),
+                    out.next_tokens_gpu[p : p + committed - 1].clone(),
+                )
             model.model._last_residual = last_res[p + committed - 1 : p + committed].clone()
 
         if committed <= k:
