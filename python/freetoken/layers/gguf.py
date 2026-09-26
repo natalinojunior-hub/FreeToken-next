@@ -36,6 +36,8 @@ TP is assumed to be 1 (the gemma4 GGUF path restricts to TP=1, like the HF path)
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from freetoken.models.gguf.dequant import (
@@ -63,6 +65,26 @@ from .base import BaseOP
 
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
 _MMVQ_SAFE = 6
+
+
+# Prefill-sized GEMMs over dequantized GGUF weights run on the fp8 tensor cores (per-token /
+# per-channel dynamic scales): 2x the bf16 rate, where bf16 already sat at the tensor roof.
+_FP8_PREFILL_MIN_ROWS = 256
+
+
+def _fp8_prefill_ok(x: torch.Tensor, n: int, k: int) -> bool:
+    if (
+        x.shape[0] < _FP8_PREFILL_MIN_ROWS
+        or not x.is_cuda
+        or x.dtype not in (torch.bfloat16, torch.float16)
+        or n % 16
+        or k % 16
+        or os.getenv("FREETOKEN_GGUF_FP8_PREFILL", "1") == "0"
+    ):
+        return False
+    from freetoken.kernel.triton.fp8_pertensor_linear import rowwise_scaled_mm_ok
+
+    return torch.cuda.get_device_capability(x.device) >= (8, 9) and rowwise_scaled_mm_ok()
 
 
 def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> torch.Tensor:
@@ -108,6 +130,10 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
         block, type_size = BLOCK_SHAPE[qweight_type]
         in_features = qweight.shape[1] // type_size * block
         weight = ggml_dequantize(qweight, qweight_type, out_features, in_features, x.dtype)
+        if _fp8_prefill_ok(x, out_features, in_features):
+            from freetoken.kernel.triton.fp8_pertensor_linear import fp8_rowwise_matmul
+
+            return fp8_rowwise_matmul(x, weight)
         return x @ weight.T
     raise NotImplementedError(f"unsupported GGUF type {GGML_NAME.get(qweight_type, qweight_type)}")
 

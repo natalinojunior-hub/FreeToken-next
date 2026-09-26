@@ -460,3 +460,44 @@ def fp8_pertensor_linear(
 
 # ======================================================================================
 # ======================================================================================
+
+
+@triton.jit
+def _rowwise_quant_kernel(
+    x_ptr, out_ptr, scale_ptr, K, stride_x, stride_xk, stride_o, BLOCK: tl.constexpr
+):
+    """One row -> fp8-e4m3 under its own dynamic scale ``amax / 448`` (two passes over K)."""
+    row = tl.program_id(0).to(tl.int64)
+    amax = tl.zeros([BLOCK], dtype=tl.float32)
+    for k0 in range(0, K, BLOCK):
+        offs = k0 + tl.arange(0, BLOCK)
+        v = tl.load(x_ptr + row * stride_x + offs * stride_xk, mask=offs < K, other=0.0).to(tl.float32)
+        amax = tl.maximum(amax, tl.abs(v))
+    scale = tl.maximum(tl.max(amax, 0), 1e-12) / 448.0
+    tl.store(scale_ptr + row, scale)
+    inv = 1.0 / scale
+    for k0 in range(0, K, BLOCK):
+        offs = k0 + tl.arange(0, BLOCK)
+        v = tl.load(x_ptr + row * stride_x + offs * stride_xk, mask=offs < K, other=0.0).to(tl.float32)
+        v = tl.minimum(tl.maximum(v * inv, -448.0), 448.0)
+        tl.store(out_ptr + row * stride_o + offs, v.to(tl.float8e4nv), mask=offs < K)
+
+
+def rowwise_quant_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``x [R, K]`` -> ``(fp8 [R, K], fp32 scale [R, 1])`` with ``x ~= fp8 * scale`` per row."""
+    rows, k = x.shape
+    out = torch.empty((rows, k), dtype=FP8, device=x.device)
+    scale = torch.empty((rows, 1), dtype=torch.float32, device=x.device)
+    if rows:
+        _rowwise_quant_kernel[(rows,)](
+            x, out, scale, k, x.stride(0), x.stride(1), out.stride(0), BLOCK=1024
+        )
+    return out, scale
+
+
+def fp8_rowwise_matmul(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``x @ weight.T`` on the fp8 tensor cores (2x the bf16 rate on consumer Blackwell/Ada):
+    per-token activation and per-output-channel weight scales, bf16/fp16 out."""
+    a8, sa = rowwise_quant_fp8(x)
+    w8, sw = rowwise_quant_fp8(weight)
+    return torch._scaled_mm(a8, w8.t(), scale_a=sa, scale_b=sw.t(), out_dtype=x.dtype)
