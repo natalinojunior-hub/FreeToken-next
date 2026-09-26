@@ -124,7 +124,25 @@ def _tuned_spec_mtp(kwargs: dict) -> int:
 
     model_path = os.path.expanduser(kwargs["model_path"])
     profile = load_for(model_path, kwargs["kv_format"], kwargs["max_seq_len_override"])
-    return profile.chosen.spec_mtp if profile is not None else ServerArgs.spec_mtp
+    if profile is not None:
+        return profile.chosen.spec_mtp
+    return 1 if _native_nextn_layers(model_path) else ServerArgs.spec_mtp
+
+
+def _native_nextn_layers(model_path: str) -> int:
+    """NextN/MTP blocks a GGUF carries in-file (``<arch>.nextn_predict_layers``). Measured
+    (campaign 20, server, 256 decode): k=1 beats k=0 on every such model at 16K-128K
+    (Tiel +32/+22/+12%, Ornith +26/+14%, 27B +26% at 16K); k>=2 loses to k=1 (draft
+    acceptance falls with depth). Engines that cannot fit the context with MTP drop it."""
+    from freetoken.models.gguf.reader import gguf_architecture, is_gguf_path, load_gguf_metadata
+
+    try:
+        if not is_gguf_path(model_path):
+            return 0
+        meta = load_gguf_metadata(model_path)
+        return int(meta.get(f"{gguf_architecture(model_path)}.nextn_predict_layers", 0) or 0)
+    except Exception:  # noqa: BLE001 -- an unreadable header just leaves MTP at its default
+        return 0
 
 
 def parse_args(

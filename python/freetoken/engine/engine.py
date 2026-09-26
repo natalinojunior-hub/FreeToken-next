@@ -65,6 +65,7 @@ from freetoken.kvcache.linear_state_pool import (
     _linear_pool_min_slots,
     _linear_pool_num_slots,
     spec_state_steps,
+    spec_state_bytes,
     state_pool_bytes,
 )
 
@@ -235,6 +236,30 @@ _KV_FIT_LADDER = {
     frozenset({AttnType.FULL}): ("fp8", "nvfp4", "turbo3"),
     "qsa": ("auto", "turbo4", "turbo3"),
 }
+
+
+def _with_format(config, fmt: str):
+    """A shallow view of ``config`` at KV format ``fmt`` (pricing only)."""
+    import copy
+
+    view = copy.copy(config)
+    object.__setattr__(view, "kv_format", fmt)
+    return view
+
+
+def _shed_mtp(config) -> bool:
+    """The context is the user's one setting and MTP only an optimization: when even the
+    narrowest KV format cannot hold the context, speculative decoding (its per-row verify
+    states and graphs) is turned off before the context is refused. True if it was on."""
+    k = getattr(config, "spec_mtp", 0)
+    if k <= 0:
+        return False
+    logger.warning_rank0(
+        f"--spec-mtp {k} -> 0: {config.max_seq_len} tokens of context need the VRAM its verify "
+        "state takes (speculative decoding off, context kept)"
+    )
+    object.__setattr__(config, "spec_mtp", 0)
+    return True
 
 
 def _kv_fit_ladder(config) -> tuple[str, ...]:
@@ -643,11 +668,39 @@ class Engine:
         available_memory -= self._host_reserve_bytes
         device_pages = self._pool_cls.solve_num_pages(config, available_memory)
         want = getattr(config, "max_seq_len_override", None) or config.max_seq_len
+        first_fmt = config.kv_format
         for fmt in _kv_fit_ladder(config):
             if (device_pages + self.host_pages) * config.page_size >= want:
                 break
             self._set_kv_format(config, fmt)
             device_pages = self._pool_cls.solve_num_pages(config, available_memory)
+        fits = (device_pages + self.host_pages) * config.page_size >= want
+        if getattr(config, "spec_mtp", 0) > 0 and (not fits or config.kv_format != first_fmt):
+            # MTP must not cost a KV rung: price the context without its verify states and
+            # draft weights, and keep MTP only when that would not buy a wider format.
+            mtp_fmt, extra = config.kv_format, self._mtp_bytes(config)
+            fmts = (first_fmt, *_kv_fit_ladder(_with_format(config, first_fmt)))
+            k0_fmt = next(
+                (
+                    f
+                    for f in fmts
+                    if (
+                        resolve_pool_class(config.model_config, f).solve_num_pages(
+                            _with_format(config, f), available_memory + extra
+                        )
+                        + self.host_pages
+                    )
+                    * config.page_size
+                    >= want
+                ),
+                None,
+            )
+            if k0_fmt is not None and (not fits or fmts.index(k0_fmt) < fmts.index(mtp_fmt)):
+                _shed_mtp(config)
+                self._release_mtp()
+                available_memory += extra
+                self._set_kv_format(config, k0_fmt)
+                device_pages = self._pool_cls.solve_num_pages(config, available_memory)
         self.num_pages = device_pages + self.host_pages
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
@@ -1187,6 +1240,23 @@ class Engine:
             )
         )
 
+    def _mtp_bytes(self, config: EngineConfig) -> int:
+        """Device bytes MTP holds that k=0 would not: the per-row verify states and the draft
+        block's own weights (its embedding is the target's, shared)."""
+        mtp = getattr(self.model, "mtp", None)
+        own = {}
+        if mtp is not None:
+            for t in mtp.state_dict().values():  # "_" attributes (the shared embedding) skipped
+                if t.is_cuda:
+                    own[t.data_ptr()] = t.nbytes
+        return spec_state_bytes(config) + sum(own.values())
+
+    def _release_mtp(self) -> None:
+        if getattr(self.model, "mtp", None) is not None:
+            self.model.mtp = None
+            gc.collect()
+            torch.cuda.empty_cache()
+
     def _set_kv_format(self, config: EngineConfig, fmt: str) -> None:
         """Step the auto KV format down one rung (same attention backend family: fp8, nvfp4 and
         turbo all run on the coded-KV backend chosen for fp8; QSA keeps qsa_sparse)."""
@@ -1379,6 +1449,7 @@ class Engine:
             from .memory_planner import ContextInfeasible
 
             ladder = list(_kv_fit_ladder(config))
+            first_fmt = config.kv_format
             while True:
                 planner = create_memory_planner(
                     config=config,
@@ -1409,9 +1480,13 @@ class Engine:
                         host_pages=self.host_pages,
                     )
                 except ContextInfeasible:
-                    if not ladder:
+                    if ladder:
+                        self._set_kv_format(config, ladder.pop(0))
+                    elif not _shed_mtp(config):
                         raise
-                    self._set_kv_format(config, ladder.pop(0))
+                    else:  # the ladder starts over without MTP's states
+                        self._set_kv_format(config, first_fmt)
+                        ladder = list(_kv_fit_ladder(config))
                     continue
                 break
 
