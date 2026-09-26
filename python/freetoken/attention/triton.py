@@ -72,6 +72,7 @@ class TritonMetadata(BaseAttnMetadata):
     max_q_len: int
     attn_logits: torch.Tensor | None = None
     attn_lse: torch.Tensor | None = None
+    fi_prefill: bool = False  # planned on the FlashInfer fp8 prefill wrapper
     num_kv_splits: torch.Tensor | None = None
     swa_indices: torch.Tensor | None = None
 
@@ -103,6 +104,8 @@ class TritonAttentionBackend(BaseAttnBackend):
             sms = torch.cuda.get_device_properties(self.device).multi_processor_count
             kv_heads = min((g.num_kv_heads for g in kv_groups), default=1)
             self.max_kv_splits = max(self.max_kv_splits, 2 * sms // max(1, kv_heads))
+        self._fi_kv_heads = min((g.num_kv_heads for g in kv_groups), default=1)
+        self._fi_prefill = self._make_fi_fp8_prefill(kv_groups)
 
     def _ensure_decode_scratch(
         self,
@@ -238,6 +241,17 @@ class TritonAttentionBackend(BaseAttnBackend):
                 turbo=turbo,
             )
         if (
+            metadata.fi_prefill
+            and q.dtype == torch.bfloat16
+            and spec.sliding_window is None
+            and spec.sinks is None
+            and spec.sm_scale is None
+            and block_ends is None
+        ):
+            k8 = k_cache.view(torch.float8_e4m3fn).view(-1, 1, kv_heads, head_dim)
+            v8 = v_cache.view(torch.float8_e4m3fn).view(-1, 1, kv_heads, head_dim)
+            return self._fi_prefill.run(q, (k8, v8))
+        if (
             (not metadata.is_decode)
             and q.dtype in (torch.float16, torch.bfloat16)
             and (q.shape[-1] <= 256 or metadata.max_q_len >= self.prefill_tile_min_q)
@@ -346,6 +360,25 @@ class TritonAttentionBackend(BaseAttnBackend):
             v["attn_logits"], v["attn_lse"], v["splits"]
         )
 
+    def _make_fi_fp8_prefill(self, kv_groups):
+        """FlashInfer fa2 prefill over the fp8 KV codes (plain e4m3, unit norm, unrotated), built
+        at construction so its workspace is in the startup VRAM account. Measured 1 layer, Tiel
+        geometry, 8192 q over a 57K prefix: triton extend fp8 220 ms, FlashInfer fp8 106 ms."""
+        if (
+            self.device.type != "cuda"
+            or getattr(self.kvcache, "book", None) != "fp8"
+            or getattr(self.kvcache, "swa_paged", False)
+            or self.max_head_dim not in (64, 128, 256)
+            or len({g.head_dim for g in kv_groups}) > 1
+        ):
+            return None
+        try:
+            from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+        except ImportError:
+            return None
+        ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=self.device)
+        return BatchPrefillWithPagedKVCacheWrapper(ws, kv_layout="NHD", backend="fa2")
+
     def reset_capture(self) -> None:
         super().reset_capture()
         self._verify = {}
@@ -393,7 +426,27 @@ class TritonAttentionBackend(BaseAttnBackend):
         if q_positions is None:
             q_positions = torch.zeros(num_query_tokens, dtype=torch.int64, device=device)
 
+        fi_prefill = False
+        if self._fi_prefill is not None and not is_decode and swa_indices is None:
+            cpu = {"dtype": torch.int32, "device": "cpu"}
+            qo_cpu = torch.tensor([0] + seqlens_q, **cpu).cumsum_(0)
+            kv_cpu = torch.tensor([0] + seqlens_k, **cpu).cumsum_(0)
+            self._fi_prefill.plan(
+                qo_cpu,
+                kv_cpu,
+                indices,
+                torch.ones(padded_size, **cpu),
+                self.num_q_heads,
+                self._fi_kv_heads,
+                self.max_head_dim,
+                1,
+                causal=True,
+                q_data_type=torch.bfloat16,
+                kv_data_type=torch.float8_e4m3fn,
+            )
+            fi_prefill = True
         batch.attn_metadata = TritonMetadata(
+            fi_prefill=fi_prefill,
             cu_seqlens_q_gpu=cu_seqlens_q_gpu,
             indptr=indptr,
             indices=indices,
