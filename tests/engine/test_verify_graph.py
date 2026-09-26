@@ -29,7 +29,7 @@ DEV = torch.device("cuda")
 def test_verify_graph_tokens(monkeypatch):
     assert verify_graph_tokens(1) == SIZES
     assert verify_graph_tokens(0) == ()
-    assert verify_graph_tokens(2) == ()  # only k=1 is captured
+    assert verify_graph_tokens(3) == (2, 3, 4)  # every adaptive k' + 1 rows; no defer extras
     monkeypatch.setenv(VERIFY_GRAPH_ENV, "0")
     assert verify_graph_tokens(1) == ()
 
