@@ -52,7 +52,7 @@ def mtp_draft_logits(model, residual: torch.Tensor) -> torch.Tensor:
     """Draft-step logits over the draft vocabulary (argmax index == token id)."""
     hidden = model.mtp.to_head(residual)
     head = model.lm_head
-    n = int(os.getenv(MTP_DRAFT_VOCAB_ENV, "32768"))
+    n = int(os.getenv(MTP_DRAFT_VOCAB_ENV, "65536"))
     qweight = getattr(head, "qweight", None)
     if n <= 0 or qweight is None or qweight.dim() != 2 or n >= qweight.shape[0]:
         return head.forward(hidden)
