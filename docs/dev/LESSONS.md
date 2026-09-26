@@ -283,3 +283,5 @@
 - **Parâmetro novo aceito mas ignorado (gdn_decode_fla intermediate buffer)** -> `str.replace` em script de edição sem assert não achou o trecho -> **fix:** todo replace de edição com `assert s.count(a)==1`; teste unitário do kernel antes do A/B no modelo.
 - **GPU idle: usage_eval waiting forever** -> `cert.py` already takes `flock gpu.lock` inside; wrapping it in an outer `flock` deadlocks -> **fix:** never wrap cert/quality harnesses in flock; only wrap raw scripts.
 - **Orphaned `spawn_main`/`resource_tracker` procs after offline runs** -> `os._exit(0)` in the offline script skips multiprocessing cleanup -> **fix:** kill leftovers by PID after runs; prefer normal exit when feasible.
+- **Disco / cheio (414 MB livres), testes falhando com "No space left"** -> `/tmp/pytest-of-natal` acumulou 26 GB de tmp_path -> **fix:** apagar `/tmp/pytest-of-*` (descartável) e sobras `tmpxft_*` do nvcc.
+- **cvt.rn.f16x2.e2m1x2 com byte inteiro dá zeros/valores errados sob strides de runtime** -> operando .b8 mal compilado (mov.b32 unpack e cvt.u8.u32) -> **fix:** decodificar e2m1 com inteiros para bits fp16 × 2^14 (exato).
