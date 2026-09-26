@@ -368,24 +368,27 @@ class SchedulerSpecMixin:
         """One MTP draft step at ``pos``: (next residual, logits, argmax token)."""
         db = Batch(reqs=[req], phase="prefill")
         db.padded_reqs = [req]
-        db.positions = torch.tensor([pos], dtype=torch.int32, device=self.device)
+        n = residual.shape[0]  # fill rows + the draft row (the last)
+        db.positions = torch.arange(pos, pos + n, dtype=torch.int32, device=self.device)
         if self._model_is_mrope:
-            db.mrope_positions = _spec_mrope_positions(req, pos, pos + 1, self.device)
-        db.out_loc = self.engine.page_table[req.table_idx, pos : pos + 1]
+            db.mrope_positions = _spec_mrope_positions(req, pos, pos + n, self.device)
+        db.out_loc = self.engine.page_table[req.table_idx, pos : pos + n]
         db.input_ids = token
         db.spec_logits_indices = torch.arange(1, device=self.device)
         self.engine.attn_backend.prepare_metadata(db)
         runner = self.engine.graph_runner
-        if runner is not None and runner.draft is not None:
+        if runner is not None and n in runner.drafts:
             if os.getenv(DRAFT_GRAPH_CHECK_ENV, "0") != "1":
                 return runner.replay_draft(db, residual, token)
             got = [t.clone() for t in runner.replay_draft(db, residual, token)]
         model = self.engine.model
         with self.engine.ctx.forward_batch(db):
-            r = model.mtp.forward(residual, token, db)
-            logits = model.lm_head.forward(model.mtp.to_head(r))
+            r = model.mtp.forward(residual, token, db)[-1:]
+            from freetoken.engine.graph import mtp_draft_logits
+
+            logits = mtp_draft_logits(model, r)
         out = (r, logits, torch.argmax(logits, dim=-1))
-        if runner is not None and runner.draft is not None:
+        if runner is not None and n in runner.drafts:
             bad = [i for i, (g, e) in enumerate(zip(got, out)) if not torch.equal(g, e)]
             if bad:
                 raise AssertionError(
@@ -393,28 +396,14 @@ class SchedulerSpecMixin:
                 )
         return out
 
-    def _fill_mtp_kv(self, req: Req) -> None:
-        """Write the NextN layer's KV for the committed positions the draft chain skipped
-        (see run_spec_step's commit); logits are not needed."""
+    def _take_mtp_fill(self, req: Req):
+        """(residual rows, tokens) for the committed positions the last draft chain skipped
+        (see run_spec_step's commit), or None; they are prepended to the first draft step."""
         rows = getattr(self, "_mtp_kv_rows", None)
         self._mtp_kv_rows = None
-        if rows is None or rows[0] != req.uid:
-            return
-        _, pos0, residual, tokens = rows
-        n = residual.shape[0]
-        saved = req.cached_len, req.device_len
-        req.cached_len, req.device_len = pos0, pos0 + n
-        fb = Batch(reqs=[req], phase="prefill")
-        fb.padded_reqs = [req]
-        fb.positions = torch.arange(pos0, pos0 + n, dtype=torch.int32, device=self.device)
-        if self._model_is_mrope:
-            fb.mrope_positions = _spec_mrope_positions(req, pos0, pos0 + n, self.device)
-        fb.out_loc = self.engine.page_table[req.table_idx, pos0 : pos0 + n]
-        fb.input_ids = tokens
-        self.engine.attn_backend.prepare_metadata(fb)
-        with self.engine.ctx.forward_batch(fb):
-            self.engine.model.mtp.forward(residual, tokens, fb)
-        req.cached_len, req.device_len = saved
+        if rows is None or rows[0] != req.uid or rows[1] + rows[2].shape[0] != req.device_len - 1:
+            return None
+        return rows[2], rows[3]
 
     def run_spec_step(self) -> bool:
         """Run one speculative decode step for the single eligible request. Returns True if
@@ -478,7 +467,7 @@ class SchedulerSpecMixin:
             pool.copy_from(self._linear_slot(req), snap_slot)
         residual_snapshot = model.model._last_residual[-1:].clone()
 
-        self._fill_mtp_kv(req)
+        fill = self._take_mtp_fill(req)
 
         # ---- draft chain: k autoregressive steps through the draft head's own QSA slot ----
         r_prev = model.model._last_residual[-1:].clone()
@@ -489,8 +478,12 @@ class SchedulerSpecMixin:
             # prepare_metadata (e.g. qsa_sparse) reads req.cached_len/device_len for
             # seqlens_k/extend_len; at i >= 1 the draft's own query must see its own prior
             # draft-step KV, which needs these advanced per step, not left at the entry value.
-            req.cached_len, req.device_len = d - 1 + i, d + i
-            r_prev, logits, tok_prev = self._draft_step(req, d - 1 + i, r_prev, tok_prev)
+            pos, r_in, tok_in = d - 1 + i, r_prev, tok_prev
+            if i == 0 and fill is not None:  # NextN-KV fill rows ride the first draft step
+                pos = d - 1 - fill[0].shape[0]
+                r_in, tok_in = torch.cat([fill[0], r_prev]), torch.cat([fill[1], tok_prev])
+            req.cached_len, req.device_len = pos, d + i
+            r_prev, logits, tok_prev = self._draft_step(req, pos, r_in, tok_in)
             drafts.append(int(tok_prev.item()))
             trace_token(
                 kind="spec_draft",
@@ -596,7 +589,7 @@ class SchedulerSpecMixin:
                 # The draft chain only wrote the NextN layer's KV at its own positions, from
                 # draft hiddens; positions d .. d+committed-2 need it from the target's hidden
                 # (row j = h_{d-1+j}) and the committed token there, or later drafts attend
-                # to holes / draft-state KV. Filled before the next chain (_fill_mtp_kv).
+                # to holes / draft-state KV. Prepended to the next chain's first draft step (_take_mtp_fill).
                 self._mtp_kv_rows = (
                     req.uid,
                     d,

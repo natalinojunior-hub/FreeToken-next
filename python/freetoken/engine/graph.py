@@ -42,6 +42,25 @@ def draft_graph_enabled(model: object) -> bool:
 SPEC_DEFER_MAX = 2
 
 
+# Draft vocabulary: MTP drafts score only the first N token ids (BPE ids are merge-ranked, so
+# the head of the vocabulary is the frequent part -- FR-Spec's observation). The verify still
+# scores the full vocabulary, so this changes only which drafts are proposed, never the output.
+MTP_DRAFT_VOCAB_ENV = "FREETOKEN_MTP_DRAFT_VOCAB"
+
+
+def mtp_draft_logits(model, residual: torch.Tensor) -> torch.Tensor:
+    """Draft-step logits over the draft vocabulary (argmax index == token id)."""
+    hidden = model.mtp.to_head(residual)
+    head = model.lm_head
+    n = int(os.getenv(MTP_DRAFT_VOCAB_ENV, "32768"))
+    qweight = getattr(head, "qweight", None)
+    if n <= 0 or qweight is None or qweight.dim() != 2 or n >= qweight.shape[0]:
+        return head.forward(hidden)
+    from freetoken.layers.gguf import fused_mul_mat_gguf
+
+    return fused_mul_mat_gguf(hidden, qweight[:n], head._quant_type)
+
+
 def verify_graph_tokens(spec_mtp: int) -> tuple[int, ...]:
     """Row counts of the captured spec-verify windows, empty for an eager verify: every
     k' + 1 for an adaptive k' <= k, plus (k=1 only) up to SPEC_DEFER_MAX deferred-replay
@@ -236,13 +255,17 @@ class GraphRunner:
         self.kv_replay_check = kv_replay_check
         self.device = device
         self.verify_graphs: dict[int, VerifyGraph] = {}
-        self.draft: DraftGraph | None = None
+        self.draft: DraftGraph | None = None  # the 1-row step (drafts[1])
+        self.drafts: Dict[int, DraftGraph] = {}
         self._capture_graphs(max_seq_len, vocab_size, model)
         if self.graph_map:
             for tokens in verify_tokens:
                 self._capture_verify(model, tokens, vocab_size)
             if verify_tokens and draft_graph_enabled(model):
-                self._capture_draft(model, vocab_size)
+                # rows = NextN-KV fill rows (committed - 1 <= k) + the draft row
+                for rows in range(1, max(verify_tokens) + 1):
+                    self._capture_draft(model, vocab_size, rows)
+                self.draft = self.drafts.get(1)
 
     def _reset_moe_offload_cache(self) -> None:
         if self.moe_offload_cache is not None:
@@ -370,12 +393,12 @@ class GraphRunner:
         self.verify_graphs[tokens] = verify
         logger.info_rank0(f"Captured spec-verify CUDA graph ({tokens} tokens)")
 
-    def _capture_draft(self, model: BaseLLMModel, vocab_size: int) -> None:
+    def _capture_draft(self, model: BaseLLMModel, vocab_size: int, rows: int = 1) -> None:
         """Capture one MTP draft step on the dummy request/page (decode graphs' pool). Any
         failure leaves the draft chain eager."""
         dummy = self.dummy_req
         req = Req(
-            input_ids=torch.zeros(2, dtype=torch.int32),
+            input_ids=torch.zeros(rows + 1, dtype=torch.int32),
             table_idx=dummy.table_idx,
             cached_len=1,
             output_len=1,
@@ -389,12 +412,12 @@ class GraphRunner:
             return
         draft = DraftGraph(
             graph=torch.cuda.CUDAGraph(),
-            residual=torch.zeros(1, ref.shape[1], dtype=ref.dtype, device=device),
-            input_ids=torch.zeros(1, dtype=torch.int32, device=device),
-            positions=torch.ones(1, dtype=torch.int32, device=device),
-            out_loc=get_global_ctx().page_table[dummy.table_idx, 1:2].clone(),
+            residual=torch.zeros(rows, ref.shape[1], dtype=ref.dtype, device=device),
+            input_ids=torch.zeros(rows, dtype=torch.int32, device=device),
+            positions=torch.arange(1, rows + 1, dtype=torch.int32, device=device),
+            out_loc=get_global_ctx().page_table[dummy.table_idx, 1 : rows + 1].clone(),
             mrope_positions=(
-                torch.zeros(3, 1, dtype=torch.int32, device=device) if self.mrope else None
+                torch.zeros(3, rows, dtype=torch.int32, device=device) if self.mrope else None
             ),
             logits_rows=torch.zeros(1, dtype=torch.int64, device=device),
             out_residual=torch.zeros(1, ref.shape[1], dtype=ref.dtype, device=device),
@@ -406,14 +429,14 @@ class GraphRunner:
         draft.bind(batch)
 
         def step():
-            r = model.mtp.forward(draft.residual, draft.input_ids, batch)
-            logits = model.lm_head.forward(model.mtp.to_head(r))
+            r = model.mtp.forward(draft.residual, draft.input_ids, batch)[-1:]
+            logits = mtp_draft_logits(model, r)
             # Copy into the pre-allocated, externally-referenced buffers (see DraftGraph's
             # out_residual/logits/token docstring) instead of returning fresh tensors -- keeps
             # this graph's outputs at addresses the shared capture pool cannot hand to a later
             # graph, exactly like VerifyGraph.logits.copy_(model.forward()) above.
             draft.out_residual.copy_(r)
-            draft.logits.copy_(logits)
+            draft.logits[:, : logits.shape[1]].copy_(logits)
             draft.token.copy_(torch.argmax(logits, dim=-1))
 
         try:
@@ -428,15 +451,15 @@ class GraphRunner:
             return
         finally:
             self._reset_moe_offload_cache()
-        self.draft = draft
-        logger.info_rank0("Captured MTP draft-step CUDA graph")
+        self.drafts[rows] = draft
+        logger.info_rank0(f"Captured MTP draft-step CUDA graph ({rows} rows)")
 
     def replay_draft(
         self, batch: Batch, residual: torch.Tensor, token: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """One draft step on the prepared 1-row ``batch``: (residual, logits, token)."""
-        d = self.draft
-        assert d is not None
+        """One draft step on the prepared ``batch`` (fill rows + the draft row): the last
+        row's (residual, logits, token)."""
+        d = self.drafts[batch.positions.shape[0]]
         d.residual.copy_(residual)
         d.input_ids.copy_(token)
         d.positions.copy_(batch.positions)
@@ -508,5 +531,6 @@ class GraphRunner:
         self.buffer = None
         self.verify_graphs = {}
         self.draft = None
+        self.drafts = {}
         self._pool = None
         gc.collect()

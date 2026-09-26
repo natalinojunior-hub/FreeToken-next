@@ -467,7 +467,7 @@ def test_run_spec_step_k2_rejection_and_acceptance_positions():
             _restore_qsa_state=lambda _req: qsa_restores.append(name),
             _restore_ple_state=lambda _req: ple_restores.append(name),
             _draft_step=None,
-            _fill_mtp_kv=lambda _req: None,
+            _take_mtp_fill=lambda _req: None,
             _prepare_batch=None,
             _checked_verify_forward=None,
             _commit_spec_tokens=None,
