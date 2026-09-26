@@ -35,6 +35,9 @@ class EngineConfig:
     # group as rotated 3/4-bit codes, so the KV a long context buys out of the expert cache is
     # ~4x smaller. Only the triton backend can read coded tiles.
     kv_format: str = "auto"
+    # Set by resolution when kv_format was "auto": the engine may then step the KV format down
+    # (engine._KV_FIT_LADDER) until the requested context fits, before refusing it.
+    kv_format_auto: bool = False
     moe_strategy: str = "auto"
     # old name of moe_strategy; __post_init__ folds it in
     moe_backend: str | None = field(default=None, repr=False)
@@ -93,7 +96,10 @@ class EngineConfig:
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
-    memory_ratio: float = 0.9
+    # Explicit cap only: the ceiling is min(ratio x baseline, baseline - modelled reserve), and
+    # the modelled reserve (vram_ledger) is what protects the runtime peaks -- a 0.9 default
+    # cost ~300 expert slots on Tiel 16K for nothing (campaign 19).
+    memory_ratio: float = 1.0
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.

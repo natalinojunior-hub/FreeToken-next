@@ -475,7 +475,7 @@ class GraphRunner:
             batch.is_prefill
             and batch.spec_logits_indices is not None
             and batch.size == 1
-            and batch.input_ids.shape[0] in self.verify_graphs
+            and batch.reqs[0].extend_len in self.verify_graphs  # input_ids may not be staged yet
             and batch.reqs[0].cached_len > 0
             and batch.mm_embeds is None
         )

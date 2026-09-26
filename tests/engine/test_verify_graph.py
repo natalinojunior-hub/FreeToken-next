@@ -43,19 +43,19 @@ def test_verify_gate():
         spec_logits_indices=torch.arange(TOKENS),
         size=1,
         input_ids=torch.zeros(TOKENS),
-        reqs=[SimpleNamespace(cached_len=5)],
+        reqs=[SimpleNamespace(cached_len=5, extend_len=TOKENS)],
         mm_embeds=None,
     )
     assert runner.can_use_cuda_graph(SimpleNamespace(**ok))
     for change in (
         dict(spec_logits_indices=None),
         dict(size=2),
-        dict(input_ids=torch.zeros(TOKENS + 1)),
-        dict(reqs=[SimpleNamespace(cached_len=0)]),
+        dict(reqs=[SimpleNamespace(cached_len=5, extend_len=TOKENS + 1)]),
+        dict(reqs=[SimpleNamespace(cached_len=0, extend_len=TOKENS)]),
         dict(mm_embeds=torch.zeros(1)),
     ):
         assert not runner.can_use_cuda_graph(SimpleNamespace(**{**ok, **change})), change
-    # pad_batch asks before the verify window has input_ids or spec_logits_indices
+    # pad_batch asks before the verify window has input_ids (the row count comes from the req)
     assert not runner.can_use_cuda_graph(
         SimpleNamespace(is_decode=False, is_prefill=True, spec_logits_indices=None)
     )

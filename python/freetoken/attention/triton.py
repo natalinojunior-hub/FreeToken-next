@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Dict, List
 
 import torch
 from freetoken.core import Batch, get_global_ctx
@@ -85,6 +85,7 @@ class TritonAttentionBackend(BaseAttnBackend):
         self.kvcache = get_global_ctx().kv_cache
         self.device = self.kvcache.device
         self.capture: TritonCaptureData | None = None
+        self._verify: Dict[int, dict] = {}  # spec rows -> static verify/draft buffers
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
         self.max_kv_splits = 8
@@ -278,7 +279,80 @@ class TritonAttentionBackend(BaseAttnBackend):
             sinks=spec.sinks,
         )
 
+    def _spec_rows_metadata(self, batch: Batch) -> bool:
+        """A one-request MTP verify/draft window (<= 8 rows over a cached prefix) becomes a
+        decode batch of one "request" per row, row i seeing prefix + i + 1 tokens (its own KV is
+        stored first, so causality holds). The split-K decode kernel then spreads the long prefix
+        over the SMs; the extend kernel runs one CTA per head over the whole prefix (24-32 CTAs
+        on 84 SMs), which made the verify attention the slow part at long context."""
+        reqs = batch.padded_reqs
+        if (
+            getattr(batch, "spec_logits_indices", None) is None
+            or len(reqs) != 1
+            or reqs[0].cached_len == 0
+            or not 1 <= reqs[0].extend_len <= 8
+            or getattr(self.kvcache, "swa_paged", False)
+            or getattr(batch, "mm_block_ends", None) is not None
+        ):
+            return False
+        req, device = reqs[0], self.device
+        rows, c = req.extend_len, req.cached_len
+        lens = [c + 1 + i for i in range(rows)]
+        base = get_global_ctx().page_table[req.table_idx, : c + rows]
+        positions = getattr(batch, "positions", None)
+        if positions is None:
+            positions = torch.arange(c, c + rows, dtype=torch.int64, device=device)
+        indptr = torch.tensor([0, *lens], dtype=torch.int32, device=device).cumsum_(0)
+        batch.attn_metadata = TritonMetadata(
+            cu_seqlens_q_gpu=torch.arange(rows + 1, dtype=torch.int32, device=device),
+            indptr=indptr,
+            indices=torch.cat([base[:n] for n in lens]),
+            q_to_req=torch.arange(rows, dtype=torch.int32, device=device),
+            q_positions=positions,
+            is_decode=True,
+            prefix_lens=indptr[1:] - 1,
+            max_q_len=1,
+        )
+        return True
+
+    def stage_verify(self, batch: Batch) -> None:
+        """Bind a spec window's row-expanded metadata to static per-row-count buffers so a
+        captured verify/draft graph reads the current window on every replay."""
+        md = batch.attn_metadata
+        assert isinstance(md, TritonMetadata) and md.is_decode
+        rows = md.q_to_req.numel()
+        v = self._verify.get(rows)
+        if v is None:
+            assert not torch.cuda.is_current_stream_capturing()
+            width = get_global_ctx().page_table.shape[1]
+            i32 = {"dtype": torch.int32, "device": self.device}
+            v = self._verify[rows] = dict(
+                cu_q=torch.arange(rows + 1, **i32),
+                indptr=torch.zeros(rows + 1, **i32),
+                indices=torch.zeros(rows * width, **i32),
+                q_to_req=torch.arange(rows, **i32),
+                positions=torch.zeros(rows, dtype=md.q_positions.dtype, device=self.device),
+                prefix=torch.zeros(rows, **i32),
+            )
+            self._ensure_decode_scratch(md, rows, max(1, self.num_q_heads), self.max_head_dim)
+            v.update(attn_logits=md.attn_logits, attn_lse=md.attn_lse, splits=md.num_kv_splits)
+        v["indptr"].copy_(md.indptr)
+        v["indices"][: md.indices.numel()].copy_(md.indices)
+        v["positions"].copy_(md.q_positions)
+        v["prefix"].copy_(md.prefix_lens)
+        md.cu_seqlens_q_gpu, md.indptr, md.indices = v["cu_q"], v["indptr"], v["indices"]
+        md.q_to_req, md.q_positions, md.prefix_lens = v["q_to_req"], v["positions"], v["prefix"]
+        md.attn_logits, md.attn_lse, md.num_kv_splits = (
+            v["attn_logits"], v["attn_lse"], v["splits"]
+        )
+
+    def reset_capture(self) -> None:
+        super().reset_capture()
+        self._verify = {}
+
     def prepare_metadata(self, batch: Batch) -> None:
+        if self._spec_rows_metadata(batch):
+            return
         reqs = batch.padded_reqs
         device = self.device
         ctx = get_global_ctx()

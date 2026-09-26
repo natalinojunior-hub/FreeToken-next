@@ -59,6 +59,10 @@ from .vram_ledger import (
 
 logger = init_logger(__name__)
 
+
+class ContextInfeasible(RuntimeError):
+    """The requested context does not fit this KV format (the auto KV ladder tries the next)."""
+
 _MIB = 1 << 20
 _GIB = 1 << 30
 _MIN_CHUNK = 256
@@ -782,7 +786,9 @@ class MemoryPlanner:
             "transient": max(rc.transient_at(chunk), rc.graph_capture_peak) if rc else 0,
         }
 
-    def infeasible(self, config: EngineConfig, budget: int, ledger: Dict[str, int]) -> RuntimeError:
+    def infeasible(
+        self, config: EngineConfig, budget: int, ledger: Dict[str, int]
+    ) -> "ContextInfeasible":
         required = sum(ledger.values())
         # Largest context the same ledger funds: every non-KV term fixed, KV pages from what
         # remains (the RAM tier, when active, still covers its share of the context).
@@ -794,7 +800,7 @@ class MemoryPlanner:
         owners = ", ".join(
             f"{k}={mem_GB(v)}" for k, v in sorted(ledger.items(), key=lambda kv: -kv[1])[:5]
         )
-        return RuntimeError(
+        return ContextInfeasible(
             f"o contexto pedido de {config.max_seq_len} tokens não é possível nesse hardware, "
             f"o máximo possível é {most} tokens. "
             f"VRAM plan infeasible for max_seq_len={config.max_seq_len}: "

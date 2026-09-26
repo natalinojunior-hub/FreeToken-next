@@ -226,7 +226,25 @@ def _page_table_width(max_seq_len: int, page_size: int) -> int:
 
 
 # Shortest context where fp8 KV measured faster than bf16 for a full-attention MoE (campaign 18).
-_FP8_KV_MIN_CONTEXT = 65536
+
+
+# Auto KV fit ladder per KV family, least to most compressed: the requested context is served
+# in the first format whose pool fits it (operator rule: the user sets only the context).
+# nvfp4 replaces turbo4 on the full-attention slab (same bytes, 2.7x faster decode, campaign 18).
+_KV_FIT_LADDER = {
+    frozenset({AttnType.FULL}): ("fp8", "nvfp4", "turbo3"),
+    "qsa": ("auto", "turbo4", "turbo3"),
+}
+
+
+def _kv_fit_ladder(config) -> tuple[str, ...]:
+    """KV formats still to try after ``config.kv_format`` (empty: explicit format or none left)."""
+    if not getattr(config, "kv_format_auto", False):
+        return ()
+    types = _required_attn_types(config.model_config)
+    ladder = _KV_FIT_LADDER["qsa"] if AttnType.QSA in types else _KV_FIT_LADDER.get(types, ())
+    fmt = config.kv_format
+    return ladder[ladder.index(fmt) + 1 :] if fmt in ladder else ()
 
 
 def _required_attn_types(model_config) -> frozenset[AttnType]:
@@ -624,6 +642,12 @@ class Engine:
             self._fit_kv_ram_tier(config)
         available_memory -= self._host_reserve_bytes
         device_pages = self._pool_cls.solve_num_pages(config, available_memory)
+        want = getattr(config, "max_seq_len_override", None) or config.max_seq_len
+        for fmt in _kv_fit_ladder(config):
+            if (device_pages + self.host_pages) * config.page_size >= want:
+                break
+            self._set_kv_format(config, fmt)
+            device_pages = self._pool_cls.solve_num_pages(config, available_memory)
         self.num_pages = device_pages + self.host_pages
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
@@ -1072,6 +1096,15 @@ class Engine:
             )
         )
 
+    def _set_kv_format(self, config: EngineConfig, fmt: str) -> None:
+        """Step the auto KV format down one rung (same attention backend family: fp8, nvfp4 and
+        turbo all run on the coded-KV backend chosen for fp8; QSA keeps qsa_sparse)."""
+        logger.info_rank0(
+            f"KV format auto: {config.kv_format} does not fit {config.max_seq_len} tokens -> {fmt}"
+        )
+        object.__setattr__(config, "kv_format", fmt)
+        self._pool_cls = resolve_pool_class(config.model_config, fmt)
+
     def _resolve_auto_moe_cache_size(
         self, config: EngineConfig, banks, method=None
     ) -> tuple[int, int, bool]:
@@ -1252,33 +1285,45 @@ class Engine:
         if config.moe_cache_auto:
             # Use new multi-stage memory planner
             logger.info_rank0("--moe-cache-auto: invoking multi-stage VRAM planner")
-            planner = create_memory_planner(
-                config=config,
-                device=self.device,
-                model_config=config.model_config,
-                dtype=self.dtype,
-                pool_cls=self._pool_cls,
-                banks=banks,
-                method=method,
-            )
-            if self.host_pages:
-                # Phase H builds the real KV pool, RAM tier included: size it against the RAM
-                # left after the weights and expert banks, not the pre-load snapshot.
-                self._fit_kv_ram_tier(config)
-            plan = planner.plan(
-                config=config,
-                model=self.model,
-                num_experts=config.model_config.num_experts,
-                num_moe_layers=config.model_config.num_moe_layers,
-                prefill_overlap=config.moe_prefill_overlap,
-                method_slot_limit=method.slot_limit() if method is not None else None,
-                max_running_req=config.max_running_req,
-                max_seq_len=config.max_seq_len,
-                page_size=config.page_size,
-                weights_bytes=self._weights_bytes,
-                host_reserve_bytes=self._host_reserve_bytes,
-                host_pages=self.host_pages,
-            )
+            from .memory_planner import ContextInfeasible
+
+            ladder = list(_kv_fit_ladder(config))
+            while True:
+                planner = create_memory_planner(
+                    config=config,
+                    device=self.device,
+                    model_config=config.model_config,
+                    dtype=self.dtype,
+                    pool_cls=self._pool_cls,
+                    banks=banks,
+                    method=method,
+                )
+                if self.host_pages:
+                    # Phase H builds the real KV pool, RAM tier included: size it against the RAM
+                    # left after the weights and expert banks, not the pre-load snapshot.
+                    self._fit_kv_ram_tier(config)
+                try:
+                    plan = planner.plan(
+                        config=config,
+                        model=self.model,
+                        num_experts=config.model_config.num_experts,
+                        num_moe_layers=config.model_config.num_moe_layers,
+                        prefill_overlap=config.moe_prefill_overlap,
+                        method_slot_limit=method.slot_limit() if method is not None else None,
+                        max_running_req=config.max_running_req,
+                        max_seq_len=config.max_seq_len,
+                        page_size=config.page_size,
+                        weights_bytes=self._weights_bytes,
+                        host_reserve_bytes=self._host_reserve_bytes,
+                        host_pages=self.host_pages,
+                    )
+                except ContextInfeasible:
+                    if not ladder:
+                        raise
+                    self._set_kv_format(config, ladder.pop(0))
+                    continue
+                break
+
             object.__setattr__(config, "moe_cache_size", plan.expert_slots)
             object.__setattr__(config, "moe_prefill_overlap", plan.prefill_overlap)
             if config.num_page_override is None:
@@ -2306,22 +2351,21 @@ def _adjust_config(config: EngineConfig):
             "W8A16 fold is only validated exact in bfloat16); use bfloat16."
         )
     specs_fn = getattr(model_config, "kv_cache_group_specs", None)
+    if getattr(config, "kv_format", "auto") == "auto":
+        override("kv_format_auto", True)
     if (
         getattr(config, "kv_format", "auto") == "auto"
         and config.attention_backend == "auto"
         and required_attn_types == frozenset({AttnType.FULL})
-        and getattr(model_config, "num_experts", 0)
-        and config.max_seq_len >= _FP8_KV_MIN_CONTEXT
         and specs_fn is not None
         and all(spec.head_dim % 128 == 0 for spec in specs_fn() if not spec.is_swa)
     ):
-        # Measured (campaign 18, Tiel 35B MoE, dense full attention): fp8 KV reads half the
-        # bytes and frees VRAM for experts -- TG 64K +6%, 256K +30% vs bf16, quality intact
-        # (needle 64K/256K, usage 20/20); at 4K it costs 4%, so short contexts stay bf16.
+        # fp8 is the auto KV format for every full-attention model (bf16 only by explicit
+        # --kv-format bf16; operator decision, campaign 19). Measured (campaign 18, Tiel 35B):
+        # half the KV bytes -> more expert slots / longer contexts; TG 64K +6%, 256K +30%, 4K -4%
+        # vs bf16; quality equal (needle 64K/256K, usage 20/20).
         override("kv_format", "fp8")
-        logger.info_rank0(
-            f"KV format auto -> fp8 (context {config.max_seq_len} >= {_FP8_KV_MIN_CONTEXT})"
-        )
+        logger.info_rank0("KV format auto -> fp8")
     if (
         getattr(config, "kv_format", "auto") in ("turbo3", "turbo4", "fp8", "nvfp4")
         and config.attention_backend == "auto"

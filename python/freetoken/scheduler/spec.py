@@ -512,8 +512,9 @@ class SchedulerSpecMixin:
         # ---- verify: one prefill-phase Batch over [d-1, d+k) ----
         req.device_len = d + k
         vb = Batch(reqs=[req], phase="prefill")
-        fi = self._prepare_batch(vb)
+        # set before _prepare_batch: backends shape a spec window's metadata off it (triton)
         vb.spec_logits_indices = torch.arange(p + k + 1, device=self.device)
+        fi = self._prepare_batch(vb)
         vb.input_ids = self.token_pool[fi.input_tuple]
         vb.spec_host_ids = [*req.input_ids[c0:d].tolist(), *drafts]
         mark("verify_prepare_batch")
