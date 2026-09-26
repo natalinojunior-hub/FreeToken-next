@@ -1,5 +1,19 @@
 # PERFORMANCE — freetoken-next
 
+## 2026-09-26 campaign 20 (server, 256 decode, auto KV; ledger ft-campaign2/campaign20/LEDGER.md)
+
+| change | before -> after |
+|---|---|
+| coded-KV prefill on FlashInfer (nvfp4/turbo prefix dequantized per 64 MiB segment) | 27B 64K PP 1126 -> 2186 |
+| fp8 prefill GEMMs (dense models only) | 27B 16K PP 1875 -> 2767; bf16 GEMM 119 TF -> fp8 235 TF (8192x5120x17408) |
+| nvfp4 decode even/odd split | 1 layer 256K 339 -> 313 us (457 -> 496 GB/s) |
+| MTP k=1 default (in-file NextN) | Tiel TG 16K 129.7->171.1, 64K 119.6->146.1, 128K 109.1->121.9, 256K 86.5->100.9; Ornith 16K 151.7->191.5, 64K 140.7->160.7, 256K 99.5->114.2; 27B 16K 57.1->71.7 |
+| MTP dropped when it costs a KV rung | 27B 64K with --spec-mtp 1: refused -> k0 nvfp4 TG 46.2 |
+
+Kept as-is after measurement: Flash hyper-connection projections (~680 GB/s, BF16 in the file), Flash
+ssm_out (already packed Q8_0), MMVQ multi-vector traits (every type already reads a block once per <=4 rows).
+Negative result: fp8 prefill on MoE (Tiel 4K TG 132.2 -> 118.9 for PP +4.6%; decode transient after fp8 prefill).
+
 ## 2026-09-24 critical-path attribution (HEAD `f83ee23`)
 
 Prompt SHA256: `645f46bf134e597f1f70697d699ea70a83bf9cbe615681dad2b5eca67fbbfcf`. Cold 4K/32-token eager pair, fresh server per arm, identical prompt and flags: k0 PP 1465.5/TG 38.48/VRAM 14.75 GiB; k1 PP 1466.5/TG 21.82/VRAM 14.72 GiB. Output hashes were stable per arm (`9b6cb430f2f6`, `28e97bbdceb2`).
