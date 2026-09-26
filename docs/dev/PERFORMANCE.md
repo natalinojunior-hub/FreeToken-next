@@ -1,5 +1,23 @@
 # PERFORMANCE — freetoken-next
 
+## 2026-09-26 campaign 21 (Qwen 3.8 Flash Next MTP evaluation on RTX 5080; ledger ft-campaign2/campaign21/LEDGER.md)
+
+| workload | k0 TG | k1 TG | Delta | Verdict / Root Cause |
+|---|---|---|---|---|
+| Flash Next AD 4.27bpw @ 16K | 53.4 | 50.8 | -4.9% | PCIe cache thrashing (996 MiB/step misses @ 53.3 GB/s = 10.5-19.6 ms) |
+| Flash Next AD 4.27bpw @ 64K | 52.1 | 53.3 | +2.3% | PCIe cache thrashing (below +5% gate) |
+| Flash Next ISTA IQ3_XXS @ 16K | 56.3 | 62.7 | +11.4% | Pass (+11.4% at 16K, lighter 1.78 MiB expert size) |
+| Flash Next ISTA IQ3_XXS @ 64K | 56.8 | 57.5 | +1.2% | Fails +5% gate at 64K |
+
+- Gate 0 attribution: 96.5% of verify cycle attributed. Warm 2-row verify graph = 17.12 ms, real verify = 27.40 ms. Unexplained gap of ~10.3-17.6 ms is 100% accounted for by 448.8 missing target experts per verify step (18.91 active experts/layer across 2 rows, 49.5% miss rate).
+- Evaluated Hypotheses:
+  - H1 (Multi-row MoE union GEMM): 16.6% overlap between verify rows saves only 176.9 MiB/step resident weight reads = 0.14-0.18 ms. NO-GO.
+  - H2 (VRAM accounting): 0 MTP tensors shareable with target (all 32 SHA256 unique); 325.4 MiB false reservations documented in ledger.
+  - H3 (QSA split-K multi-row): QSA split-K scales from 0.358 ms to 0.896 ms (delta = 0.538 ms = 1.96% of verify cycle, below 3% threshold). NO-GO.
+  - H4 (Rejection replay & state transaction): Amortized replay = 0.785 ms/step (2.86% of verify cycle, below 3% threshold). Zero-replay violates state boundary contract. NO-GO.
+  - H5 (Draft breakdown): Draft graph replay = 0.652 ms (2.38% of verify cycle, below 3% threshold). NO-GO.
+- Decision: Retain k0 default for Flash Next MTP companion models. Models with in-file NextN retain k=1.
+
 ## 2026-09-26 campaign 20 (server, 256 decode, auto KV; ledger ft-campaign2/campaign20/LEDGER.md)
 
 | change | before -> after |
@@ -47,6 +65,10 @@ No performance result or production change. CPU metadata proof confirms the IQ4_
 | **Flash-Next NVFP4 @ 16K (k=0, naive cache)** | **1681** | **27.73** | 13.75 GiB | 69.7 GiB | 94.4% | PP≥1680, TG≥27.5 |
 | **Flash-Next NVFP4 @ 16K (k=1, MTP)** | **1670** | **24.39** | 14.49 GiB | 69.7 GiB | 87.3% | PP≥1660, TG≥24.0 |
 | **Flash-Next NVFP4 @ 16K (k=2, MTP)** | **1687** | **25.09** | 14.49 GiB | 70.4 GiB | 92.4% | PP≥1680, TG≥25.0 |
+| **Flash-Next ISTA IQ3_XXS GGUF @ 16K (k0, cold, MMV_Y=4 + GDN ratio 0 + greedy pool caps)** | **2290** | **58.81** | 14.58 GiB | 79.5 GiB | 93% | PP≥2280, TG≥58 |
+| **Flash-Next ISTA IQ3_XXS GGUF @ 16K (k0, warm prefix, mesma stack)** | — | **59.58** | 14.58 GiB | 79.5 GiB | — | TG≥59 |
+| **Flash-Next ISTA IQ3_XXS GGUF @ 64K (k0, cold, mesma stack)** | **2410** | **57.97** | 14.74 GiB | — | — | PP≥2350, TG≥57 |
+| **Flash-Next AD 4.27bpw GGUF @ 16K (k0, cold, MMV_Y=4 apenas; GDN ratio 0 muda a saída aqui)** | **2218** | **54.95** | 14.36 GiB | 81.2 GiB | — | PP≥2170, TG≥54 |
 | **35B-A3B @ 128K** | 3189 | 89.3 | 14.4 GiB | 22.0 GiB | — | — |
 | **35B-A3B @ 256K** | 2354 | 63.8 | 14.5 GiB | 22.0 GiB | — | — |
 | **Flash-Next @ 128K** | 1376 | 4.86 | 14.84 GiB | — | — | — |
@@ -472,3 +494,18 @@ Verdict: **PASS** — KV-in-RAM default certified for the qwen4 (Qwen3.8 Flash N
 | 256K | 69.68 (4432 expert slots) | - | 31.51 (turbo3 34.81) |
 
 Verdict: bf16 in VRAM stays the default for dense-attention 35B. Triton backend bf16 after the split fix: 4K/16K/64K 131.25/126.90/110.16 (FlashInfer parity). Ledger: `ft-campaign2/campaign18/LEDGER.md`.
+
+## 2026-09-26 campaign 23 (re-baseline + correctness fixes; ledger ft-campaign2/campaign23/LEDGER.md)
+
+Current-tree A/B on a FIXED served prompt (bench_pp_tg.py --tokens 16384 now serves 16384 tok; campaign 22's anchors served 15715 tok from the older harness state — absolute TG across the two campaigns is NOT comparable, only same-session deltas are).
+
+| config (16384 tok served, 256 gen, greedy, k0) | TG cold | TG warm | PP cold | VRAM | sha1 |
+|---|---|---|---|---|---|
+| ISTA baseline (--spec-mtp 0, MMV_Y=4 in tree) | 52.55 | 52.93 | 2508 | 14.70 GiB | 76a5508fd576 |
+| ISTA winning stack (+ratio0 +pool-caps) | 53.71 | 53.85 | 2506 | 14.58 GiB | 76a5508fd576 |
+| AD baseline (--spec-mtp 0) | 42.04 | — | 2485 | 14.32 GiB | 76a5508fd576 |
+
+- Winning-stack delta on the robust prompt: +2.2% cold / +1.7% warm (vs +7.8%/+6.1% at c22's 15715-tok prompt) — the trace-tuned pool caps are prompt-overfit; kept (bit-exact, -0.12 GiB VRAM).
+- ISTA warm == cold sha at default chunk 8192 (no divergence); the c22 warm divergence needs chunk != 8192 (open bug, isolated).
+- AD cold single-shot at 16384 served tokens drops hard vs c22 (42.04 vs 54.95 @15715): AD is gather-bound (41% PCIe) and loses more to the bigger working set; needs warm repeats before any verdict (not run — campaign stopped by operator).
+- `--moe-pool-caps` semantics FIXED this campaign: caps are proportional weights, the planned cache_size stays the byte-budget authority (was: sum(caps) silently overrode the budget, VRAM-guard shrinks were no-ops -> rebuild churn; the c22 "64.5-65.1 TG @ 105% caps" run was that churn producing a divergent output sha — an invalid result, never a real speed).
