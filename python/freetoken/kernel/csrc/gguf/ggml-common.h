@@ -8,7 +8,7 @@
 #define CUDA_DEQUANTIZE_BLOCK_SIZE 256
 #define CUDA_QUANTIZE_BLOCK_SIZE 256
 #define GGML_CUDA_DMMV_X 32
-#define GGML_CUDA_MMV_Y 1
+#define GGML_CUDA_MMV_Y 4
 
 // Data Structures
 // QK = number of values after dequantization
