@@ -28,6 +28,7 @@ from freetoken.kvcache.base import BaseKVCachePool
 from freetoken.kvcache.linear_state_pool import (
     _linear_pool_min_slots,
     _linear_pool_num_slots,
+    spec_state_steps,
     state_pool_bytes,
 )
 from freetoken.models import create_model
@@ -562,6 +563,7 @@ class MemoryPlanner:
                 device=self.device,
                 tp_size=config.tp_info.size,
                 slot_states=config.model_config.slot_states,
+                spec_steps=spec_state_steps(config),
             )
         else:
             linear_pool = None
@@ -904,6 +906,7 @@ class MemoryPlanner:
                 device=self.device,
                 tp_size=config.tp_info.size,
                 slot_states=config.model_config.slot_states,
+                spec_steps=spec_state_steps(config),
             )
         else:
             linear_pool = None

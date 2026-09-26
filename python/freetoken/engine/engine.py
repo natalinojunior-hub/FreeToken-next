@@ -64,6 +64,7 @@ from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
     _linear_pool_min_slots,
     _linear_pool_num_slots,
+    spec_state_steps,
     state_pool_bytes,
 )
 
@@ -672,6 +673,7 @@ class Engine:
                 device=self.device,
                 tp_size=config.tp_info.size,
                 slot_states=config.model_config.slot_states,
+                spec_steps=spec_state_steps(config),
             )
             self.ctx.linear_state_pool = self.linear_state_pool
         else:

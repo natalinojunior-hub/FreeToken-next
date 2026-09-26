@@ -50,6 +50,7 @@ class LinearStatePool:
         device: torch.device,
         tp_size: int | None = None,
         slot_states: tuple[SlotStateSpec, ...] = (),
+        spec_steps: int = 0,
     ) -> None:
         if tp_size is None:
             tp_size = get_tp_info().size
@@ -75,6 +76,23 @@ class LinearStatePool:
             device=device,
         )
         self._local_index = {layer_id: i for i, layer_id in enumerate(group.layer_ids)}
+        # Zero-replay MTP verify (spec_steps = k + 1 rows): the fused recurrence writes the
+        # state after every verify row, the verify keeps its conv inputs and the pre-verify
+        # conv window, so a rejection commits row j's state instead of replaying the target.
+        self.spec_states = self.spec_conv_in = self.spec_conv_pre = None
+        if spec_steps:
+            self.spec_states = torch.empty(
+                (n_layers, spec_steps, local_v_heads, group.key_head_dim, group.value_head_dim),
+                dtype=ssm_state_dtype(),
+                device=device,
+            )
+            self.spec_conv_in = torch.empty(
+                (n_layers, spec_steps, local_conv_dim), dtype=dtype, device=device
+            )
+            self.spec_conv_pre = torch.empty(
+                (n_layers, local_conv_dim, group.conv_kernel_dim - 1), dtype=dtype, device=device
+            )
+            self.spec_index = torch.zeros(1, dtype=torch.int32, device=device)
 
         self._slot_specs = tuple(slot_states)
         names = [spec.name for spec in self._slot_specs]
@@ -188,6 +206,14 @@ class LinearStatePool:
         for t in self.slot_states.values():
             t[:, dst].copy_(t[:, src])
 
+    def commit_spec_row(self, slot: int, row: int) -> None:
+        """Set ``slot`` to the state after verify row ``row`` (all linear layers)."""
+        self.recurrent_states[:, slot].copy_(self.spec_states[:, row])
+        window = torch.cat(
+            [self.spec_conv_pre, self.spec_conv_in[:, : row + 1].transpose(1, 2)], dim=2
+        )
+        self.conv_states[:, slot].copy_(window[..., -self.conv_states.shape[-1] :])
+
     def is_linear_layer(self, layer_id: int) -> bool:
         return layer_id in self._local_index
 
@@ -269,7 +295,25 @@ def state_pool_bytes(config, num_slots: int | None = None) -> int:
     per_req = linear_state_bytes_per_req(
         linear_group, config.tp_info.size, config.dtype, slot_states
     )
-    return per_req * slots
+    return per_req * slots + spec_state_bytes(config)
+
+
+def spec_state_steps(config) -> int:
+    """Verify rows the zero-replay MTP buffers hold: k + 1 for a native-NextN model served
+    with --spec-mtp k (its verify runs the fused GDN recurrence), else 0 (no buffers)."""
+    k = getattr(config, "spec_mtp", 0)
+    return k + 1 if k > 0 and getattr(config.model_config, "native_mtp_layers", 0) else 0
+
+
+def spec_state_bytes(config) -> int:
+    group = config.model_config.linear_attention_group()
+    steps = spec_state_steps(config)
+    if group is None or not steps:
+        return 0
+    n_layers, conv_dim, v_heads = _linear_local_dims(group, config.tp_info.size)
+    state = v_heads * group.key_head_dim * group.value_head_dim * ssm_state_dtype().itemsize
+    conv = conv_dim * config.dtype.itemsize
+    return n_layers * (steps * (state + conv) + conv * (group.conv_kernel_dim - 1))
 
 
 def _linear_pool_num_slots(config) -> int:

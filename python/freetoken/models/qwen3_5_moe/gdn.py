@@ -152,7 +152,9 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
 
-    def _recurrent(self, mixed, a, b, indices, cu_seqlens, li, pool, dtype) -> torch.Tensor:
+    def _recurrent(
+        self, mixed, a, b, indices, cu_seqlens, li, pool, dtype, keep_rows: bool = False
+    ) -> torch.Tensor:
         """Fused gated-delta recurrence over ``mixed`` rows split per request by
         ``cu_seqlens``; a request's rows share one kernel with the state held on chip."""
         B = mixed.shape[0]
@@ -169,6 +171,8 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             indices=indices,
             cu_seqlens=cu_seqlens,
             scale=self.head_k_dim**-0.5,
+            intermediate_states=pool.spec_states[li].unsqueeze(0) if keep_rows else None,
+            intermediate_indices=pool.spec_index if keep_rows else None,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -210,7 +214,14 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         elif batch.spec_logits_indices is not None and fla.track_dst is None:
             # One-request MTP verify/draft window, CUDA-graph capturable and on the k=0
             # decode kernels: the conv rolls row by row (tiny), then ONE fused recurrence
-            # over all rows loads/stores the state once instead of per row.
+            # over all rows loads/stores the state once. With the pool's zero-replay buffers
+            # it also records every row's state + conv input (see commit_spec_row).
+            keep = pool.spec_states is not None and total <= pool.spec_states.shape[1]
+            if keep:
+                pool.spec_conv_pre[li].copy_(
+                    pool.conv_states[li].index_select(0, fla.cache_indices)[0]
+                )
+                pool.spec_conv_in[li, :total].copy_(conv_in)
             mixed = torch.cat(
                 [
                     self._conv_decode(conv_in[t : t + 1], fla.cache_indices, pool)
@@ -219,7 +230,15 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             )
             # one request: fla.cu_seqlens is [0, total] (a static buffer under the graph)
             core_out = self._recurrent(
-                mixed, a, b, fla.cache_indices, fla.cu_seqlens, li, pool, dtype
+                mixed,
+                a,
+                b,
+                fla.cache_indices,
+                fla.cu_seqlens,
+                li,
+                pool,
+                dtype,
+                keep_rows=keep,
             )
         else:
             mixed = self._conv_prefill(

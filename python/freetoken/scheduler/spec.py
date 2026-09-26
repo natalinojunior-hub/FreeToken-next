@@ -446,8 +446,11 @@ class SchedulerSpecMixin:
 
         # ---- snapshot linear state before the draft chain mutates it ----
         pool = self.engine.linear_state_pool
+        # Zero-replay: the draft never touches the linear state (a full-attention NextN
+        # head) and the verify records every row's state, so no snapshot, no replay.
+        zero_replay = pool is not None and pool.spec_states is not None
         snap_slot = None
-        if pool is not None:
+        if pool is not None and not zero_replay:
             snap_slot = self._spec_snapshot_slot(req)
             pool.copy_from(self._linear_slot(req), snap_slot)
         residual_snapshot = model.model._last_residual[-1:].clone()
@@ -566,6 +569,13 @@ class SchedulerSpecMixin:
         if committed <= k:
             # The verify advanced every state past the rejected draft: restore the pre-verify
             # snapshot S0, then replay all but the deferred tail of the accepted tokens.
+            if zero_replay:
+                pool.commit_spec_row(self._linear_slot(req), p + committed - 1)
+                req.cached_len, req.device_len = keep_cached, keep_device
+                mark("commit_spec_row")
+                self.cache_manager.cache_req(req, finished=False)
+                self.decode_manager.filter_reqs([req])
+                return True
             if snap_slot is not None:
                 pool.copy_from(snap_slot, self._linear_slot(req))
             self._restore_qsa_state(req)

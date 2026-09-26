@@ -43,11 +43,13 @@ SPEC_DEFER_MAX = 2
 
 
 def verify_graph_tokens(spec_mtp: int) -> tuple[int, ...]:
-    """Row counts of the captured spec-verify windows, empty for an eager verify: k+1 plus
-    up to SPEC_DEFER_MAX deferred-replay tokens. Only k=1 is captured."""
-    if spec_mtp != 1 or os.getenv(VERIFY_GRAPH_ENV, "1") == "0":
+    """Row counts of the captured spec-verify windows, empty for an eager verify: every
+    k' + 1 for an adaptive k' <= k, plus (k=1 only) up to SPEC_DEFER_MAX deferred-replay
+    tokens."""
+    if spec_mtp < 1 or os.getenv(VERIFY_GRAPH_ENV, "1") == "0":
         return ()
-    return tuple(range(spec_mtp + 1, spec_mtp + 2 + SPEC_DEFER_MAX))
+    extra = SPEC_DEFER_MAX if spec_mtp == 1 else 0
+    return tuple(range(2, spec_mtp + 2 + extra))
 
 
 @dataclass
