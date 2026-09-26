@@ -17,7 +17,7 @@ def small_batch_linear(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None 
     ``w @ x.T``, which cuBLAS runs as a batched GEMV: measured on sm_120, [48, 5120] bf16
     at 2-4 rows 34 us -> 10 us (x @ w.T picks a slow tiled GEMM there)."""
     if x.dim() == 2 and 2 <= x.shape[0] <= 8:
-        out = (w @ x.T).T
+        out = (w @ x.T).T.contiguous()  # callers (e.g. hc_silu) require row-major
         return out + b if b is not None else out
     return F.linear(x, w, b)
 
