@@ -276,4 +276,3 @@ def test_auto_kv_ram_tier_requires_certified_family():
         pass
 
     assert eng._kv_ram_tier_unsupported(cfg(True), DensePool, device) == "DensePool KV pool"
-

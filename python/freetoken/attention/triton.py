@@ -379,7 +379,9 @@ class TritonAttentionBackend(BaseAttnBackend):
         md.cu_seqlens_q_gpu, md.indptr, md.indices = v["cu_q"], v["indptr"], v["indices"]
         md.q_to_req, md.q_positions, md.prefix_lens = v["q_to_req"], v["positions"], v["prefix"]
         md.attn_logits, md.attn_lse, md.num_kv_splits = (
-            v["attn_logits"], v["attn_lse"], v["splits"]
+            v["attn_logits"],
+            v["attn_lse"],
+            v["splits"],
         )
 
     def _make_fi_fp8_prefill(self, kv_groups):

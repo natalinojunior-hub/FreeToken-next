@@ -471,14 +471,18 @@ def _rowwise_quant_kernel(
     amax = tl.zeros([BLOCK], dtype=tl.float32)
     for k0 in range(0, K, BLOCK):
         offs = k0 + tl.arange(0, BLOCK)
-        v = tl.load(x_ptr + row * stride_x + offs * stride_xk, mask=offs < K, other=0.0).to(tl.float32)
+        v = tl.load(x_ptr + row * stride_x + offs * stride_xk, mask=offs < K, other=0.0).to(
+            tl.float32
+        )
         amax = tl.maximum(amax, tl.abs(v))
     scale = tl.maximum(tl.max(amax, 0), 1e-12) / 448.0
     tl.store(scale_ptr + row, scale)
     inv = 1.0 / scale
     for k0 in range(0, K, BLOCK):
         offs = k0 + tl.arange(0, BLOCK)
-        v = tl.load(x_ptr + row * stride_x + offs * stride_xk, mask=offs < K, other=0.0).to(tl.float32)
+        v = tl.load(x_ptr + row * stride_x + offs * stride_xk, mask=offs < K, other=0.0).to(
+            tl.float32
+        )
         v = tl.minimum(tl.maximum(v * inv, -448.0), 448.0)
         tl.store(out_ptr + row * stride_o + offs, v.to(tl.float8e4nv), mask=offs < K)
 

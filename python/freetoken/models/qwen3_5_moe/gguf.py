@@ -539,7 +539,11 @@ def iter_gguf_weights(
             if nextn == "nextn.eh_proj.weight":
                 yield "mtp.eh_proj.qweight", t.packed()
                 continue
-            if nextn in ("nextn.enorm.weight", "nextn.hnorm.weight", "nextn.shared_head_norm.weight"):
+            if nextn in (
+                "nextn.enorm.weight",
+                "nextn.hnorm.weight",
+                "nextn.shared_head_norm.weight",
+            ):
                 yield f"mtp.{nextn[6:]}", _to_bf16(t)
                 continue
             if nextn.startswith("nextn."):

@@ -12,7 +12,9 @@ from ..scheme import QuantKind
 from .base import LinearKernel, LinearMethod
 
 
-def small_batch_linear(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None = None) -> torch.Tensor:
+def small_batch_linear(
+    x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None = None
+) -> torch.Tensor:
     """``F.linear`` for a 2-D activation; 2..8 rows (MTP verify/draft windows) go through
     ``w @ x.T``, which cuBLAS runs as a batched GEMV: measured on sm_120, [48, 5120] bf16
     at 2-4 rows 34 us -> 10 us (x @ w.T picks a slow tiled GEMM there)."""

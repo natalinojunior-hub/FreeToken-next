@@ -12,7 +12,9 @@ def _stub():
     stub = SimpleNamespace(
         cache_manager=SimpleNamespace(
             page_size=1,
-            free_spec_reject=lambda req, keep_len, alloc_len: rejected.append((keep_len, alloc_len)),
+            free_spec_reject=lambda req, keep_len, alloc_len: rejected.append(
+                (keep_len, alloc_len)
+            ),
         ),
         prefill_manager=SimpleNamespace(abort_req=lambda uid: aborted.append(("p", uid))),
         decode_manager=SimpleNamespace(
@@ -32,7 +34,11 @@ def test_oom_in_forward_fails_the_batch_not_the_process(monkeypatch):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda d=None: None)
     stub, sent, freed, shrinks = _stub()
     live = SimpleNamespace(
-        uid=3, table_idx=1, device_len=12288, cached_len=8192, alloc_page_bound=12288,
+        uid=3,
+        table_idx=1,
+        device_len=12288,
+        cached_len=8192,
+        alloc_page_bound=12288,
         cache_handle=SimpleNamespace(cached_len=4096),
     )
     reqs = [live, SimpleNamespace(uid=-1, table_idx=0)]  # -1: the padding dummy

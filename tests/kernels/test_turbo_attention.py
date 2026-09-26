@@ -259,7 +259,9 @@ def test_dequant_rows_matches_decode_rotated(book):
     scratch = torch.zeros(400, kv_heads + 1, head_dim, device=device, dtype=torch.bfloat16)
     out = scratch[:257, :kv_heads]
     dequant_rows(codes, norm, cent, slots, BOOK_CODE[book], out)
-    torch.testing.assert_close(out.float(), want[slots.long()].to(torch.bfloat16).float(), rtol=0, atol=0)
+    torch.testing.assert_close(
+        out.float(), want[slots.long()].to(torch.bfloat16).float(), rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize("book", ["nvfp4", "turbo4"])
@@ -278,13 +280,21 @@ def test_segmented_fi_prefill_matches_extend_on_codes(book):
     seq_lens = [p + q for p, q in zip(prefix_lens, q_lens)]
     total, num_q = sum(seq_lens), sum(q_lens)
     rotated = tk.is_rotated(book)
-    rot = (lambda t: tk.rotate(t.reshape(-1, head_dim)).reshape(t.shape).to(torch.bfloat16)) if rotated else (lambda t: t)
+    rot = (
+        (lambda t: tk.rotate(t.reshape(-1, head_dim)).reshape(t.shape).to(torch.bfloat16))
+        if rotated
+        else (lambda t: t)
+    )
     q = rot(torch.randn(num_q, q_heads, head_dim, device=device, dtype=torch.bfloat16))
     kv = rot(torch.randn(2, total, kv_heads, head_dim, device=device, dtype=torch.bfloat16))
     slots = torch.randperm(total, device=device).to(torch.int32)  # scattered pages
     codes, norms = [], []
     for t in kv:
-        c, n = tk.quantize(t.reshape(-1, head_dim), book) if not rotated else _quantize_rotated(t, book)
+        c, n = (
+            tk.quantize(t.reshape(-1, head_dim), book)
+            if not rotated
+            else _quantize_rotated(t, book)
+        )
         codes.append(c.reshape(total, kv_heads, -1).contiguous())
         norms.append(n.reshape(total, kv_heads, -1).contiguous())
     # cache row slots[i] holds logical token i
@@ -293,7 +303,9 @@ def test_segmented_fi_prefill_matches_extend_on_codes(book):
     starts = [0, seq_lens[0]]
     new = lambda t: torch.cat([t[a + p : a + s] for a, p, s in zip(starts, prefix_lens, seq_lens)])
     k_ext, v_ext = new(kv[0]), new(kv[1])
-    cumsum = lambda xs: torch.tensor([0] + xs, dtype=torch.int32, device=device).cumsum(0).to(torch.int32)
+    cumsum = lambda xs: (
+        torch.tensor([0] + xs, dtype=torch.int32, device=device).cumsum(0).to(torch.int32)
+    )
     turbo = {
         "k_norm": kn, "v_norm": vn, "book": BOOK_CODE[book],
         "cent": torch.tensor(tk._CENT_TABLE.get(book, (0.0,)), device=device, dtype=torch.float32),
@@ -309,7 +321,9 @@ def test_segmented_fi_prefill_matches_extend_on_codes(book):
     be._seg_kv = tuple(torch.empty(shape, device=device, dtype=torch.bfloat16) for _ in range(2))
     meta = SimpleNamespace(seg_lens=(q_lens, prefix_lens, seq_lens), indices=slots)
     got = be._segmented_prefill(q, k_ext, v_ext, turbo, kc, vc, meta, scale)
-    cos = torch.nn.functional.cosine_similarity(got.float().flatten(), want.float().flatten(), dim=0)
+    cos = torch.nn.functional.cosine_similarity(
+        got.float().flatten(), want.float().flatten(), dim=0
+    )
     assert cos.item() > 0.9999, cos
     assert (got.float() - want.float()).abs().max().item() < 2e-2
 
