@@ -698,11 +698,13 @@ class Engine:
                 ),
                 None,
             )
-            if k0_fmt is not None and (not fits or fmts.index(k0_fmt) < fmts.index(mtp_fmt)):
+            # Nothing fits at all: MTP goes too, so the refusal names the real maximum.
+            if not fits or (k0_fmt is not None and fmts.index(k0_fmt) < fmts.index(mtp_fmt)):
                 _shed_mtp(config)
                 self._release_mtp()
                 available_memory += extra
-                self._set_kv_format(config, k0_fmt, "fits once MTP is off")
+                if k0_fmt is not None:
+                    self._set_kv_format(config, k0_fmt, "fits once MTP is off")
                 device_pages = self._pool_cls.solve_num_pages(config, available_memory)
         self.num_pages = device_pages + self.host_pages
         num_tokens = self.num_pages * config.page_size
