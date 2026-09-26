@@ -1018,6 +1018,48 @@ class Engine:
         self._charge_expert_cache(cache)
         self._calibrate_vram_ledger()
 
+    # Free memory the runtime peak must still have left over (driver/fragmentation slack).
+    _VRAM_GUARD_MARGIN = 256 << 20
+
+    @torch.inference_mode()
+    def guard_vram_at_idle(self) -> None:
+        """Real-time VRAM guard, run while the scheduler is idle: measure how much device memory
+        was still free at the peak of the last busy window and, when that fell under
+        ``_VRAM_GUARD_MARGIN``, give the shortfall back from the expert cache (the one elastic
+        consumer) before the next request can hit an OOM; a pure shrink always fits. The peak
+        counter is reset so each window is judged on its own."""
+        cache = self.moe_offload_cache
+        if self.device.type != "cuda":
+            return
+        if not getattr(self, "_vram_guard_armed", False):
+            # first idle: the peak still holds startup (loading/planner probes); start clean
+            self._vram_guard_armed = True
+            torch.cuda.reset_peak_memory_stats(self.device)
+            return
+        free, _ = torch.cuda.mem_get_info(self.device)
+        peak = torch.cuda.max_memory_reserved(self.device)
+        now = torch.cuda.memory_reserved(self.device)
+        torch.cuda.reset_peak_memory_stats(self.device)
+        free_at_peak = free - max(0, peak - now)
+        short = self._VRAM_GUARD_MARGIN - free_at_peak
+        if short <= 0 or cache is None:
+            if short > 0:
+                logger.warning_rank0(
+                    f"VRAM guard: only {mem_GB(free_at_peak)} free at the last peak and no expert "
+                    "cache to shrink"
+                )
+            return
+        from freetoken.utils import div_ceil
+
+        _, per_slot = self._target_moe_and_expert_bytes(None)
+        target = cache.cache_size - div_ceil(short, per_slot)
+        logger.info_rank0(
+            f"VRAM guard: {mem_GB(free_at_peak)} free at the last peak (< "
+            f"{mem_GB(self._VRAM_GUARD_MARGIN)}): expert cache {cache.cache_size} -> {target} slots"
+        )
+        self.rebuild_runtime_cache(moe_cache_size=target)
+        self._charge_expert_cache(cache)
+
     def _calibrate_vram_ledger(self) -> None:
         """Print the account next to what the allocator actually holds.
 

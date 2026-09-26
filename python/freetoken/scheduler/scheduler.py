@@ -189,6 +189,9 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
+        guard = getattr(getattr(self, "engine", None), "guard_vram_at_idle", None)
+        if guard is not None:
+            guard()
         if hasattr(self, "_spec_snapshot_slots"):
             assert len(self._spec_snapshot_slots) == 0, (
                 f"leaked spec snapshot slots in idle: {self._spec_snapshot_slots}"
