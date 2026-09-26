@@ -108,6 +108,26 @@ def ggml_mul_mat_vec_a8(
     return _module().ggml_mul_mat_vec_a8(weight, x, quant_type, row)
 
 
+def ggml_quantize_row_q8_1(x: torch.Tensor) -> torch.Tensor:
+    """Quantize activation ``x`` -> q8_1 block buffer once, for reuse across MMVQ parts."""
+    return _module().ggml_quantize_row_q8_1(x)
+
+
+def ggml_mul_mat_vec_a8_prequant(
+    weight: torch.Tensor,
+    quant_x: torch.Tensor,
+    quant_type: int,
+    row: int,
+    col: int,
+    vecs: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """MMVQ against a pre-quantized q8_1 activation (bit-exact vs ggml_mul_mat_vec_a8)."""
+    return _module().ggml_mul_mat_vec_a8_prequant(
+        weight, quant_x, quant_type, row, col, vecs, out_dtype
+    )
+
+
 def ggml_mul_mat_a8(
     weight: torch.Tensor, x: torch.Tensor, quant_type: int, row: int
 ) -> torch.Tensor:
@@ -160,6 +180,8 @@ def ggml_moe_get_block_size(quant_type: int) -> int:
 __all__ = [
     "ggml_dequantize",
     "ggml_mul_mat_vec_a8",
+    "ggml_quantize_row_q8_1",
+    "ggml_mul_mat_vec_a8_prequant",
     "ggml_mul_mat_a8",
     "ggml_moe_a8",
     "ggml_moe_a8_vec",

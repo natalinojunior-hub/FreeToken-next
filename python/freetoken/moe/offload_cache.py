@@ -359,6 +359,10 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        # Decode hit/miss gather overlap stream state (lazily initialized on first use)
+        self.decode_copy_stream: torch.cuda.Stream | None = None
+        self.decode_begin_event: torch.cuda.Event | None = None
+        self.decode_ready_event: torch.cuda.Event | None = None
         self.tracer = MoeTracer.from_env()
         self._trace_kind = "decode"
         self._trace_ids: list[int] | None = None
@@ -899,6 +903,26 @@ class OffloadMoeCache:
         return layer_id in self._unpinned_layers
 
     def alphas_for_slots(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Per-slot global scales for a decode call, or ``None`` when the format
+        keeps no GPU-resident alphas (bf16 / triton-nvfp4). Slots of other layers
+        yield garbage values, but only slots routed to -- and those belong to
+        ``layer_id`` -- are ever read by the grouped GEMM."""
+        if self.gate_up_alpha is None:
+            return None
+        ids = self.pool_state(layer_id)[0]
+        idx = layer_id * self.num_experts + (ids.clamp(min=0).long() % self.num_experts)
+        return self.gate_up_alpha[idx], self.down_alpha[idx]
+
+    def get_decode_copy_stream(
+        self,
+    ) -> tuple[torch.cuda.Stream, torch.cuda.Event, torch.cuda.Event]:
+        """Lazy init of the dedicated copy stream + sync events for decode hit/miss overlap."""
+        if self.decode_copy_stream is None:
+            self.decode_copy_stream = torch.cuda.Stream(device=self.device)
+            self.decode_begin_event = torch.cuda.Event()
+            self.decode_ready_event = torch.cuda.Event()
+        assert self.decode_begin_event is not None and self.decode_ready_event is not None
+        return self.decode_copy_stream, self.decode_begin_event, self.decode_ready_event
         """Per-slot global scales for a decode call, or ``None`` when the format
         keeps no GPU-resident alphas (bf16 / triton-nvfp4). Slots of other layers
         yield garbage values, but only slots routed to -- and those belong to

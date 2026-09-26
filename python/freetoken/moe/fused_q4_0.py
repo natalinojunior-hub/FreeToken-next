@@ -283,4 +283,62 @@ def fused_experts_gguf_q4_0(
     )
 
 
-__all__ = ["fused_experts_gguf", "fused_experts_gguf_q4_0"]
+def fused_experts_gguf_split(
+    hidden_states: torch.Tensor,
+    gate_up_q: torch.Tensor,
+    down_q: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids_hit: torch.Tensor,
+    topk_ids_miss: torch.Tensor,
+    activation: str,
+    quant_type: int,
+    down_quant_type: int | None = None,
+) -> torch.Tensor:
+    """Two-pass (hit / miss) grouped expert GEMV over the same slot banks.
+
+    Each pass launches the full fixed K-route grid with the *other* subset's slots
+    sentineled to -1, so masked routes leave their zero-init ``dst`` slot
+    (see ``moe_vec_q``). ``down_hit + down_miss`` is the exact disjoint union and is
+    bit-identical to a single full ``ggml_moe_a8_vec`` (``val + 0.0 == val``, same
+    final weighted sum), so this composes the same result as ``fused_experts_gguf``.
+
+    Drives the same-layer expert hit/miss gather overlap: the hit pass runs on the
+    compute stream while a copy stream gathers the miss routes over PCIe; the miss
+    pass runs after the gather completes. Decode-only (small batch); no dequant
+    fallback path here.
+    """
+    from freetoken.kernel.gguf import ggml_moe_a8_vec
+
+    if down_quant_type is None:
+        down_quant_type = quant_type
+    for label, qt in (("gate_up", quant_type), ("down", down_quant_type)):
+        if qt not in MOE_VEC_TYPES:
+            from freetoken.models.gguf.dequant import GGML_NAME
+
+            raise NotImplementedError(
+                f"fused GGUF MoE split does not support quant type "
+                f"{GGML_NAME.get(qt, qt)} for the {label} bank (only {sorted(MOE_VEC_TYPES)})"
+            )
+    act_fn = _ACT[activation]
+    num_tokens = hidden_states.shape[0]
+    n2 = gate_up_q.shape[1]
+    h = down_q.shape[1]
+    top_k = topk_ids_hit.shape[1]
+    qt = int(quant_type)
+    dqt = int(down_quant_type)
+
+    gate_up_h = ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids_hit, top_k, qt, n2, num_tokens)
+    down_h = ggml_moe_a8_vec(act_fn(gate_up_h), down_q, topk_ids_hit, 1, dqt, h, num_tokens * top_k)
+
+    gate_up_m = ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids_miss, top_k, qt, n2, num_tokens)
+    down_m = ggml_moe_a8_vec(
+        act_fn(gate_up_m), down_q, topk_ids_miss, 1, dqt, h, num_tokens * top_k
+    )
+
+    out = (down_h + down_m).reshape(num_tokens, top_k, h) * topk_weights.reshape(
+        num_tokens, top_k, 1
+    ).to(down_h.dtype)
+    return out.sum(dim=1)
+
+
+__all__ = ["fused_experts_gguf", "fused_experts_gguf_q4_0", "fused_experts_gguf_split"]

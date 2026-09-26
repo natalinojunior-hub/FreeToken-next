@@ -17,6 +17,14 @@ static __global__ void moe_vec_q(
   const auto token = blockIdx.z / topk;
   const auto expert = (topk_ids)[blockIdx.z];
 
+  // Route-mask sentinel (-1): skip this route, leaving dst[blockIdx.z] at its
+  // zero-init. Lets one fixed-grid launch drive a hit/miss subset for the
+  // same-layer expert hit/miss gather overlap; the two disjoint passes sum back
+  // to the canonical per-route output bit-for-bit (val + 0.0 == val).
+  if (expert < 0) {
+    return;
+  }
+
   if (row >= nrows) {
     return;
   }

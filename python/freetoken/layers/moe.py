@@ -305,6 +305,13 @@ class OffloadMoELayer(MoELayer):
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         if cache.tracer is not None:
             cache.ensure_experts(self.layer_id, topk_ids, kind=self._trace_kind(hidden_states))
+        elif (
+            os.getenv("FREETOKEN_MOE_DECODE_OVERLAP", "0") == "1"
+            and cache.device.type == "cuda"
+            and cache.quant_format in ("gguf", "q4_0")
+            and hidden_states.shape[0] <= 4
+        ):
+            return self._decode_overlapped(cache, hidden_states, topk_weights, topk_ids)
         else:
             cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
@@ -318,6 +325,86 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+
+    def _decode_overlapped(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Same-layer expert hit/miss gather overlap (C1).
+
+        Computes hit routes on the compute stream concurrently while missing expert
+        weights are gathered from host RAM over PCIe on a dedicated copy stream.
+        lru_ensure guarantees victim slots never collide with current hits, so the
+        concurrent read of hit slots is race-free against miss-slot writes.
+        Bit-exact: two fixed-grid passes with route-mask sentinels sum back to the
+        canonical output in identical FP accumulation order.
+        """
+        from freetoken.kernel.gguf import ggml_moe_a8_vec
+        from freetoken.moe.fused_q4_0 import _ACT
+
+        # 1. Device-side hit classification BEFORE ensure_experts rewrites topk_ids
+        slot_map = cache.slot_for_id[self.layer_id]
+        raw_ids = topk_ids.long()
+        hit_mask = slot_map[raw_ids] >= 0
+        slots_hit = torch.where(hit_mask, slot_map[raw_ids], torch.full_like(topk_ids, -1))
+
+        # 2. Admission: assign slots to misses, rewrite topk_ids to slot ids in-place
+        cache.ensure_experts(self.layer_id, topk_ids)
+        slots_miss = torch.where(hit_mask, torch.full_like(topk_ids, -1), topk_ids)
+
+        # 3. Fork copy stream for the PCIe miss-gather
+        copy_stream, begin_ev, ready_ev = cache.get_decode_copy_stream()
+        comp_stream = torch.cuda.current_stream(cache.device)
+        begin_ev.record(comp_stream)
+        copy_stream.wait_event(begin_ev)
+        with torch.cuda.stream(copy_stream):
+            cache.copy_missing()
+            ready_ev.record(copy_stream)
+
+        # 4. Concurrently on compute stream: hit-route GEMV
+        gate_up_q, down_q = cache.bank_views(layer_id=self.layer_id)
+        if cache.quant_format == "gguf":
+            types = cache.gguf_expert_types
+            if isinstance(types, list) or (
+                isinstance(types, tuple) and isinstance(types[0], (tuple, list))
+            ):
+                qt, dqt = types[self.layer_id]
+            else:
+                qt, dqt = types
+            qt, dqt = int(qt), int(dqt)
+        else:
+            from freetoken.models.gguf.dequant import GGML_Q4_0
+
+            qt = dqt = int(GGML_Q4_0)
+
+        act_fn = _ACT[self.activation]
+        num_tokens = hidden_states.shape[0]
+        n2 = gate_up_q.shape[1]
+        h = down_q.shape[1]
+        top_k = topk_ids.shape[1]
+
+        gate_up_h = ggml_moe_a8_vec(hidden_states, gate_up_q, slots_hit, top_k, qt, n2, num_tokens)
+        down_h = ggml_moe_a8_vec(
+            act_fn(gate_up_h), down_q, slots_hit, 1, dqt, h, num_tokens * top_k
+        )
+
+        # 5. Join: wait for PCIe copy of miss-weights to complete
+        comp_stream.wait_event(ready_ev)
+
+        # 6. Miss-route GEMV
+        gate_up_m = ggml_moe_a8_vec(hidden_states, gate_up_q, slots_miss, top_k, qt, n2, num_tokens)
+        down_m = ggml_moe_a8_vec(
+            act_fn(gate_up_m), down_q, slots_miss, 1, dqt, h, num_tokens * top_k
+        )
+
+        # 7. Disjoint union + final reduction: bit-identical to the single-pass sum
+        out = (down_h + down_m).reshape(num_tokens, top_k, h) * topk_weights.reshape(
+            num_tokens, top_k, 1
+        ).to(down_h.dtype)
+        return out.sum(dim=1)
 
     def _decode_hybrid(
         self,

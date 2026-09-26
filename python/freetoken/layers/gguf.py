@@ -66,6 +66,10 @@ from .base import BaseOP
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
 _MMVQ_SAFE = 6
 
+# Kill-switch for the GGUFMergedLinear quantize-once hoist (bit-exact; default on).
+# Set to 0 to fall back to per-part re-quantization (used for same-binary A/B).
+_QUANTIZE_ONCE = os.getenv("FREETOKEN_GGUF_QUANTIZE_ONCE", "1") != "0"
+
 
 # Prefill-sized GEMMs over dequantized GGUF weights run on the fp8 tensor cores (per-token /
 # per-channel dynamic scales): 2x the bf16 rate, where bf16 already sat at the tensor roof.
@@ -286,10 +290,36 @@ class GGUFMergedLinear(BaseOP):
         Returns:
             Tensor of shape [..., out_features] with parts concatenated along dim=-1.
         """
+        # Decode (small-batch MMVQ): every part reads the same activation x, so
+        # quantize x -> q8_1 once and drive all MMVQ parts from that buffer. Bit-exact
+        # vs re-quantizing per part (same kernel, same quant_X bits); saves
+        # (n_mmvq_parts - 1) quantize_row_q8_1 launches per merged linear per token.
+        mmvq_parts = sum(1 for qt in self._quant_types if qt in MMVQ_TYPES)
+        use_qonce = (
+            _QUANTIZE_ONCE
+            and mmvq_parts >= 2
+            and 0 < x.shape[0] <= _MMVQ_SAFE
+            and x.is_cuda
+            and x.dtype in (torch.float32, torch.float16, torch.bfloat16)
+        )
+        if use_qonce:
+            from freetoken.kernel.gguf import (
+                ggml_mul_mat_vec_a8_prequant,
+                ggml_quantize_row_q8_1,
+            )
+
+            qx = ggml_quantize_row_q8_1(x)
+            col, vecs = x.shape[1], x.shape[0]
+
         parts = []
         for name, qt in zip(self.part_names, self._quant_types):
             qweight = getattr(self, name)
-            part_out = fused_mul_mat_gguf(x, qweight, qt)
+            if use_qonce and qt in MMVQ_TYPES:
+                part_out = ggml_mul_mat_vec_a8_prequant(
+                    qweight, qx, qt, qweight.shape[0], col, vecs, x.dtype
+                )
+            else:
+                part_out = fused_mul_mat_gguf(x, qweight, qt)
             parts.append(part_out)
 
         out = torch.cat(parts, dim=-1)
