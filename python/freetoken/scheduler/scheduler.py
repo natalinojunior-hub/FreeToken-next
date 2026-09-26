@@ -295,7 +295,8 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
                 # cross-stream wait and before the forward reads the live slot (program order
                 # vs the prior batch's snapshot writes). Doing this on self.stream would race.
                 self._restore_linear_states(forward_input.batch)
-                ongoing_data = (forward_input, self._forward(forward_input))
+                out = self._forward_or_fail(forward_input)
+                ongoing_data = (forward_input, out) if out is not None else None
 
         # The drain issues GPU-visible writes to state the batch just launched still reads: the
         # page-table re-point and, for the paged-SWA pools, the full->swa (DSV4: full->window)
@@ -304,6 +305,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         # in-flight forward. copy_done only covers batch N; order against N+1 explicitly.
         self.stream.wait_stream(self.engine.stream)
         self._process_last_data(last_data)
+        self._flush_oom()
         self._flush_abort_acks()
         return ongoing_data
 
@@ -324,7 +326,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         ):
             self._execute_pending_rebuild()
 
-        if getattr(self, "spec_mtp", 0) > 0 and self.run_spec_step():
+        if getattr(self, "spec_mtp", 0) > 0 and self._spec_step_or_fail():
             self._flush_abort_acks()
             return
 
@@ -333,9 +335,11 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         if forward_input is not None:
             # already inside engine_stream_ctx (run_forever); restore on the engine stream
             self._restore_linear_states(forward_input.batch)
-            ongoing_data = (forward_input, self._forward(forward_input))
+            out = self._forward_or_fail(forward_input)
+            ongoing_data = (forward_input, out) if out is not None else None
 
         self._process_last_data(ongoing_data)
+        self._flush_oom()
         self._flush_abort_acks()
 
     @torch.inference_mode()
@@ -1007,6 +1011,68 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         pending.clear()
         self.send_result([ErrorReplyMsg(uid=uid, error="request aborted") for uid in uids])
 
+    def _forward_or_fail(self, forward_input: ForwardInput) -> ForwardOutput | None:
+        """``_forward``, except that a GPU out-of-memory fails this batch's requests (error reply,
+        resources freed) and shrinks the expert cache instead of killing the process: the
+        allocation fails on the host before the rest of the forward is launched, and the dropped
+        requests' partial KV/GDN writes die with them. The failure is handled by ``_flush_oom``
+        after the loop drained the previous (overlapped) batch, which may still hold these
+        requests and must publish/free them first."""
+        try:
+            return self._forward(forward_input)
+        except Exception as e:  # noqa: BLE001 -- only OOM is handled, everything else re-raised
+            if not _is_oom(e):
+                raise
+            self._oom_failed = ([r for r in forward_input.batch.reqs if r.uid >= 0], e)
+            return None
+
+    def _flush_oom(self) -> None:
+        failed = getattr(self, "_oom_failed", None)
+        if failed is None:
+            return
+        self._oom_failed = None
+        reqs, error = failed
+        # a request that finished in the drained batch is already freed and replied to
+        self._fail_oom_reqs([r for r in reqs if r not in self.finished_reqs], error)
+
+    def _spec_step_or_fail(self) -> bool:
+        try:
+            return self.run_spec_step()
+        except Exception as e:  # noqa: BLE001 -- see _forward_or_fail
+            if not _is_oom(e):
+                raise
+            self._fail_oom_reqs(list(self.decode_manager.running_reqs), e)
+            return True
+
+    def _fail_oom_reqs(self, reqs, error: BaseException) -> None:
+        logger.error(
+            f"GPU out of memory in a forward ({error}); failing {len(reqs)} request(s) and "
+            "shrinking the expert cache"
+        )
+        # the failed forward may have launched kernels before the allocation that failed
+        torch.cuda.synchronize(self.device)
+        for req in reqs:
+            self.prefill_manager.abort_req(req.uid)
+            self.decode_manager.abort_req(req.uid)
+            if getattr(req, "table_idx", -1) >= 0:
+                # Keep only the prefix it matched in the cache: return every page it allocated
+                # past that (the failed chunk's never-committed pages would otherwise leak), and
+                # insert nothing new -- its GDN slot may hold a half-advanced state.
+                handle = getattr(req, "cache_handle", None)
+                start = getattr(handle, "cached_len", 0) or 0
+                page = self.cache_manager.page_size
+                owned = max(req.device_len, getattr(req, "alloc_page_bound", 0) * page)
+                self.cache_manager.free_spec_reject(req, keep_len=start, alloc_len=owned)
+                req.cached_len = req.device_len = start
+                self._free_req_resources(req)
+        self.send_result(
+            [ErrorReplyMsg(uid=r.uid, error="out of GPU memory; request dropped") for r in reqs]
+        )
+        torch.cuda.empty_cache()
+        shrink = getattr(self.engine, "shrink_after_oom", None)
+        if shrink is not None:
+            shrink()
+
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
@@ -1016,6 +1082,10 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+
+def _is_oom(e: BaseException) -> bool:
+    return isinstance(e, torch.OutOfMemoryError) or "out of memory" in str(e)
 
 
 def _make_mrope_positions(batch: Batch, device: torch.device) -> torch.Tensor:

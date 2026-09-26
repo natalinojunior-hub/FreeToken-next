@@ -793,6 +793,9 @@ class Engine:
         )
         self._calibrate_vram_ledger()
         self._restore_vram_headroom()
+        # the idle guard may grow a shrunken expert cache back, never past the startup plan
+        if self.moe_offload_cache is not None:
+            self._expert_plan_slots = self.moe_offload_cache.cache_size
 
     def _fit_kv_ram_tier(self, config: EngineConfig) -> None:
         """Size the RAM tier against live RAM; auto tiering drops it (KV stays in VRAM) where
@@ -1020,14 +1023,19 @@ class Engine:
 
     # Free memory the runtime peak must still have left over (driver/fragmentation slack).
     _VRAM_GUARD_MARGIN = 256 << 20
+    # Consecutive idle windows whose peak left room before a shrunken expert cache regrows.
+    _VRAM_GUARD_CALM_WINDOWS = 3
 
     @torch.inference_mode()
     def guard_vram_at_idle(self) -> None:
         """Real-time VRAM guard, run while the scheduler is idle: measure how much device memory
         was still free at the peak of the last busy window and, when that fell under
         ``_VRAM_GUARD_MARGIN``, give the shortfall back from the expert cache (the one elastic
-        consumer) before the next request can hit an OOM; a pure shrink always fits. The peak
-        counter is reset so each window is judged on its own."""
+        consumer) before the next request can hit an OOM; a pure shrink always fits. After
+        ``_VRAM_GUARD_CALM_WINDOWS`` windows in a row whose peak left more than two margins free,
+        a cache shrunk earlier (guard, OOM recovery) grows back by that surplus, never past the
+        startup plan and only through the rebuild's own budget check. The peak counter is reset
+        so each window is judged on its own."""
         cache = self.moe_offload_cache
         if self.device.type != "cuda":
             return
@@ -1042,7 +1050,7 @@ class Engine:
         torch.cuda.reset_peak_memory_stats(self.device)
         free_at_peak = free - max(0, peak - now)
         short = self._VRAM_GUARD_MARGIN - free_at_peak
-        if short <= 0 or cache is None:
+        if cache is None:
             if short > 0:
                 logger.warning_rank0(
                     f"VRAM guard: only {mem_GB(free_at_peak)} free at the last peak and no expert "
@@ -1052,11 +1060,52 @@ class Engine:
         from freetoken.utils import div_ceil
 
         _, per_slot = self._target_moe_and_expert_bytes(None)
-        target = cache.cache_size - div_ceil(short, per_slot)
-        logger.info_rank0(
-            f"VRAM guard: {mem_GB(free_at_peak)} free at the last peak (< "
-            f"{mem_GB(self._VRAM_GUARD_MARGIN)}): expert cache {cache.cache_size} -> {target} slots"
-        )
+        if short > 0:
+            self._vram_guard_calm = 0
+            target = cache.cache_size - div_ceil(short, per_slot)
+            logger.info_rank0(
+                f"VRAM guard: {mem_GB(free_at_peak)} free at the last peak (< "
+                f"{mem_GB(self._VRAM_GUARD_MARGIN)}): expert cache {cache.cache_size} -> "
+                f"{target} slots"
+            )
+        else:
+            plan = getattr(self, "_expert_plan_slots", cache.cache_size)
+            surplus = free_at_peak - 2 * self._VRAM_GUARD_MARGIN
+            if cache.cache_size >= plan or surplus < per_slot:
+                self._vram_guard_calm = 0
+                return
+            self._vram_guard_calm = getattr(self, "_vram_guard_calm", 0) + 1
+            if self._vram_guard_calm < self._VRAM_GUARD_CALM_WINDOWS:
+                return
+            self._vram_guard_calm = 0
+            target = min(plan, cache.cache_size + surplus // per_slot)
+            logger.info_rank0(
+                f"VRAM guard: {mem_GB(free_at_peak)} free at the last "
+                f"{self._VRAM_GUARD_CALM_WINDOWS} peaks: expert cache {cache.cache_size} -> "
+                f"{target} slots (plan {plan})"
+            )
+        try:
+            self.rebuild_runtime_cache(moe_cache_size=target)
+        except CacheRebuildRejected as e:
+            logger.warning_rank0(f"VRAM guard: expert cache resize refused ({e})")
+            return
+        self._charge_expert_cache(cache)
+        # the rebuild's own transient (teardown, graph re-capture) is not the next window's peak
+        torch.cuda.reset_peak_memory_stats(self.device)
+
+    def shrink_after_oom(self, fraction: float = 0.05) -> None:
+        """A forward ran out of memory: give back ``fraction`` of the expert cache (at least the
+        guard margin) so the next attempt fits; the idle guard keeps it honest afterwards."""
+        cache = self.moe_offload_cache
+        if cache is None:
+            return
+        from freetoken.utils import div_ceil
+
+        _, per_slot = self._target_moe_and_expert_bytes(None)
+        n = max(int(cache.cache_size * fraction), div_ceil(self._VRAM_GUARD_MARGIN, per_slot))
+        target = max(1, cache.cache_size - n)
+        logger.info_rank0(f"OOM recovery: expert cache {cache.cache_size} -> {target} slots")
+        self._vram_guard_calm = 0
         self.rebuild_runtime_cache(moe_cache_size=target)
         self._charge_expert_cache(cache)
 

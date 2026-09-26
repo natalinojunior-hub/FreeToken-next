@@ -34,3 +34,22 @@ def test_guard_keeps_cache_when_peak_had_margin(monkeypatch):
     eng, calls = _engine(monkeypatch, free=900 * MIB, peak=1200 * MIB, now=1000 * MIB)
     eng.guard_vram_at_idle()
     assert calls == []
+
+
+def test_guard_regrows_after_calm_windows_up_to_plan(monkeypatch):
+    # 2 GiB free at every peak: grows only on the 3rd calm window, capped at the startup plan
+    eng, calls = _engine(monkeypatch, free=2048 * MIB, peak=1000 * MIB, now=1000 * MIB)
+    eng._expert_plan_slots = 1040
+    for _ in range(2):
+        eng.guard_vram_at_idle()
+    assert calls == []
+    eng.guard_vram_at_idle()
+    assert calls == [1040]
+
+
+def test_guard_never_grows_past_plan(monkeypatch):
+    eng, calls = _engine(monkeypatch, free=4096 * MIB, peak=1000 * MIB, now=1000 * MIB)
+    eng._expert_plan_slots = 1000
+    for _ in range(5):
+        eng.guard_vram_at_idle()
+    assert calls == []

@@ -1,0 +1,73 @@
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from freetoken.scheduler.scheduler import Scheduler
+
+
+def _stub():
+    sent, freed, shrinks, aborted = [], [], [], []
+    rejected = []
+    stub = SimpleNamespace(
+        cache_manager=SimpleNamespace(
+            page_size=1,
+            free_spec_reject=lambda req, keep_len, alloc_len: rejected.append((keep_len, alloc_len)),
+        ),
+        prefill_manager=SimpleNamespace(abort_req=lambda uid: aborted.append(("p", uid))),
+        decode_manager=SimpleNamespace(
+            abort_req=lambda uid: aborted.append(("d", uid)), running_reqs=set()
+        ),
+        _free_req_resources=freed.append,
+        send_result=sent.extend,
+        device=None,
+        engine=SimpleNamespace(shrink_after_oom=lambda: shrinks.append(1)),
+    )
+    stub._fail_oom_reqs = lambda reqs, e: Scheduler._fail_oom_reqs(stub, reqs, e)
+    stub._rejected = rejected
+    return stub, sent, freed, shrinks
+
+
+def test_oom_in_forward_fails_the_batch_not_the_process(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda d=None: None)
+    stub, sent, freed, shrinks = _stub()
+    live = SimpleNamespace(
+        uid=3, table_idx=1, device_len=12288, cached_len=8192, alloc_page_bound=12288,
+        cache_handle=SimpleNamespace(cached_len=4096),
+    )
+    reqs = [live, SimpleNamespace(uid=-1, table_idx=0)]  # -1: the padding dummy
+
+    def boom(_):
+        raise torch.OutOfMemoryError("CUDA out of memory")
+
+    stub._forward = boom
+    fi = SimpleNamespace(batch=SimpleNamespace(reqs=reqs))
+    assert Scheduler._forward_or_fail(stub, fi) is None
+    assert sent == []  # handled only after the overlapped batch is drained
+    stub.finished_reqs = []
+    Scheduler._flush_oom(stub)
+    assert [m.uid for m in sent] == [3] and "out of GPU memory" in sent[0].error
+    assert freed == [live] and shrinks == [1]
+    # every page past the matched prefix goes back; nothing new is committed to the cache
+    assert stub._rejected == [(4096, 12288)] and live.cached_len == live.device_len == 4096
+
+
+def test_oom_skips_request_finished_in_the_drained_batch(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda d=None: None)
+    stub, sent, freed, shrinks = _stub()
+    done = SimpleNamespace(uid=5, table_idx=-1)
+    stub.finished_reqs = [done]
+    stub._oom_failed = ([done], torch.OutOfMemoryError("CUDA out of memory"))
+    Scheduler._flush_oom(stub)
+    assert sent == [] and freed == [] and shrinks == [1]
+
+
+def test_other_errors_still_raise():
+    stub, *_ = _stub()
+
+    def boom(_):
+        raise ValueError("bug")
+
+    stub._forward = boom
+    with pytest.raises(ValueError):
+        Scheduler._forward_or_fail(stub, SimpleNamespace(batch=SimpleNamespace(reqs=[])))
