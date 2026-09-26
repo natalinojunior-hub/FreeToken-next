@@ -70,11 +70,22 @@ _MMVQ_SAFE = 6
 # Prefill-sized GEMMs over dequantized GGUF weights run on the fp8 tensor cores (per-token /
 # per-channel dynamic scales): 2x the bf16 rate, where bf16 already sat at the tensor roof.
 _FP8_PREFILL_MIN_ROWS = 256
+# Per served model (Engine.__init__): on for models without routed experts only. Measured on a
+# MoE model (Tiel-35B), where the dense GEMMs are a small share of prefill: PP +5-7% but decode
+# graph time +10.6% for several seconds after each fp8 prefill (gone after a 30 s pause, clocks
+# and copy bandwidth unchanged) -- a net loss; dense 27B: PP +48% for ~3.6% of that transient.
+_FP8_PREFILL_MODEL = True
+
+
+def set_fp8_prefill(enabled: bool) -> None:
+    global _FP8_PREFILL_MODEL
+    _FP8_PREFILL_MODEL = enabled
 
 
 def _fp8_prefill_ok(x: torch.Tensor, n: int, k: int) -> bool:
     if (
-        x.shape[0] < _FP8_PREFILL_MIN_ROWS
+        not _FP8_PREFILL_MODEL
+        or x.shape[0] < _FP8_PREFILL_MIN_ROWS
         or not x.is_cuda
         or x.dtype not in (torch.bfloat16, torch.float16)
         or n % 16

@@ -584,6 +584,9 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        from freetoken.layers.gguf import set_fp8_prefill
+
+        set_fp8_prefill(not (getattr(config.model_config, "num_experts", 0) or 0))
         self.model.load_state_dict(self._load_weight_state_dict(config))
         finalize_quant(self.model)
         if config.active_encoders:
