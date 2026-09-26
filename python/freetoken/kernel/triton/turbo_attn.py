@@ -60,21 +60,36 @@ def _e2m1_f32(nib):
 
 
 @triton.jit
+def _e2m1_arith(nib, SCALED: tl.constexpr = True):
+    """e2m1 codes (int32, 0..15) -> fp32 with integer ops only: place sign/exponent/mantissa into
+    fp16 bits (the e2m1 grid is fp16's subnormal/low-normal range scaled by 2^-14), then * 2^14.
+    Exact for all 16 codes; no inline PTX (the b8 operand of cvt.rn.f16x2.e2m1x2 miscompiles
+    under runtime strides whichever way it is unpacked, campaign 19)."""
+    bits = ((nib & 8) << 12) | ((nib & 7) << 9)
+    v = bits.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
+    return v * 16384.0 if SCALED else v  # unscaled: the caller folds 2^14 into its block scale
+
+
+@triton.jit
 def _nvfp4_v(codes_ptr, norm_ptr, row, nrow, mask_n, D: tl.constexpr):
     """[N, D] NVFP4 tile, fp32; e4m3 block scale and fp16 group norm read once per 16 values.
-    ``row``/``nrow``: [N, 1] code / norm row offsets."""
-    j = tl.arange(0, D)
+    ``row``/``nrow``: [N, 1] code / norm row offsets. Each code byte is loaded once and split
+    into its two values (the per-element version loaded every byte twice and ran one PTX
+    conversion per value, holding the tile to ~22% of DRAM bandwidth)."""
+    j2 = tl.arange(0, D // 2)
     byte = tl.load(
-        codes_ptr + row + ((j // 128) * 72 + (j % 128) // 2)[None, :], mask=mask_n[:, None], other=0
-    )
-    vals = _e2m1_f32((byte.to(tl.int32) >> ((j % 2) * 4)[None, :]) & 15)
+        codes_ptr + row + ((j2 // 64) * 72 + j2 % 64)[None, :], mask=mask_n[:, None], other=0
+    ).to(tl.int32)
+    lo = _e2m1_arith(byte & 15, False)
+    hi = _e2m1_arith((byte >> 4) & 15, False)
+    N: tl.constexpr = lo.shape[0]
+    vals = tl.reshape(tl.join(lo, hi), (N, D))  # element 2i = low nibble of byte i
     js = tl.arange(0, D // 16)
     sc = tl.load(
         codes_ptr + row + ((js // 8) * 72 + 64 + js % 8)[None, :], mask=mask_n[:, None], other=0
     )
     nrm = tl.load(norm_ptr + nrow + (js // 8)[None, :], mask=mask_n[:, None], other=0.0)
-    scale = sc.to(tl.float8e4nv, bitcast=True).to(tl.float32) * nrm.to(tl.float32)  # [N, D/16]
-    N: tl.constexpr = vals.shape[0]
+    scale = sc.to(tl.float8e4nv, bitcast=True).to(tl.float32) * (nrm.to(tl.float32) * 16384.0)
     return tl.reshape(tl.reshape(vals, (N, D // 16, 16)) * scale[:, :, None], (N, D))
 
 
