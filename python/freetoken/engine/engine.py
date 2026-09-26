@@ -699,7 +699,7 @@ class Engine:
                 _shed_mtp(config)
                 self._release_mtp()
                 available_memory += extra
-                self._set_kv_format(config, k0_fmt)
+                self._set_kv_format(config, k0_fmt, "fits once MTP is off")
                 device_pages = self._pool_cls.solve_num_pages(config, available_memory)
         self.num_pages = device_pages + self.host_pages
         num_tokens = self.num_pages * config.page_size
@@ -1257,12 +1257,11 @@ class Engine:
             gc.collect()
             torch.cuda.empty_cache()
 
-    def _set_kv_format(self, config: EngineConfig, fmt: str) -> None:
+    def _set_kv_format(self, config: EngineConfig, fmt: str, why: str | None = None) -> None:
         """Step the auto KV format down one rung (same attention backend family: fp8, nvfp4 and
         turbo all run on the coded-KV backend chosen for fp8; QSA keeps qsa_sparse)."""
-        logger.info_rank0(
-            f"KV format auto: {config.kv_format} does not fit {config.max_seq_len} tokens -> {fmt}"
-        )
+        why = why or f"{config.kv_format} does not fit {config.max_seq_len} tokens"
+        logger.info_rank0(f"KV format auto: {config.kv_format} -> {fmt} ({why})")
         object.__setattr__(config, "kv_format", fmt)
         self._pool_cls = resolve_pool_class(config.model_config, fmt)
 
