@@ -97,7 +97,9 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
         # allocating that during CUDA graph capture fails outright. x is [tokens, hidden],
         # so casting it is negligible, and computing in the stored precision is what
         # llama.cpp does for these tensors anyway.
-        return (x.to(w.dtype) @ w.T).to(x.dtype)
+        from freetoken.layers.quantization.linear.unquantized import small_batch_linear
+
+        return small_batch_linear(x.to(w.dtype), w).to(x.dtype)
     if x.shape[0] <= _MMVQ_SAFE and qweight_type in MMVQ_TYPES:
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
     if qweight_type in DEQUANT_TYPES:

@@ -12,6 +12,16 @@ from ..scheme import QuantKind
 from .base import LinearKernel, LinearMethod
 
 
+def small_batch_linear(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None = None) -> torch.Tensor:
+    """``F.linear`` for a 2-D activation; 2..8 rows (MTP verify/draft windows) go through
+    ``w @ x.T``, which cuBLAS runs as a batched GEMV: measured on sm_120, [48, 5120] bf16
+    at 2-4 rows 34 us -> 10 us (x @ w.T picks a slow tiled GEMM there)."""
+    if x.dim() == 2 and 2 <= x.shape[0] <= 8:
+        out = (w @ x.T).T
+        return out + b if b is not None else out
+    return F.linear(x, w, b)
+
+
 class TorchLinearKernel(LinearKernel):
     name = "torch"
 
@@ -21,7 +31,7 @@ class TorchLinearKernel(LinearKernel):
         if w.dtype != x.dtype:
             w = w.to(x.dtype)
             b = b.to(x.dtype) if b is not None else None
-        return F.linear(x, w, b)
+        return small_batch_linear(x, w, b)
 
 
 @register_method(QuantKind.NONE, LayerKind.LINEAR)

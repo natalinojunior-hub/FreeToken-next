@@ -55,6 +55,70 @@ static __global__ void mul_mat_vec_q(
   }
 }
 
+// nvecs > 1 for the i-quants whose decode dominates: decode each x sub-block once (Mv::decode)
+// and dot it with every y vector (Mv::dot keeps vec_dot_*'s float order -> identical outputs).
+template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr, typename Mv, int nv>
+static __global__ void mul_mat_vec_q_mv(
+    const void* __restrict__ vx,
+    const void* __restrict__ vy,
+    scalar_t* __restrict__ dst,
+    const int ncols,
+    const int nrows,
+    const int nvecs) {
+  const auto row = blockIdx.x * blockDim.y + threadIdx.y;
+  const int vec0 = blockIdx.y * nv;
+  if (row >= nrows) {
+    return;
+  }
+  const int blocks_per_row = ncols / qk;
+  const int blocks_per_warp = vdr * WARP_SIZE / qi;
+  const int nrows_y = (ncols + 512 - 1) / 512 * 512;
+  float tmp[nv] = {0.0f};
+  const block_q_t* x = (const block_q_t*)vx;
+  const block_q8_1* y = (const block_q8_1*)vy;
+  for (auto i = threadIdx.x / (qi / vdr); i < blocks_per_row; i += blocks_per_warp) {
+    const int ibx = row * blocks_per_row + i;
+    const int iqs = vdr * (threadIdx.x % (qi / vdr));
+    int v[8];
+    const float a = Mv::decode(&x[ibx], iqs, v);
+#pragma unroll
+    for (int j = 0; j < nv; ++j) {
+      if (vec0 + j < nvecs) {
+        const int iby = (vec0 + j) * (nrows_y / QK8_1) + i * (qk / QK8_1);
+        tmp[j] += Mv::dot(v, a, &y[iby + iqs]);
+      }
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < nv; ++j) {
+#pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+      tmp[j] += SGLANG_SHFL_XOR_SYNC(uint32_t(-1), tmp[j], mask);
+    }
+    if (threadIdx.x == 0 && vec0 + j < nvecs) {
+      dst[(vec0 + j) * nrows + row] = tmp[j];
+    }
+  }
+}
+
+template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda, typename Mv>
+static void launch_mul_mat_vec_q_mv(
+    const void* vx, const void* vy, scalar_t* dst, const int ncols, const int nrows, const int nvecs,
+    cudaStream_t stream) {
+  const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+  if (nvecs == 1) {
+    mul_mat_vec_q<scalar_t, qk, qi, block_q_t, vdr, vec_dot_q_cuda, 1>
+        <<<dim3(block_num_y, 1, 1), block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+  } else if (nvecs <= 4) {
+    mul_mat_vec_q_mv<scalar_t, qk, qi, block_q_t, vdr, Mv, 4>
+        <<<dim3(block_num_y, 1, 1), block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+  } else {
+    mul_mat_vec_q_mv<scalar_t, qk, qi, block_q_t, vdr, Mv, 8>
+        <<<dim3(block_num_y, (nvecs + 7) / 8, 1), block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+  }
+}
+
 template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
 static void launch_mul_mat_vec_q(
     const void* vx, const void* vy, scalar_t* dst, const int ncols, const int nrows, const int nvecs,
@@ -253,7 +317,7 @@ static void mul_mat_vec_iq3_xxs_q8_1_cuda(
     const int nrows,
     const int nvecs,
     cudaStream_t stream) {
-  launch_mul_mat_vec_q<scalar_t, QK_K, QI3_XXS, block_iq3_xxs, 1, vec_dot_iq3_xxs_q8_1>(vx, vy, dst, ncols, nrows, nvecs, stream);
+  launch_mul_mat_vec_q_mv<scalar_t, QK_K, QI3_XXS, block_iq3_xxs, 1, vec_dot_iq3_xxs_q8_1, MvIq3xxs>(vx, vy, dst, ncols, nrows, nvecs, stream);
 }
 
 template <typename scalar_t>
@@ -301,7 +365,7 @@ static void mul_mat_vec_iq4_xs_q8_1_cuda(
     const int nrows,
     const int nvecs,
     cudaStream_t stream) {
-  launch_mul_mat_vec_q<scalar_t, QK_K, QI4_XS, block_iq4_xs, 1, vec_dot_iq4_xs_q8_1>(vx, vy, dst, ncols, nrows, nvecs, stream);
+  launch_mul_mat_vec_q_mv<scalar_t, QK_K, QI4_XS, block_iq4_xs, 1, vec_dot_iq4_xs_q8_1, MvIq4xs>(vx, vy, dst, ncols, nrows, nvecs, stream);
 }
 
 template <typename scalar_t>
@@ -313,5 +377,5 @@ static void mul_mat_vec_iq3_s_q8_1_cuda(
     const int nrows,
     const int nvecs,
     cudaStream_t stream) {
-  launch_mul_mat_vec_q<scalar_t, QK_K, QI3_XS, block_iq3_s, 1, vec_dot_iq3_s_q8_1>(vx, vy, dst, ncols, nrows, nvecs, stream);
+  launch_mul_mat_vec_q_mv<scalar_t, QK_K, QI3_XS, block_iq3_s, 1, vec_dot_iq3_s_q8_1, MvIq3s>(vx, vy, dst, ncols, nrows, nvecs, stream);
 }

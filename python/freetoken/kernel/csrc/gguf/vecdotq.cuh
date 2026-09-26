@@ -2080,3 +2080,75 @@ vec_dot_iq4_xs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__
   return d * (sumi1 + sumi2);
 #endif
 }
+
+// Multi-vector dot (verify / small batches): decode one x sub-block (32 values -> 8 packed
+// int8x4) ONCE, then dp4a it against every y vector. ``dot`` keeps the exact float order of the
+// single-vector vec_dot_*_q8_1, so each output equals that path bit for bit.
+struct MvIq3s {
+  static __device__ __forceinline__ float decode(const void* __restrict__ vbq, const int iqs, int (&v)[8]) {
+    const block_iq3_s* bq2 = (const block_iq3_s*)vbq;
+    const int ib32 = iqs;
+    const uint8_t* qs = bq2->qs + 8 * ib32;
+    for (int l = 0; l < 4; ++l) {
+      const uint32_t* grid1 = iq3xs_grid + (qs[2 * l + 0] | ((bq2->qh[ib32] << (8 - 2 * l)) & 256));
+      const uint32_t* grid2 = iq3xs_grid + (qs[2 * l + 1] | ((bq2->qh[ib32] << (7 - 2 * l)) & 256));
+      uint32_t signs0 = __vcmpeq4(((bq2->signs[4 * ib32 + l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201);
+      uint32_t signs1 = __vcmpeq4(((bq2->signs[4 * ib32 + l] >> 4) * 0x01010101) & 0x08040201, 0x08040201);
+      v[2 * l + 0] = __vsub4(grid1[0] ^ signs0, signs0);
+      v[2 * l + 1] = __vsub4(grid2[0] ^ signs1, signs1);
+    }
+    return __half2float(bq2->d) * (0.5f + ((bq2->scales[ib32 / 2] >> 4 * (ib32 % 2)) & 0xf));
+  }
+  static __device__ __forceinline__ float dot(const int (&v)[8], const float a, const block_q8_1* __restrict__ y) {
+    const int* q8 = (const int*)y->qs;
+    int sumi = 0;
+#pragma unroll
+    for (int m = 0; m < 8; ++m) sumi = __dp4a(v[m], q8[m], sumi);
+    return a * __low2float(y->ds) * 0.5f * sumi;
+  }
+};
+
+struct MvIq3xxs {
+  static __device__ __forceinline__ float decode(const void* __restrict__ vbq, const int iqs, int (&v)[8]) {
+    const block_iq3_xxs* bq2 = (const block_iq3_xxs*)vbq;
+    const int ib32 = iqs;
+    const uint8_t* q3 = bq2->qs + 8 * ib32;
+    const uint16_t* gas = (const uint16_t*)(bq2->qs + QK_K / 4) + 2 * ib32;
+    uint32_t aux32 = gas[0] | (gas[1] << 16);
+    for (int l = 0; l < 4; ++l) {
+      const uint32_t* grid1 = iq3xxs_grid + q3[2 * l + 0];
+      const uint32_t* grid2 = iq3xxs_grid + q3[2 * l + 1];
+      const uint32_t* signs = (const uint32_t*)(ksigns64 + (aux32 & 127));
+      v[2 * l + 0] = __vsub4(grid1[0] ^ signs[0], signs[0]);
+      v[2 * l + 1] = __vsub4(grid2[0] ^ signs[1], signs[1]);
+      aux32 >>= 7;
+    }
+    return __half2float(bq2->d) * (0.5f + aux32);
+  }
+  static __device__ __forceinline__ float dot(const int (&v)[8], const float a, const block_q8_1* __restrict__ y) {
+    return MvIq3s::dot(v, a, y);
+  }
+};
+
+struct MvIq4xs {
+  static __device__ __forceinline__ float decode(const void* __restrict__ vbq, const int iqs, int (&v)[8]) {
+    const block_iq4_xs* bq4 = (const block_iq4_xs*)vbq;
+    const uint8_t* values = (const uint8_t*)kvalues_iq4nl;
+    const int ib32 = iqs;
+    const uint32_t* q4 = (const uint32_t*)bq4->qs + 4 * ib32;
+    const int8_t ls = ((bq4->scales_l[ib32 / 2] >> 4 * (ib32 % 2)) & 0xf) | (((bq4->scales_h >> 2 * ib32) & 3) << 4);
+    for (int j = 0; j < 4; ++j) get_int_from_table_16(q4[j], values, v[j], v[j + 4]);
+    return __half2float(bq4->d) * (ls - 32);
+  }
+  static __device__ __forceinline__ float dot(const int (&v)[8], const float a, const block_q8_1* __restrict__ y) {
+    const int* q8 = (const int*)y->qs;
+    int sumi1 = 0, sumi2 = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      sumi1 = __dp4a(v[j], q8[j + 0], sumi1);
+      sumi2 = __dp4a(v[j + 4], q8[j + 4], sumi2);
+    }
+    return a * __low2float(y->ds) * (sumi1 + sumi2);
+  }
+};
+
