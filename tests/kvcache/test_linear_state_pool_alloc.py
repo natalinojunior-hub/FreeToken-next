@@ -206,3 +206,23 @@ def test_slot_state_bytes_for_the_real_geometry():
         group, 1, torch.bfloat16, (spec,)
     ) - linear_state_bytes_per_req(group, 1, torch.bfloat16)
     assert delta == 4 * 2560 * 9 * 2 == 180 * 1024
+
+
+def test_snapshot_cache_ratio_zero_lands_on_the_floor():
+    """``--linear-state-cache-ratio 0`` drops the cross-request GDN snapshot cache and sizes
+    the pool exactly at the non-evictable floor, handing ~0.43 GiB back to the expert cache
+    on Flash-Next; any ratio > 0 keeps the historical 4-snapshot floor, so existing configs
+    are unchanged."""
+    from freetoken.kvcache.linear_state_pool import (
+        _linear_pool_min_slots,
+        _linear_pool_num_slots,
+    )
+
+    def cfg(ratio, mr=1):
+        return SimpleNamespace(
+            max_running_req=mr, cache_type="hybrid_radix", linear_state_cache_ratio=ratio
+        )
+
+    assert _linear_pool_num_slots(cfg(2.0)) == 9  # the default: 4 live + 4 snapshots + sink
+    assert _linear_pool_num_slots(cfg(0.0)) == _linear_pool_min_slots(cfg(0.0)) == 5
+    assert _linear_pool_num_slots(cfg(0.0, mr=4)) == _linear_pool_min_slots(cfg(0.0, mr=4)) == 17

@@ -184,6 +184,9 @@ class OffloadMoeCache:
     # Mixed-geometry banks only: most distinct experts one decode step may route (decode-path
     # tokens * top_k), the floor of every geometry pool's LRU range; 0 = one full layer.
     min_pool_rows: int = 0
+    # Mixed-geometry banks only: per-pool slot caps replacing the uniform layer-count split
+    # (``pool_capacities``), in ``expert_pools`` order (largest layer group first). "" = off.
+    pool_caps_override: str = ""
 
     def __post_init__(self) -> None:
         if isinstance(self.gguf_expert_types, dict):
@@ -678,6 +681,65 @@ class OffloadMoeCache:
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         return sum(caps)
 
+    def _override_caps(self, pools, cache_size: int) -> list[int]:
+        """The ``--moe-pool-caps`` split of ``cache_size`` rows.
+
+        The override names the SHAPE of the split (its entries are relative weights);
+        ``cache_size`` stays the byte-budget authority, so the caps always sum to exactly
+        ``cache_size`` (clamped to the pools' total row domain) - at build, where the
+        planner sized the budget, and at every rebuild target, so a guard shrink/regrow
+        keeps the operator's proportions instead of silently reverting to the uniform
+        split. Largest-remainder rounding clamped to each pool's ``[floor, rows]``
+        domain; deterministic for a given input.
+        """
+        want = [int(x) for x in self.pool_caps_override.split(",") if x.strip()]
+        if len(want) != len(pools):
+            raise ValueError(
+                f"moe_pool_caps has {len(want)} entries but the banks have {len(pools)} "
+                f"geometry pools (order: largest layer group first)"
+            )
+        if any(c < 0 for c in want) or sum(want) == 0:
+            raise ValueError(f"moe_pool_caps entries must be >= 0 and sum > 0, got {want}")
+        E = self.num_experts
+        hi = [len(p.layers) * E for p in pools]
+        lo = [min(h, self.min_pool_rows or E) for h in hi]
+        for c, h in zip(want, hi):
+            if c > h:
+                raise ValueError(f"moe_pool_caps entry {c} exceeds its pool's {h} rows")
+        total = sum(want)
+        cache_size = min(cache_size, sum(hi))
+        if cache_size < sum(lo):
+            raise ValueError(
+                f"moe_pool_caps cannot split {cache_size} rows: every pool needs its decode "
+                f"floor (sum {sum(lo)})"
+            )
+        base = [max(l, min(h, w * cache_size // total)) for w, l, h in zip(want, lo, hi)]
+        rem = cache_size - sum(base)
+        order = sorted(range(len(want)), key=lambda i: (-(want[i] * cache_size % total), i))
+        while rem > 0:
+            moved = False
+            for i in order:
+                if rem == 0:
+                    break
+                if base[i] < hi[i]:
+                    base[i] += 1
+                    rem -= 1
+                    moved = True
+            if not moved:  # pragma: no cover - guarded by the sum(hi) clamp above
+                raise ValueError(f"moe_pool_caps cannot place {cache_size} rows under {hi}")
+        while rem < 0:
+            moved = False
+            for i in order:
+                if rem == 0:
+                    break
+                if base[i] > lo[i]:
+                    base[i] -= 1
+                    rem += 1
+                    moved = True
+            if not moved:  # pragma: no cover - guarded by the sum(lo) check above
+                raise ValueError(f"moe_pool_caps cannot shrink to {cache_size} rows above {lo}")
+        return base
+
     def _pool_plan(self, cache_size: int):
         """``(pools, capacities, offsets, arena_bytes)`` for ``cache_size`` rows; raises
         ``ValueError`` when a sub-layer pool's prefill staging window exceeds an arena."""
@@ -689,11 +751,14 @@ class OffloadMoeCache:
         )
 
         pools = expert_pools({n: self.bank_sources[n] for n in self.bank_schema})
-        caps = (
-            [cache_size]
-            if len(pools) == 1
-            else pool_capacities(pools, self.num_experts, cache_size, self.min_pool_rows)
-        )
+        if self.pool_caps_override and len(pools) > 1:
+            caps = self._override_caps(pools, cache_size)
+        else:
+            caps = (
+                [cache_size]
+                if len(pools) == 1
+                else pool_capacities(pools, self.num_experts, cache_size, self.min_pool_rows)
+            )
         offsets, ends = pool_layout(pools, caps)
         if not pool_staging_fits(pools, caps, self.num_experts, ends):
             raise ValueError(

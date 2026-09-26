@@ -72,6 +72,10 @@ class EngineConfig:
         False  # auto-extend RoPE table past checkpoint max_position for 512K/1M
     )
     moe_cache_policy: str = "lru"
+    # Mixed-geometry banks only: comma-separated per-pool slot caps, ordered as
+    # cache_budget.expert_pools sorts them (largest layer group first). "" = uniform
+    # layer-count split. Experimental knob; validated against the pools at init.
+    moe_pool_caps: str = ""
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8

@@ -324,7 +324,12 @@ def _linear_pool_num_slots(config) -> int:
     if config.cache_type != "hybrid_radix":
         return mr + 1  # live + dummy/padding
     ratio = config.linear_state_cache_ratio
-    n_cache = max(4, int(ratio * mr))
+    # ratio <= 0 is an explicit opt-out of the cross-request snapshot cache: the pool then
+    # sits exactly at _linear_pool_min_slots, which is what a single-request decode workload
+    # wants when the VRAM is worth more as MoE expert slots than as prefix-hit snapshots.
+    # Any ratio > 0 keeps the historical floor of 4 snapshots, so existing configs are
+    # byte-identical.
+    n_cache = 0 if ratio <= 0 else max(4, int(ratio * mr))
     return 4 * mr + n_cache + 1  # live + 2 ping-pong + locked committed snapshot + cache + padding
 
 

@@ -496,6 +496,22 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--linear-state-cache-ratio",
+        type=float,
+        default=ServerArgs.linear_state_cache_ratio,
+        help=(
+            "Cross-request GDN snapshot cache size as a multiple of --max-running-requests "
+            "(hybrid-radix only). Each snapshot is ~0.11 GiB of VRAM on Flash-Next, so a "
+            "single-request decode workload can set 0 to hand those slots to the MoE expert "
+            "cache; the price is that a warm request hitting a KV prefix must rebuild its GDN "
+            "state instead of restoring a snapshot (worse TTFT on cache hits, same output). "
+            "Checkpoint-dependent: measured +2.1% TG and bit-identical output on Flash-Next "
+            "ISTA IQ3_XXS, but on Flash-Next AD 4.27bpw it CHANGED the generated text and "
+            "cost 7% TG - do not set 0 there."
+        ),
+    )
+
+    parser.add_argument(
         "--text-model-only",
         action="store_true",
         default=False,
@@ -806,6 +822,17 @@ def parse_args(
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],
         help="The unified MoE cache eviction policy.",
+    )
+
+    parser.add_argument(
+        "--moe-pool-caps",
+        default=ServerArgs.moe_pool_caps,
+        help=(
+            "Mixed-geometry MoE banks only: comma-separated per-pool expert slot caps, "
+            "ordered by pool layer count (largest first). Default empty = the uniform "
+            "layer-count split. Experimental; the split must fit VRAM alongside the rest "
+            "of the plan."
+        ),
     )
 
     parser.add_argument(

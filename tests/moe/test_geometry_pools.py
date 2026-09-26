@@ -217,6 +217,66 @@ def test_decode_eviction_prefill_staging_rebuild_and_reset():
     resident(2, [7])
 
 
+def _oc(override: str, cache_size: int, device: str = "cpu") -> OffloadMoeCache:
+    """Build a cache with an explicit --moe-pool-caps override (bank sources attached)."""
+    cache = OffloadMoeCache(
+        num_layers=L,
+        num_experts=E,
+        cache_size=cache_size,
+        device=torch.device(device),
+        quant_format="gguf",
+        gguf_expert_types=[(23, 20)] * 3 + [(8, 8)],
+        min_pool_rows=FLOOR,
+        pool_caps_override=override,
+    )
+    cache.set_bank_sources(_sources(pin=device == "cuda"))
+    return cache
+
+
+# --moe-pool-caps: the override names the SHAPE of the split; cache_size (the planner's byte
+# budget) stays the authority, so caps always sum to cache_size and a rebuild keeps proportions
+# instead of silently reverting to uniform (campaign23 A3/A4).
+
+
+def test_override_caps_are_proportional_to_the_budget_authority():
+    cache = _oc("20,6", 26)  # sum == cache_size: identity split, no overcommit
+    assert cache.pool_caps == [20, 6] and cache.cache_size == 26
+    pools = expert_pools(_sources())
+    # sum(override) > cache_size: scaled DOWN to the budget, not allowed to override it
+    assert cache._override_caps(pools, 20) == [15, 5]  # 20,6 -> sum 20, ratio preserved
+    assert cache._override_caps(pools, 13) == [10, 3]  # pure math, staging checked elsewhere
+    # deterministic
+    assert cache._override_caps(pools, 20) == cache._override_caps(pools, 20)
+
+
+def test_override_build_never_silently_overcommits_the_budget():
+    # regression: sum(want)=32 but the planned budget is 26 -> must allocate 26, not 32
+    cache = _oc("24,8", 26)
+    assert cache.cache_size == 26 and sum(cache.pool_caps) == 26
+    assert cache.pool_caps == [20, 6]
+
+
+def test_override_rebuild_keeps_proportions_and_respects_the_target():
+    cache = _oc("20,6", 26)
+    cache.rebuild(20)  # a guard shrink must actually shrink, proportionally
+    assert cache.cache_size == sum(cache.pool_caps) == 20
+    assert cache.pool_caps == [15, 5]
+    cache.rebuild(26)  # ...and regrow back to the operator's proportions
+    assert cache.cache_size == sum(cache.pool_caps) == 26 and cache.pool_caps == [20, 6]
+
+
+def test_override_validation_domain():
+    pools = expert_pools(_sources())
+    with pytest.raises(ValueError, match="entries but the banks have"):
+        _oc("20,6,1", 27)  # wrong pool count
+    with pytest.raises(ValueError, match="must be >= 0"):
+        _oc("-1,6", 26)._override_caps(pools, 26)
+    with pytest.raises(ValueError, match="exceeds its pool"):
+        _oc("100,6", 26)._override_caps(pools, 26)  # 100 > pool0 max (3 layers * E = 24)
+    with pytest.raises(ValueError, match="decode"):
+        _oc("20,6", 26)._override_caps(pools, 3)  # below the sum of per-pool floors (2+2)
+
+
 @cuda
 def test_hybrid_gpu_kernel_matches_cpu_reference_on_a_sub_layer_pool():
     from freetoken.moe.offload_kernels import (

@@ -1545,6 +1545,7 @@ class Engine:
                 config.model_config.num_experts_per_tok,
                 config.max_running_req,
             ),
+            pool_caps_override=config.moe_pool_caps,
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
