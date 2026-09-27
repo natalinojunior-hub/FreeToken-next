@@ -148,6 +148,19 @@ def is_gguf_model(config: ModelConfig) -> bool:
     return getattr(config, "gguf_model_path", None) is not None
 
 
+def _ba_merge_ok(tb: int | None, ta: int | None) -> bool:
+    """Whether the GDN ssm_beta/ssm_alpha in_proj parts become ONE unquantized part.
+
+    Both parts are then a single [2*num_v, hidden] bf16 F.linear instead of two
+    [num_v, hidden] calls (one fewer cuBLAS M=1 launch per GDN layer per token).
+    Bit-identical: the output cat layout is unchanged and cuBLAS gemv rows are
+    independent dots (verified torch.equal over 50 random trials, campaign-33).
+    """
+    from freetoken.models.gguf.dequant import GGML_UNQUANTIZED
+
+    return tb == ta and tb in GGML_UNQUANTIZED
+
+
 def _scan_quant_types(model_path: str) -> dict[tuple[int, str], int]:
     from freetoken.models.gguf.reader import iter_gguf_tensors
 
@@ -494,15 +507,20 @@ def convert_qwen4exp_to_gguf(model, config: ModelConfig, *, model_path: str) -> 
                 ],
             )
         else:
+            merge_ba = _ba_merge_ok(
+                qt(layer_id, "ssm_beta.weight"), qt(layer_id, "ssm_alpha.weight")
+            )
+            in_proj_types = [
+                qt(layer_id, "attn_qkv.weight"),
+                qt(layer_id, "attn_gate.weight"),
+                qt(layer_id, "ssm_beta.weight"),
+            ]
+            if not merge_ba:
+                in_proj_types.append(qt(layer_id, "ssm_alpha.weight"))
             layer.linear_attn.in_proj = gguf_merged_or_plain(
                 config.hidden_size,
-                _in_proj_split,
-                [
-                    qt(layer_id, "attn_qkv.weight"),
-                    qt(layer_id, "attn_gate.weight"),
-                    qt(layer_id, "ssm_beta.weight"),
-                    qt(layer_id, "ssm_alpha.weight"),
-                ],
+                _in_proj_split[:2] + [2 * _in_proj_split[3]] if merge_ba else _in_proj_split,
+                in_proj_types,
             )
             swap_linear(layer.linear_attn, "out_proj", qt(layer_id, "ssm_out.weight"))
             gdn = layer.linear_attn
@@ -776,8 +794,14 @@ def iter_gguf_weights(
                 else:
                     yield f"{base}.linear_attn.in_proj.qweight_0", slots["qkv"]
                     yield f"{base}.linear_attn.in_proj.qweight_1", slots["gate"]
-                    yield f"{base}.linear_attn.in_proj.qweight_2", slots["beta"]
-                    yield f"{base}.linear_attn.in_proj.qweight_3", slots["alpha"]
+                    if _ba_merge_ok(types[2], types[3]):
+                        yield (
+                            f"{base}.linear_attn.in_proj.qweight_2",
+                            torch.cat([slots["beta"], slots["alpha"]], dim=0),
+                        )
+                    else:
+                        yield f"{base}.linear_attn.in_proj.qweight_2", slots["beta"]
+                        yield f"{base}.linear_attn.in_proj.qweight_3", slots["alpha"]
                 del in_proj_buf[layer]
             continue
 
