@@ -22,6 +22,31 @@ class MoeTracer:
         self._fh = (self.out_dir / "trace.jsonl").open("w")
         self._step = 0
         self.initial_written = False
+        # Opt-in router-input capture (FREETOKEN_MOE_TRACE_HIDDEN=1): stores the
+        # decode MoE input hidden row per (access_step, layer) for offline
+        # cross-layer routing-prediction studies. Keyed by the access_step the
+        # next record() will write; saved to hidden.pt on close().
+        self.capture_hidden = os.getenv("FREETOKEN_MOE_TRACE_HIDDEN", "").strip() == "1"
+        self._hidden: list[tuple[int, int, torch.Tensor]] = []
+        if self.capture_hidden:
+            import atexit
+
+            atexit.register(self._save_hidden)
+
+    def _save_hidden(self) -> None:
+        if self._hidden:
+            torch.save(self._hidden, self.out_dir / "hidden.pt")
+
+    def record_hidden(self, layer_id: int, hidden_states: torch.Tensor, kind: str) -> None:
+        if not self.capture_hidden or kind != "decode" or _capturing():
+            return
+        if hidden_states.shape[0] != 1:
+            return
+        self._hidden.append(
+            (self._step, layer_id, hidden_states.reshape(-1).to(torch.bfloat16).cpu().clone())
+        )
+        if len(self._hidden) % 2048 == 0:
+            self._save_hidden()
 
     @classmethod
     def from_env(cls) -> MoeTracer | None:
@@ -142,4 +167,7 @@ class MoeTracer:
         self._step += 1
 
     def close(self) -> None:
+        if self._hidden:
+            torch.save(self._hidden, self.out_dir / "hidden.pt")
+            self._hidden.clear()
         self._fh.close()

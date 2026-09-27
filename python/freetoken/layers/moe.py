@@ -304,7 +304,9 @@ class OffloadMoELayer(MoELayer):
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         if cache.tracer is not None:
-            cache.ensure_experts(self.layer_id, topk_ids, kind=self._trace_kind(hidden_states))
+            kind = self._trace_kind(hidden_states)
+            cache.tracer.record_hidden(self.layer_id, hidden_states, kind)
+            cache.ensure_experts(self.layer_id, topk_ids, kind=kind)
         elif (
             os.getenv("FREETOKEN_MOE_DECODE_OVERLAP", "1") == "1"
             and cache.device.type == "cuda"
