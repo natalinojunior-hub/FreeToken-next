@@ -269,21 +269,26 @@ def test_offload_decode_bit_identical_under_eviction(tp1):
     out_b = layer1._decode_routed(hidden, tw, torch.tensor([[2, 3]], dtype=torch.int32, device=dev))
     assert torch.equal(out_b, ref(1, [2, 3])), "Call B (fill cache) failed"
 
-    # Evictor: layer0 [0,1] claims the two LRU-oldest slots (A's) -> L1E0,L1E1 evicted
+    # Evictor: layer0 [0,1] claims two slots. Under flashlib timestamp LRU the victims are
+    # the oldest (A's L1E0/L1E1); under the default LRU-3 all four residents are still
+    # under-referenced (<3 refs), where the most-recently-touched lose (B's L1E2/L1E3).
+    import freetoken.moe.offload_kernels as _ok
+
+    victims = (2, 3) if _ok._EVICT_LRU3 else (0, 1)
     out_ev = layer0._decode_routed(
         hidden, tw, torch.tensor([[0, 1]], dtype=torch.int32, device=dev)
     )
     assert torch.equal(out_ev, ref(0, [0, 1])), "Evictor call failed"
-    assert int(cache.slot_for_id[1, 0].item()) == -1, (
-        "Eviction did not happen (L1E0 still resident)"
-    )
-    assert int(cache.slot_for_id[1, 1].item()) == -1, (
-        "Eviction did not happen (L1E1 still resident)"
-    )
+    for e in victims:
+        assert int(cache.slot_for_id[1, e].item()) == -1, (
+            f"Eviction did not happen (L1E{e} still resident)"
+        )
 
-    # C: L1E0,L1E1 missing -> reload (evicting L1E2,L1E3)
-    out_c = layer1._decode_routed(hidden, tw, torch.tensor([[0, 1]], dtype=torch.int32, device=dev))
-    assert torch.equal(out_c, ref(1, [0, 1])), "Call C (reload after eviction) failed"
+    # C: the evicted pair is missing -> reload (evicting two others), bit-identical
+    out_c = layer1._decode_routed(
+        hidden, tw, torch.tensor([list(victims)], dtype=torch.int32, device=dev)
+    )
+    assert torch.equal(out_c, ref(1, list(victims))), "Call C (reload after eviction) failed"
 
 
 @CUDA

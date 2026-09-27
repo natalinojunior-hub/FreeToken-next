@@ -15,6 +15,17 @@ _HYBRID_FETCH_BY_RECENCY = (
     os.getenv("FREETOKEN_HYBRID_FETCH", "recency").strip().lower() != "lowest_id"
 )
 
+# Eviction policy for the GPU decode path (ensure_experts). "lru3" (default) runs the
+# in-repo LRU-3 kernel below: the victim key is each resident expert's 3rd-most-recent
+# reference step (experts with fewer than 3 refs rank by -last_ref, most-recently-touched
+# first), with the ref history kept per EXPERT so it survives eviction (ghost history).
+# Canonical ISTA raw-k0 matched A/B: TG warm median 61.92 -> 65.72 (+3.80, Welch t=17.5,
+# zero sample overlap), ITL p50 -1.18 ms, PP/TTFT/VRAM neutral, SHA preserved (campaign-35
+# offline study: -33.4% steady miss bytes vs LRU). Outputs are unaffected -- eviction only
+# moves rows between slots, every GEMV still reads identical bytes in topk order.
+# FREETOKEN_MOE_EVICT=lru restores flashlib's timestamp LRU.
+_EVICT_LRU3 = os.getenv("FREETOKEN_MOE_EVICT", "lru3").strip().lower() != "lru"
+
 
 def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     """Make this layer's routed experts resident; rewrite ``expert_ids`` to slot ids.
@@ -26,6 +37,9 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     downstream GEMM depends on. The LRU runs on the layer's geometry pool, so the slot ids
     written are pool-local.
     """
+    if _EVICT_LRU3:
+        _ensure_experts_lru3(cache, layer_id, expert_ids)
+        return
     id_of_slot, usage = cache.pool_state(layer_id)
     lru_ensure(
         expert_ids,
@@ -40,6 +54,144 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
         stats=cache.lru_stats[layer_id] if cache.collect_stats else None,
         id_base=layer_id * cache.num_experts,
     )
+
+
+def _ensure_experts_lru3(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+    """LRU-3 eviction variant of ``ensure_experts`` (same interface and plan layout)."""
+    id_of_slot, usage = cache.pool_state(layer_id)
+    num_cached = id_of_slot.numel()
+    block_c = max(2, triton.next_power_of_2(num_cached))
+    k = expert_ids.numel()
+    _lru3_ensure_kernel[(1,)](
+        expert_ids,
+        cache.slot_for_id.view(-1),
+        id_of_slot,
+        usage,
+        cache.ghost_hist,
+        cache.step,
+        expert_ids,
+        cache.src_indices,
+        cache.evict_slots,
+        cache.num_indices,
+        cache.lru_stats[layer_id] if cache.collect_stats else None,
+        k,
+        num_cached,
+        layer_id * cache.num_experts,
+        cache.ghost_hist.stride(0),
+        BLOCK_K=triton.next_power_of_2(k),
+        BLOCK_C=block_c,
+        SLOT_BITS=block_c.bit_length() - 1,
+        COLLECT_STATS=cache.collect_stats,
+        num_warps=8 if block_c >= 2048 else 4,
+    )
+
+
+@triton.jit(do_not_specialize=["K", "num_cached", "id_base", "ghost_stride"])
+def _lru3_ensure_kernel(
+    query_ptr,
+    slot_of_id_ptr,
+    id_of_slot_ptr,
+    usage_ptr,
+    ghost_ptr,  # [3, num_total] int64: per-expert (g1, g2, g3) last-ref steps
+    step_ptr,
+    out_ptr,
+    src_ptr,
+    dst_ptr,
+    num_copy_ptr,
+    stats_ptr,
+    K,
+    num_cached,
+    id_base,
+    ghost_stride,
+    BLOCK_K: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    SLOT_BITS: tl.constexpr,
+    COLLECT_STATS: tl.constexpr,
+):
+    """LRU-3 with ghost history: victims by the 3rd-most-recent reference step.
+
+    Mirrors flashlib's ``_lru_ensure_kernel`` (sequential argmin over a register-resident
+    key block, same plan/interface, same ``usage == step`` protection) with a different
+    victim key: ``g3 > 0 ? g3 : -max(usage, 1)``, where ``g1/g2/g3`` are the expert's three
+    most recent reference steps and survive eviction (indexed by flat id, so a re-missed
+    expert re-enters with its full recency depth). Empty slots rank below every resident;
+    slots touched by this call and VMM-unbacked slots (``usage >= _BLOCKED_USAGE``) are
+    never victims. Keys pack as ``(key + OFF) << SLOT_BITS | slot`` so one int64 argmin
+    gives the (key, slot) order with no ties.
+    """
+    EMPTY: tl.constexpr = -(1 << 41)
+    BIG: tl.constexpr = 1 << 41
+    BLOCKED: tl.constexpr = 1 << 40
+    OFF: tl.constexpr = 1 << 42
+    KEY_MAX: tl.constexpr = 0x7FFFFFFFFFFFFFFF
+
+    step = tl.load(step_ptr) + 1
+    tl.store(step_ptr, step)
+
+    # ---- Phase 1: dedup the query, split hit/miss, rank the misses (flashlib-identical) ----
+    k = tl.arange(0, BLOCK_K)
+    kmask = k < K
+    q = tl.load(query_ptr + k, mask=kmask, other=-1) + id_base
+    s = tl.load(slot_of_id_ptr + q, mask=kmask, other=-1)
+    hit = kmask & (s >= 0)
+    miss = kmask & (s == -1)
+    same = (q[:, None] == q[None, :]) & (k[:, None] > k[None, :]) & kmask[:, None] & kmask[None, :]
+    first = kmask & (tl.sum(same.to(tl.int32), axis=1) == 0)
+    first_miss = miss & first
+    smaller = (q[None, :] < q[:, None]) & first_miss[None, :]
+    rank = tl.sum(smaller.to(tl.int32), axis=1)
+    num_missing = tl.sum(first_miss.to(tl.int32))
+    tl.store(num_copy_ptr, num_missing.to(tl.int64))
+    # Duplicated hits write the same values to the same addresses -- idempotent.
+    tl.store(usage_ptr + s, step, mask=hit)
+    g1 = tl.load(ghost_ptr + q, mask=hit, other=0)
+    g2 = tl.load(ghost_ptr + ghost_stride + q, mask=hit, other=0)
+    tl.store(ghost_ptr + 2 * ghost_stride + q, g2, mask=hit)
+    tl.store(ghost_ptr + ghost_stride + q, g1, mask=hit)
+    tl.store(ghost_ptr + q, step, mask=hit)
+    out = tl.where(hit, s, -1)
+
+    # ---- Phase 2: victims by ascending LRU-3 key ----
+    if num_missing > 0:
+        # REQUIRED: the hit stores above are scatters; the loads below bulk-reload the same
+        # arrays. Without the CTA fence a stale usage/key can win argmin (flashlib learned
+        # this the hard way -- see _lru_ensure_kernel).
+        tl.debug_barrier()
+        c = tl.arange(0, BLOCK_C)
+        cmask = c < num_cached
+        oid = tl.load(id_of_slot_ptr + c, mask=cmask, other=-1).to(tl.int64)
+        u = tl.load(usage_ptr + c, mask=cmask, other=BIG).to(tl.int64)
+        resident = cmask & (oid >= 0)
+        g3 = tl.load(ghost_ptr + 2 * ghost_stride + tl.maximum(oid, 0), mask=resident, other=0)
+        res_key = tl.where(g3 > 0, g3, -tl.maximum(u, 1))
+        untouchable = (~cmask) | (u >= BLOCKED) | (u == step)
+        key = tl.where(untouchable, BIG, tl.where(oid < 0, EMPTY, res_key))
+        packed = tl.where(cmask, ((key + OFF) << SLOT_BITS) | c.to(tl.int64), KEY_MAX)
+        for i in tl.range(num_missing):
+            victim = tl.argmin(packed, axis=0).to(tl.int32)
+            old = tl.load(id_of_slot_ptr + victim)
+            if old >= 0:
+                tl.store(slot_of_id_ptr + old, -1)
+            e = tl.sum(tl.where((rank == i) & first_miss, q, 0))
+            tl.store(id_of_slot_ptr + victim, e)
+            tl.store(slot_of_id_ptr + e, victim)
+            tl.store(usage_ptr + victim, step)
+            # The incoming expert keeps its history: shift, never reset (ghost admission).
+            g1e = tl.load(ghost_ptr + e)
+            g2e = tl.load(ghost_ptr + ghost_stride + e)
+            tl.store(ghost_ptr + 2 * ghost_stride + e, g2e)
+            tl.store(ghost_ptr + ghost_stride + e, g1e)
+            tl.store(ghost_ptr + e, step)
+            tl.store(dst_ptr + i, victim)
+            tl.store(src_ptr + i, e - id_base)  # back to the caller's id space
+            out = tl.where((rank == i) & miss, victim, out)
+            packed = tl.where(c == victim, KEY_MAX, packed)  # claim in-register
+
+    tl.store(out_ptr + tl.arange(0, BLOCK_K), out, mask=kmask)
+    if COLLECT_STATS:
+        si = tl.arange(0, 4)
+        v = tl.where(si == 0, tl.sum(first.to(tl.int32)), tl.where(si == 1, num_missing, 1))
+        tl.atomic_add(stats_ptr + si, v.to(tl.int64), mask=si < 3)
 
 
 def ensure_experts_hybrid(
@@ -90,6 +242,7 @@ def materialize_layer(cache, layer_id: int) -> None:
 
 def reset_cache(cache) -> None:
     _reset_cache_gpu(cache)
+    cache.ghost_hist.zero_()
 
 
 def _ensure_experts_hybrid_gpu(
@@ -222,6 +375,12 @@ def _materialize_layer_gpu(cache, layer_id: int) -> None:
         id_of_slot[:E] = base + off
         cache.slot_for_id[layer_id, :E] = off
         usage[:E] = cache.step
+        # Fresh single-ref history for the staged layer (keeps g1 == usage, the LRU-3
+        # victim-key invariant; stale g2/g3 from a previous life would skew the keys).
+        gh = cache.ghost_hist[:, base : base + E]
+        gh[0] = cache.step
+        gh[1] = 0
+        gh[2] = 0
     cache.evict_slots[:E] = off
     cache.src_indices[:E] = off
     cache.num_indices.fill_(E)

@@ -241,6 +241,13 @@ class OffloadMoeCache:
         )
         self.usage = torch.zeros((self.cache_size,), dtype=torch.int64, device=self.device)
         self.step = torch.zeros((), dtype=torch.int64, device=self.device)
+        # Per-expert LRU-3 reference history (g1, g2, g3 = the three most recent reference
+        # steps), indexed by the flat layer * num_experts + expert id. Read by the
+        # FREETOKEN_MOE_EVICT=lru3 victim-key path; the history is per EXPERT, so it
+        # survives eviction (ghost) and cache_size rebuilds only clear it with the clock.
+        self.ghost_hist = torch.zeros(
+            (3, self.num_layers * self.num_experts), dtype=torch.int64, device=self.device
+        )
         self.active_mask = torch.zeros((self.num_experts,), dtype=torch.int32, device=self.device)
         # lru_ensure validates these against plan = min(batch * top_k, cache_size), so num_experts elements would under-size them
         plan_slots = max(self.num_experts, self.cache_size)
@@ -1010,6 +1017,7 @@ class OffloadMoeCache:
         self._alloc_slot_state(cache_size)
         self._bind_pool_state()
         self.step.zero_()
+        self.ghost_hist.zero_()  # the LRU-3 history lives on the step clock: rebasing kills it
         self.active_mask.zero_()
         self.num_indices.zero_()
         self.num_missing_full.zero_()
