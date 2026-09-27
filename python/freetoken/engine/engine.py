@@ -72,6 +72,10 @@ from freetoken.kvcache.linear_state_pool import (
 logger = init_logger(__name__)
 
 
+def _decode_residency_enabled() -> bool:
+    return os.environ.get("FREETOKEN_DECODE_RESIDENCY", "1") != "0"  # A/B kill switch
+
+
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
     """The offload MoE cache needs at least one slot per expert per layer. A too-small size
     (e.g. a bare offload run with moe_cache_size unset and auto disabled) must fail loudly."""
@@ -853,7 +857,7 @@ class Engine:
         self._restore_vram_headroom()
         # the idle guard may grow a shrunken expert cache back, never past the startup plan
         if self.moe_offload_cache is not None:
-            self._expert_plan_slots = self.moe_offload_cache.cache_size
+            self._expert_plan_slots = self.moe_offload_cache.resident_rows
 
     def _fit_kv_ram_tier(self, config: EngineConfig) -> None:
         """Size the RAM tier against live RAM; auto tiering drops it (KV stays in VRAM) where
@@ -1030,13 +1034,13 @@ class Engine:
         a named non-negotiable line it is now subtracted from every LATER plan (a rebuild, a
         second auto resolve) and shows up in the report instead of in an OOM.
         """
-        measured = tensor_bytes(cache)
+        measured = tensor_bytes(cache) - getattr(cache, "unbacked_bytes", 0)
         promised = min(measured, cache.expert_pool_bytes)
         self.vram_ledger.charge(
             "cache:expert",
             promised,
             Kind.PERSISTENT,
-            f"{cache.cache_size} slots in {len(cache.pool_caps)} geometry pool(s), "
+            f"{cache.resident_rows} slots in {len(cache.pool_caps)} geometry pool(s), "
             f"{promised / (1 << 20):.1f} MiB priced by the plan",
         )
         side = measured - promised
@@ -1070,12 +1074,12 @@ class Engine:
         if deficit <= 0:
             return
         _, per_slot = self._target_moe_and_expert_bytes(None)
-        target = cache.cache_size - div_ceil(deficit, per_slot)
+        target = cache.resident_rows - div_ceil(deficit, per_slot)
         logger.info_rank0(
             f"VRAM account {mem_GB(deficit)} short after startup: expert cache "
-            f"{cache.cache_size} -> {target} slots"
+            f"{cache.resident_rows} -> {target} slots"
         )
-        self.rebuild_runtime_cache(moe_cache_size=target)
+        self._resize_experts(target)
         self._charge_expert_cache(cache)
         self._calibrate_vram_ledger()
 
@@ -1102,11 +1106,27 @@ class Engine:
             self._vram_guard_armed = True
             torch.cuda.reset_peak_memory_stats(self.device)
             return
+        if self._expert_decode_slots is not None:
+            # the prefill window was judged when the cache grew; idle is the next prefill's floor
+            self.set_decode_residency(False)
+            return
+        self._guard_window(self._window_free_at_peak())
+
+    def _window_free_at_peak(self) -> int:
+        """Device bytes still free at the peak of the window since the last peak reset."""
         free, _ = torch.cuda.mem_get_info(self.device)
         peak = torch.cuda.max_memory_reserved(self.device)
         now = torch.cuda.memory_reserved(self.device)
         torch.cuda.reset_peak_memory_stats(self.device)
         free_at_peak = free - max(0, peak - now)
+        logger.info_rank0(
+            f"VRAM guard window: reserved now {mem_GB(now)}, peak {mem_GB(peak)}, "
+            f"free now {mem_GB(free)}, free at peak {mem_GB(free_at_peak)}"
+        )
+        return free_at_peak
+
+    def _guard_window(self, free_at_peak: int) -> None:
+        cache = self.moe_offload_cache
         short = self._VRAM_GUARD_MARGIN - free_at_peak
         if cache is None:
             if short > 0:
@@ -1120,30 +1140,30 @@ class Engine:
         _, per_slot = self._target_moe_and_expert_bytes(None)
         if short > 0:
             self._vram_guard_calm = 0
-            target = cache.cache_size - div_ceil(short, per_slot)
+            target = cache.resident_rows - div_ceil(short, per_slot)
             logger.info_rank0(
                 f"VRAM guard: {mem_GB(free_at_peak)} free at the last peak (< "
-                f"{mem_GB(self._VRAM_GUARD_MARGIN)}): expert cache {cache.cache_size} -> "
+                f"{mem_GB(self._VRAM_GUARD_MARGIN)}): expert cache {cache.resident_rows} -> "
                 f"{target} slots"
             )
         else:
-            plan = getattr(self, "_expert_plan_slots", cache.cache_size)
+            plan = getattr(self, "_expert_plan_slots", cache.resident_rows)
             surplus = free_at_peak - 2 * self._VRAM_GUARD_MARGIN
-            if cache.cache_size >= plan or surplus < per_slot:
+            if cache.resident_rows >= plan or surplus < per_slot:
                 self._vram_guard_calm = 0
                 return
             self._vram_guard_calm = getattr(self, "_vram_guard_calm", 0) + 1
             if self._vram_guard_calm < self._VRAM_GUARD_CALM_WINDOWS:
                 return
             self._vram_guard_calm = 0
-            target = min(plan, cache.cache_size + surplus // per_slot)
+            target = min(plan, cache.resident_rows + surplus // per_slot)
             logger.info_rank0(
                 f"VRAM guard: {mem_GB(free_at_peak)} free at the last "
-                f"{self._VRAM_GUARD_CALM_WINDOWS} peaks: expert cache {cache.cache_size} -> "
+                f"{self._VRAM_GUARD_CALM_WINDOWS} peaks: expert cache {cache.resident_rows} -> "
                 f"{target} slots (plan {plan})"
             )
         try:
-            self.rebuild_runtime_cache(moe_cache_size=target)
+            self._resize_experts(target)
         except CacheRebuildRejected as e:
             logger.warning_rank0(f"VRAM guard: expert cache resize refused ({e})")
             return
@@ -1160,11 +1180,100 @@ class Engine:
         from freetoken.utils import div_ceil
 
         _, per_slot = self._target_moe_and_expert_bytes(None)
-        n = max(int(cache.cache_size * fraction), div_ceil(self._VRAM_GUARD_MARGIN, per_slot))
-        target = max(1, cache.cache_size - n)
-        logger.info_rank0(f"OOM recovery: expert cache {cache.cache_size} -> {target} slots")
+        n = max(int(cache.resident_rows * fraction), div_ceil(self._VRAM_GUARD_MARGIN, per_slot))
+        target = max(1, cache.resident_rows - n)
+        logger.info_rank0(f"OOM recovery: expert cache {cache.resident_rows} -> {target} slots")
         self._vram_guard_calm = 0
+        if self._expert_decode_slots is not None:
+            # a decode-phase peak the reserve did not cover: keep it reserved from now on
+            self._decode_reserve_learned += n * per_slot
+            self._expert_decode_slots = target
+        self._resize_experts(target)
+        self._charge_expert_cache(cache)
+
+    # Grown expert-cache size while only decode runs (None = at the prefill-safe plan) and the
+    # decode peak bytes learned from OOM recoveries on top of the modelled decode reserve.
+    _expert_decode_slots: int | None = None
+    _decode_reserve_learned = 0
+
+    @property
+    def decode_residency_supported(self) -> bool:
+        """Only with in-place (VMM) residency: a rebuild mid-request would tear down and
+        re-capture graphs around live long-context attention state."""
+        return (
+            self.device.type == "cuda"
+            and self.config.tp_info.size == 1
+            and bool(getattr(self.moe_offload_cache, "_vmm_arenas", None))
+            and hasattr(self, "_expert_plan_slots")
+            and _decode_residency_enabled()
+        )
+
+    def _resize_experts(self, target: int) -> None:
+        """Resize the expert cache: in place when VMM backs it and ``target`` fits its shape
+        (no teardown, no re-capture, resident slots stay warm), else through a full rebuild."""
+        cache = self.moe_offload_cache
+        if getattr(cache, "_vmm_arenas", None) and target <= cache.cache_size:
+            with torch.cuda.stream(self.stream):
+                cache.set_live(target)
+            # the backing lives outside the torch allocator: a peak straddling the resize would
+            # mix two expert footprints, so every window starts at a resize
+            torch.cuda.reset_peak_memory_stats(self.device)
+            return
         self.rebuild_runtime_cache(moe_cache_size=target)
+
+    @torch.inference_mode()
+    def set_decode_residency(self, grow: bool) -> None:
+        """Phase-aware expert residency. The plan sizes the expert cache so a full prefill chunk
+        fits; while only decode runs that prefill transient is idle, so the cache grows in place
+        into the device memory actually free (minus the guard margin), and folds back to the
+        prefill size before the next prefill. Resident experts stay warm and captured graphs
+        stay valid. The caller guarantees no forward is in flight."""
+        cache = self.moe_offload_cache
+        if not grow:
+            if self._expert_decode_slots is None:
+                return
+            self._expert_decode_slots = None
+            logger.info_rank0(
+                f"Decode residency: expert cache {cache.resident_rows} -> "
+                f"{self._expert_prefill_slots} slots"
+            )
+            self._resize_experts(self._expert_prefill_slots)
+            self._charge_expert_cache(cache)
+            return
+        if self._expert_decode_slots is not None:
+            return
+        # the prefill window that just ended is the plan's real test: judge it before the
+        # grow resets the peak counter
+        self._guard_window(self._window_free_at_peak())
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+        free, _ = torch.cuda.mem_get_info(self.device)
+        # each (bank, pool) region rounds its backing up to one granule
+        reserve = (
+            self._VRAM_GUARD_MARGIN
+            + self._decode_reserve_learned
+            + len(cache._vmm_arenas) * len(cache.pools) * (2 << 20)
+        )
+        target = cache.resident_rows
+        for _ in range(2):  # geometry pools price per slot non-linearly: refine once
+            _, per_slot = self._target_moe_and_expert_bytes(target)
+            target = min(cache.cache_size, cache.resident_rows + max(0, free - reserve) // per_slot)
+        if target <= cache.resident_rows:
+            return
+        logger.info_rank0(
+            f"Decode residency: expert cache {cache.resident_rows} -> {target} slots "
+            f"({mem_GB(free)} free, reserve {mem_GB(reserve)})"
+        )
+        self._expert_prefill_slots = cache.resident_rows
+        try:
+            self._resize_experts(target)
+        except Exception as e:  # noqa: BLE001 - backing refused: the prefill size fit a moment ago
+            logger.warning_rank0(f"Decode residency grow failed ({e!r}); back to prefill size")
+            self._decode_reserve_learned += (target - self._expert_prefill_slots) * per_slot
+            self._resize_experts(self._expert_prefill_slots)
+            self._charge_expert_cache(cache)
+            return
+        self._expert_decode_slots = target
         self._charge_expert_cache(cache)
 
     def _calibrate_vram_ledger(self) -> None:
@@ -1522,6 +1631,15 @@ class Engine:
                 )
             layout = method.layout()
             max_slots = method.slot_limit()
+        vmm_rows = 0
+        if config.moe_cache_auto and _decode_residency_enabled() and config.tp_info.size == 1:
+            from freetoken.moe import vmm
+
+            if vmm.supported(self.device):
+                # shape the cache for the most the decode phase can reclaim: the prefill
+                # transient the plan reserved (+25%); only the planned prefix is backed
+                per_slot = max(1, plan.expert_bytes // max(1, plan.expert_slots))
+                vmm_rows = config.moe_cache_size + plan.transient_reserve * 5 // 4 // per_slot
         cache = OffloadMoeCache(
             # Models with leading dense layers (GLM-4) only have experts on the MoE
             # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
@@ -1546,6 +1664,7 @@ class Engine:
                 config.max_running_req,
             ),
             pool_caps_override=config.moe_pool_caps,
+            vmm_rows=vmm_rows,
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
@@ -1671,7 +1790,7 @@ class Engine:
         target_moe = (
             moe_cache_size
             if moe_cache_size is not None
-            else (self.moe_offload_cache.cache_size if self.moe_offload_cache else 0)
+            else (self.moe_offload_cache.resident_rows if self.moe_offload_cache else 0)
         )
         cache = self.moe_offload_cache
         if cache is None:
@@ -1795,7 +1914,7 @@ class Engine:
         cache = self.moe_offload_cache
         shrink_only = (
             cache is not None
-            and target_moe <= cache.cache_size
+            and target_moe <= cache.resident_rows
             and (num_pages is None or num_pages <= self.num_pages)
             and num_swa_pages is None
             and num_mamba_slots is None
@@ -1878,6 +1997,7 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
             verify_tokens=verify_graph_tokens(config.spec_mtp),
+            warm=False,
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:

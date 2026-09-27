@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
@@ -9,6 +10,7 @@ from freetoken.attention.linear import build_fla_metadata
 from freetoken.core import Batch, Req
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
+from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.message import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -44,6 +46,8 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
+_HOST_TRACE = os.getenv("FREETOKEN_HOST_PATH_TRACE", "0") == "1"
+_host_trace_totals = [0, 0.0, 0.0, 0.0]
 
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
@@ -178,6 +182,9 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         import gc
 
         gc.collect()
+        # the startup heap (weights metadata, banks, tokenizer) is permanent: freeze it so a
+        # runtime rebuild's gc.collect() scans only what was created since, not the whole heap
+        gc.freeze()
         try:
             import ctypes
 
@@ -277,6 +284,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             and not (self.prefill_manager.runnable or self.decode_manager.runnable)
         ):
             self._execute_pending_rebuild()
+        last_data = self._switch_residency_if_due(last_data)
 
         # Order this iteration's host->device token_pool copies (issued on ``self.stream``
         # during scheduling) after the previous batch's sampled-token writes (issued on the
@@ -309,6 +317,27 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         self._flush_abort_acks()
         return ongoing_data
 
+    def _switch_residency_if_due(self, last_data: ForwardData | None) -> ForwardData | None:
+        """Grow the expert cache while only decode runs, fold it back before a prefill. The
+        in-flight batch is drained first (one step of overlap lost per transition)."""
+        engine = getattr(self, "engine", None)
+        if getattr(engine, "decode_residency_supported", False) is not True:
+            return last_data
+        grow = self.decode_manager.runnable and not self.prefill_manager.runnable
+        if grow == (engine._expert_decode_slots is not None):
+            return last_data
+        if last_data is not None:
+            self.stream.wait_stream(engine.stream)
+            self._process_last_data(last_data)
+            last_data = self._last_data = None
+            grow = self.decode_manager.runnable and not self.prefill_manager.runnable
+        engine.stream.synchronize()
+        try:
+            engine.set_decode_residency(grow)
+        except CacheRebuildRejected as e:
+            logger.warning(f"decode residency resize refused: {e}")
+        return last_data
+
     def normal_loop(self) -> None:
         blocking = not (
             self.prefill_manager.runnable
@@ -325,6 +354,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._execute_pending_rebuild()
+        self._switch_residency_if_due(None)
 
         if getattr(self, "spec_mtp", 0) > 0 and self._spec_step_or_fail():
             self._flush_abort_acks()
@@ -369,7 +399,10 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             return
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        sync_t0 = time.perf_counter() if _HOST_TRACE else 0.0
         copy_done.synchronize()
+        sync_ms = (time.perf_counter() - sync_t0) * 1e3 if _HOST_TRACE else 0.0
+        host_t0 = time.perf_counter() if _HOST_TRACE else 0.0
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -486,7 +519,28 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
         )
+        host_ms = (time.perf_counter() - host_t0) * 1e3 if _HOST_TRACE else 0.0
+        send_t0 = time.perf_counter() if _HOST_TRACE else 0.0
         self.send_result(reply)
+        send_ms = (time.perf_counter() - send_t0) * 1e3 if _HOST_TRACE else 0.0
+        if _HOST_TRACE:
+            n = len(reply)
+            _host_trace_totals[0] += n
+            _host_trace_totals[1] += sync_ms
+            _host_trace_totals[2] += host_ms
+            _host_trace_totals[3] += send_ms
+            if _host_trace_totals[0] and _host_trace_totals[0] % 64 == 0:
+                print(
+                    "[host-trace] tokens=%d sync_ms_per_token=%.4f host_ms_per_token=%.4f "
+                    "send_ms_per_token=%.4f d2h_bytes_per_token=4"
+                    % (
+                        _host_trace_totals[0],
+                        _host_trace_totals[1] / _host_trace_totals[0],
+                        _host_trace_totals[2] / _host_trace_totals[0],
+                        _host_trace_totals[3] / _host_trace_totals[0],
+                    ),
+                    flush=True,
+                )
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes

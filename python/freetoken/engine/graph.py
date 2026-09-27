@@ -239,6 +239,7 @@ class GraphRunner:
         mrope: bool = False,
         verify_tokens: tuple[int, ...] = (),
         kv_replay_check: Callable[[Batch], bool] | None = None,
+        warm: bool = True,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -257,7 +258,7 @@ class GraphRunner:
         self.verify_graphs: dict[int, VerifyGraph] = {}
         self.draft: DraftGraph | None = None  # the 1-row step (drafts[1])
         self.drafts: Dict[int, DraftGraph] = {}
-        self._capture_graphs(max_seq_len, vocab_size, model)
+        self._capture_graphs(max_seq_len, vocab_size, model, warm)
         if self.graph_map:
             for tokens in verify_tokens:
                 self._capture_verify(model, tokens, vocab_size)
@@ -271,7 +272,9 @@ class GraphRunner:
         if self.moe_offload_cache is not None:
             self.moe_offload_cache.reset()
 
-    def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: BaseLLMModel):
+    def _capture_graphs(
+        self, max_seq_len: int, vocab_size: int, model: BaseLLMModel, warm: bool = True
+    ):
         # Mark the post-weights "warmup" phase for /health: this stretch (graph capture — or the
         # remaining readiness work when graphs are disabled) moves no bytes, so without this the
         # loader would sit at 100% (last byte bar) until the ready ack. total=0 ⇒ the desktop
@@ -323,7 +326,10 @@ class GraphRunner:
             )
             self.buffer.table_idx[:bs].fill_(dummy_slot)
             with get_global_ctx().forward_batch(batch):
-                self.buffer.logits[:bs] = model.forward()
+                # the eager pass runs lazy init/autotune outside capture; a runtime re-capture
+                # (warm=False) finds all of it done, so it only costs a cold-cache forward
+                if warm:
+                    self.buffer.logits[:bs] = model.forward()
                 # Keep the offload cache warmed for capture. Resetting here forces
                 # CUDA graph capture to replay cold-cache expert copies.
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):

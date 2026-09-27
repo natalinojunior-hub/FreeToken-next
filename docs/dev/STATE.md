@@ -1,8 +1,7 @@
-# State — 2026-09-26 (campaign 23 closed by operator; report ft-campaign2/campaign23/REPORT.md, ledger LEDGER.md, numbers results.jsonl)
-DOING: nothing in flight. Campaign 23 stopped by operator after Gate A fixes + re-baseline; Gate B/C (raw-TG attacks) and Gate D (MTP) NOT executed.
-DONE c23: current-tree A/B on a fixed 16384-tok served prompt (ISTA base 52.55/52.93 cold/warm vs winning stack 53.71/53.85, bit-exact sha 76a5508fd576, VRAM 14.58 vs 14.70; AD base cold 42.04 single-shot). `--moe-pool-caps` correctness fix: caps = proportional weights, planned cache_size = byte-budget authority (was: sum(caps) silently overrode the budget, guard shrinks were no-ops -> rebuild churn; c22's "64.5-65.1 TG @105% caps" was that churn with a DIVERGENT output sha — invalid, never a real speed). Validation domain (count/negative/over-max/floor) + proportional rebuild + 4 tests. `make ci` green (2275 passed).
-KEY FINDING: c22 pool-caps are prompt-overfit (+7.8% @15715 tok -> +2.2% @16384 tok). Raw-TG lever ranking must target prompt-robust bottlenecks: expert PCIe gather (33-41% kernel time; same-layer hit/miss overlap audited FEASIBLE + graph-safe, needs route-masked GEMV) and GGUF GEMV quantize-once (240-480 redundant quantize_row_q8_1 launches/token, bit-identical, gguf_kernel.cu:113-116 + layers/gguf.py:280-298).
-OPEN BUGS (isolated, pre-existing): warm/prefix-reuse divergence on AD (always) and ISTA when prefill chunk != 8192 — top suspect: ChunkedReq continuation drops mamba_last_track_seqlen (scheduler/prefill.py:243-254, field defaults None core.py:60); also radix split drops parent mamba_value (hybrid_radix_cache.py:236-242); needs first-divergent-token trace before patching. AD + `--linear-state-cache-ratio 0` changes cold output (freed GDN slots shift expert_slots -> residency; residency change must be output-neutral -> latent eviction/metadata bug suspected).
-DEAD ENDS: unchanged from c22 (see LESSONS/LEDGER) + pool-cap re-tuning as a TG lever (overfit).
-NEXT (if resumed): Gate B re-profile winning stack -> Gate C1 gather overlap prototype / C3 quantize-once -> cert_matrix -> MTP.
-TREE: committed 2026-09-26 (campaign 22 stack + campaign 23 fix, conventional commits). Benchmarks: TMPDIR=/models/desenvolvimento/tmp, harness benchmarks/bench_pp_tg.py, results ft-campaign2/campaign23/results.jsonl.
+doing: stopped at operator request (weekly limit); all work UNCOMMITTED
+done: Campaign 26 in-place decode-phase expert residency (CUDA VMM): TG 59.25 cold / 59.77 warm (was 55.20/55.48), PP 2510, SHA 76a5508fd576
+done: 64K/128K/256K no OOM; make ci green (2295)
+done: audits without gain: KV rebalance cadence, pool caps optimum, fast_index_copy launch params
+decisions: decode residency only with VMM (mid-request rebuild changed 64K output)
+evidence: /models/desenvolvimento/old/freetoken-next/external/ft-campaign2/campaign26/
+next step: expert gather kernel efficiency (42% of decode kernel time, ~30 GB/s vs 53.5 GB/s); see ai-memory notes/campaign26-adaptive-vram-residency

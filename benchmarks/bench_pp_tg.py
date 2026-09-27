@@ -492,6 +492,7 @@ def one_run(origin: str, model_id: str, prompt: str, args: argparse.Namespace, p
         "e2e_ms": (stamps[-1] - t_send) * 1e3,
         "itl_ms_p50": gaps[len(gaps) // 2],
         "itl_ms_p95": gaps[min(len(gaps) - 1, int(len(gaps) * 0.95))],
+        "itl_ms": [round((b - a) * 1e3, 3) for a, b in zip(stamps, stamps[1:])],
         "completion_tokens": completion,
         "engine_prefill_tps": tp.get("prefill_tps"),
         "engine_decode_tps": tp.get("decode_tps"),

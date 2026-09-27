@@ -187,6 +187,10 @@ class OffloadMoeCache:
     # Mixed-geometry banks only: per-pool slot caps replacing the uniform layer-count split
     # (``pool_capacities``), in ``expert_pools`` order (largest layer group first). "" = off.
     pool_caps_override: str = ""
+    # Resizable residency (CUDA VMM): bookkeeping, views and captured graphs are shaped for
+    # ``vmm_rows`` slots while only the ``cache_size`` live prefix of each pool is physically
+    # backed; :meth:`set_live` moves that boundary in place. 0 = fixed allocation.
+    vmm_rows: int = 0
 
     def __post_init__(self) -> None:
         if isinstance(self.gguf_expert_types, dict):
@@ -323,6 +327,9 @@ class OffloadMoeCache:
         self._pool_views: list[tuple[torch.Tensor, ...]] = []
         self._staging: dict[int, tuple[tuple[torch.Tensor, ...], torch.Tensor]] = {}
         self._arenas: list[torch.Tensor] = []
+        self._vmm_arenas: list = []
+        self.live_caps: list[int] = []
+        self._staged: set[int] = set()
         self._bind_pool_state()
         # Fused multi-bank copy descriptor (built by set_bank_sources/_build_copy_plan).
         # Source pointers are per layer (_copy_src_ptrs[layer_id] -> [num_banks] device
@@ -632,8 +639,23 @@ class OffloadMoeCache:
         from freetoken.utils import div_ceil
 
         banks = {n: self.bank_sources[n] for n in self.bank_schema}
-        pools, caps, offsets, ends = self._pool_plan(cache_size)
-        arenas = [torch.empty((end,), dtype=torch.uint8, device=self.device) for end in ends]
+        self._release_vmm()
+        plan = None
+        if self.vmm_rows:
+            try:
+                plan = self._vmm_plan(cache_size)
+            except ValueError as e:
+                logger.warning(f"expert cache stays fixed-size (no in-place residency): {e}")
+                self.vmm_rows = 0
+        if plan is not None:
+            pools, caps, offsets, ends, live = plan
+            arenas = self._alloc_vmm_arenas(pools, caps, offsets, ends, live)
+        else:
+            pools, caps, offsets, ends = self._pool_plan(cache_size)
+            arenas = [torch.empty((end,), dtype=torch.uint8, device=self.device) for end in ends]
+            live = list(caps)
+            self._staged = {p for p, c in enumerate(caps) if c < self.num_experts}
+        self.live_caps = live
         starts = [sum(caps[:i]) for i in range(len(caps))]
 
         def view(arena: torch.Tensor, off: int, rows: int, head: torch.Tensor) -> torch.Tensor:
@@ -656,7 +678,7 @@ class OffloadMoeCache:
                     self.bank_caches[
                         (layer_id, name, self._get_layer_quant_type(layer_id, name))
                     ] = v
-            if cap < E:
+            if p in self._staged:
                 window = [E * rb for rb in pool.row_bytes]  # staging bytes per arena
                 overlaid = [
                     i
@@ -744,6 +766,140 @@ class OffloadMoeCache:
                 raise ValueError(f"moe_pool_caps cannot shrink to {cache_size} rows above {lo}")
         return base
 
+    def _vmm_plan(self, live_size: int):
+        """Shape caps (``vmm_rows``), per-pool granule-aligned offsets and the live caps for
+        ``live_size``; every pool gets its own virtual region so each can grow in place."""
+        from freetoken.engine.cache_budget import expert_pools
+        from freetoken.moe import vmm
+
+        E = self.num_experts
+        pools = expert_pools({n: self.bank_sources[n] for n in self.bank_schema})
+        self.vmm_rows = max(self.vmm_rows, live_size)
+        caps = self._caps_for(pools, self.vmm_rows)
+        # a pool whose planned (prefill-phase) share is below one layer stages prefill layers,
+        # whatever its decode-phase shape: that keeps the planned rows the whole prefill needs
+        planned = self._caps_for(pools, min(live_size, sum(caps)))
+        self._staged = {p for p, (c, cap) in enumerate(zip(planned, caps)) if min(c, cap) < E}
+        live = self._live_caps_for(pools, caps, live_size)
+        g = vmm.granularity(self.device.index or 0)
+        offsets, ends = [], [0] * len(self.bank_schema)
+        for pool, cap in zip(pools, caps):
+            offsets.append(list(ends))
+            for b, rb in enumerate(pool.row_bytes):
+                ends[b] += -(-cap * rb // g) * g
+        return pools, caps, offsets, ends, live
+
+    def _caps_for(self, pools, cache_size: int) -> list[int]:
+        from freetoken.engine.cache_budget import pool_capacities
+
+        if self.pool_caps_override and len(pools) > 1:
+            return self._override_caps(pools, cache_size)
+        if len(pools) == 1:
+            return [cache_size]
+        return pool_capacities(pools, self.num_experts, cache_size, self.min_pool_rows)
+
+    def _live_caps_for(self, pools, shape_caps: list[int], size: int) -> list[int]:
+        """Live rows per pool for ``size``: the usual split, inside each pool's shape and above
+        the rows a prefill always writes -- a pool shaped for a whole layer materializes it at
+        its front, a sub-layer pool stages one at the front of every arena (pool 0's region),
+        and the prefill double buffers own the first ``2 * E`` rows."""
+        E = self.num_experts
+        caps = self._caps_for(pools, min(size, sum(shape_caps)))
+        live = []
+        for p, (c, cap) in enumerate(zip(caps, shape_caps)):
+            lo = min(cap, self.min_pool_rows or E)
+            if p not in self._staged:
+                lo = max(lo, min(cap, E))
+            if self.prefill_overlap:
+                lo = max(lo, 2 * E)
+            if p == 0:
+                for q, pool in enumerate(pools):
+                    if q in self._staged:
+                        for rb0, rb in zip(pools[0].row_bytes, pool.row_bytes):
+                            lo = max(lo, -(-E * rb // rb0))
+            if lo > cap:
+                raise ValueError(f"pool {p} shape {cap} rows cannot hold its prefill front {lo}")
+            live.append(min(cap, max(lo, c)))
+        return live
+
+    def _alloc_vmm_arenas(self, pools, caps, offsets, ends, live) -> list[torch.Tensor]:
+        from freetoken.moe import vmm
+
+        self._vmm_arenas = []
+        for b in range(len(self.bank_schema)):
+            regions = [
+                (
+                    offsets[p][b],
+                    (offsets[p + 1][b] if p + 1 < len(pools) else ends[b]) - offsets[p][b],
+                )
+                for p in range(len(pools))
+            ]
+            arena = vmm.VirtualArena(self.device, ends[b], regions)
+            for p, pool in enumerate(pools):
+                arena.set_backed(p, live[p] * pool.row_bytes[b])
+            self._vmm_arenas.append(arena)
+        return [a.tensor for a in self._vmm_arenas]
+
+    def _release_vmm(self) -> None:
+        if self._vmm_arenas:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            for arena in self._vmm_arenas:
+                arena.release()
+            self._vmm_arenas = []
+
+    # usage of a slot with no physical backing: above every real LRU step, and small enough
+    # that flashlib's packed ``usage << SLOT_BITS | slot`` key cannot overflow
+    _BLOCKED_USAGE = 1 << 40
+
+    @property
+    def resident_rows(self) -> int:
+        """Slots physically backed (== ``cache_size`` unless VMM residency is on)."""
+        return sum(self.live_caps) if self._vmm_arenas else self.cache_size
+
+    def _block_unbacked(self) -> None:
+        """Park every slot past a pool's live prefix: no id, never an LRU victim."""
+        if not self._vmm_arenas:
+            return
+        for (ids, usage), live in zip(self._pool_state, self.live_caps):
+            ids[live:].fill_(-1)
+            usage[live:].fill_(self._BLOCKED_USAGE)
+
+    @torch.inference_mode()
+    def set_live(self, size: int) -> int:
+        """Move the backed boundary to ``size`` rows in place (VMM only); returns the rows now
+        live. Shrinking forgets the experts held past the new boundary, then unmaps; growing
+        maps first, then frees the new slots to the LRU. Slots inside both prefixes keep their
+        experts, and no address or shape changes, so captured graphs stay valid. The caller
+        guarantees no forward is in flight."""
+        assert self._vmm_arenas, "set_live needs VMM residency"
+        new = self._live_caps_for(self.pools, self.pool_caps, size)
+        flat = self.slot_for_id.view(-1)
+        for p, ((ids, usage), old, nxt) in enumerate(zip(self._pool_state, self.live_caps, new)):
+            if nxt < old:
+                held = ids[nxt:old]
+                gone = held[held >= 0].to(torch.int64)
+                flat[gone] = -1
+                held.fill_(-1)
+                usage[nxt:old].fill_(self._BLOCKED_USAGE)
+        torch.cuda.synchronize(self.device)
+        # rows whose bytes survived the re-map, per pool (min over banks)
+        intact = list(new)
+        for b, arena in enumerate(self._vmm_arenas):
+            for p, (pool, nxt) in enumerate(zip(self.pools, new)):
+                rb = pool.row_bytes[b]
+                intact[p] = min(intact[p], arena.set_backed(p, nxt * rb) // rb)
+        for (ids, usage), old, nxt, keep in zip(self._pool_state, self.live_caps, new, intact):
+            lost = min(keep, old)  # below this row the slot still holds its expert
+            if nxt > lost:
+                held = ids[lost:nxt]
+                gone = held[held >= 0].to(torch.int64)
+                flat[gone] = -1
+                held.fill_(-1)
+                usage[lost:nxt].zero_()
+        self.live_caps = new
+        return sum(new)
+
     def _pool_plan(self, cache_size: int):
         """``(pools, capacities, offsets, arena_bytes)`` for ``cache_size`` rows; raises
         ``ValueError`` when a sub-layer pool's prefill staging window exceeds an arena."""
@@ -777,6 +933,7 @@ class OffloadMoeCache:
             (self.id_of_slot[s : s + c], self.usage[s : s + c])
             for s, c in zip(self._pool_starts, self.pool_caps)
         ]
+        self._block_unbacked()
 
     def pool_state(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         """``(id_of_slot, usage)`` of ``layer_id``'s pool; its slot ids index these."""
@@ -785,7 +942,14 @@ class OffloadMoeCache:
     @property
     def expert_pool_bytes(self) -> int:
         """GPU bytes the slot arenas hold (every pool, alignment padding included)."""
+        if self._vmm_arenas:
+            return sum(a.backed_bytes for a in self._vmm_arenas)
         return sum(a.nbytes for a in self._arenas)
+
+    @property
+    def unbacked_bytes(self) -> int:
+        """Virtual arena bytes with no physical memory (views over them are not VRAM)."""
+        return sum(a.nbytes - a.backed_bytes for a in self._vmm_arenas)
 
     def _layer_rows(self, layer_id: int, bank: int, whole_layer: bool) -> torch.Tensor:
         """The GPU rows a copy/GEMM of ``layer_id`` addresses in bank ``bank``: its pool,
@@ -953,7 +1117,7 @@ class OffloadMoeCache:
         if layer_id is None:
             layer_id = self._pending_src_layer if self._pending_src_layer is not None else 0
         p = self.pool_of_layer[layer_id] if self._staging else None
-        if n is not None and p in self._staging and n > self.pool_caps[p]:
+        if n is not None and p in self._staging and n > self.live_caps[p]:
             return tuple(v[:n] for v in self._staging[p][0])
         views = []
         for name in self.bank_schema:
@@ -1232,8 +1396,11 @@ class OffloadMoeCache:
             self._trace_kind = kind
             self._trace_ids = [int(i) for i in expert_ids.reshape(-1).tolist()]
             self._trace_pool_id = self.pool_of_layer[layer_id]
-            pool_ids, _ = self.pool_state(layer_id)
+            pool_ids, pool_usage = self.pool_state(layer_id)
             before = [int(i) for i in pool_ids.tolist()]
+            before_usage = [int(i) for i in pool_usage.tolist()]
+            self._trace_before_ids = before
+            self._trace_before_usage = before_usage
             if not self.tracer.initial_written:
                 self.tracer.write_initial_residency(
                     [int(i) for i in self.id_of_slot.tolist()],
@@ -1243,11 +1410,14 @@ class OffloadMoeCache:
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
         if trace_active:
-            pool_ids, _ = self.pool_state(layer_id)
+            pool_ids, pool_usage = self.pool_state(layer_id)
             after = [int(i) for i in pool_ids.tolist()]
+            after_usage = [int(i) for i in pool_usage.tolist()]
             after_set = {i for i in after if i >= 0}
             self._trace_evicted_ids = sorted({i for i in before if i >= 0} - after_set)
             self._trace_resident_rows = len(after_set)
+            self._trace_after_ids = after
+            self._trace_after_usage = after_usage
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
@@ -1281,6 +1451,7 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import reset_cache
 
         reset_cache(self)
+        self._block_unbacked()
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
@@ -1499,6 +1670,29 @@ class OffloadMoeCache:
             resident_rows=self._trace_resident_rows,
             transfer_ms=transfer_ms,
             available_vram_bytes=available_vram,
+            requested_global_ids=[layer_id * self.num_experts + e for e in self._trace_ids],
+            hit_global_ids=[
+                layer_id * self.num_experts + e
+                for e in self._trace_ids
+                if layer_id * self.num_experts + e in set(getattr(self, "_trace_before_ids", []))
+            ],
+            miss_global_ids=[
+                layer_id * self.num_experts + e
+                for e in self._trace_ids
+                if layer_id * self.num_experts + e
+                not in set(getattr(self, "_trace_before_ids", []))
+            ],
+            before_ids=getattr(self, "_trace_before_ids", None),
+            after_ids=getattr(self, "_trace_after_ids", None),
+            before_usage=getattr(self, "_trace_before_usage", None),
+            after_usage=getattr(self, "_trace_after_usage", None),
+            victim_slots=[
+                i
+                for i, old in enumerate(self._trace_before_ids)
+                if old in set(self._trace_evicted_ids)
+            ]
+            if hasattr(self, "_trace_before_ids")
+            else None,
         )
         self._trace_ids = None
 
