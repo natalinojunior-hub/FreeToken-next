@@ -1850,6 +1850,16 @@ vec_dot_iq2_xs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__
   return d * ((0.5f + ls1) * sumi1 + (0.5f + ls2) * sumi2);
 }
 
+static __device__ __forceinline__ uint32_t gguf_ldu32(const void* p) {
+  const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+  const uint32_t* w = reinterpret_cast<const uint32_t*>(a & ~static_cast<uintptr_t>(3u));
+  return __funnelshift_r(__ldg(w), __ldg(w + 1), static_cast<unsigned>(a & 3u) * 8u);
+}
+
+static __device__ __forceinline__ uint32_t iq3s_ldu32(const uint8_t* p) {
+  return gguf_ldu32(p);
+}
+
 static __device__ __forceinline__ float
 vec_dot_iq2_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
 #if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
@@ -1857,15 +1867,20 @@ vec_dot_iq2_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ 
 
   const int ib32 = iqs;
   const int8_t* q8 = bq8_1[ib32].qs;
-  const uint8_t* signs = bq2->qs + QK_K / 8 + 4 * ib32;
+  const uint32_t qsw = gguf_ldu32(bq2->qs + 4 * ib32);
+  const uint32_t sgn = gguf_ldu32(bq2->qs + QK_K / 8 + 4 * ib32);
+  const uint32_t qhv = bq2->qh[ib32];
   const uint8_t ls1 = bq2->scales[ib32] & 0xf;
   const uint8_t ls2 = bq2->scales[ib32] >> 4;
   int sumi1 = 0;
+#pragma unroll
   for (int l = 0; l < 2; ++l) {
+    const uint32_t qb = (qsw >> (8u * l)) & 0xffu;
     const uint32_t* grid =
-        (const uint32_t*)(iq2s_grid + (bq2->qs[4 * ib32 + l] | ((bq2->qh[ib32] << (8 - 2 * l)) & 0x300)));
-    const uint32_t signs0 = __vcmpeq4(((signs[l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201);
-    const uint32_t signs1 = __vcmpeq4(((signs[l] >> 4) * 0x01010101) & 0x08040201, 0x08040201);
+        (const uint32_t*)(iq2s_grid + (qb | ((qhv << (8 - 2 * l)) & 0x300u)));
+    const uint32_t sbyte = (sgn >> (8u * l)) & 0xffu;
+    const uint32_t signs0 = __vcmpeq4(((sbyte & 0xfu) * 0x01010101u) & 0x08040201u, 0x08040201u);
+    const uint32_t signs1 = __vcmpeq4(((sbyte >> 4) * 0x01010101u) & 0x08040201u, 0x08040201u);
     const int grid_l = __vsub4(grid[0] ^ signs0, signs0);
     const int grid_h = __vsub4(grid[1] ^ signs1, signs1);
     sumi1 = __dp4a(grid_l, *((const int*)q8 + 0), sumi1);
@@ -1873,11 +1888,14 @@ vec_dot_iq2_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ 
     q8 += 8;
   }
   int sumi2 = 0;
+#pragma unroll
   for (int l = 2; l < 4; ++l) {
+    const uint32_t qb = (qsw >> (8u * l)) & 0xffu;
     const uint32_t* grid =
-        (const uint32_t*)(iq2s_grid + (bq2->qs[4 * ib32 + l] | ((bq2->qh[ib32] << (8 - 2 * l)) & 0x300)));
-    const uint32_t signs0 = __vcmpeq4(((signs[l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201);
-    const uint32_t signs1 = __vcmpeq4(((signs[l] >> 4) * 0x01010101) & 0x08040201, 0x08040201);
+        (const uint32_t*)(iq2s_grid + (qb | ((qhv << (8 - 2 * l)) & 0x300u)));
+    const uint32_t sbyte = (sgn >> (8u * l)) & 0xffu;
+    const uint32_t signs0 = __vcmpeq4(((sbyte & 0xfu) * 0x01010101u) & 0x08040201u, 0x08040201u);
+    const uint32_t signs1 = __vcmpeq4(((sbyte >> 4) * 0x01010101u) & 0x08040201u, 0x08040201u);
     const int grid_l = __vsub4(grid[0] ^ signs0, signs0);
     const int grid_h = __vsub4(grid[1] ^ signs1, signs1);
     sumi2 = __dp4a(grid_l, *((const int*)q8 + 0), sumi2);
@@ -1896,13 +1914,20 @@ vec_dot_iq3_xxs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict_
 
   const int ib32 = iqs;
   const uint8_t* q3 = bq2->qs + 8 * ib32;
+  const uint32_t qs01 = gguf_ldu32(q3);
+  const uint32_t qs23 = gguf_ldu32(q3 + 4);
   const uint16_t* gas = (const uint16_t*)(bq2->qs + QK_K / 4) + 2 * ib32;
   const int8_t* q8 = bq8_1[ib32].qs;
   uint32_t aux32 = gas[0] | (gas[1] << 16);
   int sumi = 0;
+#pragma unroll
   for (int l = 0; l < 4; ++l) {
-    const uint32_t* grid1 = iq3xxs_grid + q3[2 * l + 0];
-    const uint32_t* grid2 = iq3xxs_grid + q3[2 * l + 1];
+    const uint32_t qsw = (l < 2) ? qs01 : qs23;
+    const unsigned sh = (static_cast<unsigned>(l) & 1u) * 16u;
+    const uint32_t qb0 = (qsw >> sh) & 0xffu;
+    const uint32_t qb1 = (qsw >> (sh + 8u)) & 0xffu;
+    const uint32_t* grid1 = iq3xxs_grid + qb0;
+    const uint32_t* grid2 = iq3xxs_grid + qb1;
     const uint32_t* signs = (const uint32_t*)(ksigns64 + (aux32 & 127));
     const int grid_l = __vsub4(grid1[0] ^ signs[0], signs[0]);
     const int grid_h = __vsub4(grid2[0] ^ signs[1], signs[1]);
@@ -1922,14 +1947,24 @@ vec_dot_iq3_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ 
   const block_iq3_s* bq2 = (const block_iq3_s*)vbq;
 
   const int ib32 = iqs;
-  const uint8_t* qs = bq2->qs + 8 * ib32;
+  const uint8_t* qsp = bq2->qs + 8 * ib32;
+  const uint32_t qs01 = iq3s_ldu32(qsp);
+  const uint32_t qs23 = iq3s_ldu32(qsp + 4);
+  const uint32_t qhv = bq2->qh[ib32];
+  const uint32_t sgn = iq3s_ldu32(bq2->signs + 4 * ib32);
   const int8_t* q8 = bq8_1[ib32].qs;
   int sumi = 0;
+#pragma unroll
   for (int l = 0; l < 4; ++l) {
-    const uint32_t* grid1 = iq3xs_grid + (qs[2 * l + 0] | ((bq2->qh[ib32] << (8 - 2 * l)) & 256));
-    const uint32_t* grid2 = iq3xs_grid + (qs[2 * l + 1] | ((bq2->qh[ib32] << (7 - 2 * l)) & 256));
-    uint32_t signs0 = __vcmpeq4(((bq2->signs[4 * ib32 + l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201);
-    uint32_t signs1 = __vcmpeq4(((bq2->signs[4 * ib32 + l] >> 4) * 0x01010101) & 0x08040201, 0x08040201);
+    const uint32_t qsw = (l < 2) ? qs01 : qs23;
+    const unsigned sh = (static_cast<unsigned>(l) & 1u) * 16u;
+    const uint32_t qb0 = (qsw >> sh) & 0xffu;
+    const uint32_t qb1 = (qsw >> (sh + 8u)) & 0xffu;
+    const uint32_t* grid1 = iq3xs_grid + (qb0 | ((qhv << (8 - 2 * l)) & 256u));
+    const uint32_t* grid2 = iq3xs_grid + (qb1 | ((qhv << (7 - 2 * l)) & 256u));
+    const uint32_t sbyte = (sgn >> (8u * l)) & 0xffu;
+    uint32_t signs0 = __vcmpeq4(((sbyte & 0xfu) * 0x01010101u) & 0x08040201u, 0x08040201u);
+    uint32_t signs1 = __vcmpeq4(((sbyte >> 4) * 0x01010101u) & 0x08040201u, 0x08040201u);
     const int grid_l = __vsub4(grid1[0] ^ signs0, signs0);
     const int grid_h = __vsub4(grid2[0] ^ signs1, signs1);
     sumi = __dp4a(grid_l, *((int*)q8 + 0), sumi);
@@ -2088,12 +2123,22 @@ struct MvIq3s {
   static __device__ __forceinline__ float decode(const void* __restrict__ vbq, const int iqs, int (&v)[8]) {
     const block_iq3_s* bq2 = (const block_iq3_s*)vbq;
     const int ib32 = iqs;
-    const uint8_t* qs = bq2->qs + 8 * ib32;
+    const uint8_t* qsp = bq2->qs + 8 * ib32;
+    const uint32_t qs01 = iq3s_ldu32(qsp);
+    const uint32_t qs23 = iq3s_ldu32(qsp + 4);
+    const uint32_t qhv = bq2->qh[ib32];
+    const uint32_t sgn = iq3s_ldu32(bq2->signs + 4 * ib32);
+#pragma unroll
     for (int l = 0; l < 4; ++l) {
-      const uint32_t* grid1 = iq3xs_grid + (qs[2 * l + 0] | ((bq2->qh[ib32] << (8 - 2 * l)) & 256));
-      const uint32_t* grid2 = iq3xs_grid + (qs[2 * l + 1] | ((bq2->qh[ib32] << (7 - 2 * l)) & 256));
-      uint32_t signs0 = __vcmpeq4(((bq2->signs[4 * ib32 + l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201);
-      uint32_t signs1 = __vcmpeq4(((bq2->signs[4 * ib32 + l] >> 4) * 0x01010101) & 0x08040201, 0x08040201);
+      const uint32_t qsw = (l < 2) ? qs01 : qs23;
+      const unsigned sh = (static_cast<unsigned>(l) & 1u) * 16u;
+      const uint32_t qb0 = (qsw >> sh) & 0xffu;
+      const uint32_t qb1 = (qsw >> (sh + 8u)) & 0xffu;
+      const uint32_t* grid1 = iq3xs_grid + (qb0 | ((qhv << (8 - 2 * l)) & 256u));
+      const uint32_t* grid2 = iq3xs_grid + (qb1 | ((qhv << (7 - 2 * l)) & 256u));
+      const uint32_t sbyte = (sgn >> (8u * l)) & 0xffu;
+      uint32_t signs0 = __vcmpeq4(((sbyte & 0xfu) * 0x01010101u) & 0x08040201u, 0x08040201u);
+      uint32_t signs1 = __vcmpeq4(((sbyte >> 4) * 0x01010101u) & 0x08040201u, 0x08040201u);
       v[2 * l + 0] = __vsub4(grid1[0] ^ signs0, signs0);
       v[2 * l + 1] = __vsub4(grid2[0] ^ signs1, signs1);
     }
@@ -2113,11 +2158,18 @@ struct MvIq3xxs {
     const block_iq3_xxs* bq2 = (const block_iq3_xxs*)vbq;
     const int ib32 = iqs;
     const uint8_t* q3 = bq2->qs + 8 * ib32;
+    const uint32_t qs01 = gguf_ldu32(q3);
+    const uint32_t qs23 = gguf_ldu32(q3 + 4);
     const uint16_t* gas = (const uint16_t*)(bq2->qs + QK_K / 4) + 2 * ib32;
     uint32_t aux32 = gas[0] | (gas[1] << 16);
+#pragma unroll
     for (int l = 0; l < 4; ++l) {
-      const uint32_t* grid1 = iq3xxs_grid + q3[2 * l + 0];
-      const uint32_t* grid2 = iq3xxs_grid + q3[2 * l + 1];
+      const uint32_t qsw = (l < 2) ? qs01 : qs23;
+      const unsigned sh = (static_cast<unsigned>(l) & 1u) * 16u;
+      const uint32_t qb0 = (qsw >> sh) & 0xffu;
+      const uint32_t qb1 = (qsw >> (sh + 8u)) & 0xffu;
+      const uint32_t* grid1 = iq3xxs_grid + qb0;
+      const uint32_t* grid2 = iq3xxs_grid + qb1;
       const uint32_t* signs = (const uint32_t*)(ksigns64 + (aux32 & 127));
       v[2 * l + 0] = __vsub4(grid1[0] ^ signs[0], signs[0]);
       v[2 * l + 1] = __vsub4(grid2[0] ^ signs[1], signs[1]);

@@ -17,11 +17,14 @@ static __global__ void moe_vec_q(
   const auto token = blockIdx.z / topk;
   const auto expert = (topk_ids)[blockIdx.z];
 
-  // Route-mask sentinel (-1): skip this route, leaving dst[blockIdx.z] at its
-  // zero-init. Lets one fixed-grid launch drive a hit/miss subset for the
-  // same-layer expert hit/miss gather overlap; the two disjoint passes sum back
-  // to the canonical per-route output bit-for-bit (val + 0.0 == val).
+  // Route-mask sentinel (-1): zero this route's rows in-kernel. The launcher
+  // allocates Y with torch::empty, so the kernel must materialize the zeros
+  // that torch::zeros used to write (val + 0.0 == val keeps the disjoint
+  // hit/miss passes bit-identical to the single-pass reference).
   if (expert < 0) {
+    if (row < nrows && threadIdx.x == 0) {
+      dst[blockIdx.z * nrows + row] = static_cast<scalar_t>(0.0f);
+    }
     return;
   }
 
