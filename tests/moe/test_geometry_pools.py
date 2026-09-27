@@ -158,6 +158,7 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU s
 @cuda
 def test_decode_eviction_prefill_staging_rebuild_and_reset():
     cache = _cache(26, "cuda")
+    assert cache._copy_fused_ok
     cache.reset()
     gu = lambda layer: cache.bank_views(layer_id=layer)[0]  # noqa: E731
 

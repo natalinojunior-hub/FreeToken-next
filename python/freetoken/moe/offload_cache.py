@@ -331,13 +331,15 @@ class OffloadMoeCache:
         self.live_caps: list[int] = []
         self._staged: set[int] = set()
         self._bind_pool_state()
-        # Fused multi-bank copy descriptor (built by set_bank_sources/_build_copy_plan).
-        # Source pointers are per layer (_copy_src_ptrs[layer_id] -> [num_banks] device
-        # tensor); dst/feat are layer-invariant.
+        # Fused multi-bank copy descriptors (built by set_bank_sources/_build_copy_plan).
+        # Source, destination and row-byte tensors are per layer because mixed-geometry
+        # pools give each layer its own destination view.
         self._copy_fused_ok = False
         self._copy_dst_ptrs: torch.Tensor | None = None
+        self._copy_dst_ptrs_by_layer: list[torch.Tensor] | None = None
         self._copy_src_ptrs: list[torch.Tensor] | None = None
         self._copy_feat_bytes: torch.Tensor | None = None
+        self._copy_feat_bytes_by_layer: list[torch.Tensor] | None = None
         # The layer whose misses ensure_experts/materialize_layer staged last; consumed
         # by copy_missing to pick the per-layer source (part of the same pending-copy
         # state as evict_slots/src_indices/num_indices).
@@ -531,8 +533,10 @@ class OffloadMoeCache:
         """
         self._copy_fused_ok = False
         self._copy_dst_ptrs = None
+        self._copy_dst_ptrs_by_layer = None
         self._copy_src_ptrs = None
         self._copy_feat_bytes = None
+        self._copy_feat_bytes_by_layer = None
         self._copy_dst_ptrs_host: list[int] = []
         self._copy_src_ptrs_host: list[list[int]] = []
         self._copy_feat_bytes_host: list[int] = []
@@ -543,17 +547,17 @@ class OffloadMoeCache:
             return
         from freetoken.kernel.pinned import device_ptr
 
-        dst_ptrs, feats = [], []
         layer_src_ptrs = [[] for _ in range(self.num_layers)]
-        for per_layer, cache in self.banks:
-            if any(
-                s.shape != per_layer[0].shape or s.dtype != per_layer[0].dtype for s in per_layer
-            ):
-                return  # mixed geometry across layers: use per-bank copy
-            feat = math.prod(per_layer[0].shape[1:]) * per_layer[0].element_size()
-            if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
-                return  # leave fused disabled; copy_missing uses the per-bank path
+        layer_dst_ptrs = [[] for _ in range(self.num_layers)]
+        layer_feat_bytes = [[] for _ in range(self.num_layers)]
+        for bank_idx, (per_layer, _cache) in enumerate(self.banks):
             for layer_id, source in enumerate(per_layer):
+                feat = math.prod(source.shape[1:]) * source.element_size()
+                dst = self._layer_rows(layer_id, bank_idx, False)
+                if feat % 16 != 0 or dst.data_ptr() % 16 != 0:
+                    return  # leave fused disabled; copy_missing uses the per-bank path
+                layer_dst_ptrs[layer_id].append(dst.data_ptr())
+                layer_feat_bytes[layer_id].append(feat)
                 if layer_id in self._unpinned_layers:
                     # unregistered layer: no device alias exists, and the row is never consumed (CPU decode; pageable prefill)
                     # a 0 placeholder keeps the descriptor shape
@@ -566,13 +570,21 @@ class OffloadMoeCache:
                 if src_dev % 16 != 0:
                     return
                 layer_src_ptrs[layer_id].append(src_dev)
-            dst_ptrs.append(cache.data_ptr())
-            feats.append(feat)
-        self._copy_dst_ptrs = torch.tensor(dst_ptrs, dtype=torch.int64, device=self.device)
+        self._copy_dst_ptrs_by_layer = [
+            torch.tensor(ptrs, dtype=torch.int64, device=self.device) for ptrs in layer_dst_ptrs
+        ]
         self._copy_src_ptrs = [
             torch.tensor(ptrs, dtype=torch.int64, device=self.device) for ptrs in layer_src_ptrs
         ]
-        self._copy_feat_bytes = torch.tensor(feats, dtype=torch.int64, device=self.device)
+        self._copy_feat_bytes_by_layer = [
+            torch.tensor(feats, dtype=torch.int64, device=self.device) for feats in layer_feat_bytes
+        ]
+        # Keep the first-layer aliases for the pre-existing prefill overlap path, which is
+        # disabled by the runtime when layer geometry is non-uniform.
+        self._copy_dst_ptrs = self._copy_dst_ptrs_by_layer[0]
+        self._copy_feat_bytes = self._copy_feat_bytes_by_layer[0]
+        dst_ptrs = layer_dst_ptrs[0]
+        feats = layer_feat_bytes[0]
         self._copy_dst_ptrs_host = dst_ptrs
         self._copy_src_ptrs_host = layer_src_ptrs
         self._copy_feat_bytes_host = feats
@@ -1602,13 +1614,15 @@ class OffloadMoeCache:
                 cache[: self.num_experts].copy_(self.bank_sources[name][layer_id])
             self._trace_copy_missing(layer_id, trace_event, trace_start)
             return
-        if self._copy_fused_ok:
+        # Whole-layer prefill may target a staging window whose base differs from the
+        # decode pool view; keep the proven per-bank path for that one-shot copy.
+        if self._copy_fused_ok and not self._pending_whole_layer:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
             fast_index_copy_multi_jit(
-                self._copy_dst_ptrs,
+                self._copy_dst_ptrs_by_layer[layer_id],
                 self._copy_src_ptrs[layer_id],
-                self._copy_feat_bytes,
+                self._copy_feat_bytes_by_layer[layer_id],
                 self.evict_slots,
                 self.src_indices,
                 self.num_indices,
