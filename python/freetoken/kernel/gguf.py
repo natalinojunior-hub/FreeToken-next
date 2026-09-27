@@ -13,9 +13,12 @@ dequantize *inside* the kernel -- no bf16 copy of the weight is ever materialize
 from __future__ import annotations
 
 import functools
+import atexit
+import json
 import os
 import pathlib
 import shutil
+import time
 
 import torch
 
@@ -33,6 +36,48 @@ if os.path.isdir(
     os.environ["PATH"] = f"/models/outros/cuda-13.3/bin:{os.environ.get('PATH', '')}"
 
 _CSRC = pathlib.Path(__file__).parent / "csrc" / "gguf"
+
+_TRACE_DIR = os.environ.get("FREETOKEN_GGUF_TRACE", "").strip()
+_TRACE = {
+    kind: {"calls": 0, "ms": 0.0, "host_ms": 0.0, "read": 0, "write": 0}
+    for kind in ("a8_total", "quantize", "a8_prequant")
+}
+_TRACE_CALLS = 0
+
+
+def _flush_trace() -> None:
+    if _TRACE_DIR:
+        path = pathlib.Path(_TRACE_DIR)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / f"gguf-{os.getpid()}.json").write_text(json.dumps(_TRACE))
+
+
+def _trace_call(kind: str, fn, read: int, write: int):
+    global _TRACE_CALLS
+    if not _TRACE_DIR or not torch.cuda.is_available():
+        return fn()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    host_start = time.perf_counter()
+    start.record()
+    out = fn()
+    end.record()
+    end.synchronize()
+    row = _TRACE[kind]
+    row["calls"] += 1
+    row["ms"] += start.elapsed_time(end)
+    row["host_ms"] += (time.perf_counter() - host_start) * 1000
+    row["read"] += read
+    row["write"] += write
+    _TRACE_CALLS += 1
+    if _TRACE_CALLS % 256 == 0:
+        _flush_trace()
+    return out
+
+
+@atexit.register
+def _write_trace() -> None:
+    _flush_trace()
 
 
 def _host_compiler() -> str | None:
@@ -105,12 +150,23 @@ def ggml_mul_mat_vec_a8(
     weight: torch.Tensor, x: torch.Tensor, quant_type: int, row: int
 ) -> torch.Tensor:
     """MMVQ: small-batch GEMV with on-the-fly dequant. ``row`` = output features."""
-    return _module().ggml_mul_mat_vec_a8(weight, x, quant_type, row)
+    return _trace_call(
+        "a8_total",
+        lambda: _module().ggml_mul_mat_vec_a8(weight, x, quant_type, row),
+        weight.numel() * weight.element_size() + x.numel() * x.element_size(),
+        row * x.shape[0] * x.element_size(),
+    )
 
 
 def ggml_quantize_row_q8_1(x: torch.Tensor) -> torch.Tensor:
     """Quantize activation ``x`` -> q8_1 block buffer once, for reuse across MMVQ parts."""
-    return _module().ggml_quantize_row_q8_1(x)
+    padded = (x.shape[1] + 511) // 512 * 512
+    return _trace_call(
+        "quantize",
+        lambda: _module().ggml_quantize_row_q8_1(x),
+        x.numel() * x.element_size(),
+        x.shape[0] * (padded // 32 * 9) * 4,
+    )
 
 
 def ggml_mul_mat_vec_a8_prequant(
@@ -123,8 +179,13 @@ def ggml_mul_mat_vec_a8_prequant(
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
     """MMVQ against a pre-quantized q8_1 activation (bit-exact vs ggml_mul_mat_vec_a8)."""
-    return _module().ggml_mul_mat_vec_a8_prequant(
-        weight, quant_x, quant_type, row, col, vecs, out_dtype
+    return _trace_call(
+        "a8_prequant",
+        lambda: _module().ggml_mul_mat_vec_a8_prequant(
+            weight, quant_x, quant_type, row, col, vecs, out_dtype
+        ),
+        weight.numel() * weight.element_size() + quant_x.numel() * quant_x.element_size(),
+        row * vecs * torch.tensor([], dtype=out_dtype).element_size(),
     )
 
 

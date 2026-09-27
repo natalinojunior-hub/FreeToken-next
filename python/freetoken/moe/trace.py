@@ -99,6 +99,14 @@ class MoeTracer:
         resident_rows: int,
         transfer_ms: float | None,
         available_vram_bytes: int | None,
+        requested_global_ids: list[int] | None = None,
+        hit_global_ids: list[int] | None = None,
+        miss_global_ids: list[int] | None = None,
+        before_ids: list[int] | None = None,
+        after_ids: list[int] | None = None,
+        before_usage: list[int] | None = None,
+        after_usage: list[int] | None = None,
+        victim_slots: list[int] | None = None,
     ) -> None:
         if _capturing():
             return
@@ -118,6 +126,14 @@ class MoeTracer:
                     "resident_rows": resident_rows,
                     "transfer_ms": transfer_ms,
                     "available_vram_bytes": available_vram_bytes,
+                    "requested_global_ids": requested_global_ids,
+                    "hit_global_ids": hit_global_ids,
+                    "miss_global_ids": miss_global_ids,
+                    "before_ids": before_ids,
+                    "after_ids": after_ids,
+                    "before_usage": before_usage,
+                    "after_usage": after_usage,
+                    "victim_slots": victim_slots,
                 }
             )
             + "\n"

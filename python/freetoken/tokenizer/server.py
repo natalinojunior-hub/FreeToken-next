@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
+import time
 from typing import Any, List
 
 import torch
@@ -206,7 +208,9 @@ def tokenize_worker(
             assert len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) + n_control == len(
                 pending_msg
             )
+            trace_host = os.getenv("FREETOKEN_HOST_PATH_TRACE", "0") == "1"
             sampled_replies: List[UserReply] = []
+            detok_t0 = time.perf_counter() if trace_host and detokenize_msg else 0.0
             if len(detokenize_msg) > 0:
                 replies = detokenize_manager.detokenize(detokenize_msg)
                 sampled_replies = [
@@ -227,6 +231,7 @@ def tokenize_worker(
                     )
                     for msg, reply in zip(detokenize_msg, replies, strict=True)
                 ]
+            detok_ms = (time.perf_counter() - detok_t0) * 1e3 if detok_t0 else 0.0
 
             # An error reply and a client abort are both terminal for their uid, and neither
             # produces the finished DetokenizeMsg that would release the decode state.
@@ -235,12 +240,19 @@ def tokenize_worker(
             for msg in abort_msg:
                 detokenize_manager.discard(msg.uid)
 
+            send_t0 = time.perf_counter() if trace_host and sampled_replies else 0.0
             _send_generation_replies(
                 send_frontend,
                 [_prompt_admitted_reply(msg) for msg in prompt_admitted_msg],
                 sampled_replies,
                 [_error_reply(msg) for msg in error_reply_msg],
             )
+            if send_t0:
+                print(
+                    "[host-trace] tokenizer_tokens=%d detokenize_ms=%.4f frontend_send_ms=%.4f"
+                    % (len(sampled_replies), detok_ms, (time.perf_counter() - send_t0) * 1e3),
+                    flush=True,
+                )
 
             if len(tokenize_msg) > 0:
                 # Tokenize per-message so a single un-renderable request (e.g. a chat template

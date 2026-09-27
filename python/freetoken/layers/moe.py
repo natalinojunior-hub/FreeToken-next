@@ -306,7 +306,7 @@ class OffloadMoELayer(MoELayer):
         if cache.tracer is not None:
             cache.ensure_experts(self.layer_id, topk_ids, kind=self._trace_kind(hidden_states))
         elif (
-            os.getenv("FREETOKEN_MOE_DECODE_OVERLAP", "0") == "1"
+            os.getenv("FREETOKEN_MOE_DECODE_OVERLAP", "1") == "1"
             and cache.device.type == "cuda"
             and cache.quant_format in ("gguf", "q4_0")
             and hidden_states.shape[0] <= 4
