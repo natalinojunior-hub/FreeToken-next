@@ -83,6 +83,10 @@ _WFMT_IDS = {
     "iq4_nl": 9,
     "q8_0": 10,
     "q2_0": 11,
+    "iq2_xxs": 12,
+    "iq2_xs": 13,
+    "iq2_s": 14,
+    "iq3_xxs": 15,
 }
 
 # (elements per block, bytes per block) for the K-quant/i-quant expert banks the CPU GEMV
@@ -99,6 +103,13 @@ _GGUF_KQUANT_BLOCK = {
     "iq4_nl": (32, 18),
     "q8_0": (32, 34),
     "q2_0": (64, 18),
+    # Codebook i-quants, all QK_K = 256: block_iq2_xxs 66 B (fp16 d + uint16 qs[32]),
+    # block_iq2_xs 74 B (+ uint8 scales[8]), block_iq2_s 82 B (d + qs[64] + qh[8] +
+    # scales[8]), block_iq3_xxs 98 B (d + qs[96], the last 32 holding scale/sign words).
+    "iq2_xxs": (256, 66),
+    "iq2_xs": (256, 74),
+    "iq2_s": (256, 82),
+    "iq3_xxs": (256, 98),
 }
 
 # quant_format == "gguf" names a container, not a layout: the checkpoint picks a ggml type
@@ -112,6 +123,11 @@ _GGML_TO_CPU_FMT = {
     14: "q6_k",
     20: "iq4_nl",
     21: "iq3_s",
+    # GGML_IQ2_XXS/IQ2_XS/IQ3_XXS/IQ2_S: W4A8-only, like Q2_0 below.
+    16: "iq2_xxs",
+    17: "iq2_xs",
+    18: "iq3_xxs",
+    22: "iq2_s",
     23: "iq4_xs",
     # GGML_Q2_0. W4A8-only in the extension (no bf16-activation kernel), so
     # compiled_extension_supports_format additionally probes q2_0_dot_i8_available().
@@ -376,9 +392,14 @@ def compiled_extension_supports_format(fmt: str) -> bool:
     # The default is the highest id that predates the probe, not "unknown means allowed".
     if fmt_id > getattr(_cpu_moe, "max_weight_format_id", lambda: _GGUF_KQUANT_MIN_PROBED_ID - 1)():
         return False
-    # Q2_0 is W4A8-only: without AVX512-VNNI the extension has no Q2_0 kernel at all, not
-    # even a slow one, so a stale or non-VNNI build must not be handed Q2_0 layers.
-    return fmt != "q2_0" or getattr(_cpu_moe, "q2_0_dot_i8_available", lambda: False)()
+    # W4A8-only formats have no bf16-activation fallback, so without AVX512-VNNI (or in a
+    # stale build) the extension has no kernel for them at all, not even a slow one. Refuse
+    # the format here rather than faulting at decode time.
+    if fmt == "q2_0":
+        return getattr(_cpu_moe, "q2_0_dot_i8_available", lambda: False)()
+    if fmt in ("iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs"):
+        return getattr(_cpu_moe, "iquant2_dot_i8_available", lambda _fid: False)(fmt_id)
+    return True
 
 
 def physical_core_cpus() -> list[int]:

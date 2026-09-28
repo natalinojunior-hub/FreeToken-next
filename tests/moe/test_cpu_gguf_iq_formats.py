@@ -15,6 +15,9 @@ gate/up (IQ4_XS on one layer), IQ4_NL/Q8_0 down.
 
 from __future__ import annotations
 
+import pathlib
+import re
+
 import numpy as np
 import pytest
 import torch
@@ -227,6 +230,122 @@ def test_q2_0_w4a8_simd_matches_scalar_and_dequant_reference():
         worst_ref = max(worst_ref, abs(got_v - expected) / (abs(expected) + 1e-6))
     assert worst_simd < 1e-5, f"Q2_0 simd vs scalar spread {worst_simd}"
     assert worst_ref < _DEFAULT_REL_TOL, f"Q2_0 vs dequant_q2_0 spread {worst_ref}"
+
+
+# Codebook i-quants: (name, WFmt id, block bytes). All are 256-element blocks and W4A8-only.
+_IQUANT2 = [("iq2_xxs", 12, 66), ("iq2_xs", 13, 74), ("iq2_s", 14, 82), ("iq3_xxs", 15, 98)]
+_TABLES_HDR = (
+    pathlib.Path(_cpu_moe.__file__).parent.parent / "kernel/csrc/cpu_moe/gguf_iquant_tables.h"
+)
+# An installed wheel does not ship the generated header, so the transcription reference
+# below is unavailable there; the kernels are still exercised by the format-table test.
+_HDR_MISSING = not _TABLES_HDR.is_file()
+
+
+def _hdr_table(name: str, ctype: str, n: int) -> np.ndarray:
+    """Read a generated codebook table so the reference below and the C++ kernel cannot
+    drift onto different constants."""
+    body = re.search(
+        rf"static const {ctype} {name}\[{n}\] = \{{(.*?)\}};", _TABLES_HDR.read_text(), re.S
+    ).group(1)
+    vals = [int(v.rstrip("uUlL"), 0) for v in re.findall(r"0[xX][0-9a-fA-F]+|\b\d+", body)]
+    assert len(vals) == n, (name, len(vals))
+    dt = {"uint64_t": np.uint64, "uint32_t": np.uint32, "uint8_t": np.uint8}[ctype]
+    return np.array(vals, dtype=dt)
+
+
+def _grid_bytes(g: np.ndarray, idx: int, n: int) -> np.ndarray:
+    v = int(g[idx])
+    return np.array([(v >> (8 * b)) & 0xFF for b in range(n)], dtype=np.float32)
+
+
+def _iquant2_block(fmt: str, blk: bytes) -> np.ndarray:
+    """One 256-element block -> float32[256], transcribed from dequantize.cuh's
+    dequantize_block_<fmt> (the same source the CUDA kernels are checked against)."""
+    tables = {
+        "iq2_xxs": _hdr_table("iq2xxs_grid", "uint64_t", 256),
+        "iq2_xs": _hdr_table("iq2xs_grid", "uint64_t", 512),
+        "iq2_s": _hdr_table("iq2s_grid", "uint64_t", 1024),
+        "iq3_xxs": _hdr_table("iq3xxs_grid", "uint32_t", 256),
+    }
+    ksign = _hdr_table("ksigns_iq2xs", "uint8_t", 128)
+    g = tables[fmt]
+    d_h = np.frombuffer(blk[0:2], dtype=np.float16)[0].astype(np.float32)
+    bits = 1 << np.arange(8)
+    y = np.zeros(256, dtype=np.float32)
+    for ib in range(8):
+        for il in range(4):
+            base = 32 * ib + 8 * il
+            if fmt == "iq2_xxs":
+                off = 2 + 8 * ib
+                aux32 = int.from_bytes(blk[off + 4 : off + 8], "little")
+                d = d_h * (0.5 + (aux32 >> 28)) * 0.25
+                gb, sg = _grid_bytes(g, blk[off + il], 8), ksign[(aux32 >> (7 * il)) & 127]
+            elif fmt == "iq2_xs":
+                v = int.from_bytes(blk[2 + 8 * ib + 2 * il : 4 + 8 * ib + 2 * il], "little")
+                d = d_h * (0.5 + ((blk[66 + ib] >> (4 * (il // 2))) & 0xF)) * 0.25
+                gb, sg = _grid_bytes(g, v & 511, 8), ksign[v >> 9]
+            elif fmt == "iq2_s":
+                idx = blk[2 + 4 * ib + il] | ((blk[66 + ib] << (8 - 2 * il)) & 0x300)
+                d = d_h * (0.5 + ((blk[74 + ib] >> (4 * (il // 2))) & 0xF)) * 0.25
+                gb, sg = _grid_bytes(g, idx, 8), blk[2 + 32 + 4 * ib + il]
+            else:  # iq3_xxs: two uint32 grid words per 8-element group
+                q3 = 2 + 8 * ib
+                aux32 = int.from_bytes(blk[66 + 4 * ib : 70 + 4 * ib], "little")
+                d = d_h * (0.5 + (aux32 >> 28)) * 0.5
+                sg = ksign[(aux32 >> (7 * il)) & 127]
+                gb = np.concatenate(
+                    [_grid_bytes(g, blk[q3 + 2 * il], 4), _grid_bytes(g, blk[q3 + 2 * il + 1], 4)]
+                )
+            y[base : base + 8] = d * gb * np.where(sg & bits, -1.0, 1.0)
+    return y
+
+
+@pytest.mark.parametrize("fmt,fid,nbytes", _IQUANT2, ids=[c[0] for c in _IQUANT2])
+def test_iquant2_w4a8_matches_dequantize_cuh_reference(fmt, fid, nbytes):
+    """These four have no bf16-activation CPU kernel, so the W4A8 dot is the only CPU path
+    and there is no slower sibling to compare against -- check it straight against a
+    reference transcribed from dequantize.cuh."""
+    if _HDR_MISSING:
+        pytest.skip("generated codebook header not present in this install")
+    if not _cpu_moe.iquant2_dot_i8_available(fid):
+        pytest.skip("no AVX512-VNNI W4A8 dot for this format")
+    rng = np.random.default_rng(0x1234 + fid)
+    worst = 0.0
+    for n_blocks in (1, 3, 10):
+        K = 256 * n_blocks
+        raw = bytearray()
+        for _ in range(n_blocks):
+            b = bytearray(rng.integers(0, 256, size=nbytes, dtype=np.uint8).tobytes())
+            b[0:2] = np.float16(0.01 + 0.02 * rng.random()).tobytes()
+            raw += b
+        w = torch.frombuffer(bytearray(raw), dtype=torch.uint8).clone()
+        ref = np.concatenate(
+            [
+                _iquant2_block(fmt, bytes(raw[i * nbytes : (i + 1) * nbytes]))
+                for i in range(n_blocks)
+            ]
+        )
+        aq, asb = _q8_0_quantize(rng.standard_normal(K).astype(np.float32) * 0.5)
+        expected = float(np.dot(ref, aq.astype(np.float32) * np.repeat(asb, 32)))
+        got = _cpu_moe.iquant2_dot_i8_cpu(
+            fid, w, torch.from_numpy(aq), torch.from_numpy(asb.astype(np.float32))
+        )
+        worst = max(worst, abs(got - expected) / (abs(expected) + 1e-6))
+    assert worst < _DEFAULT_REL_TOL, f"{fmt}: rel error vs dequantize.cuh reference {worst}"
+
+
+def test_iquant2_format_tables_are_consistent():
+    """All four must be in the mixable family with the block geometry from ggml-common.h,
+    or _per_layer_gguf_formats rejects the whole bank before any kernel runs."""
+    for fmt, fid, nbytes in _IQUANT2:
+        assert _WFMT_IDS[fmt] == fid
+        assert _GGUF_KQUANT_BLOCK[fmt] == (256, nbytes)
+        assert _cpu_moe.max_weight_format_id() >= fid
+    assert _GGML_TO_CPU_FMT[16] == "iq2_xxs"
+    assert _GGML_TO_CPU_FMT[17] == "iq2_xs"
+    assert _GGML_TO_CPU_FMT[18] == "iq3_xxs"
+    assert _GGML_TO_CPU_FMT[22] == "iq2_s"
 
 
 def test_q2_0_format_tables_are_consistent():
