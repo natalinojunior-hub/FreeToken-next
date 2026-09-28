@@ -47,6 +47,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _HOST_TRACE = os.getenv("FREETOKEN_HOST_PATH_TRACE", "0") == "1"
+_PROFILE_DECODE = os.getenv("FREETOKEN_PROFILE_DECODE", "0") == "1"
 _host_trace_totals = [0, 0.0, 0.0, 0.0]
 
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
@@ -156,6 +157,11 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         )
         self.config = config
         self.spec_mtp = config.spec_mtp
+        self._mtp_controller = None
+        if self.spec_mtp > 0 and os.getenv("FREETOKEN_MTP_FIXED_DEPTH", "0") != "1":
+            from .adaptive_mtp import AdaptiveMtpController
+
+            self._mtp_controller = AdaptiveMtpController(min(self.spec_mtp, 2))
         self._spec_snapshot_slots: dict[int, int] = {}
         if self.spec_mtp > 0:
             if not ENV.DISABLE_OVERLAP_SCHEDULING:
@@ -203,6 +209,29 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             assert len(self._spec_snapshot_slots) == 0, (
                 f"leaked spec snapshot slots in idle: {self._spec_snapshot_slots}"
             )
+        engine = getattr(self, "engine", None)
+        cache = getattr(engine, "moe_offload_cache", None)
+        if (
+            getattr(getattr(engine, "config", None), "moe_collect_stats", False)
+            and cache is not None
+        ):
+            logger.info_rank0(
+                f"[moe-idle] totals={cache.decode_miss_stats()} "
+                f"per_layer={cache.decode_miss_stats_per_layer()}"
+            )
+            logger.info_rank0(
+                "[moe-idle] row_bytes="
+                + str([sum(cache.pools[p].row_bytes) for p in cache.pool_of_layer])
+            )
+        if (
+            _PROFILE_DECODE
+            and getattr(self, "_profile_started", False)
+            and not getattr(self, "_profile_stopped", False)
+        ):
+            torch.cuda.synchronize(self.device)
+            # Nsight may terminate the process at this boundary. Emit final counters first.
+            torch.cuda.profiler.stop()
+            self._profile_stopped = True
 
     @torch.inference_mode()
     def rebuild_cache(
@@ -356,7 +385,17 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             self._execute_pending_rebuild()
         self._switch_residency_if_due(None)
 
+        if (
+            _PROFILE_DECODE
+            and not getattr(self, "_profile_started", False)
+            and self.decode_manager.running_reqs
+        ):
+            torch.cuda.profiler.start()
+            self._profile_started = True
+
+        mtp_sample = self._begin_mtp_cycle() if getattr(self, "spec_mtp", 0) > 0 else None
         if getattr(self, "spec_mtp", 0) > 0 and self._spec_step_or_fail():
+            self._finish_mtp_cycle(mtp_sample)
             self._flush_abort_acks()
             return
 
@@ -370,6 +409,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
 
         self._process_last_data(ongoing_data)
         self._flush_oom()
+        self._finish_mtp_cycle(mtp_sample)
         self._flush_abort_acks()
 
     @torch.inference_mode()

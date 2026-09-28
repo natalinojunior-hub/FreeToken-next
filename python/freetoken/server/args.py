@@ -475,7 +475,8 @@ def parse_args(
         "--spec-mtp",
         type=_nonnegative_int,
         default=None,
-        help="Native checkpoint MTP draft depth; 0 keeps speculative decoding disabled. "
+        help="Native checkpoint MTP depth ceiling; serving measures k0/k1/k2 online and "
+        "falls back to k0 when speculation loses. 0 keeps speculative decoding disabled. "
         "Unset: the `ft tune` profile's measured choice for this machine and context, else "
         f"{ServerArgs.spec_mtp}.",
     )

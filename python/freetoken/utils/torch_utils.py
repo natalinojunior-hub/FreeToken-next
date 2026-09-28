@@ -20,7 +20,9 @@ def torch_dtype(dtype: torch.dtype):
         torch.set_default_dtype(old_dtype)
 
 
-def nvtx_annotate(name: str, layer_id_field: str | None = None):
+def nvtx_annotate(name: str, layer_id_field: str | None = None, *, enabled: bool = True):
+    if not enabled:
+        return lambda fn: fn
     import torch.cuda.nvtx as nvtx
 
     def decorator(fn):

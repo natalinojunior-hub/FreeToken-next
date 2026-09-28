@@ -387,6 +387,120 @@ def test_flush_deferred_replays_feeds_every_pending_token_before_a_plain_decode(
     assert (current.cached_len, current.device_len) == (6, 7)
 
 
+def test_replay_window_preserves_inputs_and_bookkeeping():
+    """Multi-token replay keeps every logits row but does not commit its sampled successors."""
+    from types import SimpleNamespace
+
+    class Event:
+        def __init__(self):
+            self.synced = False
+
+        def synchronize(self):
+            self.synced = True
+
+    for n in (1, 2, 3, 4):
+        req = _req(0, prompt_len=8)
+        req.cached_len, req.device_len = 3, 3 + n
+        token_pool = torch.arange(64, dtype=torch.int64).reshape(2, 32)
+        token_pool[0, : req.input_ids.numel()] = req.input_ids
+        before_pool = token_pool.clone()
+        before_ids = req.input_ids.clone()
+        prepared = []
+        event = Event()
+        stub = SimpleNamespace(
+            device=torch.device("cpu"),
+            token_pool=token_pool,
+            engine=SimpleNamespace(),
+        )
+
+        def prepare(batch, *, skip_alloc=False):
+            prepared.append((batch, skip_alloc, batch.spec_logits_indices, batch.spec_host_ids))
+            batch.padded_reqs = [req]
+            positions = torch.arange(3, 3 + n, dtype=torch.int64)
+            batch.positions = positions.to(torch.int32)
+            return SimpleNamespace(
+                input_tuple=(torch.zeros(n, dtype=torch.int64), positions), sample_args=None
+            )
+
+        def forward(batch, _sample_args):
+            assert torch.equal(batch.input_ids, before_pool[0, 3 : 3 + n])
+            # The ordinary engine path completes one pending token. Spec-indexed batches
+            # deliberately skip that implicit transition; _replay must restore it itself.
+            if batch.spec_logits_indices is None:
+                req.complete_one()
+            return SimpleNamespace(
+                next_tokens_cpu=torch.full((n,), 999, dtype=torch.int64),
+                next_tokens_gpu=torch.full((n,), 999, dtype=torch.int64),
+                copy_done_event=event,
+            )
+
+        stub._prepare_batch = prepare
+        stub.engine.forward_batch = forward
+        # Exercise the production method with only preparation/forward supplied by CPU fakes.
+        SchedulerSpecMixin._replay(stub, req, 3, n)
+
+        batch, skip_alloc, indices, host_ids = prepared[0]
+        assert skip_alloc is True
+        if n == 1:
+            assert batch.is_decode
+            assert indices is None and host_ids is None
+        else:
+            assert batch.is_prefill
+            assert torch.equal(indices, torch.arange(n))
+            assert host_ids == before_ids[3 : 3 + n].tolist()
+            assert host_ids == batch.input_ids.tolist()
+        assert torch.equal(batch.input_ids, before_pool[0, 3 : 3 + n])
+        assert event.synced
+        assert torch.equal(token_pool, before_pool)
+        assert torch.equal(req.input_ids, before_ids)
+        assert (req.cached_len, req.device_len) == (3 + n, 4 + n)
+
+
+def test_online_cost_hook_counts_committed_tokens_and_remaining_budget(monkeypatch):
+    from freetoken.scheduler.adaptive_mtp import AdaptiveMtpController
+    from freetoken.scheduler import spec
+
+    req = _req(0, prompt_len=4)
+    req.output_len = 0
+    req.device_len = 5
+    req.sampling_params = SamplingParams(max_tokens=8, temperature=0)
+    controller = AdaptiveMtpController(2)
+    scheduler = SimpleNamespace(
+        _mtp_controller=controller,
+        decode_manager=SimpleNamespace(running_reqs={req}),
+        engine=SimpleNamespace(moe_offload_cache=None, num_pages=32),
+        finished_reqs=set(),
+    )
+    clock = iter([1.0, 1.03, 2.0, 2.02])
+    monkeypatch.setattr(spec.time, "perf_counter", lambda: next(clock))
+    sample = SchedulerSpecMixin._begin_mtp_cycle(scheduler)
+    req.append_host(torch.tensor([20, 21, 22], dtype=torch.int32))
+    SchedulerSpecMixin._finish_mtp_cycle(scheduler, sample)
+    assert controller.cost_summaries[0]["samples"] == 1
+    assert abs(controller.cost_summaries[0]["seconds_per_token"] - 0.01) < 1e-12
+    assert scheduler._mtp_distribution[0][:2] == [1, 3]
+
+    # One remaining token must use ordinary decode, even during an incomplete probe.
+    req.device_len = req.max_device_len - 1
+    sample = SchedulerSpecMixin._begin_mtp_cycle(scheduler)
+    assert controller.next_depth() == 0
+    assert not controller.probing
+    req.append_host(torch.tensor([23], dtype=torch.int32))
+    scheduler.finished_reqs.add(req)
+    SchedulerSpecMixin._finish_mtp_cycle(scheduler, sample)
+    assert scheduler._mtp_distribution[0][:2] == [2, 4]
+
+
+def test_free_request_discards_only_its_pending_draft_kv():
+    req = _req(0, prompt_len=4)
+    scheduler = SimpleNamespace(_spec_snapshot_slots={}, _mtp_kv_rows=(req.uid, 1, None, None))
+    SchedulerSpecMixin.free_spec_snapshot_slot(scheduler, req)
+    assert scheduler._mtp_kv_rows is None
+    scheduler._mtp_kv_rows = (req.uid + 1, 1, None, None)
+    SchedulerSpecMixin.free_spec_snapshot_slot(scheduler, req)
+    assert scheduler._mtp_kv_rows[0] == req.uid + 1
+
+
 def test_run_spec_step_k2_rejection_and_acceptance_positions():
     """Run the production k=2 scheduler path over deterministic CPU fakes."""
     cases = (

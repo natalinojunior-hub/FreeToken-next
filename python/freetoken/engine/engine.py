@@ -31,6 +31,7 @@ from freetoken.utils import (
     is_sm90_family,
     is_sm100_family,
     mem_GB,
+    nvtx_annotate,
     torch_dtype,
 )
 
@@ -57,6 +58,7 @@ from freetoken.kvcache.base import CacheRebuildRejected
 # so the flag off path costs nothing; see _debug_dump_logits below.
 _DEBUG_LOGIT_DUMP_DIR = os.environ.get("FREETOKEN_DEBUG_LOGIT_DUMP")
 _DEBUG_LOGIT_DUMP_MAX = int(os.environ.get("FREETOKEN_DEBUG_LOGIT_DUMP_MAX", "600"))
+_DEBUG_LOGIT_DUMP_STATE = os.environ.get("FREETOKEN_DEBUG_LOGIT_DUMP_STATE", "1") != "0"
 if _DEBUG_LOGIT_DUMP_DIR:
     os.makedirs(_DEBUG_LOGIT_DUMP_DIR, exist_ok=True)
 _debug_dump_counter = 0
@@ -2023,6 +2025,7 @@ class Engine:
             warm=False,
         )
 
+    @nvtx_annotate("TargetForward", enabled=os.getenv("FREETOKEN_PROFILE_DECODE", "0") == "1")
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         if batch.mm_gather_plan:
@@ -2089,7 +2092,7 @@ class Engine:
 
         state = None
         pool = self.linear_state_pool
-        if pool is not None:
+        if pool is not None and _DEBUG_LOGIT_DUMP_STATE:
             slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
             state = {
                 "conv": pool.conv_states[:, slot].detach().to(torch.float32).cpu().clone(),
