@@ -152,25 +152,23 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         # fp32 accumulator, just like the final live state, before that workspace cast.
         if NUM_TRACK > 0 and i_t == track_chunk:
             checkpoint = initial_state + (track_slot * H + i_h) * V * K
-            p_track = tl.make_block_ptr(
-                checkpoint, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
-            )
-            tl.store(p_track, b_h1, boundary_check=(0, 1))
+            p_track = tl.make_block_ptr(checkpoint, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
+            tl.store(p_track, b_h1.to(p_track.dtype.element_ty), boundary_check=(0, 1))
             if K > 64:
                 p_track = tl.make_block_ptr(
                     checkpoint, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
                 )
-                tl.store(p_track, b_h2, boundary_check=(0, 1))
+                tl.store(p_track, b_h2.to(p_track.dtype.element_ty), boundary_check=(0, 1))
             if K > 128:
                 p_track = tl.make_block_ptr(
                     checkpoint, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
                 )
-                tl.store(p_track, b_h3, boundary_check=(0, 1))
+                tl.store(p_track, b_h3.to(p_track.dtype.element_ty), boundary_check=(0, 1))
             if K > 192:
                 p_track = tl.make_block_ptr(
                     checkpoint, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
                 )
-                tl.store(p_track, b_h4, boundary_check=(0, 1))
+                tl.store(p_track, b_h4.to(p_track.dtype.element_ty), boundary_check=(0, 1))
         p_h1 = tl.make_block_ptr(
             h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
         )
@@ -323,7 +321,9 @@ def chunk_gated_delta_rule_fwd_h(
             or track_indices.device != initial_state.device
             or track_h_rows.device != initial_state.device
         ):
-            raise ValueError("checkpoint slots and chunk rows must be equal-length device index vectors")
+            raise ValueError(
+                "checkpoint slots and chunk rows must be equal-length device index vectors"
+            )
         # The scheduler owns the slot leases: one checkpoint per sequence, with destinations
         # disjoint from every live slot. Do not read these indices on the host in the forward.
     B, T, Hg, K, V = *k.shape, u.shape[-1]
