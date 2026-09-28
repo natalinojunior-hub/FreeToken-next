@@ -21,6 +21,7 @@ pytestmark = [
 
 TOP_K = 8
 SLOTS, H, I = 16, 512, 256
+TOKEN_COUNTS = (1, 2, 3, 4, 5, 8)
 
 
 def _pack_q4_0(S: int, OUT: int, K: int, dev) -> torch.Tensor:
@@ -32,15 +33,16 @@ def _pack_q4_0(S: int, OUT: int, K: int, dev) -> torch.Tensor:
 
 
 @pytest.fixture(scope="module")
-def banks():
+def banks(request):
+    tokens = request.param
     dev = torch.device("cuda")
     torch.manual_seed(0)
     return {
         "gate_up": _pack_q4_0(SLOTS, 2 * I, H, dev),
         "down": _pack_q4_0(SLOTS, H, I, dev),
-        "ids": torch.randint(0, SLOTS, (1, TOP_K), dtype=torch.int32, device=dev),
-        "w": torch.rand(1, TOP_K, device=dev, dtype=torch.float32),
-        "x": (torch.randn(1, H, device=dev, dtype=torch.bfloat16) * 0.5).contiguous(),
+        "ids": torch.randint(0, SLOTS, (tokens, TOP_K), dtype=torch.int32, device=dev),
+        "w": torch.rand(tokens, TOP_K, device=dev, dtype=torch.float32),
+        "x": (torch.randn(tokens, H, device=dev, dtype=torch.bfloat16) * 0.5).contiguous(),
     }
 
 
@@ -69,10 +71,11 @@ def _split(b, hit_mask):
 
 
 @pytest.mark.parametrize("seed", range(6))
+@pytest.mark.parametrize("banks", TOKEN_COUNTS, indirect=True)
 def test_split_matches_full_for_random_partitions(banks, seed: int) -> None:
     """A random hit/miss partition of the K routes must reproduce the full GEMV exactly."""
     g = torch.Generator(device="cuda").manual_seed(seed)
-    hit = torch.randint(0, 2, (1, TOP_K), device="cuda", dtype=torch.bool, generator=g)
+    hit = torch.randint(0, 2, banks["ids"].shape, device="cuda", dtype=torch.bool, generator=g)
     ref = _ref(banks)
     got = _split(banks, hit)
     torch.cuda.synchronize()
@@ -82,10 +85,11 @@ def test_split_matches_full_for_random_partitions(banks, seed: int) -> None:
     )
 
 
+@pytest.mark.parametrize("banks", TOKEN_COUNTS, indirect=True)
 def test_split_all_hit_all_miss_edges(banks) -> None:
     """All-hit (miss pass fully sentineled) and all-miss edges match the full GEMV."""
     ref = _ref(banks)
-    all_hit = torch.ones(1, TOP_K, dtype=torch.bool, device="cuda")
-    all_miss = torch.zeros(1, TOP_K, dtype=torch.bool, device="cuda")
+    all_hit = torch.ones_like(banks["ids"], dtype=torch.bool)
+    all_miss = torch.zeros_like(banks["ids"], dtype=torch.bool)
     assert torch.equal(ref, _split(banks, all_hit))
     assert torch.equal(ref, _split(banks, all_miss))

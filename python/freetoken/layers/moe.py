@@ -311,7 +311,7 @@ class OffloadMoELayer(MoELayer):
             os.getenv("FREETOKEN_MOE_DECODE_OVERLAP", "1") == "1"
             and cache.device.type == "cuda"
             and cache.quant_format in ("gguf", "q4_0")
-            and hidden_states.shape[0] <= 4
+            and hidden_states.shape[0] <= DECODE_PATH_MAX_TOKENS
         ):
             return self._decode_overlapped(cache, hidden_states, topk_weights, topk_ids)
         else:
