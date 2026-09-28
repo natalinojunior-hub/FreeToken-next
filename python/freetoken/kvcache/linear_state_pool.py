@@ -322,7 +322,7 @@ def _linear_pool_num_slots(config) -> int:
     snapshot cache and a padding sink; naive GDN keeps the old (max_running_req + 1)."""
     mr = config.max_running_req
     if config.cache_type != "hybrid_radix":
-        return mr + 1  # live + dummy/padding
+        return _linear_pool_min_slots(config)
     ratio = config.linear_state_cache_ratio
     # ratio <= 0 is an explicit opt-out of the cross-request snapshot cache: the pool then
     # sits exactly at _linear_pool_min_slots, which is what a single-request decode workload
@@ -330,16 +330,18 @@ def _linear_pool_num_slots(config) -> int:
     # Any ratio > 0 keeps the historical floor of 4 snapshots, so existing configs are
     # byte-identical.
     n_cache = 0 if ratio <= 0 else max(4, int(ratio * mr))
-    return 4 * mr + n_cache + 1  # live + 2 ping-pong + locked committed snapshot + cache + padding
+    return _linear_pool_min_slots(config) + n_cache
 
 
 def _linear_pool_min_slots(config) -> int:
     """Floor on LinearStatePool slots that still runs: the non-evictable working set with a
     zero snapshot cache. Hybrid-radix needs 4 per running request (1 live + 2 ping-pong + 1
     committed snapshot locked through decode) + the padding sink; naive needs 1 per request +
-    padding. Below this, a full max_running_req batch can't get its slots and admission
-    deadlocks -- so a runtime rebuild rejects a smaller request."""
+    padding. MTP without per-row state buffers also holds a rollback snapshot per request.
+    Below this, admission or speculative snapshot allocation exhausts the pool, so runtime
+    rebuilds and the memory planner must price the same floor."""
     mr = config.max_running_req
+    rollback = mr if getattr(config, "spec_mtp", 0) > 0 and not spec_state_steps(config) else 0
     if config.cache_type != "hybrid_radix":
-        return mr + 1
-    return 4 * mr + 1
+        return mr + rollback + 1
+    return 4 * mr + rollback + 1

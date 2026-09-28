@@ -226,3 +226,27 @@ def test_snapshot_cache_ratio_zero_lands_on_the_floor():
     assert _linear_pool_num_slots(cfg(2.0)) == 9  # the default: 4 live + 4 snapshots + sink
     assert _linear_pool_num_slots(cfg(0.0)) == _linear_pool_min_slots(cfg(0.0)) == 5
     assert _linear_pool_num_slots(cfg(0.0, mr=4)) == _linear_pool_min_slots(cfg(0.0, mr=4)) == 17
+
+
+@pytest.mark.parametrize("cache_type,working_slots", [("naive", 1), ("hybrid_radix", 4)])
+@pytest.mark.parametrize("native_layers", [0, 1])
+def test_mtp_rollback_fits_after_non_evictable_slots_are_held(cache_type, working_slots, native_layers):
+    from freetoken.kvcache.linear_state_pool import _linear_pool_min_slots, _linear_pool_num_slots
+
+    config = SimpleNamespace(
+        max_running_req=1,
+        cache_type=cache_type,
+        linear_state_cache_ratio=0,
+        spec_mtp=1,
+        model_config=SimpleNamespace(native_mtp_layers=native_layers),
+    )
+    slots = _linear_pool_num_slots(config)
+    assert slots == _linear_pool_min_slots(config)
+    pool = _pool(num_slots=slots)
+    pool.alloc(working_slots)
+    # Native NextN records verify states in separate per-row buffers; other MTP paths
+    # must still allocate a rollback snapshot even with the prefix snapshot cache off.
+    assert pool.num_free_slots == (0 if native_layers else 1)
+    if not native_layers:
+        pool.alloc(1)
+        assert pool.num_free_slots == 0
