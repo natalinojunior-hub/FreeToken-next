@@ -82,13 +82,15 @@ _WFMT_IDS = {
     "iq4_xs": 8,
     "iq4_nl": 9,
     "q8_0": 10,
+    "q2_0": 11,
 }
 
 # (elements per block, bytes per block) for the K-quant/i-quant expert banks the CPU GEMV
 # reads in place. Must match ggml-common.h and the q4_gu_row_bytes arithmetic in
 # cpu_moe_ext.cpp: block_q4_K is 144 bytes / block_q6_K is 210 bytes over QK_K = 256
 # elements; block_iq3_s is 110 bytes / block_iq4_xs is 136 bytes, also QK_K = 256;
-# block_iq4_nl is 18 bytes / block_q8_0 is 34 bytes, both over 32 elements.
+# block_iq4_nl is 18 bytes / block_q8_0 is 34 bytes, both over 32 elements; block_q2_0 is
+# 18 bytes over 64 elements (fp16 d + 16 bytes of four-per-byte 2-bit quants).
 _GGUF_KQUANT_BLOCK = {
     "q4_k": (256, 144),
     "q6_k": (256, 210),
@@ -96,6 +98,7 @@ _GGUF_KQUANT_BLOCK = {
     "iq4_xs": (256, 136),
     "iq4_nl": (32, 18),
     "q8_0": (32, 34),
+    "q2_0": (64, 18),
 }
 
 # quant_format == "gguf" names a container, not a layout: the checkpoint picks a ggml type
@@ -110,6 +113,9 @@ _GGML_TO_CPU_FMT = {
     20: "iq4_nl",
     21: "iq3_s",
     23: "iq4_xs",
+    # GGML_Q2_0. W4A8-only in the extension (no bf16-activation kernel), so
+    # compiled_extension_supports_format additionally probes q2_0_dot_i8_available().
+    42: "q2_0",
 }
 
 
@@ -368,10 +374,11 @@ def compiled_extension_supports_format(fmt: str) -> bool:
     except ImportError:
         return False
     # The default is the highest id that predates the probe, not "unknown means allowed".
-    return (
-        fmt_id
-        <= getattr(_cpu_moe, "max_weight_format_id", lambda: _GGUF_KQUANT_MIN_PROBED_ID - 1)()
-    )
+    if fmt_id > getattr(_cpu_moe, "max_weight_format_id", lambda: _GGUF_KQUANT_MIN_PROBED_ID - 1)():
+        return False
+    # Q2_0 is W4A8-only: without AVX512-VNNI the extension has no Q2_0 kernel at all, not
+    # even a slow one, so a stale or non-VNNI build must not be handed Q2_0 layers.
+    return fmt != "q2_0" or getattr(_cpu_moe, "q2_0_dot_i8_available", lambda: False)()
 
 
 def physical_core_cpus() -> list[int]:

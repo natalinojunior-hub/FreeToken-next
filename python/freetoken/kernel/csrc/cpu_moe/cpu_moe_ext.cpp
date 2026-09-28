@@ -1928,8 +1928,99 @@ q4dot_fn select_iq3s_i8dot() {
   return nullptr;
 }
 
+// -------------------------------- Q2_0 (W4A8) --------------------------------
+// block_q2_0, 18 bytes / 64 elements: fp16 `d` + qs[16] holding four 2-bit quants per
+// byte, element i = (qs[i/4] >> (2*(i%4))) & 3, weight = (q - 1) * d (ggml-common.h:31,
+// dequantize.cuh:107). The 64-element block spans two Q8_0 activation blocks, so each
+// half is scaled by its own `asb` entry.
+//
+// Weights land in {-1,0,1,2}, so the ggml sign trick from q4_0_dot_i8_vnni applies
+// directly: |w| in [0,2] is a valid VPDPBUSD unsigned operand and sign(w)*a zeroes the
+// route where w == 0, which is exactly what a zero weight contributes.
+float q2_0_dot_i8_scalar(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  float acc = 0.0f;
+  const int nb = K / 64;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 18;
+    uint16_t dh;
+    std::memcpy(&dh, blk, sizeof(dh));
+    const float d = fp16_to_f32(dh);
+    const uint8_t* qs = blk + 2;
+    for (int half = 0; half < 2; ++half) {
+      const int sb = b * 2 + half;
+      const uint8_t* q8 = qs + 8 * half;
+      const int8_t* a = aq + (size_t)32 * sb;
+      int32_t sum = 0;
+      for (int j = 0; j < 8; ++j)
+        for (int k = 0; k < 4; ++k)
+          sum += ((int)((q8[j] >> (2 * k)) & 3u) - 1) * (int)a[4 * j + k];
+      acc += (float)sum * (d * asb[sb]);
+    }
+  }
+  return acc;
+}
+
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
+// Expand 8 packed bytes into 32 int8 quants (element 4j+k = (qs[j] >> 2k) & 3).
+// `_mm256_srli_epi16` shifts whole 16-bit lanes, so the low byte picks up bits from its
+// neighbour; those land at bit 2 and above, which the AND 0x03 discards, so a uniform
+// lane shift still yields the right per-byte 2-bit field.
+__attribute__((target("avx512f,avx512bw,avx512vl,avx2")))
+static inline __m256i q2_0_unpack32(const uint8_t* qs8) {
+  const __m128i b8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs8));
+  const __m256i bb = _mm256_setr_m128i(b8, b8);
+  const __m256i shuf = _mm256_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
+                                        4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7);
+  const __m256i rep = _mm256_shuffle_epi8(bb, shuf);  // byte 4j+k = qs[j]
+  const __m256i m3 = _mm256_set1_epi8(0x03);
+  const __m256i v0 = _mm256_and_si256(rep, m3);
+  const __m256i v1 = _mm256_and_si256(_mm256_srli_epi16(rep, 2), m3);
+  const __m256i v2 = _mm256_and_si256(_mm256_srli_epi16(rep, 4), m3);
+  const __m256i v3 = _mm256_and_si256(_mm256_srli_epi16(rep, 6), m3);
+  __m256i q = _mm256_mask_blend_epi8(0x22222222, v0, v1);
+  q = _mm256_mask_blend_epi8(0x44444444, q, v2);
+  return _mm256_mask_blend_epi8(static_cast<__mmask32>(0x88888888u), q, v3);
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")))
+float q2_0_dot_i8_avx512vnni(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  __m256 accF = _mm256_setzero_ps();
+  const __m256i zero = _mm256_setzero_si256();
+  const __m256i ones = _mm256_set1_epi8(1);
+  const int nb = K / 64;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 18;
+    _mm_prefetch(reinterpret_cast<const char*>(blk) + 512, _MM_HINT_T0);
+    uint16_t dh;
+    std::memcpy(&dh, blk, sizeof(dh));
+    const float d = fp16_to_f32(dh);
+    const uint8_t* qs = blk + 2;
+    for (int half = 0; half < 2; ++half) {
+      const int sb = b * 2 + half;
+      const __m256i wv = _mm256_sub_epi8(q2_0_unpack32(qs + 8 * half), ones);
+      const __m256i aw = _mm256_sign_epi8(wv, wv);  // |w| in [0,2], unsigned operand
+      const __m256i a =
+          _mm256_loadu_si256(reinterpret_cast<const __m256i*>(aq + (size_t)32 * sb));
+      const __m256i sa = _mm256_sign_epi8(a, wv);  // sign(w)*a, 0 where w == 0
+      const __m256i di = _mm256_dpbusd_epi32(zero, aw, sa);
+      accF = _mm256_fmadd_ps(_mm256_cvtepi32_ps(di), _mm256_set1_ps(d * asb[sb]), accF);
+    }
+  }
+  return hsum256(accF);
+}
+#endif  // CPU_MOE_X86 && CPU_MOE_HAS_AVX512VNNI
+
+// Best W4A8 Q2_0 dot, or nullptr to keep this format off the CPU entirely. Q2_0 has no
+// bf16-activation kernel, so a null here means the format is unsupported rather than slow.
+q4dot_fn select_q2_0_i8dot() {
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
+  if (cpu_has_avx512vnni()) return q2_0_dot_i8_avx512vnni;
+#endif
+  return nullptr;
+}
+
 enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4, WF_Q4_K = 5, WF_Q6_K = 6,
-            WF_IQ3_S = 7, WF_IQ4_XS = 8, WF_IQ4_NL = 9, WF_Q8_0 = 10 };
+            WF_IQ3_S = 7, WF_IQ4_XS = 8, WF_IQ4_NL = 9, WF_Q8_0 = 10, WF_Q2_0 = 11 };
 
 // The highest weight layout this build actually dispatches. Exposed as max_weight_format_id
 // below so the Python side can ask before handing the ctor an id: the ctor and the dot kernels
@@ -1937,7 +2028,7 @@ enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4, 
 // branch of its own, and on the paths that index a row by the format's block geometry that is
 // not a clean throw -- it is a segfault after the worker threads already hold the pointer
 // table. Fail closed on the version instead of failing loudly on the hardware.
-constexpr int WF_MAX_SUPPORTED = WF_Q8_0;
+constexpr int WF_MAX_SUPPORTED = WF_Q2_0;
 
 // Each ctor pointer arg is the address of a CPU int64 array of length
 // num_layers (one base address per layer, built by cpu_executor.py's
@@ -1988,6 +2079,10 @@ struct CpuMoeExecutor {
   // role's K, so the int8 path is only taken where its `nb = K/256` loop is exact.
   q4dot_fn iq3si8dot = nullptr;
   bool iq3s_a8_gu = false, iq3s_a8_dn = false;
+  // Q2_0 has no bf16-activation kernel at all, so a null q20i8dot means the format is
+  // unsupported rather than merely slow -- the Python gate must reject it in that case.
+  q4dot_fn q20i8dot = nullptr;
+  bool q20_a8_gu = false, q20_a8_dn = false;
   // Which roles actually consume a Q8_0-quantized activation. A mixed bank can need one
   // and not the other (IQ3_S gate_up + IQ4_NL down), and quantizing the unused side would
   // put pure overhead on the decode critical path -- prep_g_row also returns early after
@@ -2133,6 +2228,10 @@ struct CpuMoeExecutor {
     iq3si8dot = select_iq3s_i8dot();
     iq3s_a8_gu = (iq3si8dot != nullptr) && (H % 256 == 0);
     iq3s_a8_dn = (iq3si8dot != nullptr) && (I % 256 == 0);
+    // Q2_0's 64-element block spans two Q8_0 activation blocks; both roles must divide.
+    q20i8dot = select_q2_0_i8dot();
+    q20_a8_gu = (q20i8dot != nullptr) && (H % 64 == 0);
+    q20_a8_dn = (q20i8dot != nullptr) && (I % 64 == 0);
     if (weight_format == WF_Q4_0) {
       if (H % 32 != 0 || I % 32 != 0)
         throw std::runtime_error("Q4_0 CPU MoE requires H and I to be multiples of 32");
@@ -2154,6 +2253,7 @@ struct CpuMoeExecutor {
         case WF_IQ4_XS: return {256, 136};
         case WF_IQ4_NL: return {32, 18};
         case WF_Q8_0: return {32, 34};
+        case WF_Q2_0: return {64, 18};
         default: return {0, 0};
       }
     };
@@ -2200,22 +2300,25 @@ struct CpuMoeExecutor {
     // iq3_s also runs W4A8 once its int8 dot is available and the role's K divides into
     // whole 256-element blocks. A mixed bank whose nominal format is something else still
     // needs the Q8_0 scratch when any layer uses IQ3_S, so scan the per-layer tables too.
-    const auto uses_iq3s = [](const std::vector<int>& v) {
-      return std::find(v.begin(), v.end(), static_cast<int>(WF_IQ3_S)) != v.end();
+    const auto uses_fmt = [](const std::vector<int>& v, int f) {
+      return std::find(v.begin(), v.end(), f) != v.end();
     };
-    const bool iq3s_in_gu = weight_format == WF_IQ3_S || uses_iq3s(fmt_layer);
-    const bool iq3s_in_dn = fmt_dn == WF_IQ3_S || uses_iq3s(fmt_dn_layer);
-    need_xi8 = (weight_format == WF_Q4_0) || (iq3s_a8_gu && iq3s_in_gu);
+    const bool iq3s_gu = weight_format == WF_IQ3_S || uses_fmt(fmt_layer, WF_IQ3_S);
+    const bool iq3s_dn = fmt_dn == WF_IQ3_S || uses_fmt(fmt_dn_layer, WF_IQ3_S);
+    const bool q20_gu = weight_format == WF_Q2_0 || uses_fmt(fmt_layer, WF_Q2_0);
+    const bool q20_dn = fmt_dn == WF_Q2_0 || uses_fmt(fmt_dn_layer, WF_Q2_0);
+    const bool iq3s_a8 = (iq3s_a8_gu && iq3s_gu) || (iq3s_a8_dn && iq3s_dn);
+    const bool q20_a8 = (q20_a8_gu && q20_gu) || (q20_a8_dn && q20_dn);
     // Q4_0 never mixes, so a Q4_0 bank's down role is Q4_0 too; keying on weight_format
     // as well as fmt_dn keeps this correct however the ctor resolved fmt_dn.
-    need_gi8 =
-        (weight_format == WF_Q4_0) || (fmt_dn == WF_Q4_0) || (iq3s_a8_dn && iq3s_in_dn);
-    const bool iq3s_a8 = (iq3s_a8_gu && iq3s_in_gu) || (iq3s_a8_dn && iq3s_in_dn);
-    use_q4a8 = (weight_format == WF_Q4_0) || iq3s_a8;
-    const char* q4tag =
-        !use_q4a8   ? ""
-        : !iq3s_a8  ? (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)" : "+q4_0-w4a8")
-                    : "+avx512vnni(iq3_s-w4a8)";
+    need_xi8 = (weight_format == WF_Q4_0) || (iq3s_a8_gu && iq3s_gu) || (q20_a8_gu && q20_gu);
+    need_gi8 = (weight_format == WF_Q4_0) || (fmt_dn == WF_Q4_0) || (iq3s_a8_dn && iq3s_dn) ||
+               (q20_a8_dn && q20_dn);
+    use_q4a8 = need_xi8 || need_gi8;
+    const char* q4tag = !use_q4a8 ? ""
+                        : q20_a8  ? "+avx512vnni(q2_0-w4a8)"
+                        : iq3s_a8 ? "+avx512vnni(iq3_s-w4a8)"
+                                  : (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)" : "+q4_0-w4a8");
     const char* vnni_tag =
         cpu_has_avx512vnni() ? "+avx512vnni(nvfp4-w4a8)" : "+vnni(nvfp4-w4a8)";
     isa_str = std::string(c.name) + (use_vnni ? vnni_tag : "") + q4tag;
@@ -2340,6 +2443,12 @@ struct CpuMoeExecutor {
       const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)row_bytes_l;
       return q80dot(w, x, H);  // W4A16: bf16 activations, Q8_0 dequant (AVX-512 when available)
     }
+    // Q2_0 is W4A8-only. When the int8 path is unavailable this falls through to the
+    // unhandled-format TORCH_CHECK below rather than computing anything wrong.
+    if (fmt_l == WF_Q2_0 && q20_a8_gu && xi8 != nullptr && xas != nullptr) {
+      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)row_bytes_l;
+      return q20i8dot(w, xi8, xas, H);
+    }
     // Anything that reaches here is assumed NVFP4 and dereferences the scale/global
     // pointers, which are null for formats that do not have them (the GGUF banks pass 0).
     // Falling through with an unhandled format therefore segfaults inside the worker
@@ -2394,6 +2503,10 @@ struct CpuMoeExecutor {
     if (fmt_l == WF_Q8_0) {
       const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)row_bytes_l;
       return q80dot(w, g, I);  // W4A16: bf16 activations, Q8_0 dequant (AVX-512 when available)
+    }
+    if (fmt_l == WF_Q2_0 && q20_a8_dn && gi8 != nullptr && gas != nullptr) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)row_bytes_l;
+      return q20i8dot(w, gi8, gas, I);  // W4A8-only, see gemm1_dot
     }
     const size_t r = (size_t)e * H + row;
     if (use_vnni)
@@ -3105,6 +3218,38 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       },
       py::arg("w"), py::arg("aq"), py::arg("asb"), py::call_guard<py::gil_scoped_release>());
   m.def("iq3_s_dot_i8_available", []() { return select_iq3s_i8dot() != nullptr; });
+  // Q2_0 is W4A8-only: there is no bf16-activation Q2_0 kernel, so this probe is also the
+  // format-availability gate the Python side must consult before offering Q2_0 layers.
+  m.def("q2_0_dot_i8_available", []() { return select_q2_0_i8dot() != nullptr; });
+  m.def(
+      "q2_0_dot_i8_scalar_cpu",
+      [](torch::Tensor w, torch::Tensor aq, torch::Tensor asb) {
+        TORCH_CHECK(w.dtype() == torch::kUInt8 && w.is_contiguous(), "w must be contiguous uint8");
+        TORCH_CHECK(aq.dtype() == torch::kChar && aq.is_contiguous(), "aq must be contiguous int8");
+        TORCH_CHECK(asb.dtype() == torch::kFloat32 && asb.is_contiguous(),
+                    "asb must be contiguous float32");
+        TORCH_CHECK(aq.numel() % 64 == 0 && asb.numel() == aq.numel() / 32,
+                    "aq length must be a multiple of 64 and asb must hold one scale per 32");
+        return q2_0_dot_i8_scalar(w.data_ptr<uint8_t>(),
+                                  reinterpret_cast<const int8_t*>(aq.data_ptr()),
+                                  asb.data_ptr<float>(), static_cast<int>(aq.numel()));
+      },
+      py::arg("w"), py::arg("aq"), py::arg("asb"), py::call_guard<py::gil_scoped_release>());
+  m.def(
+      "q2_0_dot_i8_cpu",
+      [](torch::Tensor w, torch::Tensor aq, torch::Tensor asb) {
+        TORCH_CHECK(w.dtype() == torch::kUInt8 && w.is_contiguous(), "w must be contiguous uint8");
+        TORCH_CHECK(aq.dtype() == torch::kChar && aq.is_contiguous(), "aq must be contiguous int8");
+        TORCH_CHECK(asb.dtype() == torch::kFloat32 && asb.is_contiguous(),
+                    "asb must be contiguous float32");
+        TORCH_CHECK(aq.numel() % 64 == 0 && asb.numel() == aq.numel() / 32,
+                    "aq length must be a multiple of 64 and asb must hold one scale per 32");
+        const q4dot_fn f = select_q2_0_i8dot();
+        TORCH_CHECK(f != nullptr, "this build/CPU has no W4A8 Q2_0 dot (needs AVX512-VNNI)");
+        return f(w.data_ptr<uint8_t>(), reinterpret_cast<const int8_t*>(aq.data_ptr()),
+                 asb.data_ptr<float>(), static_cast<int>(aq.numel()));
+      },
+      py::arg("w"), py::arg("aq"), py::arg("asb"), py::call_guard<py::gil_scoped_release>());
   m.def(
       "iq4_xs_dot_cpu",
       [](torch::Tensor w, torch::Tensor x) {

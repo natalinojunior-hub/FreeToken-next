@@ -21,6 +21,7 @@ import torch
 from gguf import GGMLQuantizationType, quants
 
 from freetoken.kernel import _cpu_moe
+from freetoken.models.gguf.dequant import dequant_q2_0
 from freetoken.moe.cpu_executor import _GGML_TO_CPU_FMT, _GGUF_KQUANT_BLOCK, _WFMT_IDS
 
 # (format name, block bytes, block elements, ggml type id, dot hook)
@@ -197,6 +198,44 @@ def test_iq3s_w4a8_stays_close_to_w4a16_path():
     )
     rel = abs(i8 - f32) / (abs(f32) + 1e-6)
     assert rel < 2e-2, f"W4A8 {i8} drifted from W4A16 {f32} by rel {rel}"
+
+
+@pytest.mark.skipif(
+    not _cpu_moe.q2_0_dot_i8_available(), reason="no AVX512-VNNI W4A8 Q2_0 dot on this CPU"
+)
+def test_q2_0_w4a8_simd_matches_scalar_and_dequant_reference():
+    """Q2_0 is W4A8-only (no bf16-activation kernel exists), so the scalar int8 reference,
+    the SIMD int8 kernel and dequant_q2_0 -- the Python reference the CUDA kernels are
+    cross-checked against -- must all agree. A 64-element Q2_0 block spans two Q8_0
+    activation blocks, which is what the multi-block case exercises."""
+    rng = np.random.default_rng(0x0200)
+    worst_simd = worst_ref = 0.0
+    for n_blocks in (1, 2, 40):
+        K = 64 * n_blocks
+        raw = b"".join(
+            _random_block(rng, 18, scale=0.01 + 0.02 * rng.random()) for _ in range(n_blocks)
+        )
+        w = torch.frombuffer(bytearray(raw), dtype=torch.uint8).clone()
+        ref = dequant_q2_0(w.clone(), torch.float32).numpy().astype(np.float32)
+        assert ref.shape == (K,)
+        aq, asb = _q8_0_quantize(rng.standard_normal(K).astype(np.float32) * 0.5)
+        aq_t, asb_t = torch.from_numpy(aq), torch.from_numpy(asb.astype(np.float32))
+        got_s = _cpu_moe.q2_0_dot_i8_scalar_cpu(w, aq_t, asb_t)
+        got_v = _cpu_moe.q2_0_dot_i8_cpu(w, aq_t, asb_t)
+        expected = float(np.dot(ref, aq.astype(np.float32) * np.repeat(asb, 32)))
+        worst_simd = max(worst_simd, abs(got_v - got_s) / (abs(got_s) + 1e-9))
+        worst_ref = max(worst_ref, abs(got_v - expected) / (abs(expected) + 1e-6))
+    assert worst_simd < 1e-5, f"Q2_0 simd vs scalar spread {worst_simd}"
+    assert worst_ref < _DEFAULT_REL_TOL, f"Q2_0 vs dequant_q2_0 spread {worst_ref}"
+
+
+def test_q2_0_format_tables_are_consistent():
+    """Q2_0 must be in the mixable K/I-quant family (this checkpoint pairs Q2_0 down with
+    IQ3_S/IQ2_* gate_up) and its geometry must match block_q2_0 = 64 elems / 18 bytes."""
+    assert _GGUF_KQUANT_BLOCK["q2_0"] == (64, 18)
+    assert _WFMT_IDS["q2_0"] == 11
+    assert _GGML_TO_CPU_FMT[42] == "q2_0"  # GGML_Q2_0
+    assert _cpu_moe.max_weight_format_id() >= _WFMT_IDS["q2_0"]
 
 
 def test_max_weight_format_id_covers_new_formats():
