@@ -2,8 +2,25 @@
 
 from __future__ import annotations
 
+import os
 from collections import deque
 from math import inf, isfinite, sqrt
+
+# Measurement instrument only (default off => the shipped operating point stays 100% automatic).
+# Set FREETOKEN_MTP_FORCE_DEPTH=<k> to pin the serving speculation depth to k for a clean
+# same-depth A/B, bypassing the exploration plan and drift-triggered k=0 re-probes that otherwise
+# make run-to-run depth selection timing-dependent (see campaign37 lever 4b front-loading).
+_FORCE_DEPTH_ENV = "FREETOKEN_MTP_FORCE_DEPTH"
+
+
+def _forced_depth_or_none(safe_max_k: int) -> int | None:
+    raw = os.environ.get(_FORCE_DEPTH_ENV)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return max(0, min(int(raw), safe_max_k))
+    except ValueError:
+        return None
 
 
 def resolve_adaptive_k(
@@ -93,6 +110,7 @@ class AdaptiveMtpController:
         if type(safe_max_k) is not int or not 0 <= safe_max_k <= 4:
             raise ValueError("safe_max_k must be an integer from 0 through 4")
         self.safe_max_k = safe_max_k
+        self._force_depth = _forced_depth_or_none(safe_max_k)
         self._epoch = None
         self._request_uid = None
         self._stats = [_RatioWindow() for _ in range(safe_max_k + 1)]
@@ -145,6 +163,15 @@ class AdaptiveMtpController:
     def begin_request(self, request_uid, epoch) -> None:
         if request_uid == self._request_uid and epoch == self._epoch:
             return
+        if self._force_depth is not None:
+            # Measurement pin: no exploration plan, no drift re-probe; hold the forced depth.
+            if epoch != self._epoch:
+                self._new_epoch(epoch)
+            self._request_uid = request_uid
+            self._terminal_k0 = False
+            self._plan.clear()
+            self._selected_depth = self._force_depth
+            return
         incomplete_probe = bool(self._plan)
         if epoch != self._epoch:
             self._new_epoch(epoch)
@@ -179,6 +206,10 @@ class AdaptiveMtpController:
             raise ValueError("elapsed_s must be finite and positive")
         if type(committed_tokens) is not int or committed_tokens <= 0:
             raise ValueError("committed_tokens must be a positive integer")
+        if self._force_depth is not None:
+            # Measurement pin: record cost stats for logging, but never re-probe or re-select.
+            self._stats[depth].add(float(elapsed_s), committed_tokens)
+            return
         was_probing = bool(self._plan)
         if self._plan:
             if self._terminal_k0 or depth != self._plan[0]:
