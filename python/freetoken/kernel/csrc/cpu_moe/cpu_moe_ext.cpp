@@ -1802,6 +1802,132 @@ iqdot_fn select_iq3sdot() {
   return iq3_s_dot_f32_scalar;
 }
 
+// ------------------------------- IQ3_S (W4A8) --------------------------------
+// The bf16-activation IQ3_S kernels above are dominated by `_mm256_i32gather_epi32` over
+// the 2 KiB `iq3s_grid`: on AMD Zen that gather is microcoded (roughly one element per
+// cycle, not pipelined), which is why this format benches ~9 GB/s against 62-68 GB/s for
+// its siblings. The table is only 2 KiB, so it is permanently L1-resident and eight
+// independent scalar word loads replace the gather at ~2 loads/cycle with the latency
+// hidden by the surrounding work.
+//
+// Each grid word already holds four int8 magnitudes and the largest value in the table is
+// 15, so the magnitudes are a valid VPDPBUSD unsigned operand as loaded. Signs fold into
+// the activation with the same ggml trick `q4_0_dot_i8_vnni` uses: the sign bit for output
+// byte g = 4p+j is bit (j + 4*(p&1)) of signs[p>>1], and concatenating the four sign bytes
+// little-endian lands that bit at position g, so one 32-bit mask negates the whole
+// 32-element run in a single masked subtract.
+//
+// Activations are the Q8_0 pre-quantization the Q4_0 path already produces (int8 per
+// element plus one fp32 scale per 32-element block), which matches IQ3_S's own scale
+// granularity: a 256-element block is eight 32-element sub-blocks, each scaled by
+// `d * (1 + 2*nibble)`.
+//
+// Numerics: W4A8 is lossy against the W4A16 f32 path (int8 activations, integer block
+// accumulation), exactly as the already-accepted Q4_0 CPU path is. Results stay close,
+// not bit-identical, so a hybrid run does not reproduce the GPU-only output SHA.
+//
+// Requires K % 256 == 0 (IQ3_S block geometry); callers gate on that.
+float iq3_s_dot_i8_scalar(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  float acc = 0.0f;
+  const int nb = K / 256;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 110;
+    uint16_t dh;
+    std::memcpy(&dh, blk, sizeof(dh));
+    const float d = fp16_to_f32(dh);
+    const uint8_t* qs = blk + 2;
+    const uint8_t* qh = blk + 66;
+    const uint8_t* signs = blk + 74;
+    const uint8_t* scales = blk + 106;
+    for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+      const uint8_t sc = scales[ib32 / 2];
+      const float db[2] = {d * (1 + 2 * (sc & 0xf)), d * (1 + 2 * (sc >> 4))};
+      for (int half = 0; half < 2; ++half) {
+        const int sb = b * 8 + ib32 + half;
+        const uint32_t qhb = qh[half];
+        const int8_t* a = aq + (size_t)32 * sb;
+        int32_t sum = 0;
+        for (int p = 0; p < 8; ++p) {
+          const uint32_t idx = (uint32_t)qs[p] | ((qhb << (8 - p)) & 256u);
+          const uint32_t g = iq3s_grid[idx];
+          const uint8_t sbits = signs[p >> 1];
+          const int base = (p & 1) * 4;
+          for (int j = 0; j < 4; ++j) {
+            int wv = (int)((g >> (8 * j)) & 0xFFu);
+            if (sbits & kmask_iq2xs[base + j]) wv = -wv;
+            sum += wv * (int)a[4 * p + j];
+          }
+        }
+        acc += (float)sum * (db[half] * asb[sb]);
+        qs += 8;
+        signs += 4;
+      }
+      qh += 2;
+    }
+  }
+  return acc;
+}
+
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")))
+float iq3_s_dot_i8_avx512vnni(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  __m256 accF = _mm256_setzero_ps();
+  const __m256i zero = _mm256_setzero_si256();
+  const int nb = K / 256;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 110;
+    _mm_prefetch(reinterpret_cast<const char*>(blk) + 512, _MM_HINT_T0);
+    uint16_t dh;
+    std::memcpy(&dh, blk, sizeof(dh));
+    const float d = fp16_to_f32(dh);
+    const uint8_t* qs = blk + 2;
+    const uint8_t* qh = blk + 66;
+    const uint8_t* signs = blk + 74;
+    const uint8_t* scales = blk + 106;
+    for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+      const uint8_t sc = scales[ib32 / 2];
+      const float db[2] = {d * (1 + 2 * (sc & 0xf)), d * (1 + 2 * (sc >> 4))};
+      for (int half = 0; half < 2; ++half) {
+        const int sb = b * 8 + ib32 + half;
+        const uint32_t qhb = qh[half];
+        // Eight L1-resident scalar loads; idx[p] = qs[p] | ((qhb << (8-p)) & 256).
+        const __m256i mag = _mm256_setr_epi32(
+            (int)iq3s_grid[qs[0] | ((qhb << 8) & 256u)],
+            (int)iq3s_grid[qs[1] | ((qhb << 7) & 256u)],
+            (int)iq3s_grid[qs[2] | ((qhb << 6) & 256u)],
+            (int)iq3s_grid[qs[3] | ((qhb << 5) & 256u)],
+            (int)iq3s_grid[qs[4] | ((qhb << 4) & 256u)],
+            (int)iq3s_grid[qs[5] | ((qhb << 3) & 256u)],
+            (int)iq3s_grid[qs[6] | ((qhb << 2) & 256u)],
+            (int)iq3s_grid[qs[7] | ((qhb << 1) & 256u)]);
+        const uint32_t sm = (uint32_t)signs[0] | ((uint32_t)signs[1] << 8) |
+                            ((uint32_t)signs[2] << 16) | ((uint32_t)signs[3] << 24);
+        const __m256i a =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(aq + (size_t)32 * sb));
+        // mask bit g set -> byte g becomes -a[g], else a[g]
+        const __m256i sa = _mm256_mask_sub_epi8(a, (__mmask32)sm, zero, a);
+        const __m256i di = _mm256_dpbusd_epi32(zero, mag, sa);
+        accF = _mm256_fmadd_ps(_mm256_cvtepi32_ps(di), _mm256_set1_ps(db[half] * asb[sb]), accF);
+        qs += 8;
+        signs += 4;
+      }
+      qh += 2;
+    }
+  }
+  return hsum256(accF);
+}
+#endif  // CPU_MOE_X86 && CPU_MOE_HAS_AVX512VNNI
+
+// Best W4A8 IQ3_S dot, or nullptr when the CPU cannot do it -- the caller then keeps the
+// existing bf16-activation `iq3sdot` path unchanged. The scalar variant is a correctness
+// reference, not a fallback: it is slower than the f32 AVX-512 kernel it would replace.
+q4dot_fn select_iq3s_i8dot() {
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
+  if (cpu_has_avx512vnni()) return iq3_s_dot_i8_avx512vnni;
+#endif
+  return nullptr;
+}
+
 enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4, WF_Q4_K = 5, WF_Q6_K = 6,
             WF_IQ3_S = 7, WF_IQ4_XS = 8, WF_IQ4_NL = 9, WF_Q8_0 = 10 };
 
@@ -1856,7 +1982,17 @@ struct CpuMoeExecutor {
   nvdot_fn nvdot;
   nvi8dot_fn nvi8dot = nullptr;  // AVX-VNNI W4A8 nvfp4 dot (nullptr -> use fp32 nvdot)
   bool use_vnni = false;         // nvfp4 + AVX-VNNI: decode via int8 VPDPBUSD (W4A8)
-  bool use_q4a8 = false;       // q4_0: always W4A8 (llama.cpp Q4_0 x Q8_0); int8 pre-quant
+  bool use_q4a8 = false;       // q4_0 / iq3_s: W4A8, int8 pre-quant activations per 32-block
+  // iq3_s W4A8 dot, nullptr when the CPU lacks AVX512-VNNI (caller keeps the f32 path).
+  // The two role flags record that the 256-element IQ3_S block geometry divides that
+  // role's K, so the int8 path is only taken where its `nb = K/256` loop is exact.
+  q4dot_fn iq3si8dot = nullptr;
+  bool iq3s_a8_gu = false, iq3s_a8_dn = false;
+  // Which roles actually consume a Q8_0-quantized activation. A mixed bank can need one
+  // and not the other (IQ3_S gate_up + IQ4_NL down), and quantizing the unused side would
+  // put pure overhead on the decode critical path -- prep_g_row also returns early after
+  // quantizing, so an unneeded gi8 pass would skip the deinterleave the f32 path needs.
+  bool need_xi8 = false, need_gi8 = false;
   dsdot_fn dsdot;
   mxgemv_fn mxgemv;
   q4dot_fn q4dot;
@@ -1991,6 +2127,12 @@ struct CpuMoeExecutor {
     iq4xsdot = select_iq4xsdot();
     iq4nldot = select_iq4nldot();
     q80dot = select_q80dot();
+    // IQ3_S W4A8: the int8 dot needs K to be a whole number of 256-element blocks, and K
+    // differs per role (H for gate_up, I for down), so gate each role separately. A model
+    // whose down projection is IQ3_S with I % 256 != 0 keeps the f32 path for that role.
+    iq3si8dot = select_iq3s_i8dot();
+    iq3s_a8_gu = (iq3si8dot != nullptr) && (H % 256 == 0);
+    iq3s_a8_dn = (iq3si8dot != nullptr) && (I % 256 == 0);
     if (weight_format == WF_Q4_0) {
       if (H % 32 != 0 || I % 32 != 0)
         throw std::runtime_error("Q4_0 CPU MoE requires H and I to be multiples of 32");
@@ -2055,8 +2197,25 @@ struct CpuMoeExecutor {
     // / scalar for the tier, so the tag reflects which of those q4dot resolved to.
     nvi8dot = select_nvi8dot();
     use_vnni = (weight_format == WF_NVFP4) && (nvi8dot != nullptr);
-    use_q4a8 = (weight_format == WF_Q4_0);
-    const char* q4tag = use_q4a8 ? (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)" : "+q4_0-w4a8") : "";
+    // iq3_s also runs W4A8 once its int8 dot is available and the role's K divides into
+    // whole 256-element blocks. A mixed bank whose nominal format is something else still
+    // needs the Q8_0 scratch when any layer uses IQ3_S, so scan the per-layer tables too.
+    const auto uses_iq3s = [](const std::vector<int>& v) {
+      return std::find(v.begin(), v.end(), static_cast<int>(WF_IQ3_S)) != v.end();
+    };
+    const bool iq3s_in_gu = weight_format == WF_IQ3_S || uses_iq3s(fmt_layer);
+    const bool iq3s_in_dn = fmt_dn == WF_IQ3_S || uses_iq3s(fmt_dn_layer);
+    need_xi8 = (weight_format == WF_Q4_0) || (iq3s_a8_gu && iq3s_in_gu);
+    // Q4_0 never mixes, so a Q4_0 bank's down role is Q4_0 too; keying on weight_format
+    // as well as fmt_dn keeps this correct however the ctor resolved fmt_dn.
+    need_gi8 =
+        (weight_format == WF_Q4_0) || (fmt_dn == WF_Q4_0) || (iq3s_a8_dn && iq3s_in_dn);
+    const bool iq3s_a8 = (iq3s_a8_gu && iq3s_in_gu) || (iq3s_a8_dn && iq3s_in_dn);
+    use_q4a8 = (weight_format == WF_Q4_0) || iq3s_a8;
+    const char* q4tag =
+        !use_q4a8   ? ""
+        : !iq3s_a8  ? (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)" : "+q4_0-w4a8")
+                    : "+avx512vnni(iq3_s-w4a8)";
     const char* vnni_tag =
         cpu_has_avx512vnni() ? "+avx512vnni(nvfp4-w4a8)" : "+vnni(nvfp4-w4a8)";
     isa_str = std::string(c.name) + (use_vnni ? vnni_tag : "") + q4tag;
@@ -2164,6 +2323,9 @@ struct CpuMoeExecutor {
     }
     if (fmt_l == WF_IQ3_S) {
       const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)row_bytes_l;
+      // W4A8 when the int8 dot and its Q8_0 scratch are live (see iq3s_a8_gu); the LUT
+      // gather in the f32 kernel is the slow path this replaces.
+      if (iq3s_a8_gu && xi8 != nullptr && xas != nullptr) return iq3si8dot(w, xi8, xas, H);
       return iq3sdot(w, x, H);  // W4A16: bf16 activations, i-quant dequant
     }
     if (fmt_l == WF_IQ4_XS) {
@@ -2218,6 +2380,7 @@ struct CpuMoeExecutor {
     }
     if (fmt_l == WF_IQ3_S) {
       const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)row_bytes_l;
+      if (iq3s_a8_dn && gi8 != nullptr && gas != nullptr) return iq3si8dot(w, gi8, gas, I);
       return iq3sdot(w, g, I);  // W4A16: bf16 activations, i-quant dequant
     }
     if (fmt_l == WF_IQ4_XS) {
@@ -2521,11 +2684,14 @@ struct CpuMoeExecutor {
   // (reused across every down output row).
   void prep_g_row(int64_t r) {
     bf16_t* g = g_scratch.data() + (size_t)r * I;
-    if (use_q4a8) {  // q4_0 W4A8: Q8_0-quantize the intermediate row for the down GEMV.
+    if (need_gi8) {  // W4A8 down role: Q8_0-quantize the intermediate row for its GEMV.
       quant_q8_0(g, I, gi8_scratch.data() + (size_t)r * I,
                  gas_scratch.data() + (size_t)r * (I / 32));
       return;
     }
+    // Only the row-major fp4 families deinterleave; for anything else ge/go scratch was
+    // never allocated and the f32 down GEMV reads `g` as produced by pass1.
+    if (!needs_di) return;
     if (fmt == WF_DSFP4) fp8_roundtrip_bf16(g, g, I);
     float* ge = ge_scratch.data() + (size_t)r * (I / 2);
     float* go = go_scratch.data() + (size_t)r * (I / 2);
@@ -2571,10 +2737,12 @@ struct CpuMoeExecutor {
       do_pass1(t, p);
     }
     barrier(local_sense);
-    // Row-major fp4: prepare the intermediate rows (per token,route) before the down
-    // GEMV -- ds_fp4 FP8 round-trips (DSV4 act_quant), both deinterleave to fp32; q4_0
-    // W4A8 Q8_0-quantizes. Needs all of pass1 done (a full row spans every iblk).
-    if (needs_di || use_q4a8) {
+    // Prepare the intermediate rows (per token,route) before the down GEMV -- ds_fp4 FP8
+    // round-trips (DSV4 act_quant), the fp4 families deinterleave to fp32, and a W4A8 down
+    // role Q8_0-quantizes. Keyed on the DOWN role only: a bank whose gate_up is W4A8 but
+    // whose down is an f32 i-quant (IQ3_S gate_up + IQ4_NL down) needs no prep at all.
+    // Needs all of pass1 done (a full row spans every iblk).
+    if (needs_di || need_gi8) {
       for (;;) {
         int64_t r = prt_next.fetch_add(1, std::memory_order_relaxed);
         if (r >= prt_total) break;
@@ -2671,9 +2839,10 @@ struct CpuMoeExecutor {
         gi8_scratch.resize(static_cast<size_t>(t->num_tokens) * top_k * I);
         gas_scratch.resize(static_cast<size_t>(t->num_tokens) * top_k * (I / 32));
       }
-      for (int tok = 0; tok < t->num_tokens; ++tok)
-        quant_q8_0(t->x + (size_t)tok * H, H, xi8_scratch.data() + (size_t)tok * H,
-                   xas_scratch.data() + (size_t)tok * (H / 32));
+      if (need_xi8)
+        for (int tok = 0; tok < t->num_tokens; ++tok)
+          quant_q8_0(t->x + (size_t)tok * H, H, xi8_scratch.data() + (size_t)tok * H,
+                     xas_scratch.data() + (size_t)tok * (H / 32));
     }
     {
       std::lock_guard<std::mutex> lk(task_mtx);
@@ -2900,6 +3069,42 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         return f(w.data_ptr<uint8_t>(), reinterpret_cast<const bf16_t*>(x.data_ptr()), x.numel());
       },
       py::arg("w"), py::arg("x"), py::call_guard<py::gil_scoped_release>());
+  // W4A8 companions for the IQ3_S int8 path. ``aq`` is the Q8_0-quantized activation row
+  // (int8, length K) and ``asb`` its per-32-block fp32 scales (length K/32). The scalar
+  // reference and the dispatched SIMD kernel are exposed separately so a test can assert
+  // they agree with each other and with a dequantize-based reference.
+  m.def(
+      "iq3_s_dot_i8_scalar_cpu",
+      [](torch::Tensor w, torch::Tensor aq, torch::Tensor asb) {
+        TORCH_CHECK(w.dtype() == torch::kUInt8 && w.is_contiguous(), "w must be contiguous uint8");
+        TORCH_CHECK(aq.dtype() == torch::kChar && aq.is_contiguous(), "aq must be contiguous int8");
+        TORCH_CHECK(asb.dtype() == torch::kFloat32 && asb.is_contiguous(),
+                    "asb must be contiguous float32");
+        TORCH_CHECK(aq.numel() % 256 == 0 && asb.numel() == aq.numel() / 32,
+                    "aq length must be a multiple of 256 and asb must hold one scale per 32");
+        return iq3_s_dot_i8_scalar(w.data_ptr<uint8_t>(),
+                                   reinterpret_cast<const int8_t*>(aq.data_ptr()),
+                                   asb.data_ptr<float>(), static_cast<int>(aq.numel()));
+      },
+      py::arg("w"), py::arg("aq"), py::arg("asb"), py::call_guard<py::gil_scoped_release>());
+  m.def(
+      "iq3_s_dot_i8_cpu",
+      [](torch::Tensor w, torch::Tensor aq, torch::Tensor asb) {
+        TORCH_CHECK(w.dtype() == torch::kUInt8 && w.is_contiguous(), "w must be contiguous uint8");
+        TORCH_CHECK(aq.dtype() == torch::kChar && aq.is_contiguous(), "aq must be contiguous int8");
+        TORCH_CHECK(asb.dtype() == torch::kFloat32 && asb.is_contiguous(),
+                    "asb must be contiguous float32");
+        TORCH_CHECK(aq.numel() % 256 == 0 && asb.numel() == aq.numel() / 32,
+                    "aq length must be a multiple of 256 and asb must hold one scale per 32");
+        const q4dot_fn f = select_iq3s_i8dot();
+        TORCH_CHECK(f != nullptr,
+                    "this build/CPU has no W4A8 IQ3_S dot (needs AVX512-VNNI); the f32 path "
+                    "stays in use");
+        return f(w.data_ptr<uint8_t>(), reinterpret_cast<const int8_t*>(aq.data_ptr()),
+                 asb.data_ptr<float>(), static_cast<int>(aq.numel()));
+      },
+      py::arg("w"), py::arg("aq"), py::arg("asb"), py::call_guard<py::gil_scoped_release>());
+  m.def("iq3_s_dot_i8_available", []() { return select_iq3s_i8dot() != nullptr; });
   m.def(
       "iq4_xs_dot_cpu",
       [](torch::Tensor w, torch::Tensor x) {

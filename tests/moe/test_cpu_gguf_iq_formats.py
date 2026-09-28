@@ -109,6 +109,96 @@ def test_multi_block_row_matches_reference(fmt, nbytes, K, ggml_type, dot_fn):
     assert rel_err < tol, f"{fmt}: rel error {rel_err}"
 
 
+def _q8_0_quantize(x_f32: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Mirror cpu_moe_ext.cpp ``quant_q8_0``: per-32-block symmetric int8 + fp32 scale."""
+    assert x_f32.size % 32 == 0
+    blocks = x_f32.reshape(-1, 32)
+    amax = np.abs(blocks).max(axis=1)
+    d = np.where(amax > 0.0, amax / 127.0, 1.0).astype(np.float32)
+    inv = np.where(amax > 0.0, 1.0 / d, 0.0).astype(np.float32)
+    aq = np.clip(np.rint(blocks * inv[:, None]), -127, 127).astype(np.int8)
+    return aq.reshape(-1), d
+
+
+@pytest.mark.skipif(
+    not _cpu_moe.iq3_s_dot_i8_available(), reason="no AVX512-VNNI W4A8 IQ3_S dot on this CPU"
+)
+def test_iq3s_w4a8_simd_matches_scalar_reference():
+    """The SIMD int8 kernel must track the scalar int8 reference: same integer math, so
+    the only spread is fp accumulation order. A wrong iq3s_grid index, a mis-derived sign
+    mask, or a bad sub-block scale shows up here as an order-1 error, not a nudge."""
+    rng = np.random.default_rng(0x1035)
+    for n_blocks in (1, 2, 10):
+        K = 256 * n_blocks
+        raw = b"".join(
+            _random_block(rng, 110, scale=0.01 + 0.02 * rng.random()) for _ in range(n_blocks)
+        )
+        w = torch.frombuffer(bytearray(raw), dtype=torch.uint8).clone()
+        aq, asb = _q8_0_quantize((rng.standard_normal(K).astype(np.float32) * 0.5))
+        aq_t = torch.from_numpy(aq)
+        asb_t = torch.from_numpy(asb.astype(np.float32))
+        got_ref = _cpu_moe.iq3_s_dot_i8_scalar_cpu(w, aq_t, asb_t)
+        got_simd = _cpu_moe.iq3_s_dot_i8_cpu(w, aq_t, asb_t)
+        rel = abs(got_simd - got_ref) / (abs(got_ref) + 1e-9)
+        assert rel < 1e-5, f"n_blocks={n_blocks}: simd {got_simd} vs scalar {got_ref} rel {rel}"
+
+
+@pytest.mark.skipif(
+    not _cpu_moe.iq3_s_dot_i8_available(), reason="no AVX512-VNNI W4A8 IQ3_S dot on this CPU"
+)
+def test_iq3s_w4a8_matches_gguf_dequant_reference():
+    """Both int8 kernels against ``gguf.quants.dequantize`` weights dotted with the
+    Q8_0-round-tripped activation, so activation quantization is not part of the error."""
+    rng = np.random.default_rng(0x2035)
+    max_rel = 0.0
+    for n_blocks in (1, 4):
+        K = 256 * n_blocks
+        raw = b"".join(
+            _random_block(rng, 110, scale=0.01 + 0.02 * rng.random()) for _ in range(n_blocks)
+        )
+        w = torch.frombuffer(bytearray(raw), dtype=torch.uint8).clone()
+        ref_w = np.concatenate(
+            [
+                quants.dequantize(
+                    np.frombuffer(raw[i * 110 : (i + 1) * 110], dtype=np.uint8),
+                    GGMLQuantizationType.IQ3_S,
+                )
+                for i in range(n_blocks)
+            ]
+        ).astype(np.float32)
+        assert ref_w.shape == (K,)
+        x = rng.standard_normal(K).astype(np.float32) * 0.5
+        aq, asb = _q8_0_quantize(x)
+        expected = float(np.dot(ref_w, aq.astype(np.float32) * np.repeat(asb, 32)))
+        for hook in (_cpu_moe.iq3_s_dot_i8_scalar_cpu, _cpu_moe.iq3_s_dot_i8_cpu):
+            got = hook(w, torch.from_numpy(aq), torch.from_numpy(asb.astype(np.float32)))
+            max_rel = max(max_rel, abs(got - expected) / (abs(expected) + 1e-6))
+    assert max_rel < _REL_TOL["iq3_s"], f"W4A8 IQ3_S max relative error {max_rel}"
+
+
+@pytest.mark.skipif(
+    not _cpu_moe.iq3_s_dot_i8_available(), reason="no AVX512-VNNI W4A8 IQ3_S dot on this CPU"
+)
+def test_iq3s_w4a8_stays_close_to_w4a16_path():
+    """Bound the numerics change the W4A8 switch introduces: same weights, same underlying
+    fp32 activation, f32 (bf16-rounded) path versus Q8_0-quantized path. Q8_0 activation
+    quantization is genuinely lossy, so this is a loose statistical gate -- it catches a
+    systematically wrong scale, not last-bit drift."""
+    rng = np.random.default_rng(0x3035)
+    K = 2560  # the checkpoint's real gate_up K (H), 10 IQ3_S blocks
+    raw = b"".join(_random_block(rng, 110, scale=0.01 + 0.02 * rng.random()) for _ in range(10))
+    w = torch.frombuffer(bytearray(raw), dtype=torch.uint8).clone()
+    x_f32 = rng.standard_normal(K).astype(np.float32) * 0.5
+    x_bf16 = torch.from_numpy(x_f32).to(torch.bfloat16)
+    aq, asb = _q8_0_quantize(x_bf16.float().numpy())
+    f32 = _cpu_moe.iq3_s_dot_cpu(w, x_bf16)
+    i8 = _cpu_moe.iq3_s_dot_i8_cpu(
+        w, torch.from_numpy(aq), torch.from_numpy(asb.astype(np.float32))
+    )
+    rel = abs(i8 - f32) / (abs(f32) + 1e-6)
+    assert rel < 2e-2, f"W4A8 {i8} drifted from W4A16 {f32} by rel {rel}"
+
+
 def test_max_weight_format_id_covers_new_formats():
     assert _cpu_moe.max_weight_format_id() >= _WFMT_IDS["q8_0"]
     assert _WFMT_IDS["iq3_s"] == 7
