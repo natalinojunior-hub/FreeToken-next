@@ -292,7 +292,15 @@ class Qwen4ExpModel(BaseOP):
         if meta is not None:
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
-            commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+            spec_out = None
+            if batch.spec_logits_indices is not None:
+                buffers = getattr(get_global_ctx().linear_state_pool, "spec_slot_states", {})
+                if (
+                    "ple_ngram_ctx" in buffers
+                    and input_ids.shape[0] <= buffers["ple_ngram_ctx"].shape[1]
+                ):
+                    spec_out = buffers["ple_ngram_ctx"][0]
+            commit_ngram_context(meta, getattr(batch, "fla_metadata", None), spec_out=spec_out)
         if self._capture_mtp_residual:
             self._last_residual = hidden
         return self.hyper_connection_mixer.mix(hidden)[0]

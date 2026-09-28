@@ -435,7 +435,12 @@ def build_ple_metadata(
     )
 
 
-def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | None = None) -> None:
+def commit_ngram_context(
+    meta: PLEMetadata,
+    fla,
+    context_pool: torch.Tensor | None = None,
+    spec_out: torch.Tensor | None = None,
+) -> None:
     """Roll each request's ``ple_ngram_ctx`` forward past this forward's tokens.
 
     Called ONCE per forward after every PLE layer ran (the layers only read the context);
@@ -459,6 +464,10 @@ def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | No
         )
         nxt = torch.where(cand >= cu[:-1].unsqueeze(1), ids[cand.clamp_min(0)], old)
     context_pool.index_copy_(0, meta.state_slots, nxt.to(context_pool.dtype))
+    if spec_out is not None:
+        history = torch.cat([meta.ngram_context[0], ids])
+        rows = torch.arange(ids.numel(), device=ids.device).unsqueeze(1)
+        spec_out[: ids.numel()].copy_(history[rows + 1 + steps].to(spec_out.dtype))
     if fla is not None and fla.track_boundary_row is not None:
         win = ids[fla.track_boundary_row.unsqueeze(1) - ctx_len + steps]
         context_pool.index_copy_(0, fla.track_dst, win.to(context_pool.dtype))
@@ -694,7 +703,13 @@ class PLELayer(BaseOP):
         fla = getattr(batch, "fla_metadata", None)
         if fla is not None and fla.track_boundary_row is not None:
             self._write_track_snapshot(states, x, fla)
-        return gated + self._short_conv(x, meta, states)
+        spec_out = None
+        if batch.spec_logits_indices is not None:
+            pool = get_global_ctx().linear_state_pool
+            buffers = getattr(pool, "spec_slot_states", {})
+            if PLE_CONV_STATE in buffers and x.shape[0] <= buffers[PLE_CONV_STATE].shape[1]:
+                spec_out = buffers[PLE_CONV_STATE][self.ple_index]
+        return gated + self._short_conv(x, meta, states, spec_out)
 
     def _write_track_snapshot(self, states: torch.Tensor, x: torch.Tensor, fla) -> None:
         """Copy the conv history at the GDN track boundary into the same donatable slot, so a radix
@@ -722,11 +737,17 @@ class PLELayer(BaseOP):
             state = torch.where(meta.fresh_slots.view(-1, 1, 1), torch.zeros_like(state), state)
         return state
 
-    def _short_conv(self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor) -> torch.Tensor:
+    def _short_conv(
+        self,
+        x: torch.Tensor,
+        meta: PLEMetadata,
+        states: torch.Tensor,
+        spec_out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """silu of the dilated depthwise conv over [state | x], and roll the per-request state."""
         if meta.is_decode:
             return self._decode_conv(x, meta, states)
-        return self._prefill_conv(x, meta, states)
+        return self._prefill_conv(x, meta, states, spec_out)
 
     def _decode_conv(
         self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor
@@ -743,7 +764,11 @@ class PLELayer(BaseOP):
         return F.silu(out.to(x.dtype))
 
     def _prefill_conv(
-        self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor
+        self,
+        x: torch.Tensor,
+        meta: PLEMetadata,
+        states: torch.Tensor,
+        spec_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One conv over every request packed as ``[state_0 | chunk_0 | state_1 | chunk_1 | ...]``.
 
@@ -758,6 +783,10 @@ class PLELayer(BaseOP):
         history = x.new_empty(width, x.shape[0] + num_reqs * self.state_len)
         history.index_copy_(1, state_index, state.permute(1, 0, 2).reshape(width, -1))
         history.index_copy_(1, out_index + self.state_len, x.transpose(0, 1).contiguous())
+
+        if spec_out is not None:
+            columns = out_index.unsqueeze(1) + 1 + torch.arange(self.state_len, device=x.device)
+            spec_out[: x.shape[0]].copy_(history[:, columns].permute(1, 0, 2))
 
         out = F.conv1d(
             history.unsqueeze(0), self.conv1d.weight, groups=width, dilation=self.dilation

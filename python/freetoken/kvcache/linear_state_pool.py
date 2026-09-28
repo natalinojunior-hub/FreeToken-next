@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 from freetoken.distributed import get_tp_info
@@ -102,6 +103,11 @@ class LinearStatePool:
             spec.name: {lid: i for i, lid in enumerate(spec.layer_ids)} for spec in self._slot_specs
         }
         self.slot_states: dict[str, torch.Tensor] = self._alloc_slot_states(num_slots)
+        self.spec_slot_states = {
+            name: torch.empty((t.shape[0], spec_steps, *t.shape[2:]), dtype=t.dtype, device=device)
+            for name, t in self.slot_states.items()
+            if spec_steps
+        }
 
         # Free-list allocator over slots 1..num_slots-1 (slot 0 reserved as a padding sink,
         # sglang MambaPool convention). Live working slots, ping-pong track slots, and
@@ -213,6 +219,8 @@ class LinearStatePool:
             [self.spec_conv_pre, self.spec_conv_in[:, : row + 1].transpose(1, 2)], dim=2
         )
         self.conv_states[:, slot].copy_(window[..., -self.conv_states.shape[-1] :])
+        for name, state in self.spec_slot_states.items():
+            self.slot_states[name][:, slot].copy_(state[:, row])
 
     def is_linear_layer(self, layer_id: int) -> bool:
         return layer_id in self._local_index
@@ -302,7 +310,12 @@ def spec_state_steps(config) -> int:
     """Verify rows the zero-replay MTP buffers hold: k + 1 for a native-NextN model served
     with --spec-mtp k (its verify runs the fused GDN recurrence), else 0 (no buffers)."""
     k = getattr(config, "spec_mtp", 0)
-    return k + 1 if k > 0 and getattr(config.model_config, "native_mtp_layers", 0) else 0
+    model = config.model_config
+    row_commit = (
+        getattr(model, "mtp_row_state_commit", False)
+        and os.getenv("FREETOKEN_MTP_ROW_COMMIT", "0") == "1"
+    )
+    return k + 1 if k > 0 and (getattr(model, "native_mtp_layers", 0) or row_commit) else 0
 
 
 def spec_state_bytes(config) -> int:
@@ -313,7 +326,15 @@ def spec_state_bytes(config) -> int:
     n_layers, conv_dim, v_heads = _linear_local_dims(group, config.tp_info.size)
     state = v_heads * group.key_head_dim * group.value_head_dim * ssm_state_dtype().itemsize
     conv = conv_dim * config.dtype.itemsize
-    return n_layers * (steps * (state + conv) + conv * (group.conv_kernel_dim - 1))
+    siblings = sum(
+        max(1, len(spec.layer_ids))
+        * math.prod(spec.shape)
+        * (spec.dtype if spec.dtype is not None else config.dtype).itemsize
+        for spec in getattr(config.model_config, "slot_states", ())
+    )
+    return (
+        n_layers * (steps * (state + conv) + conv * (group.conv_kernel_dim - 1)) + steps * siblings
+    )
 
 
 def _linear_pool_num_slots(config) -> int:

@@ -403,6 +403,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         vision_config=getattr(shim, "vision_config", None),
         image_token_id=getattr(shim, "image_token_id", None),
         slot_states=ple_slot_states(qwen4_args),
+        mtp_row_state_commit=True,
         attn_quant="gguf",
         dense_quant="gguf",
         lm_head_quant="gguf",

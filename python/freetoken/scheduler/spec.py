@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Callable, List
 
 import torch
 from freetoken.core import Batch, Req
@@ -92,20 +92,25 @@ class SchedulerSpecMixin:
             return
 
         old_cached, old_device = req.cached_len, req.device_len
+        from freetoken.moe.offload_cache import DECODE_PATH_MAX_TOKENS
+
         try:
-            req.cached_len, req.device_len = start_pos, end
-            wb = Batch(reqs=[req], phase="prefill")
-            wb.padded_reqs = [req]
-            wb.positions = torch.arange(start_pos, end, dtype=torch.int32, device=self.device)
-            if self._model_is_mrope:
-                wb.mrope_positions = _spec_mrope_positions(req, start_pos, end, self.device)
-            wb.out_loc = self.engine.page_table[req.table_idx, start_pos:end]
-            wb.input_ids = tok_window
-            # Do NOT set spec_logits_indices: we want full prefill attention to populate
-            # the draft head's QSA slot for ALL prefill positions, not just the last token.
-            self.engine.attn_backend.prepare_metadata(wb)
-            with self.engine.ctx.forward_batch(wb):
-                mtp.forward(r_window, tok_window, wb)
+            # Draft-only expert banks have no full-prefill staging pool. Keep each warmup
+            # window on the fixed-size on-demand expert path, including on a cold prompt.
+            for offset in range(0, tok_window.numel(), DECODE_PATH_MAX_TOKENS):
+                stop = min(offset + DECODE_PATH_MAX_TOKENS, tok_window.numel())
+                lo, hi = start_pos + offset, start_pos + stop
+                req.cached_len, req.device_len = lo, hi
+                wb = Batch(reqs=[req], phase="prefill")
+                wb.padded_reqs = [req]
+                wb.positions = torch.arange(lo, hi, dtype=torch.int32, device=self.device)
+                if self._model_is_mrope:
+                    wb.mrope_positions = _spec_mrope_positions(req, lo, hi, self.device)
+                wb.out_loc = self.engine.page_table[req.table_idx, lo:hi]
+                wb.input_ids = tok_window[offset:stop]
+                self.engine.attn_backend.prepare_metadata(wb)
+                with self.engine.ctx.forward_batch(wb):
+                    mtp.forward(r_window[offset:stop], wb.input_ids, wb)
         finally:
             req.cached_len, req.device_len = old_cached, old_device
 
@@ -208,7 +213,7 @@ class SchedulerSpecMixin:
             snap_scratch.copy_(scratch_src)
         return snap_ring, snap_scratch
 
-    def _restore_qsa_state(self, req: Req) -> None:
+    def _restore_qsa_state(self, req: Req, *, keep_start: int = 0, keep_count: int = 0) -> None:
         if not hasattr(self, "_spec_qsa_snapshots"):
             return
         snap = self._spec_qsa_snapshots.get(req.uid)
@@ -219,7 +224,14 @@ class SchedulerSpecMixin:
         if ring_buf is None:
             return
         snap_ring, snap_scratch = snap
-        ring_buf[req.table_idx].copy_(snap_ring)
+        ring = ring_buf[req.table_idx]
+        if keep_count:
+            capacity = ring.shape[-2]
+            positions = torch.arange(capacity, device=ring.device)
+            keep = (positions - keep_start) % capacity < keep_count
+            ring.copy_(torch.where(keep[None, :, None], ring, snap_ring))
+        else:
+            ring.copy_(snap_ring)
         scratch_base = getattr(kv, "_cmp_scratch_base", 0)
         kv._cmp_k_buffer[:, scratch_base + req.table_idx].copy_(snap_scratch)
 
@@ -308,7 +320,12 @@ class SchedulerSpecMixin:
         return req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
 
     def _commit_spec_tokens(
-        self, req: Req, tokens: List[int], start_pos: int, spec_alloc_len: int
+        self,
+        req: Req,
+        tokens: List[int],
+        start_pos: int,
+        spec_alloc_len: int,
+        finish_state: Callable[[int], None] | None = None,
     ) -> int:
         """Append tokens one at a time, applying _process_last_data's per-token EOS/stop
         /length finish logic. ``start_pos`` is tokens[0]'s device-table position (== d in
@@ -376,26 +393,15 @@ class SchedulerSpecMixin:
             self.send_result(reply)
             if finished_now:
                 keep_cached, keep_device = spec_rollback_lengths(start_pos, committed)
-                if keep_device < spec_alloc_len:
-                    # free_spec_reject's keep_len is an EXCLUSIVE boundary (page_ceil(keep_len)
-                    # must exclude the page containing it): keep_device respects the standing
-                    # complete_one-style lag (keep_cached + 1 == keep_device).
+                if finish_state is not None:
+                    finish_state(committed)
+                if keep_cached < spec_alloc_len:
                     self.cache_manager.free_spec_reject(
-                        req, keep_len=keep_device, alloc_len=spec_alloc_len
+                        req, keep_len=keep_cached, alloc_len=spec_alloc_len
                     )
-                # cache_req(finished=True) (via _free_req_resources) uses req.cached_len as the
-                # "KV already written" boundary, same as normal decode's complete_one lag -- but
-                # that lag is only real for the k+1'th (bonus/correction) token, which is a fresh
-                # sample never fed through the verify forward. Every other committed token WAS
-                # fed as the verify batch's own input (drafts at positions [d, d+k)) and already
-                # has written KV. Finishing on one of those (committed <= k) with cached_len left
-                # at keep_cached excludes that token's own page from both insert_prefix and the
-                # tail-free -- and free_spec_reject starts its range one page later -- so a page
-                # landing exactly on that boundary is neither freed nor retained: orphaned. This
-                # produced the live 'free_pages + cache_pages != num_pages' idle-check crash.
-                k = spec_alloc_len - start_pos
-                req.cached_len = start_pos + min(committed, k)
-                req.device_len = req.cached_len + 1
+                # The final output may correct a rejected input; never cache its draft KV.
+                # Reclaim from the same boundary, including a terminal page never donated.
+                req.cached_len, req.device_len = keep_cached, keep_device
                 self.decode_manager.remove_req(req)
                 self._free_req_resources(req)
                 self.finished_reqs.add(req)
@@ -631,7 +637,22 @@ class SchedulerSpecMixin:
 
         # ---- commit: only the tokens up to (and including) any finish reason count ----
         self.token_pool[req.table_idx, d : d + m] = out.next_tokens_gpu[p : p + m]
-        committed = self._commit_spec_tokens(req, accepted, start_pos=d, spec_alloc_len=d + k)
+
+        def finish_state(count: int) -> None:
+            n = p + count
+            if n < vb.input_ids.shape[0]:
+                if zero_replay:
+                    pool.commit_spec_row(self._linear_slot(req), n - 1)
+                    self._restore_qsa_state(req, keep_start=c0, keep_count=n)
+                else:
+                    if snap_slot is not None:
+                        pool.copy_from(snap_slot, self._linear_slot(req))
+                    self._restore_qsa_state(req)
+                    self._replay(req, c0, n)
+
+        committed = self._commit_spec_tokens(
+            req, accepted, start_pos=d, spec_alloc_len=d + k, finish_state=finish_state
+        )
         finished = committed < m or (committed == m and req in self.finished_reqs)
         mark("commit")
 
@@ -675,6 +696,7 @@ class SchedulerSpecMixin:
             # snapshot S0, then replay all but the deferred tail of the accepted tokens.
             if zero_replay:
                 pool.commit_spec_row(self._linear_slot(req), p + committed - 1)
+                self._restore_qsa_state(req, keep_start=c0, keep_count=p + committed)
                 req.cached_len, req.device_len = keep_cached, keep_device
                 mark("commit_spec_row")
                 self.cache_manager.cache_req(req, finished=False)

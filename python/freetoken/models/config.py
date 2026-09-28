@@ -366,6 +366,7 @@ class ModelConfig:
     # In-file NextN/MTP draft blocks (GGUF ``nextn_predict_layers``) a non-qwen4 family can
     # serve with --spec-mtp; the expert types then cover the draft's own bank too.
     native_mtp_layers: int = 0
+    mtp_row_state_commit: bool = False
     native_mtp_expert_types: tuple[int, int] | list[tuple[int, int]] | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
