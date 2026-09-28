@@ -893,6 +893,14 @@ class OffloadMoeCache:
         guarantees no forward is in flight."""
         assert self._vmm_arenas, "set_live needs VMM residency"
         new = self._live_caps_for(self.pools, self.pool_caps, size)
+        if size < sum(self.live_caps):
+            # A whole-cache shrink must never GROW an individual pool: the split's
+            # largest-remainder rounding can hand a pool more rows than it holds, and
+            # growing needs fresh physical backing -- a cuMemCreate the memory pressure
+            # prompting the shrink may not have (killed the 128K certification worker).
+            # Clamped per pool, a shrink stays a pure unmap and always fits; both the ray
+            # split and the old live caps satisfy every pool floor, so the min does too.
+            new = [min(n, o) for n, o in zip(new, self.live_caps)]
         flat = self.slot_for_id.view(-1)
         for p, ((ids, usage), old, nxt) in enumerate(zip(self._pool_state, self.live_caps, new)):
             if nxt < old:

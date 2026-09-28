@@ -98,3 +98,23 @@ def test_staging_and_reset_after_resize():
         assert (usage[live:] == cache._BLOCKED_USAGE).all() and (ids[live:] == -1).all()
     _resident(cache, 3, [0, 1])
     _consistent(cache)
+
+
+def test_set_live_shrink_never_grows_a_pool(monkeypatch):
+    """Apportionment flips must not turn a shrink into a per-pool grow: growing needs a
+    cuMemCreate the pressure prompting the shrink may not have (128K cert worker death)."""
+    cache = _cache(12, vmm_rows=30)
+    cache.set_live(30)
+    live_before = list(cache.live_caps)
+    arena = cache._vmm_arenas[0]
+    backed_p1_before = arena.backed[1]
+    # A shrink split that hands pool 1 MORE rows than it holds (largest-remainder flip).
+    flipped = [live_before[0] - 3, live_before[1] + 1]
+    assert sum(flipped) < sum(live_before)
+    monkeypatch.setattr(cache, "_live_caps_for", lambda pools, caps, size: list(flipped))
+    grown = cache.set_live(sum(flipped))
+    # clamped per pool, the shrink frees at least what was asked (never grows pool 1)
+    assert grown == flipped[0] + live_before[1]
+    assert cache.live_caps == [flipped[0], live_before[1]], "pool 1 grew during a shrink"
+    assert arena.backed[1] == backed_p1_before, "pool 1 backing grew during a shrink"
+    _consistent(cache)
