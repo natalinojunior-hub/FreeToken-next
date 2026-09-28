@@ -268,6 +268,54 @@ def _shed_mtp(config) -> bool:
     return True
 
 
+def _resolve_mtp_state_precision(config) -> None:
+    """Resolver-side GDN state precision for speculative MTP (no hardcoded knobs; env overrides).
+
+    When ``--spec-mtp k`` runs on a GatedDeltaNet model the MTP verify state and the GDN
+    recurrent state compete with the MoE expert pool for VRAM. If their fp32 footprint pushes
+    the planned expert-pool cap below the prefill-front cliff (``offload_cache._live_caps_for``)
+    the whole VMM lazy-residency plan is rejected and the pool falls back to fixed-size
+    full-back -- the slow lever-3 locality regime (measured: k4 90.23 full-back vs 104.08
+    lazy). Two VRAM cuts keep the pool lazy, and the resolver turns both on automatically
+    rather than demanding an env incantation:
+
+    1. Compact verify state (``FREETOKEN_MTP_COMPACT_STATE=1``): ONE shared SSM verify row +
+       small ``spec_qkv``/``spec_ba`` reconstruction buffers instead of ``k+1`` full rows. A
+       numerically-equivalent reconstruction -- a pure VRAM cut, no precision cost.
+    2. bfloat16 SSM state (``FREETOKEN_MAMBA_SSM_DTYPE``): halves the GDN recurrent + spec
+       state bytes. This reduces precision on the WHOLE GDN recurrence, not just the verify
+       row, so it is a measured tradeoff: greedy output SHA is identical to fp32 through 16K
+       context (3 prompt offsets), but long-context (256K-1M) recurrence is an unvalidated
+       gate before bf16 is trusted there.
+
+    Scope: ``spec_mtp>0`` AND a linear-attention (GDN) group only; every other model keeps the
+    fp32 / per-row defaults. An explicit env always wins (``setdefault`` for compact, a
+    ``getenv``-None guard for the dtype), so a caller can pin fp32 or the per-row layout for an
+    A/B or a quality cert.
+    """
+    if getattr(config, "spec_mtp", 0) <= 0:
+        return
+    if config.model_config.linear_attention_group() is None:
+        return
+    os.environ.setdefault("FREETOKEN_MTP_COMPACT_STATE", "1")
+    if os.getenv("FREETOKEN_MAMBA_SSM_DTYPE") is None:
+        # ssm_state_dtype() reads the ENV singleton (snapshotted from os.environ at import
+        # time), so setting os.environ now would be ignored -- mutate the snapshot instead.
+        from freetoken.env import ENV
+
+        ENV.MAMBA_SSM_DTYPE.value = "bfloat16"
+        logger.info_rank0(
+            "spec-mtp on a GDN model: auto-selected bfloat16 SSM state (halves GDN "
+            "recurrent+spec VRAM so the expert pool stays VMM-lazy); SHA-validated to 16K, "
+            "set FREETOKEN_MAMBA_SSM_DTYPE=float32 to keep fp32"
+        )
+    # ponytail: in-scope-global bf16, not pressure-aware. Ceiling: a model with VRAM headroom
+    # keeps the pool lazy at fp32 and pays the precision cut for zero TG gain. Upgrade path --
+    # cut only when the fp32 expert-pool plan actually falls back to full-back (catch the
+    # offload_cache._vmm_plan ValueError) and replan; and re-validate bf16 recurrence drift at
+    # 256K-1M before trusting it there (fp16 = more mantissa, less overflow headroom).
+
+
 def _kv_fit_ladder(config) -> tuple[str, ...]:
     """KV formats still to try after ``config.kv_format`` (empty: explicit format or none left)."""
     if not getattr(config, "kv_format_auto", False):
@@ -627,6 +675,10 @@ class Engine:
         # fit-checks) asks it for a budget instead of re-deriving one from free memory, and
         # --memory-ratio becomes a cap on the account rather than the safety policy itself.
         self.vram_ledger = self._open_vram_ledger(config)
+        # Resolve GDN state precision for speculative MTP BEFORE any pool budget is priced:
+        # both the expert-cache memory planner (spec_state_bytes) and the GDN LinearStatePool
+        # read the SSM dtype + compact-state env, so both must see the resolved values.
+        _resolve_mtp_state_precision(config)
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
             if self.moe_offload_cache is not None:
