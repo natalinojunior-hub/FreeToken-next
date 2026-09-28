@@ -101,3 +101,53 @@ def test_decode_residency_failed_grow_restores_prefill_size_and_learns(monkeypat
     eng.set_decode_residency(True)
     assert calls == [1179, 1000] and eng._expert_decode_slots is None
     assert eng._decode_reserve_learned == 179 * 10 * MIB
+
+
+def _vmm_guard_engine(monkeypatch, free, arenas=2, pools=10):
+    eng, calls = _engine(monkeypatch, free=free, peak=1000 * MIB, now=1000 * MIB)
+    eng.moe_offload_cache = SimpleNamespace(
+        cache_size=2000,
+        resident_rows=1000,
+        pools=[object()] * pools,
+        _vmm_arenas=[object()] * arenas,
+        live_caps=[100] * pools,
+        set_live=lambda n: calls.append(("set_live", n)),
+    )
+    eng._resize_experts = calls.append  # bypass the real method's stream/VMM plumbing
+    eng._expert_plan_slots = 1200
+    return eng, calls
+
+
+def test_guard_regrow_prices_the_vmm_granule_rounding(monkeypatch):
+    # free at peak 2048 MiB: surplus = 2048 - 2*256 margin - 2*10*2 MiB granules = 1496 MiB
+    eng, calls = _vmm_guard_engine(monkeypatch, free=2048 * MIB)
+    for _ in range(3):
+        eng.guard_vram_at_idle()
+    assert calls == [1000 + 1496 * MIB // (10 * MIB)]  # 1149, not the 1153 an unpriced grow asks
+
+
+def test_guard_regrow_backing_failure_keeps_size_and_learns(monkeypatch):
+    eng, calls = _vmm_guard_engine(monkeypatch, free=2048 * MIB)
+
+    def boom(target):
+        raise RuntimeError("cuMemCreate failed with CUresult 2")
+
+    eng._resize_experts = boom
+    for _ in range(3):
+        eng.guard_vram_at_idle()  # must not raise out of the idle hook
+    assert eng._decode_reserve_learned == 149 * 10 * MIB
+    assert ("set_live", 1000) in calls  # best-effort unmap of the partially backed grow
+    assert eng.moe_offload_cache.resident_rows == 1000
+
+
+def test_guard_shrink_failure_stays_fatal(monkeypatch):
+    eng, calls = _vmm_guard_engine(monkeypatch, free=100 * MIB)
+
+    def boom(target):
+        raise RuntimeError("backing refused")
+
+    eng._resize_experts = boom
+    import pytest
+
+    with pytest.raises(RuntimeError):
+        eng.guard_vram_at_idle()

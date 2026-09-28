@@ -1148,7 +1148,14 @@ class Engine:
             )
         else:
             plan = getattr(self, "_expert_plan_slots", cache.resident_rows)
-            surplus = free_at_peak - 2 * self._VRAM_GUARD_MARGIN
+            # Growing the backing rounds every (bank, pool) region up to one VMM granule;
+            # keep that out of the spendable surplus, same as the decode-phase grow does.
+            granules = (
+                len(getattr(cache, "_vmm_arenas", None) or ())
+                * len(getattr(cache, "pools", None) or ())
+                * (2 << 20)
+            )
+            surplus = free_at_peak - 2 * self._VRAM_GUARD_MARGIN - granules
             if cache.resident_rows >= plan or surplus < per_slot:
                 self._vram_guard_calm = 0
                 return
@@ -1166,6 +1173,22 @@ class Engine:
             self._resize_experts(target)
         except CacheRebuildRejected as e:
             logger.warning_rank0(f"VRAM guard: expert cache resize refused ({e})")
+            return
+        except RuntimeError as e:
+            if short > 0:
+                raise  # a refused SHRINK stays fatal: nothing else can give memory back
+            # A speculative regrow hit the physical-backing wall (cuMemCreate OOM): keep the
+            # current size, reserve the shortfall so the next attempt asks for less, and
+            # unmap whatever the aborted grow already backed (best effort).
+            logger.warning_rank0(
+                f"VRAM guard: regrow to {target} slots refused by backing ({e!r}); "
+                f"staying at {cache.resident_rows} slots"
+            )
+            self._decode_reserve_learned += max(1, target - cache.resident_rows) * per_slot
+            try:
+                cache.set_live(cache.resident_rows)
+            except Exception:  # noqa: BLE001 - cleanup only; the size is already consistent
+                pass
             return
         self._charge_expert_cache(cache)
         # the rebuild's own transient (teardown, graph re-capture) is not the next window's peak
