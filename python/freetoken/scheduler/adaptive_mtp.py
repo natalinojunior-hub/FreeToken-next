@@ -98,6 +98,18 @@ class _RatioWindow:
         return abs(older.cost - newer.cost) > 2 * sqrt(older.se**2 + newer.se**2)
 
 
+# Calibration probe budget. The k=0 baseline is measured first (contiguous, so it is not
+# confounded with the warmup that the positive depths then interleave over), then the positive
+# depths are probed ROUND-ROBIN (_PROBE_REPEATS passes of 1..safe_max_k) rather than grouped.
+# Round-robin matters for reliability: a grouped plan ([1,1,1,1,2,2,2,2,...]) confounds depth
+# with time, so any warmup/cool-down drift across the probe makes later depths look
+# systematically cheaper/dearer and the depth pick becomes a timing coin-flip. Interleaving
+# gives every depth the same average conditions, so the measured ordering reflects the depths.
+_MIN_BASELINE_SAMPLES = 8
+_MIN_DEPTH_SAMPLES = 4
+_PROBE_REPEATS = 4
+
+
 class AdaptiveMtpController:
     """Choose a safe MTP depth from measured seconds per committed token.
 
@@ -147,18 +159,32 @@ class AdaptiveMtpController:
         self._discard_partial_stats = False
 
     def _best_depth(self) -> int:
+        """Cheapest speculation depth, biased toward actually speculating.
+
+        The caller asked for ``--spec-mtp k>0``, so k=0 (speculation off) is a LAST RESORT:
+        return it only when every positive depth is *significantly worse* than the k=0
+        baseline (speculation actively hurts -- e.g. a residency cliff makes every depth
+        slower than not drafting). A depth stays eligible unless its own cost lower bound
+        exceeds the baseline upper bound (2-sigma), so timing noise on a short probe can
+        never lock k=0 the way the old "must be significantly BETTER" gate did -- that gate
+        failed on noise and abandoned speculation for the whole request (campaign37: auto
+        runs locked k0 at ~74 TG while fixed-depth k4 measured ~104). Among the eligible
+        depths take the lowest measured cost, breaking ties toward the deeper draft.
+        """
         baseline = self._stats[0]
-        if len(baseline.samples) < 8:
+        if len(baseline.samples) < _MIN_BASELINE_SAMPLES:
             return 0
-        eligible = [0]
+        eligible = []
         for depth in range(1, self.safe_max_k + 1):
             window = self._stats[depth]
-            if (
-                len(window.samples) >= 4
-                and window.cost + 2 * window.se < baseline.cost - 2 * baseline.se
-            ):
+            if len(window.samples) < _MIN_DEPTH_SAMPLES:
+                continue
+            significantly_worse = window.cost - 2 * window.se > baseline.cost + 2 * baseline.se
+            if not significantly_worse:
                 eligible.append(depth)
-        return min(eligible, key=lambda depth: self._stats[depth].cost)
+        if not eligible:
+            return 0  # every positive depth is significantly worse -> speculation hurts
+        return min(eligible, key=lambda depth: (self._stats[depth].cost, -depth))
 
     def begin_request(self, request_uid, epoch) -> None:
         if request_uid == self._request_uid and epoch == self._epoch:
@@ -183,8 +209,12 @@ class AdaptiveMtpController:
         self._terminal_k0 = False
         self._observations_since_check = 0
         if self._needs_reprobe:
+            # k=0 baseline first (contiguous), then the positive depths round-robin so the
+            # depth-vs-time confound does not bias which depth looks cheapest (see the
+            # _PROBE_REPEATS comment above).
             self._plan = deque(
-                [0] * 8 + [depth for depth in range(1, self.safe_max_k + 1) for _ in range(4)]
+                [0] * _MIN_BASELINE_SAMPLES
+                + [d for _ in range(_PROBE_REPEATS) for d in range(1, self.safe_max_k + 1)]
             )
             self._needs_reprobe = False
             self._selected_depth = 0
@@ -223,9 +253,10 @@ class AdaptiveMtpController:
         if calibration_finished:
             self._observations_since_check = 0
             if window.drifted():
+                # A drift this early (a fresh _PROBE_REPEATS-sample window) is not possible
+                # (drifted() needs >= 8 samples), but keep the policy uniform: drift only
+                # schedules a re-probe for the NEXT request, it never abandons this one.
                 self._needs_reprobe = True
-                if depth > 0:
-                    self.fallback_to_k0()
             if not self._terminal_k0:
                 self._selected_depth = self._best_depth()
                 if self._selected_depth == 0:
@@ -235,28 +266,34 @@ class AdaptiveMtpController:
             if self._observations_since_check >= 8:
                 self._observations_since_check = 0
                 if window.drifted():
+                    # Cost moved enough to recalibrate the NEXT request. Drift is not a
+                    # safety failure: do NOT force the rest of THIS request onto k=0 (that
+                    # threw away ~20 TG on noise). Re-selection below drops to k=0 only if
+                    # the drifted depth is now genuinely worse than the baseline; a depth
+                    # that merely got cheaper (beneficial drift) is kept.
                     self._needs_reprobe = True
-                    if depth > 0:
-                        self.fallback_to_k0()
                 if not self._terminal_k0:
                     self._reselect_with_hysteresis()
 
     def _reselect_with_hysteresis(self) -> None:
         best = self._best_depth()
         if best == 0:
+            # Every positive depth is now significantly worse than the k=0 baseline:
+            # speculation stopped paying (a real regime change), so drop to k=0.
             self.fallback_to_k0()
             return
+        if best == self._selected_depth:
+            return  # still the cheapest eligible depth; keep it (no thrash)
         current = self._stats[self._selected_depth]
         candidate = self._stats[best]
-        current_still_safe = (
-            len(current.samples) >= 4
-            and current.cost + 2 * current.se < self._stats[0].cost - 2 * self._stats[0].se
-        )
-        if not current_still_safe:
-            self.fallback_to_k0()
-        elif best == self._selected_depth or (
-            candidate.cost + 2 * candidate.se < current.cost - 2 * current.se
-        ):
+        # Switch only on a clear win: the candidate is significantly cheaper than the current
+        # depth, OR the current depth has itself become significantly worse than the baseline.
+        # The old gate dropped straight to k=0 whenever the current depth was no longer
+        # *significantly better* than k=0 -- on noise that abandoned a depth that was still
+        # the cheapest, so hysteresis now compares against the baseline only to detect a
+        # genuinely unsafe current depth, and otherwise moves to the better positive depth.
+        current_unsafe = current.cost - 2 * current.se > self._stats[0].cost + 2 * self._stats[0].se
+        if current_unsafe or (candidate.cost + 2 * candidate.se < current.cost - 2 * current.se):
             self._selected_depth = best
 
     def fallback_to_k0(self) -> None:

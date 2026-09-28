@@ -41,7 +41,7 @@ def test_mtp_is_shed_before_the_context_is_refused():
 
 
 def _gdn_cfg(spec_mtp, has_group=True):
-    mc = SimpleNamespace(linear_attention_group=lambda: (object() if has_group else None))
+    mc = SimpleNamespace(linear_attention_group=lambda: object() if has_group else None)
     return SimpleNamespace(spec_mtp=spec_mtp, model_config=mc)
 
 

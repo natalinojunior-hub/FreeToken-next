@@ -141,6 +141,25 @@ def test_learned_depth_retained_and_measured_drift_schedules_probe():
     assert controller.next_depth() == 0
 
 
+def test_beneficial_drift_keeps_safe_positive_depth_until_reprobe():
+    controller = AdaptiveMtpController(1)
+    _calibrate(controller, costs={0: [0.010] * 8, 1: [0.008] * 4})
+    assert controller.selected_depth == 1
+    controller.begin_request("request-2", "epoch-a")
+
+    # The selected depth gets faster enough to trigger drift detection, while remaining
+    # statistically cheaper than k0. Drift requests fresh calibration; it is not a safety
+    # failure and should not force this request onto k0.
+    for _ in range(8):
+        controller.observe(1, 0.004, 1)
+
+    assert controller.selected_depth == 1
+    assert controller.next_depth() == 1
+    controller.begin_request("request-3", "epoch-a")
+    assert controller.probing
+    assert controller.next_depth() == 0
+
+
 @pytest.mark.parametrize("safe_max_k", [-1, 5, 1.0, True])
 def test_rejects_invalid_safe_depth(safe_max_k):
     with pytest.raises(ValueError):
@@ -161,3 +180,57 @@ def test_rejects_invalid_committed_tokens(committed):
     controller.begin_request("invalid", 1)
     with pytest.raises(ValueError):
         controller.observe(0, 0.01, committed)
+
+
+def test_calibration_interleaves_positive_depth_probes_after_k0_baseline():
+    controller = AdaptiveMtpController(4)
+    controller.begin_request("interleaved", "epoch-a")
+    plan = []
+    while controller.probing:
+        depth = controller.next_depth()
+        plan.append(depth)
+        elapsed = 0.01 if depth == 0 else 0.005 / (depth + 1)
+        controller.observe(depth, elapsed, depth + 1)
+
+    assert plan == [0] * 8 + [1, 2, 3, 4] * 4
+    assert {depth: controller.cost_summaries[depth]["samples"] for depth in range(5)} == {
+        0: 8, 1: 4, 2: 4, 3: 4, 4: 4
+    }
+
+
+def test_monotonic_cheaper_deeper_selects_max_depth():
+    """The cert-model regime: with compact verify state + bf16 SSM keeping the expert pool
+    VMM-lazy, every deeper draft is cheaper per committed token (k4 < k3 < k2 < k1 < k0). The
+    controller must land on safe_max_k, not lock k0 -- this is the auto operating point the
+    +20.5% (86.4 -> 104.1 TG) win depends on reaching reliably."""
+    controller = AdaptiveMtpController(4)
+    costs = {
+        0: [0.0154] * 8,
+        1: [0.0140] * 4,
+        2: [0.0125] * 4,
+        3: [0.0108] * 4,
+        4: [0.0096] * 4,
+    }
+    controller.begin_request("monotonic", "epoch-a")
+    while controller.probing:
+        depth = controller.next_depth()
+        index = controller.cost_summaries[depth]["samples"]
+        controller.observe(depth, costs[depth][index], 1)
+    assert controller.selected_depth == 4
+    assert controller.next_depth() == 4
+
+
+def test_noisy_but_cheaper_depth_is_not_locked_out_on_noise():
+    """A depth truly cheaper than k0 but with high per-sample variance (a short, noisy probe).
+    The old 'must be significantly BETTER than k0' gate failed on the noise and locked k0 for
+    the whole request (~74 TG instead of ~104); the 'eligible unless significantly WORSE' rule
+    keeps the cheaper depth, which is the run1-2 k0-lock fix."""
+    controller = AdaptiveMtpController(1)
+    # k0 tight at 0.010; k1 noisy but centered clearly below it (mean 0.0075).
+    costs = {0: [0.010] * 8, 1: [0.012, 0.004, 0.011, 0.003]}
+    controller.begin_request("noisy", "epoch-a")
+    while controller.probing:
+        depth = controller.next_depth()
+        index = controller.cost_summaries[depth]["samples"]
+        controller.observe(depth, costs[depth][index], 1)
+    assert controller.selected_depth == 1
