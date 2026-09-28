@@ -42,4 +42,4 @@ Focused MTP/graph/launch/profile tests: **17 passed**. Full `make ci`: **2311 pa
 
 ## Production decision
 
-**NOT READY.** The k0 engine is production-ready under the campaign-35 contract. MTP needs long-context physical certification, an online economics controller with hysteresis and safe k0 fallback, and an end-to-end accepted-state proof before it can be enabled automatically.
+**NOT READY.** The k0 engine is production-ready under the campaign-35 contract. The serving default now stays at k0 when no local measured profile exists; a stored profile can still opt into MTP. MTP needs long-context physical certification, an online economics controller with hysteresis and safe k0 fallback, and an end-to-end accepted-state proof before it can be enabled automatically.

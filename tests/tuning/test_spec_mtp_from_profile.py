@@ -24,6 +24,12 @@ def test_no_profile_keeps_default(monkeypatch):
     assert _tuned_spec_mtp({**KW, "max_running_req": 1}) == ServerArgs.spec_mtp
 
 
+def test_native_mtp_without_measurement_keeps_k0(monkeypatch):
+    _stub(monkeypatch, None)
+    monkeypatch.setattr("freetoken.server.args._native_nextn_layers", lambda _: 1)
+    assert _tuned_spec_mtp({**KW, "max_running_req": 1}) == ServerArgs.spec_mtp
+
+
 def test_multi_request_server_never_gets_mtp(monkeypatch):
     _stub(monkeypatch, 1)
     assert _tuned_spec_mtp({**KW, "max_running_req": 8}) == ServerArgs.spec_mtp

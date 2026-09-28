@@ -126,7 +126,9 @@ def _tuned_spec_mtp(kwargs: dict) -> int:
     profile = load_for(model_path, kwargs["kv_format"], kwargs["max_seq_len_override"])
     if profile is not None:
         return profile.chosen.spec_mtp
-    return 1 if _native_nextn_layers(model_path) else ServerArgs.spec_mtp
+    # No profile means no measured economics. Keep the safe k0 path until a local profile
+    # proves speculation wins; native NextN metadata alone does not predict throughput.
+    return ServerArgs.spec_mtp
 
 
 def _native_nextn_layers(model_path: str) -> int:
