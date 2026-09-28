@@ -81,6 +81,15 @@ def test_transient_is_linear_between_measured_points_and_floored_below():
         c.transient_at(16384)  # never extrapolate past what was measured
 
 
+def test_speculative_state_is_charged_once_across_request_slots():
+    from dataclasses import replace
+
+    sm = _static(gdn_fixed_state_bytes=220 * MIB)
+    assert sm.gdn_state_total_bytes() == (900 + 220) * MIB
+    assert replace(sm, gdn_num_slots=5).gdn_state_total_bytes() == (500 + 220) * MIB
+    assert sm.fixed_overhead_bytes() - _static().fixed_overhead_bytes() == 220 * MIB
+
+
 def test_graph_capture_and_prefill_peaks_are_not_summed():
     p = _planner(calib=_calib(graph_capture_peak=900 * MIB))
     assert p.ledger(_Cfg, 4096, 0, 256)["transient"] == 900 * MIB

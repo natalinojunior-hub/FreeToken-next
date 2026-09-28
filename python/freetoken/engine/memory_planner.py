@@ -28,6 +28,7 @@ from freetoken.kvcache.base import BaseKVCachePool
 from freetoken.kvcache.linear_state_pool import (
     _linear_pool_min_slots,
     _linear_pool_num_slots,
+    spec_state_bytes,
     spec_state_steps,
     state_pool_bytes,
 )
@@ -172,6 +173,7 @@ class StaticCostModel:
     # empty = one geometry, linear in slots.
     expert_pools: tuple[ExpertPool, ...] = ()
     min_pool_rows: int = 0
+    gdn_fixed_state_bytes: int = 0
 
     def kv_pages_for_context(self, tokens: int) -> int:
         return div_ceil(tokens, self.page_tokens)
@@ -201,7 +203,7 @@ class StaticCostModel:
         return min(self.max_expert_slots, budget // self.expert_bytes_per_slot)
 
     def gdn_state_total_bytes(self) -> int:
-        return self.gdn_state_bytes_per_slot * self.gdn_num_slots
+        return self.gdn_state_bytes_per_slot * self.gdn_num_slots + self.gdn_fixed_state_bytes
 
     def fixed_overhead_bytes(self) -> int:
         """All non-negotiable fixed costs EXCEPT model weights and KV.
@@ -445,8 +447,8 @@ class MemoryPlanner:
         # at min_slots under-reserved every plan by (num_slots - min_slots) GDN slots --
         # a plan the solver approved as fitting could still OOM at final construction.
         gdn_slots = _linear_pool_num_slots(self.config)
-        gdn_bytes_per_slot = state_pool_bytes(self.config, 1)
-        gdn_total = gdn_bytes_per_slot * gdn_slots
+        gdn_fixed = spec_state_bytes(self.config)
+        gdn_bytes_per_slot = state_pool_bytes(self.config, 1) - gdn_fixed
 
         # Page table
         pt_bytes = page_table_bytes(max_running_req, max_seq_len, page_size)
@@ -491,6 +493,7 @@ class MemoryPlanner:
             dummy_page_bytes=dummy_page_bytes,
             gdn_state_bytes_per_slot=gdn_bytes_per_slot,
             gdn_num_slots=gdn_slots,
+            gdn_fixed_state_bytes=gdn_fixed,
             page_table_bytes=pt_bytes,
             expert_auxiliary_bytes=self.expert_auxiliary_bytes,
             quantization_side_tables=self.quantization_side_tables,
@@ -611,7 +614,7 @@ class MemoryPlanner:
         planned = {
             "kv": sm.kv_bytes_for_context(required_pages * sm.page_tokens),
             "experts": sm.expert_bytes_for_slots(min_experts),
-            "gdn": state_pool_bytes(config, 1) * _linear_pool_min_slots(config)
+            "gdn": state_pool_bytes(config, _linear_pool_min_slots(config))
             if linear_group is not None
             else 0,
             "attn_backend": sm.attention_backend_fixed,
