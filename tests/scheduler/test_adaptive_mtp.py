@@ -34,3 +34,15 @@ def test_resolve_adaptive_k_remain_len_clamp():
     req.remain_len = 2  # remain_len - 1 = 1
     k = resolve_adaptive_k(req, max_k=2)
     assert k == 1
+
+
+def test_serving_depth_fits_remaining_output_budget():
+    from types import SimpleNamespace
+
+    req = SimpleNamespace(device_len=16384, remain_len=2)
+    assert resolve_adaptive_k(req, base_k=6) == 1
+    req.remain_len = 1
+    assert resolve_adaptive_k(req, base_k=6) == 0
+    req.remain_len = 128
+    assert resolve_adaptive_k(req, base_k=6) == 6
+    assert resolve_adaptive_k(req, base_k=0) == 0

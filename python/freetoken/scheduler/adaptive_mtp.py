@@ -39,4 +39,6 @@ def resolve_adaptive_k(
         max_by_remain = max(1, remain_len - 1)
         return min(max_k, max_by_remain)
 
-    return base_k if base_k is not None else 0
+    # The verify consumes k draft inputs plus the pending token. Do not allocate beyond
+    # the request's remaining output budget even when serving uses a fixed configured k.
+    return max(0, min(base_k or 0, req.remain_len - 1))
