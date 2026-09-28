@@ -26,13 +26,13 @@ The draft-KV warmup helper exists (`spec.py:58-99`) but has no scheduler caller.
 
 ## Historical physical measurements
 
-The latest measured MTP evidence predates campaign 35. At the documented run, k0 was 35.36 TG (28.3 ms/token); k1 was 22.43 TG at 55.5% acceptance. Cycle medians were draft 3.2 ms, verify 59.3 ms, bookkeeping 0.6 ms, and rejection replay 15.5 ms on 44.5% of cycles. The measured model predicts 22.2 TG and identifies verify, replay, and acceptance as the dominant costs. Own MTP expert banks were fixed later (`a9d30f4`), raising acceptance to 75.2% but leaving TG at 22.47 and increasing verify/replay; this is stale and must be re-baselined on HEAD.
+Fresh HEAD preflight (IQ3_XXS, 4,104 prompt tokens, 16 generated, graph off, one repeat) completed with the fixed prompt file: k0 **47.93 TG**, ITL p50/p95 **20.39/32.40 ms**, VRAM **5.14 GiB**, SHA `238f7db579b7`; k1 **29.36 TG**, ITL p50/p95 **38.05/57.92 ms**, VRAM **13.45 GiB**, same SHA. The server trace showed about 3 accepted draft tokens in 13 k=1 cycles (~23%), so speculation loses materially to k0. This is a short preflight, not long-context certification. Historical runs were worse (k0 35.36 TG; k1 22.43 TG at 55.5% acceptance); own MTP expert banks were fixed later (`a9d30f4`), but no throughput win followed.
 
 ## Closure and limits
 
 - Raw k0: CLOSED/WIN. Campaign-35 certification covers 16K, 64K, 128K and ~256K, LRU-3, adaptive-VRAM, SHA and pressure gates.
 - MTP k selection: OPEN. No online acceptance/cost/VRAM hysteresis controller exists; production serving uses fixed `base_k`.
-- MTP physical baseline: OPEN. Fresh harness run failed before serving because Transformers could not instantiate the local tokenizer backend (missing sentencepiece/tiktoken).
+- MTP physical baseline: measured at 4K only; k1 is a loss (29.36 vs 47.93 TG) with much higher VRAM and ITL. 16K/64K/128K/~256K MTP certification remains OPEN.
 - State transaction: correctness helpers pass, but complete accepted-boundary proof for PLE/QSA/GDN/linear state remains unproven; replay is still required on the non-zero-replay path.
 - Warm-prefix AD divergence: documented workaround remains `--cache-type naive`; exact GDN boundary recomposition is not implemented.
 
@@ -42,4 +42,4 @@ Focused MTP/graph/launch/profile tests: **17 passed**. Full `make ci`: **2311 pa
 
 ## Production decision
 
-**NOT READY.** The k0 engine is production-ready under the campaign-35 contract. MTP needs a fresh physical re-baseline on a usable tokenizer, an online economics controller with hysteresis and safe k0 fallback, and an end-to-end accepted-state proof before it can be enabled automatically.
+**NOT READY.** The k0 engine is production-ready under the campaign-35 contract. MTP needs long-context physical certification, an online economics controller with hysteresis and safe k0 fallback, and an end-to-end accepted-state proof before it can be enabled automatically.
