@@ -184,7 +184,17 @@ class AdaptiveMtpController:
                 eligible.append(depth)
         if not eligible:
             return 0  # every positive depth is significantly worse -> speculation hurts
-        return min(eligible, key=lambda depth: (self._stats[depth].cost, -depth))
+        # Among the eligible depths prefer the DEEPEST whose cost is not *significantly* worse
+        # than the cheapest eligible depth. The user asked for --spec-mtp k (the deepest draft),
+        # so a shallower depth only wins when a deeper one is PROVABLY slower (a residency
+        # cliff), not when a short 4-sample probe failed to show its edge. k3 and k4 differ by
+        # ~2% in true cost while a 4-sample probe carries ~10-40% noise, so plain min-cost
+        # coin-flipped k3/k4 and the engine settled at ~102 TG instead of the ~104 the cap can
+        # reach ("always max TG"). Ties and noise therefore break toward the deeper draft.
+        cheapest = min(eligible, key=lambda d: self._stats[d].cost)
+        ceiling = self._stats[cheapest].cost + 2 * self._stats[cheapest].se
+        within_noise = [d for d in eligible if self._stats[d].cost - 2 * self._stats[d].se <= ceiling]
+        return max(within_noise)
 
     def begin_request(self, request_uid, epoch) -> None:
         if request_uid == self._request_uid and epoch == self._epoch:

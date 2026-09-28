@@ -234,3 +234,46 @@ def test_noisy_but_cheaper_depth_is_not_locked_out_on_noise():
         index = controller.cost_summaries[depth]["samples"]
         controller.observe(depth, costs[depth][index], 1)
     assert controller.selected_depth == 1
+
+
+def test_deepest_within_noise_of_cheapest_wins():
+    """campaign37 reality: at calibration k4 (the --spec-mtp cap) measured *more* expensive
+    than k3 over 4 noisy samples (a cold outlier inflates its cost and se), but the two are
+    within noise of each other (k4's cost lower bound sits below k3's upper bound). The cap
+    the user asked for must win -- plain min-cost picked k3 (~102 TG) and left k4 (~104 TG,
+    'always max TG') on the table. A depth that is PROVABLY slower (low se, above the
+    ceiling) is still correctly skipped, so a real residency cliff is not mistaken for noise."""
+    controller = AdaptiveMtpController(4)
+    costs = {
+        0: [0.0154] * 8,
+        1: [0.0140] * 4,
+        2: [0.0125] * 4,
+        3: [0.0096, 0.0095, 0.0097, 0.0096],  # tight ~0.0096, se ~0 -> the cheapest
+        4: [0.030, 0.0090, 0.0095, 0.0092],  # one cold outlier -> cost ~0.0144 but large se
+    }
+    controller.begin_request("deep", "epoch-a")
+    while controller.probing:
+        depth = controller.next_depth()
+        index = controller.cost_summaries[depth]["samples"]
+        controller.observe(depth, costs[depth][index], 1)
+    assert controller.selected_depth == 4
+
+
+def test_provably_slower_deep_depth_is_not_picked():
+    """The other side: when the deepest draft is genuinely slower (a residency cliff makes k4
+    consistently expensive, low se), it is above the cheapest depth's noise ceiling and must
+    NOT be selected -- the controller backs off to the cheapest provably-good depth."""
+    controller = AdaptiveMtpController(4)
+    costs = {
+        0: [0.0154] * 8,
+        1: [0.0140] * 4,
+        2: [0.0125] * 4,
+        3: [0.0096] * 4,  # cheapest, tight
+        4: [0.0140] * 4,  # consistently slower than k3, tight (low se) -> provably worse
+    }
+    controller.begin_request("cliff", "epoch-a")
+    while controller.probing:
+        depth = controller.next_depth()
+        index = controller.cost_summaries[depth]["samples"]
+        controller.observe(depth, costs[depth][index], 1)
+    assert controller.selected_depth == 3
