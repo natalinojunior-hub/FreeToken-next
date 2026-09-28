@@ -505,9 +505,12 @@ def parse_args(
             "single-request decode workload can set 0 to hand those slots to the MoE expert "
             "cache; the price is that a warm request hitting a KV prefix must rebuild its GDN "
             "state instead of restoring a snapshot (worse TTFT on cache hits, same output). "
-            "Checkpoint-dependent: measured +2.1% TG and bit-identical output on Flash-Next "
-            "ISTA IQ3_XXS, but on Flash-Next AD 4.27bpw it CHANGED the generated text and "
-            "cost 7% TG - do not set 0 there."
+            "Measured bit-identical for ratio 0 vs 2.0 on ISTA IQ3_XXS (+2.1% TG) and on "
+            "Flash-Next AD 4.27bpw (campaign-35, 2K/32 warm prefix-hit, 6 runs; an older "
+            "build's AD text change does not reproduce). Note AD's warm radix prefix reuse "
+            "is itself NOT bit-identical to its cold full prefill (early greedy flip from "
+            "the fp re-composition at the reuse boundary; ISTA is bit-stable): use "
+            "--cache-type naive on AD when cross-request determinism matters."
         ),
     )
 
