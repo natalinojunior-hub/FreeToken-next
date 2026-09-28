@@ -121,14 +121,18 @@ def pool_layout(pools: list[ExpertPool], caps: list[int]) -> tuple[list[list[int
 
 
 def pool_staging_fits(
-    pools: list[ExpertPool], caps: list[int], num_experts: int, arena_bytes: list[int]
+    pools: list[ExpertPool],
+    caps: list[int],
+    num_experts: int,
+    arena_bytes: list[int],
+    prefill_pools: set[int] | None = None,
 ) -> bool:
     """A pool smaller than one layer materializes a prefill layer into the front of each
     arena (overlaying resident rows), so every arena must hold ``num_experts`` of its rows."""
     return all(
         num_experts * rb <= size
-        for pool, cap in zip(pools, caps)
-        if cap < num_experts
+        for p, (pool, cap) in enumerate(zip(pools, caps))
+        if (prefill_pools is None or p in prefill_pools) and cap < num_experts
         for rb, size in zip(pool.row_bytes, arena_bytes)
     )
 
@@ -143,7 +147,12 @@ def expert_cache_bytes(pools: list[ExpertPool], num_experts: int, rows: int, min
     return sum(ends)
 
 
-def expert_rows_bounds(pools: list[ExpertPool], num_experts: int, min_rows: int) -> tuple[int, int]:
+def expert_rows_bounds(
+    pools: list[ExpertPool],
+    num_experts: int,
+    min_rows: int,
+    prefill_pools: set[int] | None = None,
+) -> tuple[int, int]:
     """Smallest and largest usable ``rows``: the floor is one full layer (the offload
     cache's historic minimum), raised until every sub-layer pool can stage a prefill layer
     (monotone in ``rows``, so a bisection finds it)."""
@@ -151,7 +160,9 @@ def expert_rows_bounds(pools: list[ExpertPool], num_experts: int, min_rows: int)
 
     def fits(rows: int) -> bool:
         caps = pool_capacities(pools, num_experts, rows, min_rows)
-        return pool_staging_fits(pools, caps, num_experts, pool_layout(pools, caps)[1])
+        return pool_staging_fits(
+            pools, caps, num_experts, pool_layout(pools, caps)[1], prefill_pools=prefill_pools
+        )
 
     lo, hi = min(num_experts, top), top
     while lo < hi:

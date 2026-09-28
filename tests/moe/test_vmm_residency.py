@@ -118,3 +118,38 @@ def test_set_live_shrink_never_grows_a_pool(monkeypatch):
     assert cache.live_caps == [flipped[0], live_before[1]], "pool 1 grew during a shrink"
     assert arena.backed[1] == backed_p1_before, "pool 1 backing grew during a shrink"
     _consistent(cache)
+
+
+def test_vmm_mtp_draft_bank_prefill_boundary():
+    """Draft-only layers (prefill_moe_layers) must not force prefill staging reservations in pool 0."""
+    def bank(shapes, tag):
+        out = []
+        for layer, shape in enumerate(shapes):
+            t = torch.empty(E, *shape, dtype=torch.uint8)
+            for e in range(E):
+                t[e].fill_(tag + layer * E + e)
+            out.append(t.pin_memory())
+        return out
+
+    # Pool 0 has 3 layers at 256 B / row; layer 3 is a draft layer at 1024 B / row.
+    # Staging layer 3 in pool 0 would require E * 1024 // 256 = 32 rows, exceeding pool 0 cap.
+    wide_gu = [(4, 64)] * 3 + [(4, 256)]
+    wide_dn = [(2, 64)] * 3 + [(2, 256)]
+    cache = OffloadMoeCache(
+        num_layers=L,
+        num_experts=E,
+        cache_size=12,
+        device=torch.device("cuda"),
+        quant_format="gguf",
+        gguf_expert_types=[(23, 20)] * 3 + [(8, 8)],
+        min_pool_rows=2,
+        vmm_rows=20,
+        prefill_moe_layers=3,  # layer 3 is draft-only
+    )
+    cache.set_bank_sources({"gate_up": bank(wide_gu, 0), "down": bank(wide_dn, 100)})
+    assert cache._vmm_arenas, "VMM must succeed with draft bank boundary"
+    assert 1 not in cache._staged, "draft pool must not be marked staged"
+    grown = cache.set_live(20)
+    assert grown >= 12
+    cache.reset()
+    _consistent(cache)

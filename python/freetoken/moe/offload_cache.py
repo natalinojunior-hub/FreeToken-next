@@ -191,8 +191,13 @@ class OffloadMoeCache:
     # ``vmm_rows`` slots while only the ``cache_size`` live prefix of each pool is physically
     # backed; :meth:`set_live` moves that boundary in place. 0 = fixed allocation.
     vmm_rows: int = 0
+    # Prefill-eligible layer boundary: layers >= prefill_moe_layers are decode-only (e.g. MTP draft heads)
+    # and never stage or materialize prefill rows. None = all num_layers run prefill.
+    prefill_moe_layers: int | None = None
 
     def __post_init__(self) -> None:
+        if self.prefill_moe_layers is None:
+            self.prefill_moe_layers = self.num_layers
         if isinstance(self.gguf_expert_types, dict):
             try:
                 self.gguf_expert_types = list(
@@ -643,6 +648,9 @@ class OffloadMoeCache:
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
 
+    def _is_prefill_pool(self, pool) -> bool:
+        return any(layer < self.prefill_moe_layers for layer in pool.layers)
+
     def _alloc_bank_caches(self, cache_size: int) -> int:
         """Allocate the GPU slot cache as one byte arena per bank, split into geometry pools.
 
@@ -673,7 +681,10 @@ class OffloadMoeCache:
             pools, caps, offsets, ends = self._pool_plan(cache_size)
             arenas = [torch.empty((end,), dtype=torch.uint8, device=self.device) for end in ends]
             live = list(caps)
-            self._staged = {p for p, c in enumerate(caps) if c < self.num_experts}
+            self._staged = {
+                p for p, c in enumerate(caps)
+                if self._is_prefill_pool(pools[p]) and c < self.num_experts
+            }
         self.live_caps = live
         starts = [sum(caps[:i]) for i in range(len(caps))]
 
@@ -798,7 +809,11 @@ class OffloadMoeCache:
         # a pool whose planned (prefill-phase) share is below one layer stages prefill layers,
         # whatever its decode-phase shape: that keeps the planned rows the whole prefill needs
         planned = self._caps_for(pools, min(live_size, sum(caps)))
-        self._staged = {p for p, (c, cap) in enumerate(zip(planned, caps)) if min(c, cap) < E}
+        self._staged = {
+            p
+            for p, (c, cap) in enumerate(zip(planned, caps))
+            if self._is_prefill_pool(pools[p]) and min(c, cap) < E
+        }
         live = self._live_caps_for(pools, caps, live_size)
         g = vmm.granularity(self.device.index or 0)
         offsets, ends = [], [0] * len(self.bank_schema)
@@ -827,9 +842,9 @@ class OffloadMoeCache:
         live = []
         for p, (c, cap) in enumerate(zip(caps, shape_caps)):
             lo = min(cap, self.min_pool_rows or E)
-            if p not in self._staged:
+            if self._is_prefill_pool(pools[p]) and p not in self._staged:
                 lo = max(lo, min(cap, E))
-            if self.prefill_overlap:
+            if self.prefill_overlap and self._is_prefill_pool(pools[p]):
                 lo = max(lo, 2 * E)
             if p == 0:
                 for q, pool in enumerate(pools):
@@ -947,7 +962,8 @@ class OffloadMoeCache:
                 else pool_capacities(pools, self.num_experts, cache_size, self.min_pool_rows)
             )
         offsets, ends = pool_layout(pools, caps)
-        if not pool_staging_fits(pools, caps, self.num_experts, ends):
+        prefill_pools = {p for p, pool in enumerate(pools) if self._is_prefill_pool(pool)}
+        if not pool_staging_fits(pools, caps, self.num_experts, ends, prefill_pools=prefill_pools):
             raise ValueError(
                 f"moe_cache_size={cache_size} is too small for the mixed expert geometry: a "
                 f"pool below one layer ({caps}) cannot stage a prefill layer in its arenas"

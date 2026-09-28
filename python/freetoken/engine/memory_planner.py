@@ -467,7 +467,17 @@ class MemoryPlanner:
         pools = expert_pools(self.banks_sources) if self.banks_sources else []
         pool_floor = self.min_pool_rows(num_experts)
         if len(pools) > 1:
-            lo, hi = expert_rows_bounds(pools, num_experts, pool_floor)
+            prefill_layers = (
+                self.model_config.num_layers - self.model_config.first_k_dense_replace
+            )
+            prefill_pools = {
+                p
+                for p, pool in enumerate(pools)
+                if any(layer < prefill_layers for layer in pool.layers)
+            }
+            lo, hi = expert_rows_bounds(
+                pools, num_experts, pool_floor, prefill_pools=prefill_pools
+            )
             min_slots, max_slots = max(min_slots, lo), min(max_slots, hi)
         else:
             pools = []
@@ -533,6 +543,9 @@ class MemoryPlanner:
         # Create minimal expert cache
         method = self.method
         method_slot_limit = method.slot_limit() if method is not None else None
+        prefill_moe_layers = (
+            self.model_config.num_layers - self.model_config.first_k_dense_replace
+        )
         expert_cache = OffloadMoeCache(
             num_layers=self.model_config.num_moe_layers,
             num_experts=self.model_config.num_experts,
@@ -547,6 +560,7 @@ class MemoryPlanner:
             layout=None,
             max_slots=method_slot_limit,
             min_pool_rows=self.min_pool_rows(self.model_config.num_experts),
+            prefill_moe_layers=prefill_moe_layers,
         )
         expert_cache.set_bank_sources(self.banks_sources)
         expert_cache.set_alphas(
@@ -879,6 +893,9 @@ class MemoryPlanner:
 
         method = self.method
         method_slot_limit = method.slot_limit() if method is not None else None
+        prefill_moe_layers = (
+            config.model_config.num_layers - config.model_config.first_k_dense_replace
+        )
         expert_cache = OffloadMoeCache(
             num_layers=config.model_config.num_moe_layers,
             num_experts=config.model_config.num_experts,
@@ -893,6 +910,7 @@ class MemoryPlanner:
             layout=None,
             max_slots=method_slot_limit,
             min_pool_rows=self.min_pool_rows(self.model_config.num_experts),
+            prefill_moe_layers=prefill_moe_layers,
         )
         expert_cache.set_bank_sources(self.banks_sources)
         expert_cache.set_alphas(

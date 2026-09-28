@@ -1665,6 +1665,9 @@ class Engine:
                 # transient the plan reserved (+25%); only the planned prefix is backed
                 per_slot = max(1, plan.expert_bytes // max(1, plan.expert_slots))
                 vmm_rows = config.moe_cache_size + plan.transient_reserve * 5 // 4 // per_slot
+        prefill_moe_layers = (
+            config.model_config.num_layers - config.model_config.first_k_dense_replace
+        )
         cache = OffloadMoeCache(
             # Models with leading dense layers (GLM-4) only have experts on the MoE
             # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
@@ -1690,6 +1693,7 @@ class Engine:
             ),
             pool_caps_override=config.moe_pool_caps,
             vmm_rows=vmm_rows,
+            prefill_moe_layers=prefill_moe_layers,
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids

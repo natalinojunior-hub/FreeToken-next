@@ -57,13 +57,13 @@ class SchedulerSpecMixin:
     """Mixed into Scheduler. Needs self.spec_mtp/token_pool/cache_manager/engine/decode_manager
     /eos_token_ids/toolcall_anchor_id/finished_reqs/_prepare_batch (see scheduler.py)."""
 
-    def warmup_mtp_draft_kv(self, req: Req) -> None:
-        """Populate the draft head's KV cache over the prefill window.
+    def warmup_mtp_draft_kv(self, req: Req, target_batch: Batch | None = None) -> None:
+        """Fill prompt draft KV with h_i and token_(i+1), carrying one row across chunks.
 
-        Resolves EXP-025 / EXP-050 gap: warms up the draft KV slot over prompt tokens
-        so initial draft steps have full context instead of starting cold with ~0% accept rate.
+        A radix hit has no saved target residual history: only its recomputed suffix can
+        be warmed. Position zero has no preceding target residual and stays zero-filled.
         """
-        if self.spec_mtp <= 0:
+        if self.spec_mtp <= 0 or target_batch is None:
             return
         model = getattr(self.engine, "model", None)
         mtp = getattr(model, "mtp", None)
@@ -73,24 +73,33 @@ class SchedulerSpecMixin:
         if r_last is None or r_last.numel() == 0:
             return
 
-        d = req.device_len
-        win_len = min(r_last.shape[0], d)
-        if win_len <= 0:
+        n = target_batch.input_ids.numel()
+        if r_last.shape[0] != n:
             return
-
-        start_pos = d - win_len
-        tok_window = self.token_pool[req.table_idx, start_pos:d]
-        r_window = r_last[-win_len:]
+        end = req.cached_len  # engine.complete_one has consumed the original target window
+        start = end - n
+        carry = getattr(self, "_mtp_prompt_carry", None)
+        self._mtp_prompt_carry = (req.uid, end, r_last[-1:].clone())
+        if carry is not None and carry[0] == req.uid and carry[1] == start:
+            start_pos = start
+            r_window = torch.cat([carry[2], r_last[:-1]])
+            tok_window = target_batch.input_ids
+        else:
+            start_pos = start + 1
+            r_window = r_last[:-1]
+            tok_window = target_batch.input_ids[1:]
+        if tok_window.numel() == 0:
+            return
 
         old_cached, old_device = req.cached_len, req.device_len
         try:
-            req.cached_len, req.device_len = start_pos, d
+            req.cached_len, req.device_len = start_pos, end
             wb = Batch(reqs=[req], phase="prefill")
             wb.padded_reqs = [req]
-            wb.positions = torch.arange(start_pos, d, dtype=torch.int32, device=self.device)
+            wb.positions = torch.arange(start_pos, end, dtype=torch.int32, device=self.device)
             if self._model_is_mrope:
-                wb.mrope_positions = _spec_mrope_positions(req, start_pos, d, self.device)
-            wb.out_loc = self.engine.page_table[req.table_idx, start_pos:d]
+                wb.mrope_positions = _spec_mrope_positions(req, start_pos, end, self.device)
+            wb.out_loc = self.engine.page_table[req.table_idx, start_pos:end]
             wb.input_ids = tok_window
             # Do NOT set spec_logits_indices: we want full prefill attention to populate
             # the draft head's QSA slot for ALL prefill positions, not just the last token.
@@ -174,6 +183,9 @@ class SchedulerSpecMixin:
         rows = getattr(self, "_mtp_kv_rows", None)
         if rows is not None and rows[0] == req.uid:
             self._mtp_kv_rows = None
+        carry = getattr(self, "_mtp_prompt_carry", None)
+        if carry is not None and carry[0] == req.uid:
+            self._mtp_prompt_carry = None
 
     def _snapshot_qsa_state(self, req: Req) -> tuple[torch.Tensor, torch.Tensor] | None:
         kv = getattr(self.engine, "kv_cache", None)
