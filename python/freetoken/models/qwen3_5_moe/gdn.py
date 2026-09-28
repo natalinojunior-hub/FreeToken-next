@@ -142,15 +142,13 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         return causal_conv1d_decode(conv_in, pool.conv_states[li], self._conv_weight(), table_idx)
 
     def _write_track_snapshot(
-        self, pool, li: int, conv_in: torch.Tensor, h: torch.Tensor, fla
+        self, pool, li: int, conv_in: torch.Tensor, fla
     ) -> None:
-        """Snapshot this layer's recurrent + conv state at the chunk-aligned track boundary
-        into a donatable pool slot, on the forward stream (hybrid-radix extra_buffer path).
-        SSM: ``recurrent_states[li, dst] = h[0, h_row]`` -- a DIRECT copy (h is [V,K], the
-        state pool is [K,V]; they coincide because GDN requires head_k_dim == head_v_dim).
-        Conv: the last (kernel-1) raw conv-input timesteps ending at the boundary."""
-        rec = pool.recurrent_states[li]
-        rec.index_copy_(0, fla.track_dst, h[0, fla.track_h_row].to(rec.dtype))
+        """Snapshot conv history; the chunk kernel writes recurrent checkpoints in fp32.
+
+        The bf16 per-chunk output workspace cannot serve as a recurrent checkpoint: it
+        rounds the carried state, changing the continuation's logits after prefix reuse.
+        """
         cv = pool.conv_states[li]
         # conv_in [total, conv_dim]; gather the (kernel-1) window per tracked req.
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
@@ -262,7 +260,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             if fla.fresh_state_indices is not None:
                 pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
             track = fla.track_dst is not None
-            result = gdn_prefill_chunk_fla(
+            core_out = gdn_prefill_chunk_fla(
                 q,
                 k,
                 v,
@@ -272,13 +270,11 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 indices=fla.cache_indices,
                 cu_seqlens=fla.cu_seqlens,
                 scale=self.head_k_dim**-0.5,
-                return_h=track,
+                track_indices=fla.track_dst,
+                track_h_rows=fla.track_h_row,
             )
             if track:
-                core_out, h = result
-                self._write_track_snapshot(pool, li, conv_in, h, fla)
-            else:
-                core_out = result
+                self._write_track_snapshot(pool, li, conv_in, fla)
 
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)

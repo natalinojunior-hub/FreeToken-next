@@ -15,6 +15,8 @@ def gdn_prefill_chunk_fla(
     cu_seqlens: torch.Tensor,  # [num_seqs+1] int64
     scale: float,
     return_h: bool = False,
+    track_indices: torch.Tensor | None = None,
+    track_h_rows: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Chunked gated-delta-rule prefill via the vendored fla kernel. GQA is handled
     in-kernel (q/k at num_k_heads), q/k l2norm is done in-kernel, and the per-sequence
@@ -42,6 +44,8 @@ def gdn_prefill_chunk_fla(
         cu_seqlens=cu_seqlens.to(torch.int64),
         head_first=False,
         use_qk_l2norm_in_kernel=True,
+        track_indices=track_indices,
+        track_h_rows=track_h_rows,
     )
     if return_h:
         return o[0], h  # h: [1, NT_total, num_v_heads, head_v_dim, head_k_dim]

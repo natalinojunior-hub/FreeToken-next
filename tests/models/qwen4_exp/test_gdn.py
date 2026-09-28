@@ -285,6 +285,70 @@ def test_decode_prefill_gdn_kernel_inequivalence():
     assert diff_rec > 1e-4, f"Expected Bug A recurrent state inequivalence, got diff {diff_rec}"
 
 
+@pytest.mark.parametrize("width", (16, 64, 128, 192, 256))
+def test_chunk_checkpoint_tracks_fp32_exactly_without_changing_outputs(width):
+    from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_prefill_chunk_fla
+
+    torch.manual_seed(23)
+    first, half, total = 64, 64, 192
+    q = torch.randn(1, total, 2, width, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn(1, total, 4, width, device=DEV, dtype=torch.bfloat16)
+    g = -torch.rand(1, total, 4, device=DEV, dtype=torch.float32)
+    beta = torch.rand_like(g)
+    init = torch.randn(4, 4, width, width, device=DEV, dtype=torch.float32)
+    init[3].copy_(init[1])
+    indices = torch.tensor([0, 1], dtype=torch.int32, device=DEV)
+    cu_seqlens = torch.tensor([0, first, total], dtype=torch.int64, device=DEV)
+
+    plain_state = init.clone()
+    plain = gdn_prefill_chunk_fla(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state_source=plain_state,
+        indices=indices,
+        cu_seqlens=cu_seqlens,
+        scale=width**-0.5,
+    )
+    tracked_state = init.clone()
+    tracked = gdn_prefill_chunk_fla(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state_source=tracked_state,
+        indices=indices,
+        cu_seqlens=cu_seqlens,
+        scale=width**-0.5,
+        track_indices=torch.tensor([2], dtype=torch.int32, device=DEV),
+        track_h_rows=torch.tensor([2], dtype=torch.int32, device=DEV),
+    )
+    boundary_state = init.clone()
+    gdn_prefill_chunk_fla(
+        q[:, first : first + half],
+        k[:, first : first + half],
+        v[:, first : first + half],
+        g[:, first : first + half],
+        beta[:, first : first + half],
+        state_source=boundary_state,
+        indices=torch.tensor([3], dtype=torch.int32, device=DEV),
+        cu_seqlens=torch.tensor([0, half], dtype=torch.int64, device=DEV),
+        scale=width**-0.5,
+    )
+
+    assert torch.equal(tracked, plain)
+    assert torch.equal(tracked_state[0], plain_state[0])
+    assert torch.equal(tracked_state[1], plain_state[1])
+    assert torch.equal(tracked_state[2], boundary_state[3]), (
+        "tracked second-sequence state after row 64 differs from a separate 64-token prefill; "
+        f"max_abs_diff={(tracked_state[2] - boundary_state[3]).abs().max().item():.8g}"
+    )
+
+
 def test_spec_verify_graph_matches_eager():
     """The 2-token spec-verify window (fused multi-row recurrence) captured once replays
     bitwise-equal to the eager verify -- output and the slot's conv/recurrent state -- over

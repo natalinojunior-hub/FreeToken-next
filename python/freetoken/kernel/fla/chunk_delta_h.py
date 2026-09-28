@@ -62,6 +62,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     initial_state_indices,
     cu_seqlens,
     chunk_offsets,
+    track_indices,
+    track_h_rows,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -76,6 +78,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     NT_BUCKET: tl.constexpr,
+    NUM_TRACK: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -135,8 +138,39 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             p_h0_4 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0))
             b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
 
+    track_slot, track_chunk = -1, -1
+    if NUM_TRACK > 0:
+        for i_track in range(NUM_TRACK):
+            row = tl.load(track_h_rows + i_track).to(tl.int32)
+            if (row >= boh) & (row < boh + NT):
+                track_slot = tl.load(track_indices + i_track).to(tl.int32)
+                track_chunk = row - boh
+
     # main recurrence
     for i_t in range(NT):
+        # h is bf16 workspace for the output GEMM. Prefix checkpoints must retain the
+        # fp32 accumulator, just like the final live state, before that workspace cast.
+        if NUM_TRACK > 0 and i_t == track_chunk:
+            checkpoint = initial_state + (track_slot * H + i_h) * V * K
+            p_track = tl.make_block_ptr(
+                checkpoint, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
+            )
+            tl.store(p_track, b_h1, boundary_check=(0, 1))
+            if K > 64:
+                p_track = tl.make_block_ptr(
+                    checkpoint, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+                )
+                tl.store(p_track, b_h2, boundary_check=(0, 1))
+            if K > 128:
+                p_track = tl.make_block_ptr(
+                    checkpoint, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
+                )
+                tl.store(p_track, b_h3, boundary_check=(0, 1))
+            if K > 192:
+                p_track = tl.make_block_ptr(
+                    checkpoint, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
+                )
+                tl.store(p_track, b_h4, boundary_check=(0, 1))
         p_h1 = tl.make_block_ptr(
             h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
         )
@@ -272,7 +306,26 @@ def chunk_gated_delta_rule_fwd_h(
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
+    track_indices: Optional[torch.Tensor] = None,
+    track_h_rows: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if (track_indices is None) != (track_h_rows is None):
+        raise ValueError("checkpoint slots and chunk rows must be provided together")
+    if track_indices is not None:
+        if initial_state is None:
+            raise ValueError("checkpoint destinations require a state pool")
+        if (
+            track_indices.ndim != 1
+            or track_h_rows.ndim != 1
+            or track_indices.numel() != track_h_rows.numel()
+            or track_indices.dtype not in (torch.int32, torch.int64)
+            or track_h_rows.dtype not in (torch.int32, torch.int64)
+            or track_indices.device != initial_state.device
+            or track_h_rows.device != initial_state.device
+        ):
+            raise ValueError("checkpoint slots and chunk rows must be equal-length device index vectors")
+        # The scheduler owns the slot leases: one checkpoint per sequence, with destinations
+        # disjoint from every live slot. Do not read these indices on the host in the forward.
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE
@@ -324,6 +377,8 @@ def chunk_gated_delta_rule_fwd_h(
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
+        track_indices=track_indices,
+        track_h_rows=track_h_rows,
         T=T,
         H=H,
         Hg=Hg,
@@ -337,5 +392,6 @@ def chunk_gated_delta_rule_fwd_h(
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
+        NUM_TRACK=0 if track_indices is None else track_indices.numel(),
     )
     return h, v_new
