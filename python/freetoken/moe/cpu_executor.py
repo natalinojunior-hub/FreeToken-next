@@ -537,6 +537,13 @@ class CpuMoeExecutor:
         banks_by_role = {
             canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()
         }
+        # _resolve_kquant_banks validates bank geometry against a single nominal format,
+        # which cannot hold for a checkpoint that mixes formats across layers. Resolve that
+        # case before the call so it defers to the authoritative per-layer validation below
+        # (which runs after _resolve_banks and needs banks_by_role).
+        self._kquant_validated_per_layer = bool(
+            gguf_container and _per_layer_gguf_formats(cache, self.num_layers) is not None
+        )
         ptrs, (self.H, self.I) = self._resolve_banks(banks_by_role, fmt, down_fmt)
 
         # Per-layer format dispatch (see _per_layer_gguf_formats): a mixed GGUF checkpoint's
@@ -876,21 +883,25 @@ class CpuMoeExecutor:
             raise ValueError(f"gate_up must be a fused [S, 2I, ...] bank, got {gate_up[0].shape}")
         # A partial block has no representation in the format, so a non-multiple here means
         # the bank was built wrong; the C++ row arithmetic would silently truncate it.
-        if H % gu_qk:
-            raise ValueError(f"{fmt} gate_up needs H to be a multiple of {gu_qk}, got H={H}")
-        if I % dn_qk:
-            raise ValueError(f"{down_fmt} down needs I to be a multiple of {dn_qk}, got I={I}")
-        want_gu, want_dn = (H // gu_qk) * gu_blk, (I // dn_qk) * dn_blk
-        if int(gate_up[0].shape[2]) != want_gu:
-            raise ValueError(
-                f"{fmt} gate_up row is {int(gate_up[0].shape[2])} bytes, expected {want_gu} "
-                f"for K={H}"
-            )
-        if int(down[0].shape[2]) != want_dn:
-            raise ValueError(
-                f"{down_fmt} down row is {int(down[0].shape[2])} bytes, expected {want_dn} "
-                f"for K={I}"
-            )
+        # Skipped for a per-layer mixed checkpoint: the ctor already checked every layer
+        # against its own format, and `fmt` here is only the majority vote, so layer 0's
+        # row width legitimately differs from it.
+        if not self._kquant_validated_per_layer:
+            if H % gu_qk:
+                raise ValueError(f"{fmt} gate_up needs H to be a multiple of {gu_qk}, got H={H}")
+            if I % dn_qk:
+                raise ValueError(f"{down_fmt} down needs I to be a multiple of {dn_qk}, got I={I}")
+            want_gu, want_dn = (H // gu_qk) * gu_blk, (I // dn_qk) * dn_blk
+            if int(gate_up[0].shape[2]) != want_gu:
+                raise ValueError(
+                    f"{fmt} gate_up row is {int(gate_up[0].shape[2])} bytes, expected {want_gu} "
+                    f"for K={H}"
+                )
+            if int(down[0].shape[2]) != want_dn:
+                raise ValueError(
+                    f"{down_fmt} down row is {int(down[0].shape[2])} bytes, expected {want_dn} "
+                    f"for K={I}"
+                )
         ptrs = dict(
             gate_up_ptr=self._make_table(gate_up).data_ptr(),
             down_ptr=self._make_table(down).data_ptr(),
