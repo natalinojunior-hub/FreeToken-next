@@ -992,3 +992,43 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+def test_vmm_plan_resplits_around_pool0_front_floor(monkeypatch):
+    # A sub-layer wide pool (an MTP draft-style geometry group) stages its prefill layer
+    # over pool 0's front: ceil(E * rb_wide / rb_narrow) rows. When the equal share gives
+    # pool 0 fewer rows than that floor, the plan must re-split with the floors as minimums
+    # (stealing from pools above theirs) instead of rejecting the whole lazy-residency plan.
+    from freetoken.moe import vmm
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=7,
+        num_experts=8,
+        cache_size=38,
+        device=torch.device("cpu"),
+        min_pool_rows=2,
+    )
+    cache.bank_sources = {
+        "gate_up": [torch.zeros(8, 4, dtype=torch.bfloat16) for _ in range(5)]
+        + [torch.zeros(8, 16, dtype=torch.bfloat16)]
+        + [torch.zeros(8, 4, dtype=torch.float32)],
+        "down": [torch.zeros(8, 2, dtype=torch.bfloat16) for _ in range(5)]
+        + [torch.zeros(8, 8, dtype=torch.bfloat16)]
+        + [torch.zeros(8, 2, dtype=torch.float32)],
+    }
+    cache.bank_schema = ("gate_up", "down")
+    cache.prefill_moe_layers = 6
+    monkeypatch.setattr(vmm, "granularity", lambda _dev: 1)
+
+    # default off: the raise is the engine ladder's precision-downgrade signal
+    with pytest.raises(ValueError, match="prefill front"):
+        cache._vmm_plan(40)
+    cache.front_floor_resplit = True
+    pools, caps, _offsets, _ends, live = cache._vmm_plan(40)
+
+    assert [len(p.layers) for p in pools] == [5, 1, 1]
+    assert caps[0] == 32  # floor: 8 experts x (32 B / 8 B) staged-wide rows, not the 30 share
+    assert sum(caps) == 40
+    assert live == [32, 4, 4]

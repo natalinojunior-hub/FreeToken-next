@@ -1,6 +1,8 @@
 """Native MTP (multi-token prediction) speculative decode: draft chain + verify + accept/reject.
 
-Single-request only. Verification uses a spec-indexed prefill Batch and captured target windows
+One spec cycle owns one request per iteration (FREETOKEN_MTP_ROTATE=1 round-robins the cycle
+across the greedy-eligible running set so several streams each get k-depth cycles between raw
+batches; rotation mode is EXPERIMENTAL). Verification uses a spec-indexed prefill Batch and captured target windows
 when available. Production chooses depths through k4 from measured seconds per committed token.
 Bypasses scheduler._forward /
 _process_last_data entirely: their single-token-per-request write logic cannot carry more than
@@ -16,6 +18,7 @@ from typing import TYPE_CHECKING, Callable, List
 import torch
 from freetoken.core import Batch, Req
 from freetoken.engine.graph import DRAFT_GRAPH_CHECK_ENV, SPEC_DEFER_MAX, mtp_forward_last
+from freetoken.scheduler.adaptive_mtp import AdaptiveMtpController
 from freetoken.engine.spec import accept_drafts, lookup_drafts, spec_rollback_lengths
 from freetoken.message import DetokenizeMsg
 from freetoken.debug.token_trace import enabled as trace_enabled
@@ -28,6 +31,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 SPEC_TIMING_ENV = "FREETOKEN_DEBUG_SPEC_TIMING"
+MTP_ROTATE_ENV = "FREETOKEN_MTP_ROTATE"
+
+
 # "1": run every graph-eligible verify eagerly first and assert the graph replay reproduces it
 # bitwise (logits, sampled tokens, MTP residual, every state tensor the forward writes).
 VERIFY_GRAPH_CHECK_ENV = "FREETOKEN_VERIFY_GRAPH_CHECK"
@@ -51,6 +57,13 @@ def _spec_mrope_positions(
         device=device,
     )
     return row.unsqueeze(0).expand(3, -1)
+
+
+def rotate_spec_enabled() -> bool:
+    """EXPERIMENTAL opt-in: let spec_mtp serve with max_running_req > 1 by rotating the
+    single-cycle ownership across the running set (one stream cycles spec, the others
+    advance through the plain batch between cycles)."""
+    return os.getenv(MTP_ROTATE_ENV, "0") == "1"
 
 
 class SchedulerSpecMixin:
@@ -137,24 +150,69 @@ class SchedulerSpecMixin:
             token = torch.cat([rows[3], token])
         self._mtp_kv_rows = (req.uid, pos, residual.clone(), token.clone())
 
+    def _pick_spec_req(self) -> Req | None:
+        """The request this iteration's spec cycle owns (called from _begin_mtp_cycle, once
+        per iteration, so the round-robin pointer advances exactly once per cycle). Mirrors
+        the legacy single-slot rule unless rotation is enabled. Greedy-only, and a tail-token
+        request (its last step goes through the raw path) never owns a cycle."""
+        running = self.decode_manager.running_reqs
+        if not rotate_spec_enabled():
+            if len(running) != 1:
+                return None
+            (req,) = running
+        else:
+            cands = [req for req in running if req.sampling_params.is_greedy and req.remain_len > 1]
+            if not cands:
+                return None
+            idx = getattr(self, "_spec_rr_idx", 0)
+            self._spec_rr_idx = idx + 1
+            req = cands[idx % len(cands)]
+        if not req.sampling_params.is_greedy:
+            return None
+        self._spec_cycle_req = req
+        return req
+
+    def _controller_for(self, req: Req | None):
+        """Per-uid economics in rotation mode: a shared controller re-keys begin_request on
+        every cycle switch and drowns each stream's cost samples in the other streams' raw
+        steps, collapsing depth selection toward k0. Single-slot keeps the one controller."""
+        base = getattr(self, "_mtp_controller", None)
+        if not rotate_spec_enabled() or req is None:
+            return base
+        table = getattr(self, "_mtp_controllers", None)
+        if table is None:
+            table = self._mtp_controllers = {}
+        controller = table.get(req.uid)
+        if controller is None and base is not None:
+            controller = AdaptiveMtpController(
+                base.safe_max_k, profiled_depth=getattr(self, "_mtp_profiled_depth", None)
+            )
+            table[req.uid] = controller
+        return controller if controller is not None else base
+
     def _spec_eligible_req(self) -> Req | None:
         if self.spec_mtp <= 0:
             return None
-        running = self.decode_manager.running_reqs
-        if len(running) != 1:
+        if not rotate_spec_enabled():
+            running = self.decode_manager.running_reqs
+            if len(running) != 1:
+                return None
+            (req,) = running
+            if not req.sampling_params.is_greedy or req.remain_len <= 1:
+                return None
+            return req
+        req = getattr(self, "_spec_cycle_req", None)
+        if req is None or req not in self.decode_manager.running_reqs:
             return None
-        (req,) = running
         if not req.sampling_params.is_greedy or req.remain_len <= 1:
             return None
         return req
 
     def _begin_mtp_cycle(self):
-        controller = getattr(self, "_mtp_controller", None)
-        running = self.decode_manager.running_reqs
-        if controller is None or len(running) != 1:
-            return None
-        (req,) = running
-        if not req.sampling_params.is_greedy:
+        req = SchedulerSpecMixin._pick_spec_req(self)
+        controller = SchedulerSpecMixin._controller_for(self, req)
+        if req is None or controller is None:
+            self._spec_cycle_req = None
             return None
         cache = getattr(self.engine, "moe_offload_cache", None)
         epoch = (
@@ -176,6 +234,7 @@ class SchedulerSpecMixin:
         return req, req.input_ids.numel(), time.perf_counter()
 
     def _finish_mtp_cycle(self, sample) -> None:
+        self._spec_cycle_req = None
         if sample is None:
             return
         req, before, started = sample
@@ -183,7 +242,7 @@ class SchedulerSpecMixin:
         if committed <= 0:
             return
         elapsed = time.perf_counter() - started
-        controller = self._mtp_controller
+        controller = SchedulerSpecMixin._controller_for(self, req)
         depth = self._mtp_cycle_depth
         if self._mtp_cycle_observe:
             controller.observe(depth, elapsed, committed)
@@ -192,13 +251,20 @@ class SchedulerSpecMixin:
             learned = controller.consume_learned_depth()
             if learned is not None:
                 self._save_mtp_depth_profile(learned)
-        counts = self._mtp_distribution.setdefault(depth, [0, 0, 0.0])
+        if rotate_spec_enabled():
+            table = getattr(self, "_mtp_distributions", None)
+            if table is None:
+                table = self._mtp_distributions = {}
+            distribution = table.setdefault(req.uid, {})
+        else:
+            distribution = self._mtp_distribution
+        counts = distribution.setdefault(depth, [0, 0, 0.0])
         counts[0] += 1
         counts[1] += committed
         counts[2] += elapsed
         if req in self.finished_reqs:
             logger.info(
-                f"[mtp-economics] uid={req.uid} distribution={self._mtp_distribution} "
+                f"[mtp-economics] uid={req.uid} distribution={distribution} "
                 f"costs={controller.cost_summaries} selected={controller.selected_depth}"
             )
 
@@ -542,7 +608,7 @@ class SchedulerSpecMixin:
             return False
         from freetoken.scheduler.adaptive_mtp import resolve_adaptive_k
 
-        controller = getattr(self, "_mtp_controller", None)
+        controller = SchedulerSpecMixin._controller_for(self, req)
         requested_k = controller.next_depth() if controller is not None else self.spec_mtp
         k = resolve_adaptive_k(req, requested_k)
         # Output-budget truncation is valid at the shallower depth, but is not a sample

@@ -191,6 +191,10 @@ class OffloadMoeCache:
     # ``vmm_rows`` slots while only the ``cache_size`` live prefix of each pool is physically
     # backed; :meth:`set_live` moves that boundary in place. 0 = fixed allocation.
     vmm_rows: int = 0
+    # Let a starved prefill front floor re-split the budget (steal from pools above their
+    # own floors) instead of raising. Only the engine sets this on the ladder's final GDN
+    # precision (BF16 fallback): a raise on the FP32 probe is the ladder's downgrade signal.
+    front_floor_resplit: bool = False
     # Prefill-eligible layer boundary: layers >= prefill_moe_layers are decode-only (e.g. MTP draft heads)
     # and never stage or materialize prefill rows. None = all num_layers run prefill.
     prefill_moe_layers: int | None = None
@@ -838,7 +842,30 @@ class OffloadMoeCache:
             for p, (c, cap) in enumerate(zip(planned, caps))
             if self._is_prefill_pool(pools[p]) and min(c, cap) < E
         }
-        live = self._live_caps_for(pools, caps, live_size)
+        try:
+            live = self._live_caps_for(pools, caps, live_size)
+        except ValueError:
+            if not self.front_floor_resplit:
+                raise
+            # The equal-share split starved a pool below its prefill front floor. That is a
+            # split problem, not a residency problem: re-split once with the floors as hard
+            # minimums (pool_capacities steals the rows from pools above their own floors)
+            # so a marginal byte-budget dip never throws the whole lazy plan away -- at
+            # 256K context the old path fell back to fixed full-backing and shed ~13% of
+            # the affordable expert rows for want of 103 rows in pool 0.
+            floors = self._front_floors(pools)
+            hi = [len(p.layers) * E for p in pools]
+            boosted = [min(h, f) for h, f in zip(hi, floors)]
+            if sum(boosted) > min(self.vmm_rows, sum(hi)):
+                raise
+            caps = self._caps_for(pools, self.vmm_rows, extra_lo=boosted)
+            planned = self._caps_for(pools, min(live_size, sum(caps)), extra_lo=boosted)
+            self._staged = {
+                p
+                for p, (c, cap) in enumerate(zip(planned, caps))
+                if self._is_prefill_pool(pools[p]) and min(c, cap) < E
+            }
+            live = self._live_caps_for(pools, caps, live_size)
         g = vmm.granularity(self.device.index or 0)
         offsets, ends = [], [0] * len(self.bank_schema)
         for pool, cap in zip(pools, caps):
@@ -847,14 +874,36 @@ class OffloadMoeCache:
                 ends[b] += -(-cap * rb // g) * g
         return pools, caps, offsets, ends, live
 
-    def _caps_for(self, pools, cache_size: int) -> list[int]:
+    def _caps_for(self, pools, cache_size: int, extra_lo: list[int] | None = None) -> list[int]:
         from freetoken.engine.cache_budget import pool_capacities
 
         if self.pool_caps_override and len(pools) > 1:
             return self._override_caps(pools, cache_size)
         if len(pools) == 1:
             return [cache_size]
-        return pool_capacities(pools, self.num_experts, cache_size, self.min_pool_rows)
+        return pool_capacities(
+            pools, self.num_experts, cache_size, self.min_pool_rows, extra_lo=extra_lo
+        )
+
+    def _front_floors(self, pools) -> list[int]:
+        """Rows each pool's shape must hold for prefill given ``self._staged`` -- the raw
+        (unclamped) per-pool floors of :meth:`_live_caps_for`, safe to feed to
+        ``pool_capacities`` as ``extra_lo`` (which clamps to each pool's own ceiling)."""
+        E = self.num_experts
+        floors = []
+        for p, pool in enumerate(pools):
+            lo = self.min_pool_rows or E
+            if self._is_prefill_pool(pool) and p not in self._staged:
+                lo = max(lo, E)
+            if self.prefill_overlap and self._is_prefill_pool(pool):
+                lo = max(lo, 2 * E)
+            if p == 0:
+                for q, staged in enumerate(pools):
+                    if q in self._staged:
+                        for rb0, rb in zip(pool.row_bytes, staged.row_bytes):
+                            lo = max(lo, -(-E * rb // rb0))
+            floors.append(lo)
+        return floors
 
     def _live_caps_for(self, pools, shape_caps: list[int], size: int) -> list[int]:
         """Live rows per pool for ``size``: the usual split, inside each pool's shape and above

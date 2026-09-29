@@ -1143,6 +1143,10 @@ class Engine:
     _VRAM_GUARD_MARGIN = 256 << 20
     # Consecutive idle windows whose peak left room before a shrunken expert cache regrows.
     _VRAM_GUARD_CALM_WINDOWS = 3
+    # Absolute OOM floor for the in-place decode residency grow. The prefill fold reclaims
+    # that expansion synchronously and the prefill-time guard enforces _VRAM_GUARD_MARGIN at
+    # the spike, so decode-grow only needs to cover driver/fragmentation between folds.
+    _VRAM_DECODE_GROW_MIN = 32 << 20
 
     @torch.inference_mode()
     def guard_vram_before_forward(self, *, prefill: bool = False) -> bool:
@@ -1395,7 +1399,17 @@ class Engine:
         torch.cuda.empty_cache()
         self._decode_allocator_baseline = torch.cuda.memory_reserved(self.device)
         free, _ = torch.cuda.mem_get_info(self.device)
-        reserve = self._VRAM_GUARD_MARGIN + self._decode_reserve_learned
+        # the decode-grow floor is fragmentation, not the prefill spike: the fold reclaims
+        # this expansion synchronously before the next burst and guard_vram_before_forward
+        # prices _VRAM_GUARD_MARGIN at prefill -- charging the full margin again here double-
+        # counted it and stranded ~190 MiB under the 256K usable ceiling. The granules term
+        # is VMM rounding the grow cannot spend (same price _guard_window's regrow uses).
+        granules = (
+            len(getattr(cache, "_vmm_arenas", None) or ())
+            * len(getattr(cache, "pools", None) or ())
+            * (2 << 20)
+        )
+        reserve = max(self._VRAM_DECODE_GROW_MIN, self._decode_reserve_learned + granules)
         prefill_rows = cache.resident_rows
         current_backing = cache.expert_pool_bytes
         available = max(0, free - reserve)
@@ -1875,6 +1889,10 @@ class Engine:
                 if vmm_rows:
                     candidate = make_cache(plan.expert_slots, plan.prefill_overlap, vmm_rows)
                     candidate.cpu_layer_ids = cpu_layer_ids
+                    # a starved front floor may re-split instead of raising only once the
+                    # ladder is on its final GDN precision; on the FP32 probe the raise is
+                    # the BF16-downgrade signal (BF16 buys more expert rows at 16K context)
+                    candidate.front_floor_resplit = ENV.MAMBA_SSM_DTYPE.value == "bfloat16"
                     candidate._prepare_bank_sources(
                         banks.sources, layer_residency=banks.layer_residency
                     )

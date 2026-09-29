@@ -12,6 +12,7 @@ prefills into one, and so each stream carries its own 16K KV footprint.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import statistics
 import subprocess
@@ -91,6 +92,7 @@ def main() -> int:
                 gaps = sorted((b - a) * 1e3 for a, b in zip(st, st[1:]))
                 print(
                     f"  stream {i}: tokens={r['usage']['completion_tokens']} "
+                    f"sha1={hashlib.sha1(r['text'].encode()).hexdigest()[:12]} "
                     f"TG={steps / dt if dt > 0 else 0:.2f} "
                     f"TTFT={(st[0] - r['t0']) * 1e3:.1f}ms "
                     f"ITL p50={gaps[len(gaps) // 2]:.2f} p95={gaps[int(len(gaps) * 0.95)]:.2f}ms"

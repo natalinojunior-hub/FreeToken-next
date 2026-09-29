@@ -7,7 +7,7 @@ measured quantities, so it is unit-testable without a device.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 from freetoken.utils import div_ceil
 
@@ -80,15 +80,23 @@ def expert_pools(sources: dict[str, "list[torch.Tensor]"]) -> list[ExpertPool]:
 
 
 def pool_capacities(
-    pools: list[ExpertPool], num_experts: int, rows: int, min_rows: int
+    pools: list[ExpertPool],
+    num_experts: int,
+    rows: int,
+    min_rows: int,
+    extra_lo: Sequence[int] | None = None,
 ) -> list[int]:
     """Split ``rows`` resident expert rows over ``pools``: an equal share per layer (what a
     global LRU converges to), each pool clamped to ``[min(min_rows, hi), hi]`` where
     ``hi = layers * num_experts`` is all it can ever hold. ``min_rows`` is the most distinct
     experts one decode step may route (the LRU needs them resident at once); 0 means one
-    full layer. The remainder goes to unsaturated pools, largest first."""
+    full layer. ``extra_lo`` raises per-pool minimums further (prefill front floors); they
+    are part of the budget, so the equal share simply shrinks to pay for them. The
+    remainder goes to unsaturated pools, largest first."""
     hi = [len(p.layers) * num_experts for p in pools]
     lo = [min(h, min_rows or num_experts) for h in hi]
+    if extra_lo is not None:
+        lo = [max(l, min(h, x)) for l, h, x in zip(lo, hi, extra_lo)]
     rows = min(rows, sum(hi))
 
     def caps(share: int) -> list[int]:

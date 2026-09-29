@@ -205,10 +205,17 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             # fingerprint) so this serve skips the calibration probe; None -> calibrate.
             profiled = self._load_mtp_depth_profile(cap)
             self._mtp_controller = AdaptiveMtpController(cap, profiled_depth=profiled)
+            self._mtp_profiled_depth = profiled
         self._spec_snapshot_slots: dict[int, int] = {}
         if self.spec_mtp > 0:
             if config.max_running_req != 1:
-                raise ValueError("--spec-mtp > 0 supports single-request serving only for now.")
+                from freetoken.scheduler.spec import MTP_ROTATE_ENV, rotate_spec_enabled
+
+                if not rotate_spec_enabled():
+                    raise ValueError(
+                        "--spec-mtp > 0 supports single-request serving only for now "
+                        f"(EXPERIMENTAL opt-in: {MTP_ROTATE_ENV}=1 rotates cycles across streams)."
+                    )
             if getattr(self.engine.model, "mtp", None) is None:
                 raise ValueError(
                     "--spec-mtp > 0 requires a checkpoint with a registered MTP layer."
@@ -454,9 +461,11 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
     def _guard_vram_pressure(self) -> None:
         guard = getattr(getattr(self, "engine", None), "guard_vram_before_forward", None)
         if guard is not None and guard(prefill=self.prefill_manager.runnable):
-            controller = getattr(self, "_mtp_controller", None)
-            if controller is not None:
-                controller.fallback_to_k0()
+            for controller in [getattr(self, "_mtp_controller", None)] + list(
+                getattr(self, "_mtp_controllers", {}).values()
+            ):
+                if controller is not None:
+                    controller.fallback_to_k0()
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:

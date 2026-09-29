@@ -75,12 +75,12 @@ def _residency_engine(monkeypatch, free):
 
 
 def test_decode_residency_grows_into_measured_free_and_folds_back(monkeypatch):
-    # 2 GiB free, 256 MiB guard, and exact 10 MiB per-row backing -> 179 additional rows.
+    # 2 GiB free, 32 MiB decode-grow floor, and exact 10 MiB per-row backing -> 201 extra rows.
     eng, calls = _residency_engine(monkeypatch, free=2048 * MIB)
     eng.set_decode_residency(True)
     assert eng._decode_allocator_baseline == 1000 * MIB
-    assert calls == [1179]
-    eng.moe_offload_cache.resident_rows = 1179
+    assert calls == [1201]
+    eng.moe_offload_cache.resident_rows = 1201
     eng.set_decode_residency(True)  # already grown: no churn
     eng.set_decode_residency(False)
     assert calls[1:] == [1000]
@@ -89,13 +89,16 @@ def test_decode_residency_grows_into_measured_free_and_folds_back(monkeypatch):
 
 
 def test_decode_residency_never_touches_the_reserve(monkeypatch):
-    eng, calls = _residency_engine(monkeypatch, free=258 * MIB)
+    # grow spends down to the decode-grow floor (32 MiB + the granule slack), never through
+    # it: 1024 MiB free, 10 MiB rows -> 99 extra rows, not 102.
+    eng, calls = _residency_engine(monkeypatch, free=1024 * MIB)
     syncs = []
     monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: syncs.append(None))
     eng.set_decode_residency(True)
-    assert calls == [] and eng._expert_decode_slots == 1000
+    assert calls == [1099] and eng._expert_decode_slots == 1099
+    eng.moe_offload_cache.resident_rows = 1099
     eng.set_decode_residency(True)
-    assert calls == [] and len(syncs) == 1  # the no-grow phase is not retried each decode
+    assert calls == [1099] and len(syncs) == 1  # the grown phase is not retried each decode
 
 
 def test_decode_residency_failed_grow_does_not_keep_external_pressure_debt(monkeypatch):
@@ -112,14 +115,14 @@ def test_decode_residency_failed_grow_does_not_keep_external_pressure_debt(monke
 
     eng._resize_experts = resize
     eng.set_decode_residency(True)
-    assert calls == [1179] and eng._expert_decode_slots == 1000
+    assert calls == [1201] and eng._expert_decode_slots == 1000
     assert eng._decode_reserve_learned == 0
     assert eng._decode_allocator_baseline == 1000 * MIB
 
     eng.set_decode_residency(False)  # close the failed decode phase before the next request
     eng.set_decode_residency(True)
-    assert calls == [1179, 1000, 1179]
-    assert cache.resident_rows == 1179
+    assert calls == [1201, 1000, 1201]
+    assert cache.resident_rows == 1201
     assert eng._decode_reserve_learned == 0
 
 
