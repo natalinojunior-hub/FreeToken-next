@@ -120,6 +120,7 @@ def test_fallback_is_terminal_until_next_request():
         controller.observe(0, 0.010, 1)
         assert controller.next_depth() == 0
     controller.begin_request("request-2", "epoch-a")
+    assert not controller.probing  # a safety/tail clamp does not invent a fresh economics probe
     assert controller.next_depth() == 1
 
 
@@ -141,23 +142,22 @@ def test_learned_depth_retained_and_measured_drift_schedules_probe():
     assert controller.next_depth() == 0
 
 
-def test_beneficial_drift_keeps_safe_positive_depth_until_reprobe():
+def test_beneficial_drift_keeps_safe_positive_depth_without_reprobe():
     controller = AdaptiveMtpController(1)
     _calibrate(controller, costs={0: [0.010] * 8, 1: [0.008] * 4})
     assert controller.selected_depth == 1
     controller.begin_request("request-2", "epoch-a")
 
-    # The selected depth gets faster enough to trigger drift detection, while remaining
-    # statistically cheaper than k0. Drift requests fresh calibration; it is not a safety
-    # failure and should not force this request onto k0.
+    # The selected depth gets faster while remaining cheaper than k0. Beneficial drift is
+    # neither a safety failure nor a reason to pay for another probe.
     for _ in range(8):
         controller.observe(1, 0.004, 1)
 
     assert controller.selected_depth == 1
     assert controller.next_depth() == 1
     controller.begin_request("request-3", "epoch-a")
-    assert controller.probing
-    assert controller.next_depth() == 0
+    assert not controller.probing
+    assert controller.next_depth() == 1
 
 
 @pytest.mark.parametrize("safe_max_k", [-1, 5, 1.0, True])
@@ -194,7 +194,11 @@ def test_calibration_interleaves_positive_depth_probes_after_k0_baseline():
 
     assert plan == [0] * 8 + [1, 2, 3, 4] * 4
     assert {depth: controller.cost_summaries[depth]["samples"] for depth in range(5)} == {
-        0: 8, 1: 4, 2: 4, 3: 4, 4: 4
+        0: 8,
+        1: 4,
+        2: 4,
+        3: 4,
+        4: 4,
     }
 
 
@@ -282,51 +286,142 @@ def test_provably_slower_deep_depth_is_not_picked():
 # --- warm start from a persisted depth profile (tuning.mtp_profile) -----------------------
 
 
-def test_warm_start_skips_probe_and_holds_profiled_depth():
-    """A depth learned by a previous serve under the same fingerprint warm-starts the
-    controller: it uses that depth from the first token with NO 24-cycle calibration probe
-    (the entire point of the profile -- reach steady-state ~104 TG immediately). It must also
-    HOLD across requests: with no k=0 baseline, _best_depth() would return 0, so the warm path
-    has to keep the profiled depth rather than fall through to it."""
+def test_warm_profile_seeds_first_epoch_without_startup_probe():
+    """The cached depth avoids startup calibration but stays provisional."""
     controller = AdaptiveMtpController(4, profiled_depth=4)
     controller.begin_request("warm", "epoch-a")
     assert not controller.probing
     assert controller.next_depth() == 4
-    for _ in range(5):
+    for _ in range(8):
         controller.observe(4, 0.0096, 4)
-    controller.begin_request("warm2", "epoch-a")  # next request, same epoch
-    assert controller.next_depth() == 4  # still warm, not dropped to k0
+    controller.begin_request("warm2", "epoch-a")
+    assert not controller.probing
+    assert controller.next_depth() == 4
     assert controller.consume_learned_depth() is None  # a warm start learned nothing new
 
 
-def test_warm_start_survives_epoch_churn_without_reprobing():
-    """Pool warmup changes live_caps -> the epoch tuple changes -> a cold controller would
-    re-probe. A warm one must keep the profiled depth through the churn (the profile encodes
-    the steady-state optimum for this fingerprint), not pay the probe again."""
+def test_warm_profile_is_invalidated_by_a_later_economic_epoch():
+    """A cached optimum must be remeasured after context/cache economics change."""
     controller = AdaptiveMtpController(4, profiled_depth=4)
     controller.begin_request("warm", "epoch-a")
     assert controller.next_depth() == 4
-    controller.begin_request("warm", "epoch-b")  # epoch changed (residency grew)
-    assert not controller.probing
-    assert controller.next_depth() == 4
+    controller.begin_request("warm", "epoch-b")
+    assert controller.probing
+    assert controller.next_depth() == 0
+    assert controller.cost_summaries[0]["samples"] == 0
 
 
-def test_warm_start_is_rigid_through_in_serve_drift():
-    """Warm start is RIGID for the whole serve: the profile's key (hardware+model+build+config)
-    is fixed within a serve, so even a large cost rise is warmup/noise/a request transition,
-    not a config change -- the controller holds the profiled depth and does NOT re-probe (a
-    spurious re-probe was costing ~3 TG of warm mean). Recalibration happens only on a
-    fingerprint change (next serve) or FREETOKEN_MTP_PROFILE=refresh; a genuine runtime FAILURE
-    is handled by spec.py's fallback_to_k0, not by drift here."""
+def test_costly_initial_profile_audits_k0_then_falls_back():
+    """A profile that is wrong in the first prompt regime gets a fresh k0 comparison."""
     controller = AdaptiveMtpController(1, profiled_depth=1)
     controller.begin_request("warm", "epoch-a")
     assert controller.next_depth() == 1
+    for i in range(32):
+        controller.observe(1, 0.030, 1)
+        if i < 31:
+            assert controller.next_depth() == 1
+    assert controller.probing
+    assert controller.next_depth() == 0
+    assert controller.cost_summaries[1]["samples"] == 32
     for _ in range(8):
-        controller.observe(1, 0.008, 1)  # steady warm cost
+        controller.observe(0, 0.010, 1)
+    assert controller.selected_depth == 0
+    assert controller.next_depth() == 0
+    controller.begin_request("after-audit", "epoch-a")
+    assert controller.probing  # an economic k0 fallback is rechecked next request
+    assert controller.next_depth() == 0
+
+
+def test_warm_k0_audit_retains_beneficial_seed_and_never_selects_unmeasured_depth():
+    controller = AdaptiveMtpController(3, profiled_depth=2)
+    controller.begin_request("warm", "epoch-a")
+    for _ in range(32):
+        controller.observe(2, 0.008, 1)
+    assert controller.probing
+    assert controller.next_depth() == 0
+    assert controller.cost_summaries[2]["samples"] == 32
     for _ in range(8):
-        controller.observe(1, 0.030, 1)  # a big rise -- ignored while warm (rigid)
-    controller.begin_request("warm2", "epoch-a")
-    assert not controller.probing  # rigid: no re-probe on in-serve drift
+        controller.observe(0, 0.020, 1)
+    assert controller.selected_depth == 2
+    assert controller.next_depth() == 2
+    assert {k: controller.cost_summaries[k]["samples"] for k in (1, 3)} == {1: 0, 3: 0}
+
+
+def test_warm_audit_accumulates_across_requests_and_keeps_partial_baseline():
+    controller = AdaptiveMtpController(1, profiled_depth=1)
+    controller.begin_request("one", "epoch-a")
+    for _ in range(20):
+        controller.observe(1, 0.008, 1)
+    controller.begin_request("two", "epoch-a")
+    for _ in range(12):
+        controller.observe(1, 0.008, 1)
+    assert controller.probing
+    assert controller.next_depth() == 0
+    for _ in range(3):
+        controller.observe(0, 0.020, 1)
+    controller.begin_request("three", "epoch-a")
+    assert controller.probing
+    assert controller.next_depth() == 0
+    assert controller.cost_summaries[0]["samples"] == 3
+    for _ in range(5):
+        controller.observe(0, 0.020, 1)
+    assert controller.selected_depth == 1
+    assert controller.next_depth() == 1
+
+
+def test_calibrated_controller_periodically_audits_fresh_k0():
+    controller = AdaptiveMtpController(1)
+    _calibrate(controller, costs={0: [0.010] * 8, 1: [0.008] * 4})
+    assert controller.selected_depth == 1
+    for _ in range(32):
+        controller.observe(1, 0.008, 1)
+    assert controller.probing
+    assert controller.next_depth() == 0
+    assert controller.cost_summaries[0]["samples"] == 0  # discard stale baseline
+    for _ in range(8):
+        controller.observe(0, 0.020, 1)
+    assert controller.selected_depth == 1
+    assert controller.next_depth() == 1
+    for _ in range(31):
+        controller.observe(1, 0.008, 1)
+        assert not controller.probing
+    controller.observe(1, 0.008, 1)
+    assert controller.probing  # the positive-cycle counter restarted after the audit
+    assert controller.next_depth() == 0
+
+
+def test_harmful_warm_drift_reprobes_next_request_but_beneficial_drift_does_not():
+    controller = AdaptiveMtpController(1, profiled_depth=1)
+    controller.begin_request("harmful", "epoch-a")
+    for _ in range(8):
+        controller.observe(1, 0.008, 1)
+    for _ in range(8):
+        controller.observe(1, 0.012, 1)
+    assert controller.next_depth() == 1  # never changes depth mid-request
+    controller.begin_request("after-harmful", "epoch-a")
+    assert controller.probing
+    assert controller.next_depth() == 0
+
+    beneficial = AdaptiveMtpController(1, profiled_depth=1)
+    beneficial.begin_request("beneficial", "epoch-a")
+    for _ in range(8):
+        beneficial.observe(1, 0.012, 1)
+    for _ in range(8):
+        beneficial.observe(1, 0.008, 1)
+    beneficial.begin_request("after-beneficial", "epoch-a")
+    assert not beneficial.probing
+    assert beneficial.next_depth() == 1
+
+
+def test_small_cost_rise_does_not_reprobe():
+    controller = AdaptiveMtpController(1, profiled_depth=1)
+    controller.begin_request("noise", "epoch-a")
+    for _ in range(8):
+        controller.observe(1, 0.0100, 1)
+    for _ in range(8):
+        controller.observe(1, 0.0104, 1)
+    controller.begin_request("after-noise", "epoch-a")
+    assert not controller.probing
     assert controller.next_depth() == 1
 
 
@@ -352,7 +447,10 @@ def test_force_depth_overrides_profile_and_never_saves(monkeypatch):
     controller = AdaptiveMtpController(4, profiled_depth=4)
     controller.begin_request("forced", "epoch-a")
     assert controller.next_depth() == 2  # force wins over the profiled 4
-    controller.observe(2, 0.010, 3)
+    for _ in range(40):
+        controller.observe(2, 0.010, 3)
+    assert not controller.probing
+    assert controller.next_depth() == 2
     assert controller.consume_learned_depth() is None
 
 
@@ -366,11 +464,7 @@ def test_invalid_profiled_depth_is_ignored(bad):
 
 
 def test_warm_start_beneficial_drift_keeps_profile():
-    """The warmup fix: a first warm request's cost DROPS as the expert pool reaches steady
-    residency. That benign (beneficial) drift must NOT invalidate the profile -- otherwise the
-    next request re-probes and the warm serve never settles at the ~104 TG the profile is for
-    (measured: warm mean 101 with run0 at 104 because uid0's warmup drift re-probed uid1).
-    Only a HARMFUL drift (cost rising) invalidates -- see the sibling reprobe test."""
+    """A beneficial warmup shift keeps the seed and does not trigger a full probe."""
     controller = AdaptiveMtpController(1, profiled_depth=1)
     controller.begin_request("warm", "epoch-a")
     assert controller.next_depth() == 1
@@ -384,11 +478,7 @@ def test_warm_start_beneficial_drift_keeps_profile():
 
 
 def test_warm_start_small_cost_rise_does_not_invalidate():
-    """The relative-floor fix: a warm-started depth at steady state has low-variance samples,
-    so a few-percent cost rise (normal fluctuation) must NOT invalidate the profile and force a
-    re-probe -- that spuriously dropped the warm mean from ~104 to ~101 TG (one re-probed
-    request). Only a MATERIAL (>=10%) and significant rise -- a real regime change such as the
-    expert pool falling back to full-back (~13.5% slower) -- counts as harmful drift."""
+    """A rise below the material-drift floor is noise, not a reason to re-probe."""
     controller = AdaptiveMtpController(1, profiled_depth=1)
     controller.begin_request("warm", "epoch-a")
     assert controller.next_depth() == 1

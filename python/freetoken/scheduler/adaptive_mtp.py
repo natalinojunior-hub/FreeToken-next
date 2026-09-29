@@ -86,7 +86,7 @@ class _RatioWindow:
         residual_ss = sum((elapsed - cost * tokens) ** 2 for elapsed, tokens in self.samples)
         return sqrt(n * residual_ss / ((n - 1) * committed**2))
 
-    def drifted(self) -> bool:
+    def drifted(self, *, harmful_only: bool = False) -> bool:
         n = len(self.samples)
         half = n // 2
         if half < 4:
@@ -95,6 +95,8 @@ class _RatioWindow:
         older, newer = _RatioWindow(), _RatioWindow()
         older.samples.extend(samples[:half])
         newer.samples.extend(samples[-half:])
+        if harmful_only and newer.cost <= 1.10 * older.cost:
+            return False
         return abs(older.cost - newer.cost) > 2 * sqrt(older.se**2 + newer.se**2)
 
 
@@ -113,8 +115,8 @@ _PROBE_REPEATS = 4
 class AdaptiveMtpController:
     """Choose a safe MTP depth from measured seconds per committed token.
 
-    The caller must keep each calibration probe contiguous: first k=0, then
-    increasing positive depths. Once a request enters k=0 fallback, it stays
+    Each calibration samples k=0 first, then positive depths round-robin.
+    Cached depths receive bounded k=0 audits. Once a request enters k=0 fallback, it stays
     there until ``begin_request`` starts a different request.
     """
 
@@ -147,6 +149,8 @@ class AdaptiveMtpController:
         self._needs_reprobe = True
         self._observations_since_check = 0
         self._discard_partial_stats = False
+        self._auditing = False
+        self._cycles_since_baseline = 0
 
     @property
     def selected_depth(self) -> int:
@@ -181,10 +185,15 @@ class AdaptiveMtpController:
         }
 
     def _new_epoch(self, epoch) -> None:
+        if self._epoch is not None:
+            self._profiled_depth = None
         self._epoch = epoch
         self._stats = [_RatioWindow() for _ in range(self.safe_max_k + 1)]
         self._needs_reprobe = True
+        self._observations_since_check = 0
         self._discard_partial_stats = False
+        self._auditing = False
+        self._cycles_since_baseline = 0
 
     def _best_depth(self) -> int:
         """Cheapest speculation depth, biased toward actually speculating.
@@ -221,7 +230,9 @@ class AdaptiveMtpController:
         # reach ("always max TG"). Ties and noise therefore break toward the deeper draft.
         cheapest = min(eligible, key=lambda d: self._stats[d].cost)
         ceiling = self._stats[cheapest].cost + 2 * self._stats[cheapest].se
-        within_noise = [d for d in eligible if self._stats[d].cost - 2 * self._stats[d].se <= ceiling]
+        within_noise = [
+            d for d in eligible if self._stats[d].cost - 2 * self._stats[d].se <= ceiling
+        ]
         return max(within_noise)
 
     def begin_request(self, request_uid, epoch) -> None:
@@ -239,20 +250,19 @@ class AdaptiveMtpController:
         incomplete_probe = bool(self._plan)
         if epoch != self._epoch:
             self._new_epoch(epoch)
+        elif incomplete_probe and self._auditing:
+            self._request_uid = request_uid
+            self._terminal_k0 = False
+            return
         elif incomplete_probe or self._discard_partial_stats:
             self._stats = [_RatioWindow() for _ in range(self.safe_max_k + 1)]
             self._needs_reprobe = True
             self._discard_partial_stats = False
         self._request_uid = request_uid
         self._terminal_k0 = False
-        self._observations_since_check = 0
         if self._needs_reprobe:
             if self._profiled_depth is not None:
-                # Warm start: a profile learned under this exact hardware+model+build+config
-                # fingerprint says this depth won, so skip the 24-cycle calibration probe.
-                # Epoch churn during pool warmup does NOT invalidate it (the profile encodes
-                # the steady-state optimum); only measured drift (in observe) or an explicit
-                # FREETOKEN_MTP_PROFILE=refresh does.
+                # A cached depth seeds the first epoch; live economics still audit it below.
                 self._plan.clear()
                 self._selected_depth = self._profiled_depth
             else:
@@ -267,7 +277,10 @@ class AdaptiveMtpController:
             self._needs_reprobe = False
         else:
             self._plan.clear()
-            if self._profiled_depth is not None and len(self._stats[0].samples) < _MIN_BASELINE_SAMPLES:
+            if (
+                self._profiled_depth is not None
+                and len(self._stats[0].samples) < _MIN_BASELINE_SAMPLES
+            ):
                 # Still warm (no calibration has run this epoch): hold the profiled depth
                 # rather than _best_depth(), which has no k=0 baseline to compare against.
                 self._selected_depth = self._profiled_depth
@@ -294,7 +307,7 @@ class AdaptiveMtpController:
             return
         was_probing = bool(self._plan)
         if self._plan:
-            if self._terminal_k0 or depth != self._plan[0]:
+            if (self._terminal_k0 and not self._auditing) or depth != self._plan[0]:
                 raise ValueError(f"expected calibration depth {self.next_depth()}, got {depth}")
             self._plan.popleft()
         elif depth != self.next_depth():
@@ -303,8 +316,11 @@ class AdaptiveMtpController:
         window.add(float(elapsed_s), committed_tokens)
         calibration_finished = was_probing and not self._plan
         if calibration_finished:
+            self._auditing = False
+            self._profiled_depth = None
+            self._cycles_since_baseline = 0
             self._observations_since_check = 0
-            if window.drifted():
+            if window.drifted(harmful_only=True):
                 # A drift this early (a fresh _PROBE_REPEATS-sample window) is not possible
                 # (drifted() needs >= 8 samples), but keep the policy uniform: drift only
                 # schedules a re-probe for the NEXT request, it never abandons this one.
@@ -313,6 +329,7 @@ class AdaptiveMtpController:
                 self._selected_depth = self._best_depth()
                 if self._selected_depth == 0:
                     self.fallback_to_k0()
+                    self._needs_reprobe = True
             if self._selected_depth > 0 and not self._terminal_k0:
                 # A fresh calibration just converged: expose the learned depth so the engine can
                 # persist it (tuning.mtp_profile) and the next serve skip the probe. Only a
@@ -321,30 +338,20 @@ class AdaptiveMtpController:
                 self._pending_learned_depth = self._selected_depth
         elif not was_probing:
             self._observations_since_check += 1
+            if depth > 0:
+                self._cycles_since_baseline += 1
             if self._observations_since_check >= 8:
                 self._observations_since_check = 0
-                if self._profiled_depth is None:
-                    # Cold/calibrated: drift schedules a re-probe for the NEXT request (never a
-                    # k0 lock -- that threw away ~20 TG on noise); re-selection below drops to
-                    # k0 only if the depth became genuinely worse than the baseline, and keeps a
-                    # depth that merely got cheaper (beneficial drift).
-                    if window.drifted():
-                        self._needs_reprobe = True
-                    if (
-                        not self._terminal_k0
-                        and len(self._stats[0].samples) >= _MIN_BASELINE_SAMPLES
-                    ):
-                        self._reselect_with_hysteresis()
-                # else: WARM start is RIGID for the whole serve. The profile is keyed on the
-                # hardware+model+build+config fingerprint -- all fixed within a serve -- and the
-                # resolver pins residency (compact + bf16 keep the expert pool VMM-lazy), so
-                # in-serve cost movement is warmup/noise/request-transition or an LRU residency
-                # change that hits every depth equally: NOT a change in which depth is optimal.
-                # Reacting to it re-probed a request spuriously and cost ~3 TG of warm mean
-                # (observed 100.9 vs run0 103.8). Hold the profiled depth; recalibration happens
-                # on a fingerprint change (next serve) or FREETOKEN_MTP_PROFILE=refresh. A
-                # genuine runtime FAILURE still falls back to k0 via spec.py's error handling,
-                # so rigidity costs no safety.
+                if window.drifted(harmful_only=True):
+                    self._profiled_depth = None
+                    self._needs_reprobe = True
+                if not self._terminal_k0 and len(self._stats[0].samples) >= _MIN_BASELINE_SAMPLES:
+                    self._reselect_with_hysteresis()
+            if not self._terminal_k0 and self._cycles_since_baseline >= 32:
+                # Measure the counterfactual even when a bad cached depth never drifts.
+                self._stats[0] = _RatioWindow()
+                self._plan = deque([0] * _MIN_BASELINE_SAMPLES)
+                self._auditing = True
 
     def _reselect_with_hysteresis(self) -> None:
         best = self._best_depth()
@@ -352,6 +359,7 @@ class AdaptiveMtpController:
             # Every positive depth is now significantly worse than the k=0 baseline:
             # speculation stopped paying (a real regime change), so drop to k=0.
             self.fallback_to_k0()
+            self._needs_reprobe = True
             return
         if best == self._selected_depth:
             return  # still the cheapest eligible depth; keep it (no thrash)
@@ -369,6 +377,10 @@ class AdaptiveMtpController:
 
     def fallback_to_k0(self) -> None:
         """Lock k=0 through request end; re-probe only at the next request."""
+        if self._auditing:
+            # Tail raw steps are valid baseline samples; retain an unfinished audit.
+            self._terminal_k0 = True
+            return
         if self._plan:
             self._needs_reprobe = True
             self._discard_partial_stats = True
