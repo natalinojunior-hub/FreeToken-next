@@ -9,8 +9,9 @@ Reference comparison is fp32 on purpose: the split-K reduce reassociates the len
 bit-equality with cuBLAS is neither expected nor wanted. The shipped `w @ x.T` small-batch path
 measures ~4e-3 relative against `F.linear` (both ~3e-3 from fp32); this kernel must land in the
 same class. Shapes below are the real resident-bf16 decode operands: the router gate
-`ffn_gate_inp` [512, 2560], the fused hyper-connection down+inject block [336, 10240], the
-hyper-connection up [10240, 320], and a square [2560, 2560] control.
+`ffn_gate_inp` [512, 2560], SSM in-projection [48, 2560], indexer K-projection [128, 2560],
+the fused hyper-connection down+inject block [336, 10240], the hyper-connection up [10240, 320],
+and a square [2560, 2560] control.
 """
 
 from __future__ import annotations
@@ -25,6 +26,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 
 # (name, N=out_features, K=in_features). All native-bf16 resident decode operands.
 SHAPES = [
+    ("ssm_in_proj", 48, 2560),
+    ("indexer_k", 128, 2560),
     ("router_gate", 512, 2560),
     ("hc_down_inject", 336, 10240),
     ("hc_up", 10240, 320),
