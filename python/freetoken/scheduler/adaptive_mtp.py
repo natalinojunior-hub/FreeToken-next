@@ -97,6 +97,21 @@ class _RatioWindow:
         newer.samples.extend(samples[-half:])
         return abs(older.cost - newer.cost) > 2 * sqrt(older.se**2 + newer.se**2)
 
+    def drifted_worse(self) -> bool:
+        """True only when the recent half is significantly MORE expensive than the older half
+        (a harmful regime change). A cost DECREASE -- pool warmup reaching steady residency, or
+        any beneficial drift -- returns False, so a warm-started profile is not thrown away by
+        the very warmup it survives. Same 2-sigma bar as ``drifted()``, signed."""
+        n = len(self.samples)
+        half = n // 2
+        if half < 4:
+            return False
+        samples = list(self.samples)
+        older, newer = _RatioWindow(), _RatioWindow()
+        older.samples.extend(samples[:half])
+        newer.samples.extend(samples[-half:])
+        return (newer.cost - older.cost) > 2 * sqrt(older.se**2 + newer.se**2)
+
 
 # Calibration probe budget. The k=0 baseline is measured first (contiguous, so it is not
 # confounded with the warmup that the positive depths then interleave over), then the positive
@@ -324,23 +339,28 @@ class AdaptiveMtpController:
             if self._observations_since_check >= 8:
                 self._observations_since_check = 0
                 if window.drifted():
-                    # Cost moved enough to recalibrate the NEXT request. Drift is not a
-                    # safety failure: do NOT force the rest of THIS request onto k=0 (that
-                    # threw away ~20 TG on noise). Re-selection below drops to k=0 only if
-                    # the drifted depth is now genuinely worse than the baseline; a depth
-                    # that merely got cheaper (beneficial drift) is kept.
-                    self._needs_reprobe = True
                     if self._profiled_depth is not None:
-                        # Drift while trusting a profile: the profiled depth may no longer be
-                        # optimal for current conditions. Invalidate it so the re-probe is a
-                        # full cold calibration (and the engine re-saves the newly learned depth).
-                        self._profiled_depth = None
+                        # Warm start: only a HARMFUL drift (the profiled depth got genuinely
+                        # slower) invalidates the profile and forces a re-probe. The first warm
+                        # request's cost DROPS as the expert pool reaches steady residency --
+                        # that benign warmup drift must NOT throw away the profile, or the next
+                        # request re-probes and the warm serve never reaches steady ~104 TG.
+                        if window.drifted_worse():
+                            self._profiled_depth = None
+                            self._needs_reprobe = True
+                    else:
+                        # Cold/calibrated: cost moved enough to recalibrate the NEXT request.
+                        # Drift is not a safety failure -- do NOT force the rest of THIS request
+                        # onto k=0 (that threw away ~20 TG on noise). Re-selection below drops
+                        # to k=0 only if the depth is now genuinely worse than the baseline; a
+                        # depth that merely got cheaper (beneficial drift) is kept.
+                        self._needs_reprobe = True
                 if not self._terminal_k0:
                     if len(self._stats[0].samples) >= _MIN_BASELINE_SAMPLES:
                         self._reselect_with_hysteresis()
                     # else: warm-started from a profile with no k=0 baseline to compare
-                    # against; hold the profiled depth (drift above or an epoch change will
-                    # trigger a re-probe if conditions move).
+                    # against; hold the profiled depth (a harmful drift above or an epoch
+                    # change will trigger a re-probe if conditions move).
 
     def _reselect_with_hysteresis(self) -> None:
         best = self._best_depth()

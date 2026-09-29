@@ -359,3 +359,21 @@ def test_invalid_profiled_depth_is_ignored(bad):
     controller = AdaptiveMtpController(4, profiled_depth=bad)
     controller.begin_request("bad", "epoch-a")
     assert controller.probing  # cold calibration, not a warm start
+
+
+def test_warm_start_beneficial_drift_keeps_profile():
+    """The warmup fix: a first warm request's cost DROPS as the expert pool reaches steady
+    residency. That benign (beneficial) drift must NOT invalidate the profile -- otherwise the
+    next request re-probes and the warm serve never settles at the ~104 TG the profile is for
+    (measured: warm mean 101 with run0 at 104 because uid0's warmup drift re-probed uid1).
+    Only a HARMFUL drift (cost rising) invalidates -- see the sibling reprobe test."""
+    controller = AdaptiveMtpController(1, profiled_depth=1)
+    controller.begin_request("warm", "epoch-a")
+    assert controller.next_depth() == 1
+    for _ in range(8):
+        controller.observe(1, 0.030, 1)  # early: pool cold, slow
+    for _ in range(8):
+        controller.observe(1, 0.008, 1)  # steady: fast -> beneficial drift
+    controller.begin_request("warm2", "epoch-a")
+    assert not controller.probing  # profile survived the warmup drift
+    assert controller.next_depth() == 1
