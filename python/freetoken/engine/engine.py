@@ -683,11 +683,9 @@ class Engine:
         # card is the weights: every later sizing decision (expert slots, KV pages, rebuild
         # fit-checks) asks it for a budget instead of re-deriving one from free memory, and
         # --memory-ratio becomes a cap on the account rather than the safety policy itself.
-        self.vram_ledger = self._open_vram_ledger(config)
-        # Resolve GDN state precision for speculative MTP BEFORE any pool budget is priced:
-        # both the expert-cache memory planner (spec_state_bytes) and the GDN LinearStatePool
-        # read the SSM dtype + compact-state env, so both must see the resolved values.
+        # Ledger, planner and pool must price the same resolved state layout and dtype.
         _resolve_mtp_state_precision(config)
+        self.vram_ledger = self._open_vram_ledger(config)
         from freetoken.tuning import diagnostics
 
         diagnostics.configure(
@@ -1080,7 +1078,8 @@ class Engine:
                 state_bytes,
                 Kind.PERSISTENT,
                 f"{_linear_pool_num_slots(config)} physical slots x "
-                f"{mem_GB(state_pool_bytes(config, 1))} per sequence",
+                f"{mem_GB(state_pool_bytes(config, 1) - spec_state_bytes(config))} per slot "
+                f"+ {mem_GB(spec_state_bytes(config))} shared speculative state",
             )
         ple_host = int(getattr(self, "_host_tables_bytes", 0) or 0)
         ledger.charge(
