@@ -54,3 +54,30 @@ Archived session evidence is under `/models/desenvolvimento/old/freetoken-next/m
 Runtime and session evidence commit: `c8c30a9` (`fix(mtp): restore automatic state and residency correctness`). Documentation/ai-memory closure followed the user's instruction to stop validation and all agents.
 
 The original 512K claim is recorded as user history, not verified decode evidence. Capacity planning, prompt ingestion and decode certification are separate gates.
+
+## Final validation — resumed run, 2026-09-29 (HEAD `317588b`, source `c8c30a9`)
+
+The user authorized resuming validation. All checks ran serially on the frozen source (no runtime file changed during the batch; `git diff HEAD -- python tests` stayed empty). Evidence: `/models/desenvolvimento/old/freetoken-next/mtp-regression-20260929/` (`closure-orchestrator.status`, `full-ci-final.log`, `bench16-final.log`, `auto-final16.jsonl`, `diag16.jsonl`, `pressure-final16.result.json`, `usage-final16.json`, `val16.status`).
+
+- Full CI (GPU attached): `make ci` passed — 2693 passed, 209 skipped, 17 deselected, 3 warnings. Formatting left all 685 source files unchanged.
+- Bare automatic ISTA 16K (`auto-final16`, one warmup + six measured, context 16704, no flags beyond context): mean TG 102.066 tok/s, min 98.93→99.11 range, all six outputs 256 tokens with SHA-1 `76a5508fd576` — RAW parity holds. **The 103.58 tok/s gate was not met**, so 256K certification was not run and is not claimed. Repeat diagnostics on the same frozen source: bare rerun mean 101.612; explicit `FREETOKEN_MAMBA_SSM_DTYPE=bfloat16` (skips the FP32-first probe) mean 102.215 — the probe is not the tax.
+- Physical pressure/recovery at 16K passed: before/under/recovered all exact 256 tokens, identical SHA, `pressure_error=None`, KV 389 pages and GDN 7 slots invariant, expert rows 5853→5773→5950 (recovered above baseline).
+- Usage quality at 16K passed: 20/20 tasks (`gates.usage_20_of_20 = true`).
+
+### Measured attribution of the 103.58 gap (~1.5–2%)
+
+1. Automatic GDN snapshot default (`linear_state_cache_ratio=2.0`) prices ~59–90 expert rows below the ratio-0 opt-out that produced the 103.58 reference; the reference itself is correct (SHA `76a5508fd576`) but used an explicit opt-out and pre-final-fix code — the pairs were never re-run on the final HEAD.
+2. Final correctness fixes (BF16 carry rounding, FP32-first probe ladder, probe-conservative reserves) cost roughly 0.4–1% end-to-end versus the old-code same-pool 102.63; the FP32→BF16 discard path leaks no cache, but a discarded probe candidate is never explicitly destroyed (`python/freetoken/engine/engine.py:1884-1912`) — unproven residue, worth an isolated experiment.
+3. Steady automatic TG already matches the legitimate same-pool forced-k4 reference within noise; the remaining mean loss is the ratio-default VRAM economics plus in-run prefill-pressure shrink churn (guard shrinks ~100 rows at prefill and regrows mid-decode).
+
+### 113.36 tok/s path — verified status
+
+`notes/open-investigations.md` (#1/#2) recorded 113.36 = 104 × a QSA M=5 kernel-level +9%. Root cause #1 (premature k0 via under-priced transients) is fixed by `c8c30a9`; automatic runs keep k4 (365/384 cycles). The M=5 candidate `[32,16,4]` was implemented, tested end-to-end A/B/A (≈100.06/99.90/100.30 — no gain; kernel-level 9% did not translate), reverted, and is absent from the tree. Conclusion: **113.36 is falsified as written**; its re-evaluation precondition ("once k4 headroom is cleared") is still unmet because automatic sits ~1.5% below 104. Remaining levers, in measured order of size: adaptive snapshot-cache economics (price ratio-2.0 default against measured prefix-hit benefit under binding VRAM), prefill-transient overpricing that triggers mid-run shrink/regrow churn, the ~0.4–1% correctness-fix dtype cost, and the probe-discard cleanup experiment. None is certified; none may be claimed without a bare automatic 16K rerun meeting its gate.
+
+### Open items after this run
+
+1. Re-pair the references on the final HEAD (forced-k4 ratio-0 and ratio-2.0, six measured repeats) to convert attribution items 1/2 from cross-code inference into same-code measurements.
+2. Root-fix batch for the gap above; each fix requires CI + bare 16K rerun before any gate claim.
+3. 256K certification only after a bare automatic 16K meets 103.58 on frozen source (not met 2026-09-29).
+4. Accepted-prefix QSA commit-vs-RAW proof across the compressed 128-row boundary remains open.
+5. The validation harnesses used here were copied from the closure worktree into `scripts/` (`physical_pressure_acceptance.py`, `qualify_long_context.py`) plus the serial `closure_orchestrator.sh`; pre-existing checkout WIP remains untouched and uncommitted.
