@@ -265,6 +265,7 @@ def _shed_mtp(config) -> bool:
         "state takes (speculative decoding off, context kept)"
     )
     from freetoken.tuning import diagnostics
+
     diagnostics.log_event(
         "degrade",
         "shed_mtp",
@@ -688,12 +689,15 @@ class Engine:
         # read the SSM dtype + compact-state env, so both must see the resolved values.
         _resolve_mtp_state_precision(config)
         from freetoken.tuning import diagnostics
+
         diagnostics.configure(
             config.model_path,
             {
                 "spec_mtp": getattr(config, "spec_mtp", 0),
                 "kv_format": str(getattr(config, "kv_format", "auto")),
-                "max_seq_len": int(getattr(config, "max_seq_len_override", 0) or getattr(config, "max_seq_len", 0)),
+                "max_seq_len": int(
+                    getattr(config, "max_seq_len_override", 0) or getattr(config, "max_seq_len", 0)
+                ),
                 "moe_strategy": str(getattr(config, "moe_strategy", "")),
                 "max_running_req": int(getattr(config, "max_running_req", 1)),
             },
@@ -1373,10 +1377,10 @@ class Engine:
         self._charge_expert_cache(cache)
 
     def _calibrate_vram_ledger(self) -> None:
-        """Print the account next to what the allocator actually holds.
+        """Compare the account with live allocator bytes plus driver-backed expert arenas.
 
         ``_sync_get_memory`` resets the peak counter on the way through init, so a peak is only
-        ever one window's peak; the honest steady-state comparison is what the allocator holds
+        ever one window's peak; the steady-state comparison includes physical VMM backing
         right now. A positive gap is an unmodelled consumer -- exactly what this account exists
         to expose -- so it is warned about, never asserted: an assertion would take a serving
         process down over an accounting detail, and a live forward can outrun the model without
@@ -1392,8 +1396,17 @@ class Engine:
             "measured:allocator-held",
             held,
             Kind.MEASURED,
-            "what the allocator holds; the account must explain it",
+            "live PyTorch allocations; excludes CUDA Driver VMM backing",
         )
+        cache = getattr(self, "moe_offload_cache", None)
+        vmm_backed = sum(a.backed_bytes for a in getattr(cache, "_vmm_arenas", ()))
+        ledger.charge(
+            "measured:vmm-backed",
+            vmm_backed,
+            Kind.MEASURED,
+            "physical expert backing outside the PyTorch allocator",
+        )
+        held += vmm_backed
         base = getattr(self, "_transient_probe_base", None)
         if base is not None:
             # peak minus the steady state at the probe = the biggest transient the runtime has
@@ -1411,22 +1424,23 @@ class Engine:
         if unexplained > CALIBRATION_TOLERANCE:
             logger.warning_rank0(
                 f"VRAM ledger under-modelled the account by {mem_GB(unexplained)}: the allocator "
-                f"holds {mem_GB(held)} and the account claims {mem_GB(ledger.held_bytes())}. "
+                f"and VMM hold {mem_GB(held)} and the account claims {mem_GB(ledger.held_bytes())}. "
                 "Something allocates outside the model (a per-slot expert cost that omits the "
                 "kernel's side tables is the known case) -- find it or leave ratio headroom."
             )
             from freetoken.tuning import diagnostics
+
             diagnostics.log_event(
                 "warn",
                 "vram_ledger",
-                f"ledger under-modelled by {mem_GB(unexplained)}: allocator holds {mem_GB(held)} vs account {mem_GB(ledger.held_bytes())} (OOM risk)",
+                f"ledger under-modelled by {mem_GB(unexplained)}: allocator and VMM hold {mem_GB(held)} vs account {mem_GB(ledger.held_bytes())} (OOM risk)",
                 unexplained_bytes=unexplained,
                 **diagnostics.vram_snapshot(self.device),
             )
         elif -unexplained > CALIBRATION_TOLERANCE:
             logger.info_rank0(
                 f"VRAM ledger over-modelled the account by {mem_GB(-unexplained)}: the pools it "
-                "priced are smaller than the account claimed, so context is being left unspent."
+                "priced conservatively. Driver free memory remains the physical headroom authority."
             )
 
     def _log_context_feasibility(self, config: EngineConfig, ledger) -> None:
@@ -1481,6 +1495,7 @@ class Engine:
         why = why or f"{config.kv_format} does not fit {config.max_seq_len} tokens"
         logger.info_rank0(f"KV format auto: {config.kv_format} -> {fmt} ({why})")
         from freetoken.tuning import diagnostics
+
         diagnostics.log_event(
             "degrade",
             "kv_format",
