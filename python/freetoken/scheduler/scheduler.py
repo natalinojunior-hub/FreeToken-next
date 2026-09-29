@@ -200,7 +200,10 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         if self.spec_mtp > 0 and os.getenv("FREETOKEN_MTP_FIXED_DEPTH", "0") != "1":
             from .adaptive_mtp import AdaptiveMtpController
 
-            cap = min(self.spec_mtp, 4)
+            # Depth ceiling is the configured --spec-mtp itself (the single-head
+            # tuning default stays at 4 by choice, not by clamp); verify/draft graphs
+            # and mmvq row shapes scale with it in engine._maybe_enable_spec_mtp.
+            cap = self.spec_mtp
             # Warm start from a previously learned depth (same hardware+model+build+config
             # fingerprint) so this serve skips the calibration probe; None -> calibrate.
             profiled = self._load_mtp_depth_profile(cap)
@@ -209,12 +212,18 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         self._spec_snapshot_slots: dict[int, int] = {}
         if self.spec_mtp > 0:
             if config.max_running_req != 1:
-                from freetoken.scheduler.spec import MTP_ROTATE_ENV, rotate_spec_enabled
+                from freetoken.scheduler.spec import (
+                    MTP_BATCHED_ENV,
+                    MTP_ROTATE_ENV,
+                    batched_spec_enabled,
+                    rotate_spec_enabled,
+                )
 
-                if not rotate_spec_enabled():
+                if not rotate_spec_enabled() and not batched_spec_enabled():
                     raise ValueError(
                         "--spec-mtp > 0 supports single-request serving only for now "
-                        f"(EXPERIMENTAL opt-in: {MTP_ROTATE_ENV}=1 rotates cycles across streams)."
+                        f"(EXPERIMENTAL opt-ins: {MTP_ROTATE_ENV}=1 rotates cycles across "
+                        f"streams; {MTP_BATCHED_ENV}=1 verifies all streams in one window)."
                     )
             if getattr(self.engine.model, "mtp", None) is None:
                 raise ValueError(
@@ -1226,6 +1235,9 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             return self.run_spec_step()
         except Exception as e:  # noqa: BLE001 -- see _forward_or_fail
             if not _is_oom(e):
+                import traceback
+
+                logger.error("[spec-trace]\n" + traceback.format_exc())
                 raise
             self._fail_oom_reqs(list(self.decode_manager.running_reqs), e)
             return True

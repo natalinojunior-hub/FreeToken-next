@@ -311,7 +311,7 @@ def test_offline_generate_keeps_uids_monotonic_across_calls(monkeypatch):
 @pytest.mark.parametrize(
     ("native_layers", "kwargs", "expected_req", "expected_spec"),
     [
-        (1, {}, 1, 4),
+        (1, {}, 1, 6),
         (0, {}, 4, 0),
         (1, {"max_running_req": 2}, 2, 0),
         (1, {"spec_mtp": 0}, 4, 0),

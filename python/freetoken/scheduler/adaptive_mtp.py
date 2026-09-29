@@ -123,8 +123,8 @@ class AdaptiveMtpController:
     """
 
     def __init__(self, safe_max_k: int, profiled_depth: int | None = None):
-        if type(safe_max_k) is not int or not 0 <= safe_max_k <= 4:
-            raise ValueError("safe_max_k must be an integer from 0 through 4")
+        if type(safe_max_k) is not int or safe_max_k < 0:
+            raise ValueError("safe_max_k must be a non-negative integer")
         self.safe_max_k = safe_max_k
         self._force_depth = _forced_depth_or_none(safe_max_k)
         # A depth learned by a previous serve under the SAME hardware+model+build+config
@@ -210,7 +210,7 @@ class AdaptiveMtpController:
         never lock k=0 the way the old "must be significantly BETTER" gate did -- that gate
         failed on noise and abandoned speculation for the whole request (campaign37: auto
         runs locked k0 at ~74 TG while fixed-depth k4 measured ~104). Among the eligible
-        depths take the lowest measured cost, breaking ties toward the deeper draft.
+        depths take the lowest measured cost, unbiased by depth.
         """
         baseline = self._stats[0]
         if len(baseline.samples) < _MIN_BASELINE_SAMPLES:
@@ -225,19 +225,15 @@ class AdaptiveMtpController:
                 eligible.append(depth)
         if not eligible:
             return 0  # every positive depth is significantly worse -> speculation hurts
-        # Among the eligible depths prefer the DEEPEST whose cost is not *significantly* worse
-        # than the cheapest eligible depth. The user asked for --spec-mtp k (the deepest draft),
-        # so a shallower depth only wins when a deeper one is PROVABLY slower (a residency
-        # cliff), not when a short 4-sample probe failed to show its edge. k3 and k4 differ by
-        # ~2% in true cost while a 4-sample probe carries ~10-40% noise, so plain min-cost
-        # coin-flipped k3/k4 and the engine settled at ~102 TG instead of the ~104 the cap can
-        # reach ("always max TG"). Ties and noise therefore break toward the deeper draft.
+        # Among the eligible depths take the lowest measured cost with NO depth bias.
+        # (Previous bias took the DEEPEST depth whose noise band touched the cheapest's;
+        # on a saturated-acceptance corpus one extra draft step is +27% true step cost and
+        # a 4-sample band still waved it through, so auto settled on k6 at 97 TG while k5
+        # measured 106. campaign37's k0-lock fear is handled by the eligibility gate above
+        # (2-sigma vs baseline), not by depth preference; the hysteresis in
+        # _reselect_with_hysteresis keeps the incumbent on genuine 2% coin-flips.)
         cheapest = min(eligible, key=lambda d: self._stats[d].cost)
-        ceiling = self._stats[cheapest].cost + 2 * self._stats[cheapest].se
-        within_noise = [
-            d for d in eligible if self._stats[d].cost - 2 * self._stats[d].se <= ceiling
-        ]
-        return max(within_noise)
+        return cheapest
 
     def begin_request(self, request_uid, epoch) -> None:
         if request_uid == self._request_uid and epoch == self._epoch:

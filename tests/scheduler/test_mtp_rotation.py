@@ -4,6 +4,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from freetoken.scheduler.spec import SchedulerSpecMixin
 
@@ -13,6 +14,8 @@ class _Sched(SchedulerSpecMixin):
         self.spec_mtp = spec_mtp
         self.decode_manager = SimpleNamespace(running_reqs=running)
         self._mtp_controller = controller
+        self.finished_reqs = []  # list: SimpleNamespace fakes are unhashable
+        self._save_mtp_depth_profile = lambda _depth: None
 
 
 _seq = iter(range(1_000_000, 1_000_000_000))
@@ -21,7 +24,12 @@ _seq = iter(range(1_000_000, 1_000_000_000))
 def _req(greedy=True, remain=10):
     # distinct uid keeps SimpleNamespace structural equality from aliasing two stubs
     return SimpleNamespace(
-        sampling_params=SimpleNamespace(is_greedy=greedy), remain_len=remain, uid=next(_seq)
+        sampling_params=SimpleNamespace(is_greedy=greedy),
+        remain_len=remain,
+        uid=next(_seq),
+        device_len=5,
+        input_ids=torch.zeros(5, dtype=torch.int32),
+        append_host=None,
     )
 
 
@@ -72,3 +80,53 @@ def test_begin_requires_controller(monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def _controller():
+    return SimpleNamespace(
+        safe_max_k=4,
+        begin_request=lambda uid, epoch: None,
+        fallback_to_k0=lambda: None,
+        next_depth=lambda: 4,
+        observe=lambda *a: None,
+        consume_learned_depth=lambda: None,
+        cost_summaries={},
+        selected_depth=4,
+    )
+
+
+def test_batched_begin_stashes_all_greedy_including_tails(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_MTP_BATCHED", "1")
+    monkeypatch.delenv("FREETOKEN_MTP_ROTATE", raising=False)
+    a, tail = _req(), _req(remain=1)
+    sched = _Sched([a, tail])
+    sched.engine = SimpleNamespace(moe_offload_cache=None, num_pages=8)
+    sched._mtp_controller = _controller()
+    sched._mtp_controllers = {a.uid: _controller(), tail.uid: _controller()}
+    sample = SchedulerSpecMixin._begin_mtp_cycle(sched)
+    assert [p[0] for p in sample] == [a, tail]
+    assert sched._spec_cycle_reqs == [a, tail]
+    # per-uid controllers exist and tail's depth is decided by remain, not the controller
+    assert set(sched._mtp_controllers) == {a.uid, tail.uid}
+    sched._mtp_cycle_depths = {a.uid: 4, tail.uid: 0}
+    for part in sample:
+        part[0].input_ids = torch.zeros(part[1] + 1, dtype=torch.int32)
+    SchedulerSpecMixin._finish_mtp_cycle(sched, sample)
+    assert sched._spec_cycle_req is None
+
+
+def test_batched_pick_empty_returns_none(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_MTP_BATCHED", "1")
+    sched = _Sched([])
+    assert SchedulerSpecMixin._begin_mtp_cycle(sched) is None
+
+
+def test_single_mode_begin_unchanged_under_batched_off(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_MTP_BATCHED", raising=False)
+    monkeypatch.delenv("FREETOKEN_MTP_ROTATE", raising=False)
+    a = _req()
+    sched = _Sched([a])
+    sched.engine = SimpleNamespace(moe_offload_cache=None, num_pages=8)
+    sched._mtp_controller = _controller()
+    sample = SchedulerSpecMixin._begin_mtp_cycle(sched)
+    assert isinstance(sample, tuple) and sample[0] is a

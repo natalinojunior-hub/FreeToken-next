@@ -65,6 +65,7 @@ from .base import BaseOP
 
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
 _MMVQ_SAFE = 6
+_MMVQ_CHUNK_MAX_ROWS = 32
 
 # Kill-switch for the GGUFMergedLinear quantize-once hoist (bit-exact; default on).
 # Set to 0 to fall back to per-part re-quantization (used for same-binary A/B).
@@ -139,6 +140,15 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
         return small_batch_linear(x.to(w.dtype), w).to(x.dtype)
     if x.shape[0] <= _MMVQ_SAFE and qweight_type in MMVQ_TYPES:
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
+    if qweight_type in MMVQ_TYPES and x.shape[0] <= _MMVQ_CHUNK_MAX_ROWS:
+        # Above the GEMV comfort zone (batched-verify windows, bs > 6 decode): the
+        # full-matrix dequant below is a >1 GiB scratch per forward on a 248k-vocab
+        # head and OOMs an occupied card. Chunks keep the GEMV path with zero scratch.
+        outs = [
+            ggml_mul_mat_vec_a8(qweight, chunk, qweight_type, out_features)
+            for chunk in x.split(_MMVQ_SAFE)
+        ]
+        return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
     if qweight_type in DEQUANT_TYPES:
         # Beats the vendored MMQ ~9x on SM120 from 64 rows up, and is more accurate (no
         # int8 activation rounding): Q8_0 [2560x6144] x 4096 rows 10.9 ms MMQ, 1.2 ms here.

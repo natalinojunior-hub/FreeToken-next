@@ -32,6 +32,7 @@ logger = init_logger(__name__)
 
 SPEC_TIMING_ENV = "FREETOKEN_DEBUG_SPEC_TIMING"
 MTP_ROTATE_ENV = "FREETOKEN_MTP_ROTATE"
+MTP_BATCHED_ENV = "FREETOKEN_MTP_BATCHED"
 
 
 # "1": run every graph-eligible verify eagerly first and assert the graph replay reproduces it
@@ -64,6 +65,15 @@ def rotate_spec_enabled() -> bool:
     single-cycle ownership across the running set (one stream cycles spec, the others
     advance through the plain batch between cycles)."""
     return os.getenv(MTP_ROTATE_ENV, "0") == "1"
+
+
+def batched_spec_enabled() -> bool:
+    """EXPERIMENTAL opt-in (F2b): one spec cycle per iteration covers EVERY greedy running
+    request — per-req draft chains, one multi-window verify forward. The single-rotation
+    mode starves non-owning streams between cycles; batched windows remove that. Verify
+    runs eager (multi-req) and the linear state uses the snapshot+replay path, so v1 pays
+    a few ms/iter back versus the CUDA-graph single-req fast path."""
+    return os.getenv(MTP_BATCHED_ENV, "0") == "1"
 
 
 class SchedulerSpecMixin:
@@ -177,7 +187,7 @@ class SchedulerSpecMixin:
         every cycle switch and drowns each stream's cost samples in the other streams' raw
         steps, collapsing depth selection toward k0. Single-slot keeps the one controller."""
         base = getattr(self, "_mtp_controller", None)
-        if not rotate_spec_enabled() or req is None:
+        if not (rotate_spec_enabled() or batched_spec_enabled()) or req is None:
             return base
         table = getattr(self, "_mtp_controllers", None)
         if table is None:
@@ -208,7 +218,15 @@ class SchedulerSpecMixin:
             return None
         return req
 
+    def _pick_spec_reqs(self) -> list:
+        """Batched mode cycle owners: every running greedy request, tail tokens included
+        (they ride the verify batch as one-row windows instead of waiting for a raw
+        iteration). Order = running order; cycle offsets derive from it."""
+        return [req for req in self.decode_manager.running_reqs if req.sampling_params.is_greedy]
+
     def _begin_mtp_cycle(self):
+        if batched_spec_enabled() and len(self._pick_spec_reqs()) > 1:
+            return SchedulerSpecMixin._begin_mtp_cycle_batched(self)
         req = SchedulerSpecMixin._pick_spec_req(self)
         controller = SchedulerSpecMixin._controller_for(self, req)
         if req is None or controller is None:
@@ -233,25 +251,73 @@ class SchedulerSpecMixin:
         self._mtp_cycle_observe = True
         return req, req.input_ids.numel(), time.perf_counter()
 
+    def _begin_mtp_cycle_batched(self):
+        self._batched_maps()
+        reqs = self._pick_spec_reqs()
+        if not reqs:
+            self._spec_cycle_req = None
+            return None
+        cache = getattr(self.engine, "moe_offload_cache", None)
+        epoch = (
+            max(req.device_len.bit_length() for req in reqs),
+            getattr(cache, "cache_size", None),
+            bool(getattr(cache, "_vmm_arenas", ())),
+            self.engine.num_pages,
+        )
+        self._mtp_cycle_depths = {}
+        self._mtp_cycle_depth = 0
+        self._mtp_cycle_observe = True
+        self._spec_cycle_reqs = reqs
+        samples = []
+        for req in reqs:
+            controller = SchedulerSpecMixin._controller_for(self, req)
+            if controller is None:
+                self._spec_cycle_reqs = None
+                return None
+            controller.begin_request(req.uid, epoch)
+            if req.remain_len <= 1:
+                controller.fallback_to_k0()
+            samples.append((req, req.input_ids.numel(), time.perf_counter()))
+        return samples
+
     def _finish_mtp_cycle(self, sample) -> None:
         self._spec_cycle_req = None
+        if isinstance(sample, list):
+            for part in sample:
+                SchedulerSpecMixin._finish_mtp_cycle_part(self, part)
+            return
         if sample is None:
             return
+        SchedulerSpecMixin._finish_mtp_cycle_part(self, sample)
+
+    def _finish_mtp_cycle_part(self, sample) -> None:
+        req, before, started = sample
         req, before, started = sample
         committed = req.input_ids.numel() - before
         if committed <= 0:
             return
         elapsed = time.perf_counter() - started
         controller = SchedulerSpecMixin._controller_for(self, req)
-        depth = self._mtp_cycle_depth
-        if self._mtp_cycle_observe:
+        depths = getattr(self, "_mtp_cycle_depths", None)
+        depth = (
+            depths.get(req.uid, getattr(self, "_mtp_cycle_depth", 0))
+            if depths
+            else self._mtp_cycle_depth
+        )
+        per_uid_observe = getattr(self, "_mtp_cycle_observes", None)
+        observed = (
+            per_uid_observe.get(req.uid, self._mtp_cycle_observe)
+            if per_uid_observe
+            else self._mtp_cycle_observe
+        )
+        if observed and depth is not None:
             controller.observe(depth, elapsed, committed)
             # A calibration just converged -> persist the learned depth so the next serve of
             # this fingerprint warm-starts at it. None on non-calibration cycles.
             learned = controller.consume_learned_depth()
             if learned is not None:
                 self._save_mtp_depth_profile(learned)
-        if rotate_spec_enabled():
+        if rotate_spec_enabled() or batched_spec_enabled():
             table = getattr(self, "_mtp_distributions", None)
             if table is None:
                 table = self._mtp_distributions = {}
@@ -592,16 +658,236 @@ class SchedulerSpecMixin:
     def _take_mtp_fill(self, req: Req):
         """(residual rows, tokens) for the committed positions the last draft chain skipped
         (see run_spec_step's commit), or None; they are prepended to the first draft step."""
+        rows_map = getattr(self, "_mtp_kv_rows_map", None)
+        if rows_map is not None and req.uid in rows_map:
+            pos, res, tok = rows_map.pop(req.uid)
+            if pos + res.shape[0] == req.device_len - 1:
+                return res, tok
+            return None
         rows = getattr(self, "_mtp_kv_rows", None)
         self._mtp_kv_rows = None
         if rows is None or rows[0] != req.uid or rows[1] + rows[2].shape[0] != req.device_len - 1:
             return None
         return rows[2], rows[3]
 
+    def _batched_maps(self):
+        if getattr(self, "_mtp_kv_rows_map", None) is None:
+            self._mtp_kv_rows_map = {}
+        if getattr(self, "_mtp_residual_by_uid", None) is None:
+            self._mtp_residual_by_uid = {}
+
+    @nvtx_annotate("MTPCycleBatched", enabled=_PROFILE_DECODE)
+    def _batched_spec_cycle(self) -> bool:
+        """F2b: one iteration advances EVERY greedy running request. Each k>0 request runs
+        its own draft chain (sequential MTP steps, per-req snapshots), then ONE multi-req
+        prefill forward verifies all windows ([d-1, d+k) rows per request; k=0 requests get
+        a 1-row window == the raw decode step). Correctness anchor: only the verify model's
+        argmax is ever committed, so a wrong chain residual costs acceptance, not text.
+        ponytail: chains are sequential (b*k draft steps/iter) and verify is eager
+        (multi-req misses the captured graphs); batch the chains (S2) and per-bs verify
+        graphs once the economics prove the verify-sharing win."""
+        from freetoken.scheduler.adaptive_mtp import resolve_adaptive_k
+
+        self._batched_maps()
+        reqs = getattr(self, "_spec_cycle_reqs", None) or self._pick_spec_reqs()
+        if not reqs:
+            return False
+        self._flush_deferred_replays()
+        model = self.engine.model
+        pool = self.engine.linear_state_pool
+        # Width cap: the multi-window verify runs eager (no captured graph) and its
+        # prefill expert staging scales with total rows (~0.5 GiB per row beyond the
+        # single-req 5-row budget). FREETOKEN_MTP_BATCHED_MAX_ROWS trades per-stream
+        # acceptance depth for stream count; 12 rows measured safe at 16K.
+        max_rows = max(len(reqs), int(os.getenv("FREETOKEN_MTP_BATCHED_MAX_ROWS", "12")))
+        k_cap = max(0, min(self.spec_mtp, (max_rows - len(reqs)) // max(1, len(reqs))))
+        depths: dict[int, int] = {}
+        observe: dict[int, bool] = {}
+        for req in reqs:
+            controller = SchedulerSpecMixin._controller_for(self, req)
+            requested = int(controller.next_depth()) if controller else 0
+            k = max(0, int(resolve_adaptive_k(req, requested))) if controller else 0
+            if req.remain_len <= 1:
+                k = 0
+            if k > requested or (k == 0 and requested != 0):
+                # clamp: partial -> unobserved hole (legacy k != requested_k rule);
+                # full clamp to 0 -> notify via fallback so observe(0) stays honest.
+                if k == 0 and requested != 0 and controller is not None:
+                    controller.fallback_to_k0()
+                    observe[req.uid] = True
+                else:
+                    observe[req.uid] = False
+            else:
+                observe[req.uid] = True
+            depths[req.uid] = k
+        # Register depths even when the cycle declines: every next_depth() call must be
+        # answered by an observe on the raw step's finish, or the controllers' probe
+        # accounting desyncs (same contract as the legacy k<=0 branch).
+        self._mtp_cycle_depths = depths
+        self._mtp_cycle_observes = observe
+        self._mtp_cycle_observe = True
+        if not any(k > 0 for k in depths.values()):
+            return False
+
+        chains: dict[int, dict] = {}
+        for req in reqs:
+            k = depths[req.uid]
+            if not k:
+                continue
+            d = req.device_len
+            c0 = req.cached_len
+            snap_slot = None
+            if pool is not None:
+                snap_slot = self._spec_snapshot_slot(req)
+                pool.copy_from(self._linear_slot(req), snap_slot)
+            self._snapshot_qsa_state(req)
+            self._snapshot_ple_state(req)
+            residual_snapshot = self._mtp_residual_by_uid.get(
+                req.uid, model.model._last_residual[-1:]
+            ).clone()
+            fill = self._take_mtp_fill(req)
+            r_prev = residual_snapshot
+            tok_prev = self.token_pool[req.table_idx, d - 1 : d]
+            for i in range(k):
+                pos = d - 1 + i
+                r_in, tok_in = r_prev, tok_prev
+                if i == 0 and fill is not None:
+                    pos = d - 1 - fill[0].shape[0]
+                    r_in, tok_in = torch.cat([fill[0], r_prev]), torch.cat([fill[1], tok_prev])
+                req.cached_len, req.device_len = pos, d + i
+                r_prev, _logits, tok_prev = self._draft_step(req, pos, r_in, tok_in)
+                if i == 0:
+                    self._retain_mtp_ring(req)
+                self.token_pool[req.table_idx, d + i] = tok_prev
+            drafts = self.token_pool[req.table_idx, d : d + k].tolist()
+            req.cached_len, req.device_len = c0, d
+            if snap_slot is not None:
+                pool.copy_from(snap_slot, self._linear_slot(req))
+            model.model._last_residual = residual_snapshot
+            self._restore_qsa_state(req)
+            self._restore_ple_state(req)
+            chains[req.uid] = {"d": d, "c0": c0, "drafts": drafts, "snap_slot": snap_slot}
+
+        windows = []
+        host_ids: list[int] = []
+        for req in reqs:
+            ctx = chains.get(req.uid)
+            k = depths[req.uid] or 0
+            d = ctx["d"] if ctx else req.device_len
+            c0 = ctx["c0"] if ctx else req.cached_len
+            req.cached_len, req.device_len = c0, d + k
+            windows.append((req, d, k, ctx))
+            host_ids += [*req.input_ids[c0:d].tolist(), *(ctx["drafts"] if ctx else [])]
+        vb = Batch(reqs=[w[0] for w in windows], phase="prefill")
+        vb.spec_logits_indices = torch.arange(
+            sum(k + 1 for _, _, k, _ in windows), device=self.device
+        )
+        fi = self._prepare_batch(vb)
+        vb.input_ids = self.token_pool[fi.input_tuple]
+        vb.spec_host_ids = host_ids
+        try:
+            out = self.engine.forward_batch(vb, fi.sample_args)
+            out.copy_done_event.synchronize()
+        except torch.cuda.OutOfMemoryError:
+            if os.getenv("FREETOKEN_OOM_SNAPSHOT") and not getattr(
+                self, "_oom_snap_done", False
+            ):
+                self._oom_snap_done = True
+                torch.cuda.memory._record_memory_history(max_entries=100000)
+                torch.cuda.memory._dump_snapshot(os.environ["FREETOKEN_OOM_SNAPSHOT"])
+            # A refused speculative window costs cycles, never requests: reclaim the
+            # uncommitted windows, force k0 everywhere so the raw batch runs next
+            # iteration, and let the VRAM pressure loop shrink what it needs to.
+            for req, d, k, ctx in windows:
+                c0 = ctx["c0"] if ctx else req.cached_len
+                if k > 0:
+                    self.cache_manager.free_spec_reject(req, keep_len=d, alloc_len=d + k)
+                req.cached_len, req.device_len = c0, d
+                self._restore_qsa_state(req)
+                if ctx and ctx["snap_slot"] is not None:
+                    pool.copy_from(ctx["snap_slot"], self._linear_slot(req))
+            for req in reqs:
+                controller = SchedulerSpecMixin._controller_for(self, req)
+                if controller is not None:
+                    controller.fallback_to_k0()
+                    self._mtp_cycle_observes[req.uid] = False
+            torch.cuda.empty_cache()
+            import traceback
+
+            logger.error(
+                "batched spec verify OOM: windows rolled back, all streams k0\n"
+                + traceback.format_exc()
+            )
+            return False
+        sampled_all = out.next_tokens_cpu.tolist()
+
+        last_res = getattr(model.model, "_last_residual", None)
+        finished: list[Req] = []
+        offset = 0
+        for req, d, k, ctx in windows:
+            rows = k + 1
+            sampled = sampled_all[offset : offset + rows]
+            drafts = ctx["drafts"] if ctx else []
+            accepted = accept_drafts(sampled, drafts)
+            m = len(accepted)
+            c0 = ctx["c0"] if ctx else req.cached_len
+            snap_slot = ctx["snap_slot"] if ctx else None
+            self.token_pool[req.table_idx, d : d + m] = out.next_tokens_gpu[offset : offset + m]
+            if k > 0:
+                logger.info(
+                    f"spec[b{len(windows)}]: uid={req.uid} k={k} m={m} "
+                    f"accepted={m - 1}/{k} drafts={drafts} sampled={sampled} "
+                    f"d={d} c0={c0} off={offset} tot={vb.input_ids.shape[0]}"
+                )
+
+            def finish_state(count: int, req=req, c0=c0, snap_slot=snap_slot) -> None:
+                if snap_slot is not None:
+                    pool.copy_from(snap_slot, self._linear_slot(req))
+                self._restore_qsa_state(req)
+                if count > 0:
+                    self._replay(req, c0, count)
+
+            committed = self._commit_spec_tokens(
+                req, accepted, start_pos=d, spec_alloc_len=d + k, finish_state=finish_state
+            )
+            finished_now = committed < m or (committed == m and req in self.finished_reqs)
+            if finished_now:
+                self.free_spec_snapshot_slot(req)
+                finished.append(req)
+                offset += rows
+                continue
+            if committed <= k:
+                keep_cached, keep_device = spec_rollback_lengths(d, committed)
+                self.cache_manager.free_spec_reject(req, keep_len=keep_device, alloc_len=d + k)
+                if snap_slot is not None:
+                    pool.copy_from(snap_slot, self._linear_slot(req))
+                self._restore_qsa_state(req)
+                if keep_cached - c0 > 0:
+                    self._replay(req, c0, keep_cached - c0)
+                req.cached_len, req.device_len = keep_cached, keep_device
+            if last_res is not None and last_res.shape[0] >= offset + committed:
+                if committed > 1:
+                    self._mtp_kv_rows_map[req.uid] = (
+                        d,
+                        last_res[offset : offset + committed - 1].clone(),
+                        out.next_tokens_gpu[offset : offset + committed - 1].clone(),
+                    )
+                self._mtp_residual_by_uid[req.uid] = last_res[
+                    offset + committed - 1 : offset + committed
+                ].clone()
+            self.cache_manager.cache_req(req, finished=False)
+            self.decode_manager.filter_reqs([req])
+            offset += rows
+        if finished:
+            self.decode_manager.filter_reqs(finished)
+        return True
+
     @nvtx_annotate("MTPCycle", enabled=_PROFILE_DECODE)
     def run_spec_step(self) -> bool:
         """Run one speculative decode step for the single eligible request. Returns True if
         it ran (the caller should skip its own _schedule_next_batch/_forward this iteration)."""
+        if batched_spec_enabled() and len(self._pick_spec_reqs()) > 1:
+            return SchedulerSpecMixin._batched_spec_cycle(self)
         req = self._spec_eligible_req()
         if req is None:
             self._flush_deferred_replays()

@@ -219,7 +219,9 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             core_out = self._recurrent(
                 mixed, a, b, fla.cache_indices, fla.cu_seqlens, li, pool, dtype
             )
-        elif batch.spec_logits_indices is not None and fla.track_dst is None:
+        elif (
+            batch.spec_logits_indices is not None and fla.track_dst is None and len(batch.reqs) == 1
+        ):
             # One-request MTP verify/draft window, CUDA-graph capturable and on the k=0
             # decode kernels: the conv rolls row by row (tiny), then ONE fused recurrence
             # over all rows loads/stores the state once. With the pool's zero-replay buffers

@@ -120,7 +120,7 @@ def _tuned_spec_mtp(kwargs: dict, native_mtp_layers: int | None = None) -> int:
         return ServerArgs.spec_mtp
     if native_mtp_layers is None:
         native_mtp_layers = _native_mtp_layers(kwargs["model_path"])
-    return 4 if native_mtp_layers == 1 else ServerArgs.spec_mtp
+    return 6 if native_mtp_layers == 1 else ServerArgs.spec_mtp
 
 
 def _resolve_mtp_defaults(kwargs: dict, model_path: str | None = None) -> None:
