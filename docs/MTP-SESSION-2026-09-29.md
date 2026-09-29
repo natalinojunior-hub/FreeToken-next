@@ -33,6 +33,6 @@ QSA `[16,32,4]` vs `[32,16,4]` A/B/A produced about 100.06/99.90/100.30 tok/s; t
 
 Archived session evidence is under `/models/desenvolvimento/old/freetoken-next/mtp-regression-20260929/`. `final-runtime.patch` contains the complete candidate runtime patch relative to checkpoint `c6ef2af`; all 15 changed runtime files match the candidate byte-for-byte. Candidate tests also match except for the unrelated IQ4 tolerance change, which was deliberately left untouched. The checkout had substantial pre-existing work, including archive/doc removals. Those unrelated changes were preserved and must not be swept into the MTP task commit. The local benchmark harness file `scripts/bench_runner.py` is pre-existing work.
 
-Commit: added after the user requested a commit and documentation update; see the commit recorded in the main checkout history. The user then explicitly stopped all further work.
+Runtime and session evidence commit: `c8c30a9` (`fix(mtp): restore automatic state and residency correctness`). Documentation/ai-memory closure followed the user's instruction to stop validation and all agents.
 
 The original 512K claim is recorded as user history, not verified decode evidence. Capacity planning, prompt ingestion and decode certification are separate gates.
