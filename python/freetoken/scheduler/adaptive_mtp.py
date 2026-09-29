@@ -110,6 +110,8 @@ class _RatioWindow:
 _MIN_BASELINE_SAMPLES = 8
 _MIN_DEPTH_SAMPLES = 4
 _PROBE_REPEATS = 4
+# Cap for the amortized k=0 audit cadence (see observe(): doubles on each confirming audit).
+_MAX_BASELINE_INTERVAL = 4096
 
 
 class AdaptiveMtpController:
@@ -321,18 +323,40 @@ class AdaptiveMtpController:
         window.add(float(elapsed_s), committed_tokens)
         calibration_finished = was_probing and not self._plan
         if calibration_finished:
-            if self._auditing:
-                # Validate a cached choice promptly, then amortize repeated counterfactuals.
-                self._baseline_interval = 128
+            was_auditing = self._auditing
+            depth_before_audit = self._selected_depth
             self._auditing = False
             self._profiled_depth = None
             self._cycles_since_baseline = 0
             self._observations_since_check = 0
             if not self._terminal_k0:
-                self._selected_depth = self._best_depth()
+                if was_auditing:
+                    # An audit is an insurance re-check of a cached depth, not a fresh
+                    # campaign: keep the current depth unless it is clearly beaten or
+                    # unsafe. The old direct _best_depth() call let probe noise flip the
+                    # pick every cycle, and each flip reset the amortized cadence --
+                    # the whole 103.6 -> 101.6 auto deficit measured on the cert model.
+                    self._reselect_with_hysteresis()
+                else:
+                    self._selected_depth = self._best_depth()
                 if self._selected_depth == 0:
                     self.fallback_to_k0()
                     self._needs_reprobe = True
+            if was_auditing:
+                # Amortized counterfactual insurance: each audit that CONFIRMS the same
+                # depth is new evidence of a stable regime, so the cadence quadruples
+                # (capped). A changed pick resets it -- a contested choice must be
+                # re-audited promptly.
+                self._baseline_interval = (
+                    128
+                    if self._selected_depth != depth_before_audit
+                    else min(4 * max(self._baseline_interval, 32), _MAX_BASELINE_INTERVAL)
+                )
+            else:
+                # A fresh campaign just measured every depth against a brand-new k=0
+                # baseline; the counterfactual is proven current, so the first audit can
+                # wait a full amortized interval instead of taxing the next served burst.
+                self._baseline_interval = 512
             if self._selected_depth > 0 and not self._terminal_k0:
                 # A fresh calibration just converged: expose the learned depth so the engine can
                 # persist it (tuning.mtp_profile) and the next serve skip the probe. Only a
@@ -350,6 +374,8 @@ class AdaptiveMtpController:
                     # measured comparison. Periodic fresh k0 audits remain active below.
                     self._profiled_depth = None
                     self._needs_reprobe = True
+                    # A contested regime earns its counterfactual promptly again.
+                    self._baseline_interval = 64
                 if not self._terminal_k0 and len(self._stats[0].samples) >= _MIN_BASELINE_SAMPLES:
                     self._reselect_with_hysteresis()
             if not self._terminal_k0 and self._cycles_since_baseline >= self._baseline_interval:

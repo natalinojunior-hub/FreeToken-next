@@ -171,8 +171,9 @@ def test_cost_rise_keeps_measured_winner_and_counterfactual_audits():
     controller.begin_request("still-cheapest", "epoch-a")
     assert not controller.probing
     assert controller.next_depth() == 2
-    # The measured winner still receives fresh k0 comparisons on the normal audit schedule.
-    for _ in range(24):
+    # The measured winner still receives fresh k0 comparisons on the audit schedule:
+    # a fresh campaign just proved every depth, so the counterfactual is amortized.
+    for _ in range(controller._baseline_interval - 8):
         controller.observe(2, 0.010, 1)
     assert controller.probing
     assert controller.next_depth() == 0
@@ -391,7 +392,10 @@ def test_calibrated_controller_periodically_audits_fresh_k0():
     controller = AdaptiveMtpController(1)
     _calibrate(controller, costs={0: [0.010] * 8, 1: [0.008] * 4})
     assert controller.selected_depth == 1
-    for _ in range(32):
+    # A completed campaign is the freshest possible counterfactual proof: the first audit
+    # waits a full amortized interval, then quadruples on each confirmation.
+    assert controller._baseline_interval == 512
+    for _ in range(controller._baseline_interval):
         controller.observe(1, 0.008, 1)
     assert controller.probing
     assert controller.next_depth() == 0
@@ -400,7 +404,8 @@ def test_calibrated_controller_periodically_audits_fresh_k0():
         controller.observe(0, 0.020, 1)
     assert controller.selected_depth == 1
     assert controller.next_depth() == 1
-    for _ in range(127):
+    assert controller._baseline_interval == 2048
+    for _ in range(controller._baseline_interval - 1):
         controller.observe(1, 0.008, 1)
         assert not controller.probing
     controller.observe(1, 0.008, 1)
@@ -411,7 +416,7 @@ def test_calibrated_controller_periodically_audits_fresh_k0():
 def test_audit_cost_variation_does_not_invalidate_its_measured_winner():
     controller = AdaptiveMtpController(1)
     _calibrate(controller, costs={0: [0.020] * 8, 1: [0.008] * 4})
-    for _ in range(32):
+    for _ in range(controller._baseline_interval):
         controller.observe(1, 0.008, 1)
     for elapsed in [0.020] * 4 + [0.030] * 4:
         controller.observe(0, elapsed, 1)

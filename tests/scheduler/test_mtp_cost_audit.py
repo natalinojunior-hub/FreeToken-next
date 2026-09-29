@@ -183,3 +183,25 @@ def test_output_budget_truncation_keeps_controller_depth_and_reports_actual_dept
     assert saved == []
     assert scheduler._mtp_distribution[1][:2] == [1, 1]
     assert "[mtp-economics] uid=tail" in caplog.text
+
+
+def test_k0_audit_cadence_doubles_while_cached_depth_keeps_winning():
+    controller = AdaptiveMtpController(4, profiled_depth=4)
+    controller.begin_request("amortize", 0)
+
+    def run(n, elapsed_per_step, committed):
+        for _ in range(n):
+            depth = controller.next_depth()
+            controller.observe(depth, elapsed_per_step, committed)
+
+    run(32, 0.010, 5)  # prompt validation of the cached depth: first audit at 32
+    run(8, 0.040, 1)
+    assert controller._baseline_interval == 128
+    run(128, 0.010, 5)
+    run(8, 0.040, 1)
+    assert controller._baseline_interval == 512
+    run(512, 0.010, 5)
+    run(8, 0.040, 1)
+    assert controller._baseline_interval == 2048
+    assert controller.selected_depth == 4
+    assert controller.consume_learned_depth() == 4
