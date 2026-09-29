@@ -97,11 +97,20 @@ class _RatioWindow:
         newer.samples.extend(samples[-half:])
         return abs(older.cost - newer.cost) > 2 * sqrt(older.se**2 + newer.se**2)
 
-    def drifted_worse(self) -> bool:
-        """True only when the recent half is significantly MORE expensive than the older half
-        (a harmful regime change). A cost DECREASE -- pool warmup reaching steady residency, or
-        any beneficial drift -- returns False, so a warm-started profile is not thrown away by
-        the very warmup it survives. Same 2-sigma bar as ``drifted()``, signed."""
+    def drifted_worse(self, rel_floor: float = 0.10) -> bool:
+        """True when the recent half is BOTH statistically significant AND materially
+        (>= ``rel_floor``, default 10%) MORE expensive than the older half -- a harmful regime
+        change. A cost DECREASE (pool warmup reaching steady residency, any beneficial drift)
+        returns False, so a warm-started profile is not thrown away by the very warmup it
+        survives.
+
+        The relative floor is the important part: a warm-started depth at steady state has
+        low-variance samples, so a pure 2-sigma test trips on a few-percent fluctuation and
+        spuriously re-probes (observed: a clean k4 warm serve re-probed one request and lost
+        ~6 TG, mean 100.8 vs run0 103.7). A genuine regime change -- e.g. the expert pool
+        falling back to full-back, ~13.5% slower -- moves cost well past 10%, so it is still
+        caught. A cost decrease never counts as worse.
+        """
         n = len(self.samples)
         half = n // 2
         if half < 4:
@@ -110,7 +119,10 @@ class _RatioWindow:
         older, newer = _RatioWindow(), _RatioWindow()
         older.samples.extend(samples[:half])
         newer.samples.extend(samples[-half:])
-        return (newer.cost - older.cost) > 2 * sqrt(older.se**2 + newer.se**2)
+        if older.cost <= 0:
+            return False
+        material = newer.cost > older.cost * (1.0 + rel_floor)
+        return material and (newer.cost - older.cost) > 2 * sqrt(older.se**2 + newer.se**2)
 
 
 # Calibration probe budget. The k=0 baseline is measured first (contiguous, so it is not

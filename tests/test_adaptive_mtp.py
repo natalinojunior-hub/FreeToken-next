@@ -377,3 +377,21 @@ def test_warm_start_beneficial_drift_keeps_profile():
     controller.begin_request("warm2", "epoch-a")
     assert not controller.probing  # profile survived the warmup drift
     assert controller.next_depth() == 1
+
+
+def test_warm_start_small_cost_rise_does_not_invalidate():
+    """The relative-floor fix: a warm-started depth at steady state has low-variance samples,
+    so a few-percent cost rise (normal fluctuation) must NOT invalidate the profile and force a
+    re-probe -- that spuriously dropped the warm mean from ~104 to ~101 TG (one re-probed
+    request). Only a MATERIAL (>=10%) and significant rise -- a real regime change such as the
+    expert pool falling back to full-back (~13.5% slower) -- counts as harmful drift."""
+    controller = AdaptiveMtpController(1, profiled_depth=1)
+    controller.begin_request("warm", "epoch-a")
+    assert controller.next_depth() == 1
+    for _ in range(8):
+        controller.observe(1, 0.0100, 1)  # steady
+    for _ in range(8):
+        controller.observe(1, 0.0104, 1)  # a ~4% rise: noise, not a regime change
+    controller.begin_request("warm2", "epoch-a")
+    assert not controller.probing  # small rise ignored -> still warm
+    assert controller.next_depth() == 1
