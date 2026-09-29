@@ -311,19 +311,23 @@ def test_warm_start_survives_epoch_churn_without_reprobing():
     assert controller.next_depth() == 4
 
 
-def test_warm_start_drift_invalidates_profile_and_reprobes():
-    """Drift while trusting a profile means conditions moved: invalidate and run a full cold
-    calibration next request (the engine then re-saves the newly learned depth)."""
+def test_warm_start_is_rigid_through_in_serve_drift():
+    """Warm start is RIGID for the whole serve: the profile's key (hardware+model+build+config)
+    is fixed within a serve, so even a large cost rise is warmup/noise/a request transition,
+    not a config change -- the controller holds the profiled depth and does NOT re-probe (a
+    spurious re-probe was costing ~3 TG of warm mean). Recalibration happens only on a
+    fingerprint change (next serve) or FREETOKEN_MTP_PROFILE=refresh; a genuine runtime FAILURE
+    is handled by spec.py's fallback_to_k0, not by drift here."""
     controller = AdaptiveMtpController(1, profiled_depth=1)
     controller.begin_request("warm", "epoch-a")
     assert controller.next_depth() == 1
     for _ in range(8):
-        controller.observe(1, 0.008, 1)  # stable warm cost
+        controller.observe(1, 0.008, 1)  # steady warm cost
     for _ in range(8):
-        controller.observe(1, 0.030, 1)  # regime change: depth 1 got much slower -> drift
+        controller.observe(1, 0.030, 1)  # a big rise -- ignored while warm (rigid)
     controller.begin_request("warm2", "epoch-a")
-    assert controller.probing  # profile invalidated -> cold calibration
-    assert controller.next_depth() == 0  # probe restarts at the k0 baseline
+    assert not controller.probing  # rigid: no re-probe on in-serve drift
+    assert controller.next_depth() == 1
 
 
 def test_cold_calibration_exposes_learned_depth_exactly_once():
