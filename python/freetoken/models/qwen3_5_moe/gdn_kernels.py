@@ -67,6 +67,7 @@ def gdn_decode_fla(
     scale: float,
     intermediate_states: torch.Tensor | None = None,  # [1, steps, num_v, K, V]: per-row state
     intermediate_indices: torch.Tensor | None = None,  # [1] int32 (0)
+    rollback_tape: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Fused sigmoid-gating gated-delta-rule decode (vendored fla triton kernel): gating +
     in-kernel l2norm + recurrent update + state read/write-by-index in one kernel, with no
@@ -90,6 +91,7 @@ def gdn_decode_fla(
         cu_seqlens=cu_seqlens,
         intermediate_states_buffer=intermediate_states,
         intermediate_state_indices=intermediate_indices,
+        rollback_tape=rollback_tape,
     )
     # kernel returns o = [NK, *v.shape] then squeeze(NK) -> [1, B, num_v, V].
     # o[0] -> [B, num_v, V] (all B decode tokens; o[0,0] would drop B>1).

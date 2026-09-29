@@ -86,4 +86,6 @@ def test_log_event_never_raises_on_unwritable_dir(isolated, monkeypatch):
 
     monkeypatch.setattr(os, "makedirs", fail_makedirs)
     # Must swallow exception silently and never raise
-    diagnostics.log_event("warn", "vram_ledger", "ledger under-modelled", severity="warn", unexplained_bytes=1024)
+    diagnostics.log_event(
+        "warn", "vram_ledger", "ledger under-modelled", severity="warn", unexplained_bytes=1024
+    )

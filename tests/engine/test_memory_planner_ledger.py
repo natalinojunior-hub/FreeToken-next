@@ -157,8 +157,8 @@ def test_gdn_slots_budgeted_at_built_pool_size():
         linear_state_cache_ratio = 2.0
         model_config = MC()
 
-    # 1 request: 4 working + max(4, 2) snapshot + 1 padding
-    assert _linear_pool_num_slots(C) == 9 > _linear_pool_min_slots(C)
+    # 1 request: 4 working + ceil(2 * 1) snapshots + 1 padding
+    assert _linear_pool_num_slots(C) == 7 > _linear_pool_min_slots(C)
 
 
 def test_ram_tier_keeps_only_the_hot_floor_on_device():

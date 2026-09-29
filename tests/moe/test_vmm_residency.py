@@ -63,21 +63,49 @@ def _consistent(cache) -> None:
                 assert ids[cache._pool_starts[p] + slot] == layer * E + e
 
 
+def test_physical_shrink_keeps_every_retained_granule(monkeypatch):
+    device = torch.device("cuda")
+    granule = vmm.granularity(torch.cuda.current_device())
+    arena = vmm.VirtualArena(device, 4 * granule, [(0, 4 * granule)])
+    try:
+        arena.set_backed(0, 4 * granule)
+        arena.tensor[: 2 * granule].fill_(73)
+        torch.cuda.synchronize()
+
+        def forbidden_map(*args):
+            raise AssertionError("a physical shrink must not allocate or remap the prefix")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(arena, "_map", forbidden_map)
+            assert arena.set_backed(0, 2 * granule) == 2 * granule
+        assert arena.backed_bytes == 2 * granule
+        assert bool((arena.tensor[: 2 * granule] == 73).all())
+        assert arena.set_backed(0, 3 * granule) == 2 * granule
+        assert bool((arena.tensor[: 2 * granule] == 73).all())
+    finally:
+        torch.cuda.synchronize()
+        arena.release()
+
+
 def test_grow_keeps_residents_and_shrink_keeps_the_prefix():
     cache = _cache(12, vmm_rows=30)
     assert cache.resident_rows < cache.cache_size
     cache.reset()  # must leave the unbacked tail blocked
     before = cache.expert_pool_bytes
     a = _resident(cache, 0, [1, 2, 3])
+    grow_backing = cache.backed_bytes_for(30)
     grown = cache.set_live(30)
     assert grown > 12 and cache.expert_pool_bytes >= before  # tiny rows: one granule each
+    assert cache.expert_pool_bytes == grow_backing
     assert _resident(cache, 0, [1, 2, 3]) == a  # warm: same slots, no reload
     _resident(cache, 0, [0, 4, 5, 6, 7])
     _resident(cache, 1, list(range(E)))
     _resident(cache, 2, list(range(E)))
     _consistent(cache)
+    shrink_backing = cache.backed_bytes_for(12)
     cache.set_live(12)
     assert cache.expert_pool_bytes == before
+    assert cache.expert_pool_bytes == shrink_backing
     _consistent(cache)
     _resident(cache, 2, [0, 1, 2, 3, 4, 5, 6, 7])  # evictions stay inside the live prefix
     _consistent(cache)
@@ -122,6 +150,7 @@ def test_set_live_shrink_never_grows_a_pool(monkeypatch):
 
 def test_vmm_mtp_draft_bank_prefill_boundary():
     """Draft-only layers (prefill_moe_layers) must not force prefill staging reservations in pool 0."""
+
     def bank(shapes, tag):
         out = []
         for layer, shape in enumerate(shapes):

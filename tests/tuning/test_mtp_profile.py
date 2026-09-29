@@ -44,6 +44,18 @@ def test_key_deterministic(isolated):
     assert _key(isolated) == _key(isolated)
 
 
+def test_source_fingerprint_includes_state_pool_implementation(monkeypatch, tmp_path):
+    package = tmp_path / "freetoken"
+    state_dir = package / "kvcache"
+    state_dir.mkdir(parents=True)
+    source = state_dir / "linear_state_pool.py"
+    monkeypatch.setattr(mp, "__file__", str(package / "tuning" / "mtp_profile.py"))
+    source.write_text("slots = 9\n")
+    fingerprint = mp._calibration_source_fingerprint.__wrapped__()
+    source.write_text("slots = 7\n")
+    assert fingerprint != mp._calibration_source_fingerprint.__wrapped__()
+
+
 @pytest.mark.parametrize(
     "axis,value",
     [

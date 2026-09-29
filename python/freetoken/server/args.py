@@ -114,21 +114,30 @@ def _json_object(text: str) -> dict:
     return value
 
 
-def _tuned_spec_mtp(kwargs: dict) -> int:
-    """--spec-mtp left unset: the stored `ft tune` choice for this machine, model, KV format
-    and context, else the built-in default. MTP serves one request at a time, so a profile
-    never turns it on for a multi-request server."""
+def _tuned_spec_mtp(kwargs: dict, native_mtp_layers: int | None = None) -> int:
+    """Enable online depth selection only when the checkpoint has a native MTP head."""
     if kwargs.get("max_running_req") not in (None, 1):
         return ServerArgs.spec_mtp
-    from freetoken.tuning.profile import load_for
+    if native_mtp_layers is None:
+        native_mtp_layers = _native_mtp_layers(kwargs["model_path"])
+    return 4 if native_mtp_layers == 1 else ServerArgs.spec_mtp
 
-    model_path = os.path.expanduser(kwargs["model_path"])
-    profile = load_for(model_path, kwargs["kv_format"], kwargs["max_seq_len_override"])
-    if profile is not None:
-        return profile.chosen.spec_mtp
-    # No profile means no measured economics. Keep the safe k0 path until a local profile
-    # proves speculation wins; native NextN metadata alone does not predict throughput.
-    return ServerArgs.spec_mtp
+
+def _resolve_mtp_defaults(kwargs: dict, model_path: str | None = None) -> None:
+    """Resolve request concurrency and MTP together while preserving explicit values."""
+    max_running_req = kwargs.get("max_running_req")
+    spec_mtp = kwargs.get("spec_mtp")
+    native_mtp_layers = None
+    if (max_running_req is None and spec_mtp != 0) or (
+        spec_mtp is None and max_running_req in (None, 1)
+    ):
+        native_mtp_layers = _native_mtp_layers(kwargs.get("model_path", model_path))
+    if max_running_req is None:
+        kwargs["max_running_req"] = (
+            1 if native_mtp_layers == 1 and spec_mtp != 0 else ServerArgs.max_running_req
+        )
+    if spec_mtp is None:
+        kwargs["spec_mtp"] = _tuned_spec_mtp(kwargs, native_mtp_layers)
 
 
 def _native_nextn_layers(model_path: str) -> int:
@@ -144,6 +153,27 @@ def _native_nextn_layers(model_path: str) -> int:
         meta = load_gguf_metadata(model_path)
         return int(meta.get(f"{gguf_architecture(model_path)}.nextn_predict_layers", 0) or 0)
     except Exception:  # noqa: BLE001 -- an unreadable header just leaves MTP at its default
+        return 0
+
+
+def _native_mtp_layers(model_path: str) -> int:
+    """Return the loaded checkpoint's native MTP layer count, including discovered GGUF heads."""
+    try:
+        from freetoken.utils import cached_load_hf_config
+
+        config = cached_load_hf_config(model_path)
+        if getattr(config, "metadata", None) is not None:
+            if getattr(config, "model_type", None) == "qwen4exp":
+                from freetoken.models.qwen4_exp.gguf import _parse_mtp_config_from_gguf
+
+                return _parse_mtp_config_from_gguf(model_path).num_hidden_layers
+            return _native_nextn_layers(model_path)
+
+        raw = config.to_dict()
+        text_config = raw.get("text_config") or raw
+        mtp = text_config.get("mtp") or {}
+        return int(mtp.get("num_hidden_layers", 0) or 0)
+    except Exception:  # noqa: BLE001 -- failed discovery must leave MTP off
         return 0
 
 
@@ -332,8 +362,11 @@ def parse_args(
         "--max-running-requests",
         type=int,
         dest="max_running_req",
-        default=ServerArgs.max_running_req,
-        help="The maximum number of running requests.",
+        default=None,
+        help=(
+            "The maximum number of running requests. Unset defaults to 1 when the checkpoint "
+            f"has a native MTP head, else {ServerArgs.max_running_req}."
+        ),
     )
 
     parser.add_argument(
@@ -475,9 +508,9 @@ def parse_args(
         "--spec-mtp",
         type=_nonnegative_int,
         default=None,
-        help="Native checkpoint MTP depth ceiling; serving measures k0/k1/k2 online and "
+        help="Native checkpoint MTP depth ceiling; serving measures depths through k4 online and "
         "falls back to k0 when speculation loses. 0 keeps speculative decoding disabled. "
-        "Unset: the `ft tune` profile's measured choice for this machine and context, else "
+        "Unset: k4 online selection for a native head with one running request; otherwise "
         f"{ServerArgs.spec_mtp}.",
     )
 
@@ -506,14 +539,10 @@ def parse_args(
             "Cross-request GDN snapshot cache size as a multiple of --max-running-requests "
             "(hybrid-radix only). Each snapshot is ~0.11 GiB of VRAM on Flash-Next, so a "
             "single-request decode workload can set 0 to hand those slots to the MoE expert "
-            "cache; the price is that a warm request hitting a KV prefix must rebuild its GDN "
-            "state instead of restoring a snapshot (worse TTFT on cache hits, same output). "
-            "Measured bit-identical for ratio 0 vs 2.0 on ISTA IQ3_XXS (+2.1% TG) and on "
-            "Flash-Next AD 4.27bpw (campaign-35, 2K/32 warm prefix-hit, 6 runs; an older "
-            "build's AD text change does not reproduce). Note AD's warm radix prefix reuse "
-            "is itself NOT bit-identical to its cold full prefill (early greedy flip from "
-            "the fp re-composition at the reuse boundary; ISTA is bit-stable): use "
-            "--cache-type naive on AD when cross-request determinism matters."
+            "cache. Active requests still reserve their working snapshots. ISTA IQ3_XXS "
+            "passed cold/warm output checks with ratio 0. The GDN IQ2_S/IQ4_NL layout "
+            "used by AD diverged with the tight snapshot pool at 16K: ratio 0 automatically "
+            "selects naive cache for that layout; a positive ratio keeps hybrid radix."
         ),
     )
 
@@ -961,8 +990,6 @@ def parse_args(
         )
 
     # resolve some arguments
-    if kwargs["spec_mtp"] is None:
-        kwargs["spec_mtp"] = _tuned_spec_mtp(kwargs)
     run_shell |= kwargs.pop("shell_mode")
     kwargs["shell_mode"] = run_shell
     if run_shell:
@@ -1027,6 +1054,9 @@ def parse_args(
                 ignore_patterns = ["*.bin", "*.safetensors", "*.pt", "*.ckpt"]
             model_path = snapshot_download(model_path, ignore_patterns=ignore_patterns)
             kwargs["model_path"] = model_path
+
+    _resolve_mtp_defaults(kwargs)
+
     del kwargs["model_source"]
 
     # "auto" (or an unspecified dtype) resolves to the checkpoint's dtype. Multimodal /

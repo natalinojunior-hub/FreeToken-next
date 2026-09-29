@@ -33,7 +33,7 @@ SHAPES = [
     ("hc_up", 10240, 320),
     ("square", 2560, 2560),
 ]
-MS = (1, 2, 3, 4, 8)
+MS = (1, 2, 3, 4, 5, 8)
 
 # The split-K reduce reassociates in fp32 then casts to bf16, so it tracks the fp32 reference
 # at least as tightly as cuBLAS does. Measured: rel-to-fp32 ~1.6-1.8e-3, rel-to-cuBLAS <=2.8e-3.

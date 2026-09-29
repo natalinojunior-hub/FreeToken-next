@@ -55,6 +55,28 @@ def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capaci
     )
 
 
+def _gpu_mtp_pool(*, kv_format="bf16", host_pages=0, host_dtype=None, preserve=True):
+    return QSAKVCache(
+        num_kv_heads=2,
+        num_layers=3,
+        head_dim=128,
+        num_pages=4,
+        page_size=64,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+        index_head_dim=32,
+        num_index_layers=3,
+        index_ratio=4,
+        num_req_slots=4,
+        layer_ids=(0, 1, 2),
+        kv_format=kv_format,
+        mtp_layer_id=2,
+        host_pages=host_pages,
+        host_dtype=host_dtype,
+        preserve_mtp_prefix=preserve,
+    )
+
+
 def _spec(
     *,
     index_ratio=4,
@@ -362,3 +384,122 @@ def test_free_req_clears_mtp_draft_slot():
     pool_t4.free_req(0)
     assert pool_t4._pool._k_codes[4].abs().sum().item() == 0
     assert pool_t4._pool._k_norm[4].abs().sum().item() == 0.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_free_req_preserves_mtp_prefix_and_other_request_state():
+    pool = _gpu_mtp_pool()
+    assert pool.preserve_mtp_prefix
+    pool._kv_buffer.fill_(3.0)
+    pool._cmp_k_buffer.fill_(5.0)
+    pool._pending_ring.fill_(7.0)
+    pool._cmp_k_buffer[:, pool.cmp_scratch_base + 1].fill_(11.0)
+    pool._cmp_k_buffer[:, pool.cmp_scratch_base + 2].fill_(13.0)
+
+    prefix_k = pool.k_cache(2)[:, :8].clone()
+    prefix_v = pool.v_cache(2)[:, :8].clone()
+    prefix_cmp = pool._cmp_k_buffer[:, :8].clone()
+    other_k = pool.k_cache(0)[:, 8:16].clone()
+    other_v = pool.v_cache(0)[:, 8:16].clone()
+    other_ring = pool._pending_ring[2].clone()
+    other_scratch = pool._cmp_k_buffer[:, pool.cmp_scratch_base + 2].clone()
+
+    pool.free_req(1)
+
+    assert torch.equal(pool.k_cache(2)[:, :8], prefix_k)
+    assert torch.equal(pool.v_cache(2)[:, :8], prefix_v)
+    assert torch.equal(pool._cmp_k_buffer[:, :8], prefix_cmp)
+    assert torch.equal(pool.k_cache(0)[:, 8:16], other_k)
+    assert torch.equal(pool.v_cache(0)[:, 8:16], other_v)
+    assert torch.equal(pool._pending_ring[2], other_ring)
+    assert torch.equal(pool._cmp_k_buffer[:, pool.cmp_scratch_base + 2], other_scratch)
+    assert torch.count_nonzero(pool._pending_ring[1]) == 0
+    assert torch.count_nonzero(pool._cmp_k_buffer[:, pool.cmp_scratch_base + 1]) == 0
+
+
+@pytest.mark.parametrize("kv_format", ("bf16", "turbo4"))
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_zero_mtp_first_token_changes_only_target_layer_row(kv_format):
+    pool = _gpu_mtp_pool(kv_format=kv_format)
+    logical = pool._page_size + 5
+    out_loc = torch.tensor([logical], dtype=torch.int32, device=pool.device)
+
+    if kv_format == "bf16":
+        pool._kv_buffer.fill_(9.0)
+        k_before, v_before = pool.k_cache(2).clone(), pool.v_cache(2).clone()
+        target_before = [
+            (pool.k_cache(layer).clone(), pool.v_cache(layer).clone()) for layer in (0, 1)
+        ]
+        pool.zero_mtp_first_token(out_loc)
+        expected_k, expected_v = k_before.clone(), v_before.clone()
+        expected_k[1, 5].zero_()
+        expected_v[1, 5].zero_()
+        assert torch.equal(pool.k_cache(2), expected_k)
+        assert torch.equal(pool.v_cache(2), expected_v)
+        for layer, (k, v) in zip((0, 1), target_before):
+            assert torch.equal(pool.k_cache(layer), k)
+            assert torch.equal(pool.v_cache(layer), v)
+        return
+
+    pool._pool._k_codes.fill_(7)
+    pool._pool._v_codes.fill_(9)
+    pool._pool._k_norm.fill_(2.0)
+    pool._pool._v_norm.fill_(3.0)
+    before = [
+        t.clone()
+        for t in (
+            pool._pool._k_codes,
+            pool._pool._k_norm,
+            pool._pool._v_codes,
+            pool._pool._v_norm,
+        )
+    ]
+    pool.zero_mtp_first_token(out_loc)
+    from freetoken.kernel.triton.turbo_kv import quantize
+
+    zeros = torch.zeros(2, 128, device=pool.device, dtype=torch.bfloat16)
+    zero_codes, zero_norms = quantize(zeros, "turbo4")
+    expected = [t.clone() for t in before]
+    dense = 2
+    expected[0][dense, logical] = zero_codes.reshape_as(expected[0][dense, logical])
+    expected[1][dense, logical] = zero_norms.reshape_as(expected[1][dense, logical])
+    expected[2][dense, logical] = zero_codes.reshape_as(expected[2][dense, logical])
+    expected[3][dense, logical] = zero_norms.reshape_as(expected[3][dense, logical])
+    for actual, wanted in zip(
+        (pool._pool._k_codes, pool._pool._k_norm, pool._pool._v_codes, pool._pool._v_norm),
+        expected,
+    ):
+        assert torch.equal(actual, wanted)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_zero_mtp_first_token_uses_page_map_for_fp8_host_tier():
+    pool = _gpu_mtp_pool(
+        host_pages=2,
+        host_dtype=torch.float8_e4m3fn,
+    )
+    # Route logical page zero to physical RAM page three; zeroing must honor this indirection.
+    pool.page_map[0] = 3
+    logical = 5
+    out_loc = torch.tensor([logical], dtype=torch.int32, device=pool.device)
+    pool._kv_buffer.fill_(6.0)
+    for layer in (0, 1, 2):
+        host_k, host_v = pool.host_kv(layer)
+        host_k.fill_(4.0)
+        host_v.fill_(5.0)
+    host_before = [tuple(t.clone() for t in pool.host_kv(layer)) for layer in (0, 1, 2)]
+    device_before = pool._kv_buffer.clone()
+
+    pool.zero_mtp_first_token(out_loc)
+
+    for layer, (k_before, v_before) in zip((0, 1), host_before[:2]):
+        host_k, host_v = pool.host_kv(layer)
+        assert torch.equal(host_k, k_before)
+        assert torch.equal(host_v, v_before)
+    target_k, target_v = pool.host_kv(2)
+    expected_k, expected_v = host_before[2][0].clone(), host_before[2][1].clone()
+    expected_k[1, 5].zero_()
+    expected_v[1, 5].zero_()
+    assert torch.equal(target_k, expected_k)
+    assert torch.equal(target_v, expected_v)
+    assert torch.equal(pool._kv_buffer, device_before)

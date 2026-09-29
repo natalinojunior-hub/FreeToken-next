@@ -301,6 +301,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         qwen4_args=qwen4_args,
         slot_states=ple_slot_states(qwen4_args),
         mtp_row_state_commit=True,
+        mtp_residual_width=qwen4_args.hc_count * qwen4_args.hidden_size,
         kv_ram_tier_certified=True,
     )
 

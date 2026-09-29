@@ -201,6 +201,50 @@ def test_pool_sizing_covers_4mr_floor():
         assert _linear_pool_num_slots(c) >= 4 * mr + 1, (mr, _linear_pool_num_slots(c))
 
 
+def test_locked_restore_survives_eviction_at_four_usable_slots():
+    """A pinned hit must survive eviction pressure in the minimum five-slot pool."""
+    pool = _pool(num_slots=5)  # slot 0 is padding; four slots are usable
+    pt = torch.zeros(2, 16, dtype=torch.int32)
+    cm = CacheManager(16, 1, pt, "hybrid_radix", linear_state_pool=pool)
+
+    pages = cm._allocate(4)
+    source, unrelated = pool.alloc(2)
+    for tensor, value in (
+        (pool.conv_states, 11),
+        (pool.recurrent_states, 23),
+    ):
+        tensor[:, source].fill_(value)
+        tensor[:, unrelated].fill_(value + 1)
+
+    cache = cm.prefix_cache
+    cache.insert(torch.tensor([1, 2], dtype=torch.int32), pages[:2], source)
+    cache.insert(torch.tensor([3, 4], dtype=torch.int32), pages[2:], unrelated)
+    unrelated_node = cache.match_prefix(torch.tensor([3, 4], dtype=torch.int32)).node
+    hit = cm.match_req(_pend([1, 2, 9]))
+    assert hit.mamba_value == source
+    cm.lock(hit.cuda_handle)
+
+    # The two free slots are insufficient, so the unrelated checkpoint is evicted.
+    cm.ensure_mamba_slots(3)
+    assert pool.num_free_slots == 3
+    assert unrelated_node.mamba_value is None
+    assert hit.cuda_handle.node.mamba_value == source
+    assert torch.all(pool.conv_states[:, source] == 11)
+    assert torch.all(pool.recurrent_states[:, source] == 23)
+
+    live, ping_pong_a, ping_pong_b = pool.alloc(3)
+    pool.copy_from(source, live)
+    assert torch.equal(pool.conv_states[:, live], pool.conv_states[:, source])
+    assert torch.equal(pool.recurrent_states[:, live], pool.recurrent_states[:, source])
+    cm.unlock(hit.cuda_handle)
+    pool.free([live, ping_pong_a, ping_pong_b])
+
+    # One tree snapshot remains and the other three usable slots are free.
+    assert pool.num_free_slots == 3
+    assert pool.num_free_slots + cache.mamba_evictable_size + cache.mamba_protected == 4
+    cm.check_integrity()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

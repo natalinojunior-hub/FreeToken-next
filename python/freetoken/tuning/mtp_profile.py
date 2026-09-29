@@ -11,10 +11,8 @@ learned depth directly. On the campaign37 cert model that is the difference betw
 
 VERSIONING + FORCED RECALIBRATION (the operator requirement this module exists to satisfy):
 
-* The key folds in a *content* fingerprint of every source tree that can change which depth
-  wins -- ``kernel/`` + ``moe/`` (numerics and timing) and ``scheduler/`` + ``engine/`` (the
-  depth-selection logic: the adaptive controller, the spec driver, the resolver). Editing any
-  file under them changes the fingerprint, so a stale profile is never silently trusted: the
+* The key folds in a *content* fingerprint of the runtime source tree. Editing any
+  runtime source changes the fingerprint, so a stale profile is never silently trusted: the
   engine recalibrates and re-saves. This is the automatic, fine-grained version, and it needs
   no manual ``__version__`` bump (``__version__`` is coupled to the installed kernel-cache
   package's ABI check, so bumping it in isolation would break the build).
@@ -55,9 +53,6 @@ _MODE_OFF = "off"
 _MODE_REFRESH = "refresh"
 _VALID_MODES = (_MODE_AUTO, _MODE_OFF, _MODE_REFRESH)
 
-# Source trees whose CONTENT can change which MTP depth is optimal. Hashed into the key so any
-# edit to the depth-deciding logic forces recalibration (see the module docstring).
-_CALIBRATION_SOURCE_BASES = ("kernel", "moe", "scheduler", "engine")
 _SOURCE_SUFFIXES = (".py", ".cu", ".cuh", ".cpp", ".cc", ".h", ".hpp")
 
 
@@ -74,11 +69,8 @@ def _calibration_source_fingerprint() -> str:
     root = os.path.dirname(os.path.dirname(__file__))  # python/freetoken
     h = hashlib.sha256()
     paths: list[str] = []
-    for base in _CALIBRATION_SOURCE_BASES:
-        for dirpath, _dirs, files in os.walk(os.path.join(root, base)):
-            paths += [
-                os.path.join(dirpath, n) for n in files if n.endswith(_SOURCE_SUFFIXES)
-            ]
+    for dirpath, _dirs, files in os.walk(root):
+        paths += [os.path.join(dirpath, n) for n in files if n.endswith(_SOURCE_SUFFIXES)]
     for p in sorted(paths, key=lambda p: os.path.relpath(p, root)):
         try:
             with open(p, "rb") as f:

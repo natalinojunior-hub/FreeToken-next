@@ -207,12 +207,6 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             self._mtp_controller = AdaptiveMtpController(cap, profiled_depth=profiled)
         self._spec_snapshot_slots: dict[int, int] = {}
         if self.spec_mtp > 0:
-            if not ENV.DISABLE_OVERLAP_SCHEDULING:
-                raise ValueError(
-                    "--spec-mtp > 0 requires overlap scheduling disabled "
-                    "(FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1): the verify step's accept "
-                    "decision is host-side and must land before the next forward launches."
-                )
             if config.max_running_req != 1:
                 raise ValueError("--spec-mtp > 0 supports single-request serving only for now.")
             if getattr(self.engine.model, "mtp", None) is None:
@@ -357,6 +351,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         ):
             self._execute_pending_rebuild()
         last_data = self._switch_residency_if_due(last_data)
+        self._guard_vram_pressure()
 
         # Order this iteration's host->device token_pool copies (issued on ``self.stream``
         # during scheduling) after the previous batch's sampled-token writes (issued on the
@@ -437,6 +432,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             self._profile_started = True
 
         mtp_sample = self._begin_mtp_cycle() if getattr(self, "spec_mtp", 0) > 0 else None
+        self._guard_vram_pressure()
         if getattr(self, "spec_mtp", 0) > 0 and self._spec_step_or_fail():
             self._finish_mtp_cycle(mtp_sample)
             self._flush_abort_acks()
@@ -455,22 +451,58 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         self._finish_mtp_cycle(mtp_sample)
         self._flush_abort_acks()
 
+    def _guard_vram_pressure(self) -> None:
+        guard = getattr(getattr(self, "engine", None), "guard_vram_before_forward", None)
+        if guard is not None and guard(prefill=self.prefill_manager.runnable):
+            controller = getattr(self, "_mtp_controller", None)
+            if controller is not None:
+                controller.fallback_to_k0()
+
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
         # DSV4 (owned-KV) decode reads its per-token window/cmp/idx slot maps off the attention
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
-            with self.engine_stream_ctx:
-                self.engine.stream.wait_stream(self.stream)
-                while True:
-                    self.normal_loop()
-        else:
-            assert torch.cuda.current_stream() == self.stream
-            data = None
-            while True:
-                data = self.overlap_loop(data)
+        data = None
+        normal = False
+        while True:
+            use_normal = ENV.DISABLE_OVERLAP_SCHEDULING or self._has_greedy_mtp_req(data)
+            if use_normal:
+                if data is not None:
+                    self.stream.wait_stream(self.engine.stream)
+                    self._last_data = data
+                    self._process_last_data(data)
+                    self._last_data = data = None
+                    self._flush_oom()
+                    self._flush_abort_acks()
+                    use_normal = ENV.DISABLE_OVERLAP_SCHEDULING or self._has_greedy_mtp_req(None)
+                    if not use_normal:
+                        continue
+                with self.engine_stream_ctx:
+                    self.engine.stream.wait_stream(self.stream)
+                    while ENV.DISABLE_OVERLAP_SCHEDULING or self._has_greedy_mtp_req(None):
+                        self.normal_loop()
+                normal = True
+            else:
+                if normal:
+                    self.stream.wait_stream(self.engine.stream)
+                    with torch.cuda.stream(self.stream):
+                        data = self.overlap_loop(data)
+                else:
+                    assert torch.cuda.current_stream() == self.stream
+                    data = self.overlap_loop(data)
+                normal = False
+
+    def _has_greedy_mtp_req(self, pending_data: ForwardData | None) -> bool:
+        if self.spec_mtp <= 0:
+            return False
+        reqs = self.decode_manager.running_reqs
+        sampling = [req.sampling_params for req in reqs]
+        sampling.extend(pending.sampling_params for pending in self.prefill_manager.pending_list)
+        if pending_data is not None:
+            sampling.extend(req.sampling_params for req in pending_data[0].batch.reqs)
+        return any(params.is_greedy for params in sampling)
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
@@ -528,7 +560,9 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
                 )
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
-                hit_length = not req.can_decode
+                # Overlap may already have advanced device_len for the following forward;
+                # finish only after this drained token reaches the output budget.
+                hit_length = req.input_ids.numel() >= req.max_device_len
                 hit_eos = not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
                 matched_stop = (
                     self._match_stop_str(req)
@@ -821,6 +855,12 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         for req in batch.reqs:
             if req.mamba_restore_src is not None:
                 pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
+                if pool.has_slot_state("mtp_residual"):
+                    self._mtp_prompt_carry = (
+                        req.uid,
+                        req.cached_len,
+                        pool.slot_state("mtp_residual")[req.linear_slot_idx].unsqueeze(0).clone(),
+                    )
                 req.mamba_restore_src = None  # consumed: restore exactly once
 
     def _free_req_resources(self, req: Req) -> None:
@@ -1215,8 +1255,24 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
+        probe_residual = None
+        controller = getattr(self, "_mtp_controller", None)
+        if batch.is_decode and batch.size == 1 and controller is not None and controller.probing:
+            residual = getattr(self.engine.model.model, "_last_residual", None)
+            if residual is not None:
+                probe_residual = residual[-1:].clone()
+                probe_pos = batch.reqs[0].cached_len
         forward_output = self.engine.forward_batch(batch, sample_args)
+        if probe_residual is not None:
+            self._queue_mtp_fill(batch.reqs[0], probe_pos, probe_residual, batch.input_ids)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        if (
+            getattr(self, "spec_mtp", 0) > 0
+            and os.getenv("FREETOKEN_MTP_PROMPT_WARMUP", "1") == "1"
+            and batch.is_prefill
+            and batch.size == 1
+        ):
+            self.warmup_mtp_draft_kv(batch.reqs[0], batch)
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 

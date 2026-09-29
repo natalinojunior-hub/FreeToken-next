@@ -5,8 +5,11 @@ one-layer bank at a wide quant (a GGUF MTP draft's own Q8_0 experts) no longer c
 for every resident slot of the target.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
+from freetoken.moe import vmm
 
 from freetoken.engine.cache_budget import (
     ExpertPool,
@@ -23,6 +26,7 @@ from freetoken.moe.offload_cache import OffloadMoeCache
 
 # 3 "target" layers + 1 "draft" layer with 4x wider gate_up and down rows.
 L, E, FLOOR = 4, 8, 2
+MIB = 1 << 20
 GU = [(4, 64)] * 3 + [(4, 256)]  # row bytes 256 / 1024
 DN = [(2, 64)] * 3 + [(2, 256)]  # row bytes 128 / 512
 
@@ -59,6 +63,41 @@ def test_pools_group_layers_by_geometry_largest_first():
     assert pools == [ExpertPool((0, 1, 2), (256, 128)), ExpertPool((3,), (1024, 512))]
 
 
+def test_bank_geometry_can_be_prepared_before_cache_allocation():
+    cache = OffloadMoeCache(
+        num_layers=L,
+        num_experts=E,
+        cache_size=32,
+        device=torch.device("cpu"),
+        quant_format="gguf",
+        gguf_expert_types=[(23, 20)] * 3 + [(8, 8)],
+        min_pool_rows=FLOOR,
+    )
+    cache._prepare_bank_sources(_sources())
+    assert cache._arenas == []
+    assert cache._vmm_arenas == []
+    assert len(cache.bank_sources["gate_up"]) == L
+
+
+def test_vmm_geometry_preflight_needs_no_arena_allocation(monkeypatch):
+    cache = OffloadMoeCache(
+        num_layers=L,
+        num_experts=E,
+        cache_size=32,
+        device=torch.device("cpu"),
+        quant_format="gguf",
+        gguf_expert_types=[(23, 20)] * 3 + [(8, 8)],
+        min_pool_rows=FLOOR,
+        vmm_rows=64,
+    )
+    cache._prepare_bank_sources(_sources())
+    monkeypatch.setattr(vmm, "granularity", lambda _device: 1024)
+    plan = cache._vmm_plan(cache.cache_size)
+    assert len(plan) == 5
+    assert cache._arenas == []
+    assert cache._vmm_arenas == []
+
+
 def test_capacities_share_rows_per_layer_and_clamp_each_pool():
     pools = expert_pools(_sources())
     # share 6/layer -> [18, 6], remainder 2 to the largest unsaturated pool
@@ -70,6 +109,127 @@ def test_capacities_share_rows_per_layer_and_clamp_each_pool():
     assert pool_capacities(pools, E, 0, FLOOR) == [FLOOR, FLOOR]
     # ...but "no cache" prices at zero (the planner's residual ledger asks for 0 slots)
     assert expert_cache_bytes(pools, E, 0, FLOOR) == 0
+
+
+def test_live_capacity_floors_do_not_spend_the_shrink_budget():
+    cache = _cache(26)
+    cache._staged = set()
+    # A full-layer prefill front in the small pool used to add rows AFTER the split,
+    # making 24 -> 23 a no-op although the large pool still had evictable experts.
+    before = cache._live_caps_for(cache.pools, [24, 8], 24)
+    after = cache._live_caps_for(cache.pools, [24, 8], 23)
+    assert sum(before) == 24
+    assert sum(after) == 23
+    assert all(8 <= n <= cap for n, cap in zip(after, [24, 8]))
+    assert all(n <= old for n, old in zip(after, before))
+    assert cache._live_caps_for(cache.pools, [24, 8], 1) == [8, 8]
+
+
+def test_exact_vmm_backing_price_uses_live_floors_and_each_pool_granule():
+    cache = _cache(26)
+    cache._staged = set()
+    cache.pool_caps = [24, 8]
+    cache.live_caps = cache._live_caps_for(cache.pools, cache.pool_caps, 24)
+    granule = 1024
+    cache._vmm_arenas = [SimpleNamespace(g=granule)]
+
+    for size in (1, 12, 23, 24, 25, 32):
+        live = cache._effective_live_caps_for(size)
+        expected = sum(
+            -(-(rows * row_bytes) // granule) * granule
+            for rows, pool in zip(live, cache.pools)
+            for row_bytes in pool.row_bytes
+        )
+        assert cache.backed_bytes_for(size) == expected
+
+    # A shrink uses set_live's per-pool clamp, including a remainder flip.
+    cache.live_caps = [18, 8]
+    cache._live_caps_for = lambda *_args: [15, 10]
+    assert cache._effective_live_caps_for(23) == [15, 8]
+
+
+def test_exact_vmm_backing_price_can_fall_when_logical_rows_increase():
+    cache = OffloadMoeCache(
+        num_layers=53,
+        num_experts=21,
+        cache_size=212,
+        device=torch.device("cpu"),
+        quant_format="gguf",
+        gguf_expert_types=[(23, 20)] * 53,
+        min_pool_rows=12,
+        prefill_overlap=True,
+    )
+    layer_ends = [14, 33, 36, 53]
+    layer_start = 0
+    cache.pools = []
+    for layer_end, row_mib in zip(layer_ends, (10, 1, 1, 1)):
+        cache.pools.append(ExpertPool(tuple(range(layer_start, layer_end)), (row_mib * MIB,)))
+        layer_start = layer_end
+    cache.prefill_moe_layers = 53
+    cache._staged = set()
+    cache.pool_caps = [14 * 21, 19 * 21, 3 * 21, 17 * 21]
+    cache.live_caps = cache._live_caps_for(cache.pools, cache.pool_caps, 210)
+    cache._vmm_arenas = [SimpleNamespace(g=MIB)]
+    cache._backing_cost_curve = tuple(
+        cache._backed_bytes_for_live(cache._live_caps_for(cache.pools, cache.pool_caps, size), MIB)
+        for size in range(cache.cache_size + 1)
+    )
+
+    assert cache._effective_live_caps_for(211) == [80, 47, 42, 42]
+    assert cache._effective_live_caps_for(212) == [46, 66, 42, 58]
+    assert cache.backed_bytes_for(211) == 931 * MIB
+    assert cache.backed_bytes_for(212) == 626 * MIB
+    # Growth prices come from the precomputed, unclamped curve without rebuilding geometry.
+    cache._live_caps_for = lambda *_args: pytest.fail("grow query recomputed pool geometry")
+    for size in range(sum(cache.live_caps), cache.cache_size + 1):
+        assert cache.backed_bytes_for(size) == cache._backing_cost_curve[size]
+
+
+def test_rebuild_invalidates_vmm_backing_cost_curve():
+    cache = _cache(26)
+    cache._backing_cost_curve = (0,) * 27
+
+    cache.rebuild(24)
+
+    assert cache._backing_cost_curve is None
+
+
+def test_set_live_unmaps_before_mixed_pool_growth(monkeypatch):
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=8,
+        cache_size=16,
+        device=torch.device("cpu"),
+        quant_format="gguf",
+        gguf_expert_types=[(23, 20)] * 2,
+    )
+    cache.pools = [ExpertPool((0,), (MIB,)), ExpertPool((1,), (MIB,))]
+    cache.pool_caps = [8, 8]
+    cache.live_caps = [7, 1]
+    cache.slot_for_id = torch.full((16,), -1, dtype=torch.int32)
+    cache._pool_state = [
+        (torch.full((8,), -1, dtype=torch.int32), torch.zeros((8,), dtype=torch.int64))
+        for _ in cache.pools
+    ]
+    cache._live_caps_for = lambda *_args: [8, 0]
+    events = []
+
+    class FakeArena:
+        g = MIB
+
+        def __init__(self):
+            self.backed = [7 * MIB, MIB]
+
+        def set_backed(self, pool, nbytes):
+            events.append("grow" if nbytes > self.backed[pool] else "shrink")
+            intact = min(nbytes, self.backed[pool])
+            self.backed[pool] = nbytes
+            return intact
+
+    cache._vmm_arenas = [FakeArena()]
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
+    assert cache.set_live(8) == 8
+    assert events == ["shrink", "grow"]
 
 
 def test_one_layer_bank_cannot_take_target_sized_capacity():

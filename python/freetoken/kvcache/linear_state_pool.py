@@ -60,6 +60,7 @@ class LinearStatePool:
         self._num_slots = num_slots
         self._device = device
         self._conv_dtype = dtype
+        self.compact_spec_state = os.getenv("FREETOKEN_MTP_COMPACT_STATE", "0") == "1"
 
         n_layers, local_conv_dim, local_v_heads = _linear_local_dims(group, tp_size)
 
@@ -81,9 +82,17 @@ class LinearStatePool:
         # state after every verify row, the verify keeps its conv inputs and the pre-verify
         # conv window, so a rejection commits row j's state instead of replaying the target.
         self.spec_states = self.spec_conv_in = self.spec_conv_pre = None
+        self.spec_qkv = self.spec_ba = None
+        self.spec_gate_params = {}
         if spec_steps:
             self.spec_states = torch.empty(
-                (n_layers, spec_steps, local_v_heads, group.key_head_dim, group.value_head_dim),
+                (
+                    n_layers,
+                    1 if self.compact_spec_state else spec_steps,
+                    local_v_heads,
+                    group.key_head_dim,
+                    group.value_head_dim,
+                ),
                 dtype=ssm_state_dtype(),
                 device=device,
             )
@@ -94,6 +103,13 @@ class LinearStatePool:
                 (n_layers, local_conv_dim, group.conv_kernel_dim - 1), dtype=dtype, device=device
             )
             self.spec_index = torch.zeros(1, dtype=torch.int32, device=device)
+            if self.compact_spec_state:
+                self.spec_qkv = torch.empty(
+                    (n_layers, spec_steps, local_conv_dim), dtype=dtype, device=device
+                )
+                self.spec_ba = torch.empty(
+                    (n_layers, spec_steps, 2 * local_v_heads), dtype=dtype, device=device
+                )
 
         self._slot_specs = tuple(slot_states)
         names = [spec.name for spec in self._slot_specs]
@@ -214,13 +230,46 @@ class LinearStatePool:
 
     def commit_spec_row(self, slot: int, row: int) -> None:
         """Set ``slot`` to the state after verify row ``row`` (all linear layers)."""
-        self.recurrent_states[:, slot].copy_(self.spec_states[:, row])
+        if self.compact_spec_state:
+            self._replay_spec_recurrence(row + 1)
+            self.recurrent_states[:, slot].copy_(self.spec_states[:, 0])
+        else:
+            self.recurrent_states[:, slot].copy_(self.spec_states[:, row])
         window = torch.cat(
             [self.spec_conv_pre, self.spec_conv_in[:, : row + 1].transpose(1, 2)], dim=2
         )
         self.conv_states[:, slot].copy_(window[..., -self.conv_states.shape[-1] :])
         for name, state in self.spec_slot_states.items():
             self.slot_states[name][:, slot].copy_(state[:, row])
+
+    def _replay_spec_recurrence(self, count: int) -> None:
+        """Recompute only the accepted recurrent prefix from its exact raw-input tape."""
+        from freetoken.kernel.fla import fused_sigmoid_gating_delta_rule_update
+
+        layers, _, heads, key_dim, value_dim = self.spec_states.shape
+        rows = self.spec_qkv[:, :count].contiguous().reshape(1, layers * count, -1)
+        ba = self.spec_ba[:, :count].contiguous().reshape(layers * count, 2 * heads)
+        key_width = (rows.shape[-1] - heads * value_dim) // 2
+        key_heads = key_width // key_dim
+        q, k, v = rows.split([key_width, key_width, heads * value_dim], dim=-1)
+        gates = [self.spec_gate_params[i] for i in range(layers)]
+        fused_sigmoid_gating_delta_rule_update(
+            A_log=torch.stack([g[0] for g in gates]),
+            dt_bias=torch.stack([g[1] for g in gates]),
+            a=ba[:, heads:],
+            b=ba[:, :heads],
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=q.reshape(1, layers * count, key_heads, key_dim),
+            k=k.reshape(1, layers * count, key_heads, key_dim),
+            v=v.reshape(1, layers * count, heads, value_dim),
+            initial_state_source=self.spec_states[:, 0],
+            initial_state_indices=torch.arange(layers, dtype=torch.int32, device=self._device),
+            cu_seqlens=torch.arange(layers + 1, dtype=torch.int32, device=self._device) * count,
+            scale=key_dim**-0.5,
+            use_qk_l2norm_in_kernel=True,
+            gate_batch_stride=heads,
+        )
 
     def is_linear_layer(self, layer_id: int) -> bool:
         return layer_id in self._local_index
@@ -313,7 +362,7 @@ def spec_state_steps(config) -> int:
     model = config.model_config
     row_commit = (
         getattr(model, "mtp_row_state_commit", False)
-        and os.getenv("FREETOKEN_MTP_ROW_COMMIT", "0") == "1"
+        and os.getenv("FREETOKEN_MTP_ROW_COMMIT", "1") == "1"
     )
     return k + 1 if k > 0 and (getattr(model, "native_mtp_layers", 0) or row_commit) else 0
 
@@ -332,9 +381,12 @@ def spec_state_bytes(config) -> int:
         * (spec.dtype if spec.dtype is not None else config.dtype).itemsize
         for spec in getattr(config.model_config, "slot_states", ())
     )
-    return (
-        n_layers * (steps * (state + conv) + conv * (group.conv_kernel_dim - 1)) + steps * siblings
-    )
+    if os.getenv("FREETOKEN_MTP_COMPACT_STATE", "0") == "1":
+        gates = 2 * v_heads * config.dtype.itemsize
+        per_layer = state + steps * (2 * conv + gates)
+    else:
+        per_layer = steps * (state + conv)
+    return n_layers * (per_layer + conv * (group.conv_kernel_dim - 1)) + steps * siblings
 
 
 def _linear_pool_num_slots(config) -> int:
@@ -348,9 +400,7 @@ def _linear_pool_num_slots(config) -> int:
     # ratio <= 0 is an explicit opt-out of the cross-request snapshot cache: the pool then
     # sits exactly at _linear_pool_min_slots, which is what a single-request decode workload
     # wants when the VRAM is worth more as MoE expert slots than as prefix-hit snapshots.
-    # Any ratio > 0 keeps the historical floor of 4 snapshots, so existing configs are
-    # byte-identical.
-    n_cache = 0 if ratio <= 0 else max(4, int(ratio * mr))
+    n_cache = 0 if ratio <= 0 else math.ceil(ratio * mr)
     return _linear_pool_min_slots(config) + n_cache
 
 

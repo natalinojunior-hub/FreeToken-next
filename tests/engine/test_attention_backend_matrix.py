@@ -127,6 +127,20 @@ def test_auto_resolves_per_type(monkeypatch, kind, expected):
     assert config.attention_backend == expected
 
 
+@pytest.mark.parametrize(
+    "pair,ratio,expected",
+    [((22, 20), 0, "naive"), ((22, 20), 2, "hybrid_radix"), ((21, 42), 0, "hybrid_radix")],
+)
+def test_tight_gdn_snapshot_cache_uses_safe_metadata_fallback(monkeypatch, pair, ratio, expected):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("qsa", linear_state_cache_ratio=ratio)
+    config.model_config.gguf_expert_types = pair
+    _adjust_config(config)
+    assert config.cache_type == expected
+
+
 def test_auto_bsa_sets_block_page_size(monkeypatch):
     # m3_sparse declares page_sizes=(128,): one KV page == one sparse block, and
     # config-time resolution must coerce the page size to match.

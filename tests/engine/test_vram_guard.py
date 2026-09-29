@@ -1,6 +1,8 @@
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 from freetoken.engine.engine import Engine
 
@@ -64,6 +66,8 @@ def _residency_engine(monkeypatch, free):
         pools=[SimpleNamespace(layers=[0, 1])],
         num_experts=1000,
         _vmm_arenas=[object()],
+        expert_pool_bytes=1000 * 10 * MIB,
+        backed_bytes_for=lambda size: size * 10 * MIB,
     )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda d: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
@@ -71,9 +75,10 @@ def _residency_engine(monkeypatch, free):
 
 
 def test_decode_residency_grows_into_measured_free_and_folds_back(monkeypatch):
-    # 2 GiB free, reserve = 256 MiB margin + one 2 MiB granule per region -> 179 slots of 10 MiB
+    # 2 GiB free, 256 MiB guard, and exact 10 MiB per-row backing -> 179 additional rows.
     eng, calls = _residency_engine(monkeypatch, free=2048 * MIB)
     eng.set_decode_residency(True)
+    assert eng._decode_allocator_baseline == 1000 * MIB
     assert calls == [1179]
     eng.moe_offload_cache.resident_rows = 1179
     eng.set_decode_residency(True)  # already grown: no churn
@@ -85,22 +90,54 @@ def test_decode_residency_grows_into_measured_free_and_folds_back(monkeypatch):
 
 def test_decode_residency_never_touches_the_reserve(monkeypatch):
     eng, calls = _residency_engine(monkeypatch, free=258 * MIB)
+    syncs = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: syncs.append(None))
     eng.set_decode_residency(True)
-    assert calls == [] and eng._expert_decode_slots is None
+    assert calls == [] and eng._expert_decode_slots == 1000
+    eng.set_decode_residency(True)
+    assert calls == [] and len(syncs) == 1  # the no-grow phase is not retried each decode
 
 
-def test_decode_residency_failed_grow_restores_prefill_size_and_learns(monkeypatch):
+def test_decode_residency_failed_grow_does_not_keep_external_pressure_debt(monkeypatch):
     eng, calls = _residency_engine(monkeypatch, free=2048 * MIB)
+    cache = eng.moe_offload_cache
+    refused = [True]
 
     def resize(target):
         calls.append(target)
-        if target > 1000:
+        if target > 1000 and refused[0]:
+            refused[0] = False  # one-off external backing refusal; reserved bytes do not change
             raise RuntimeError("cuMemCreate failed")
+        cache.resident_rows = target
 
     eng._resize_experts = resize
     eng.set_decode_residency(True)
-    assert calls == [1179, 1000] and eng._expert_decode_slots is None
-    assert eng._decode_reserve_learned == 179 * 10 * MIB
+    assert calls == [1179] and eng._expert_decode_slots == 1000
+    assert eng._decode_reserve_learned == 0
+    assert eng._decode_allocator_baseline == 1000 * MIB
+
+    eng.set_decode_residency(False)  # close the failed decode phase before the next request
+    eng.set_decode_residency(True)
+    assert calls == [1179, 1000, 1179]
+    assert cache.resident_rows == 1179
+    assert eng._decode_reserve_learned == 0
+
+
+def test_decode_residency_scans_exact_nonmonotone_pool_costs(monkeypatch):
+    eng, calls = _residency_engine(monkeypatch, free=256 * MIB)
+    cache = eng.moe_offload_cache
+    cache.cache_size = 212
+    cache.resident_rows = 210
+    cache.expert_pool_bytes = 921 * MIB
+
+    def backing_bytes(rows):
+        # Geometry floors transfer rows between pools at 212: 211 costs 931 MiB, while
+        # 212 costs 626 MiB. A monotone binary search could miss the larger fitting target.
+        return {211: 931 * MIB, 212: 626 * MIB}.get(rows, 2_000 * MIB)
+
+    cache.backed_bytes_for = backing_bytes
+    eng.set_decode_residency(True)
+    assert calls == [212]
 
 
 def _vmm_guard_engine(monkeypatch, free, arenas=2, pools=10):
@@ -126,18 +163,35 @@ def test_guard_regrow_prices_the_vmm_granule_rounding(monkeypatch):
     assert calls == [1000 + 1496 * MIB // (10 * MIB)]  # 1149, not the 1153 an unpriced grow asks
 
 
-def test_guard_regrow_backing_failure_keeps_size_and_learns(monkeypatch):
+def test_guard_regrow_backing_failure_charges_safe_prefix_without_learning_debt(monkeypatch):
     eng, calls = _vmm_guard_engine(monkeypatch, free=2048 * MIB)
+    cache = eng.moe_offload_cache
+    charged = []
 
     def boom(target):
+        cache.resident_rows = 950
+        cache.live_caps = [95] * len(cache.live_caps)
         raise RuntimeError("cuMemCreate failed with CUresult 2")
 
     eng._resize_experts = boom
+    eng._charge_expert_cache = lambda actual: charged.append(actual.resident_rows)
     for _ in range(3):
         eng.guard_vram_at_idle()  # must not raise out of the idle hook
-    assert eng._decode_reserve_learned == 149 * 10 * MIB
-    assert ("set_live", 1000) in calls  # best-effort unmap of the partially backed grow
-    assert eng.moe_offload_cache.resident_rows == 1000
+    assert eng._decode_reserve_learned == 0  # no allocator growth was measured
+    assert ("set_live", 1000) not in calls  # set_live owns its own allocation-free rollback
+    assert cache.resident_rows == 950
+    assert charged == [950]
+
+    def recover(target):
+        calls.append(target)
+        cache.resident_rows = target
+
+    eng._resize_experts = recover
+    for _ in range(3):
+        eng.guard_vram_at_idle()
+    assert calls[-1] == 1099  # retry from the compensated prefix after transient refusal
+    assert cache.resident_rows == 1099
+    assert eng._decode_reserve_learned == 0
 
 
 def test_guard_shrink_failure_stays_fatal(monkeypatch):
@@ -151,3 +205,154 @@ def test_guard_shrink_failure_stays_fatal(monkeypatch):
 
     with pytest.raises(RuntimeError):
         eng.guard_vram_at_idle()
+
+
+def _pressure_engine(monkeypatch, *, rows=1000, floor=1):
+    eng = Engine.__new__(Engine)
+    eng.device = SimpleNamespace(type="cuda")
+    eng.config = SimpleNamespace(tp_info=SimpleNamespace(size=1))
+    eng.stream = object()
+    calls = []
+
+    def set_live(size):
+        actual = max(floor, size)
+        calls.append(("set_live", size, actual))
+        cache.resident_rows = actual
+        cache.live_caps = [actual]
+        return actual
+
+    cache = SimpleNamespace(
+        cache_size=1200,
+        resident_rows=rows,
+        live_caps=[rows],
+        pools=[object()],
+        _vmm_arenas=[object()],
+        set_live=set_live,
+    )
+    eng.moe_offload_cache = cache
+    eng._target_moe_and_expert_bytes = lambda _: (None, 10 * MIB)
+    eng._charge_expert_cache = lambda _cache: None
+    eng.rebuild_runtime_cache = lambda **kwargs: calls.append(("rebuild", kwargs))
+    eng._expert_decode_slots = rows + 10
+    eng._expert_prefill_slots = rows
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda _device: None)
+    return eng, cache, calls
+
+
+def test_before_forward_guard_syncs_then_shrinks_vmm_and_clamps_foldback(monkeypatch):
+    eng, cache, calls = _pressure_engine(monkeypatch, rows=1000)
+    events = []
+
+    def driver_free(_device):
+        # The mocked VMM shrink returns enough physical memory to leave the margin.
+        return (100 if cache.resident_rows == 1000 else 300) * MIB, 16 << 30
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", driver_free)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: events.append("sync"))
+    original_set_live = cache.set_live
+
+    def record_set_live(size):
+        events.append("set_live")
+        return original_set_live(size)
+
+    cache.set_live = record_set_live
+    assert eng.guard_vram_before_forward() is False
+    assert events.index("sync") < events.index("set_live")
+    assert cache.resident_rows == cache.live_caps[0] < 1000
+    assert eng._expert_decode_slots == cache.resident_rows
+    assert eng._expert_prefill_slots == cache.resident_rows
+    eng.set_decode_residency(False)
+    assert calls[-1] == ("set_live", cache.resident_rows, cache.resident_rows)
+    assert not any(call[0] == "rebuild" for call in calls)
+
+
+def test_before_forward_guard_calm_path_does_not_sync_or_resize(monkeypatch):
+    eng, cache, calls = _pressure_engine(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _device: (300 * MIB, 16 << 30))
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda _device: pytest.fail("calm guard must not synchronize"),
+    )
+    assert eng.guard_vram_before_forward() is False
+    assert cache.resident_rows == 1000
+    assert calls == []
+
+
+def test_before_forward_guard_floor_no_progress_reports_unresolved(monkeypatch):
+    eng, cache, calls = _pressure_engine(monkeypatch, rows=5, floor=5)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _device: (0, 16 << 30))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
+    assert eng.guard_vram_before_forward() is True
+    assert cache.resident_rows == 5
+    assert calls == [("set_live", 1, 5)]
+
+
+def test_before_forward_guard_learns_decode_allocator_growth(monkeypatch):
+    eng, _cache, _calls = _pressure_engine(monkeypatch)
+    eng._decode_allocator_baseline = 1000 * MIB
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _device: (100 * MIB, 16 << 30))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _device: 1064 * MIB)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
+
+    assert eng.guard_vram_before_forward(prefill=False) is True
+    assert eng._decode_reserve_learned == 64 * MIB
+
+
+def test_before_forward_external_pressure_does_not_learn_decode_reserve(monkeypatch):
+    eng, _cache, _calls = _pressure_engine(monkeypatch)
+    eng._decode_allocator_baseline = 1000 * MIB
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _device: (100 * MIB, 16 << 30))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _device: 1000 * MIB)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
+
+    assert eng.guard_vram_before_forward(prefill=False) is True
+    assert eng._decode_reserve_learned == 0
+
+
+def test_before_forward_guard_fixed_back_cache_reports_unresolved(monkeypatch):
+    eng, cache, calls = _pressure_engine(monkeypatch)
+    cache._vmm_arenas = []
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _device: (100 * MIB, 16 << 30))
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda _device: pytest.fail("fixed-back cache cannot be resized in the live request"),
+    )
+    assert eng.guard_vram_before_forward() is True
+    assert cache.resident_rows == 1000
+    assert calls == []
+
+
+def test_before_forward_prefill_reserve_shrinks_to_measured_requirement(monkeypatch):
+    eng, cache, calls = _pressure_engine(monkeypatch)
+    eng._prefill_transient_reserve = 1 << 30
+    free = iter((300 * MIB, 300 * MIB, 1300 * MIB, 1300 * MIB))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _device: (next(free), 16 << 30))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _device: 0)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _device: 0)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
+    assert eng.guard_vram_before_forward(prefill=True) is False
+    # 1 GiB transient + 256 MiB margin; one 2 MiB VMM granule is also budgeted.
+    assert calls == [("set_live", 901, 901)]
+    assert cache.resident_rows == 901
+
+
+@pytest.mark.parametrize("prefill,reserved", [(True, 1 << 30), (False, 0)])
+def test_before_forward_guard_skips_funded_prefill_reserve_or_decode(
+    monkeypatch, prefill, reserved
+):
+    eng, cache, calls = _pressure_engine(monkeypatch)
+    eng._prefill_transient_reserve = 1 << 30
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _device: (300 * MIB, 16 << 30))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _device: reserved)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _device: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda _device: pytest.fail("funded reserve or decode phase must not shrink"),
+    )
+    assert eng.guard_vram_before_forward(prefill=prefill) is False
+    assert cache.resident_rows == 1000
+    assert calls == []

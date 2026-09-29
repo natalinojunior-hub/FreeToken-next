@@ -141,9 +141,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         li = pool.local_index(self.layer_id)
         return causal_conv1d_decode(conv_in, pool.conv_states[li], self._conv_weight(), table_idx)
 
-    def _write_track_snapshot(
-        self, pool, li: int, conv_in: torch.Tensor, fla
-    ) -> None:
+    def _write_track_snapshot(self, pool, li: int, conv_in: torch.Tensor, fla) -> None:
         """Snapshot conv history; the chunk kernel writes recurrent checkpoints in fp32.
 
         The bf16 per-chunk output workspace cannot serve as a recurrent checkpoint: it
@@ -160,6 +158,9 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         """Fused gated-delta recurrence over ``mixed`` rows split per request by
         ``cu_seqlens``; a request's rows share one kernel with the state held on chip."""
         B = mixed.shape[0]
+        compact = keep_rows and getattr(pool, "compact_spec_state", False)
+        if compact:
+            pool.spec_gate_params[li] = (self.A_log, self.dt_bias)
         qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
         return gdn_decode_fla(
             qf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype),
@@ -173,8 +174,13 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             indices=indices,
             cu_seqlens=cu_seqlens,
             scale=self.head_k_dim**-0.5,
-            intermediate_states=pool.spec_states[li].unsqueeze(0) if keep_rows else None,
-            intermediate_indices=pool.spec_index if keep_rows else None,
+            intermediate_states=pool.spec_states[li].unsqueeze(0)
+            if keep_rows and not compact
+            else None,
+            intermediate_indices=pool.spec_index if keep_rows and not compact else None,
+            rollback_tape=(pool.spec_states[li, 0], pool.spec_qkv[li], pool.spec_ba[li])
+            if compact
+            else None,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -219,7 +225,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             # over all rows loads/stores the state once. With the pool's zero-replay buffers
             # it also records every row's state + conv input (see commit_spec_row).
             spec_states = getattr(pool, "spec_states", None)
-            keep = spec_states is not None and total <= spec_states.shape[1]
+            keep = spec_states is not None and total <= pool.spec_conv_in.shape[1]
             if keep:
                 pool.spec_conv_pre[li].copy_(
                     pool.conv_states[li].index_select(0, fla.cache_indices)[0]

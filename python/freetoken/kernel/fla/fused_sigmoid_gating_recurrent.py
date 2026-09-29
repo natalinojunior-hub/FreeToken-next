@@ -58,6 +58,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
+    gate_batch_stride: tl.constexpr = 0,
+    saved_initial_state=None,
+    saved_qkv=None,
+    saved_ba=None,
+    SAVE_ROLLBACK_TAPE: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -87,13 +92,13 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     # Gating computation pointers
-    p_A_log = A_log + i_hv
+    p_A_log = A_log + i_n * gate_batch_stride + i_hv
     if IS_KDA:
         p_a = a + bos * stride_a + i_hv * K + o_k
         p_dt_bias = dt_bias + i_hv * K + o_k
     else:
         p_a = a + bos * stride_a + i_hv
-        p_dt_bias = dt_bias + i_hv
+        p_dt_bias = dt_bias + i_n * gate_batch_stride + i_hv
 
     mask_k = o_k < K
     mask_v = o_v < V
@@ -105,6 +110,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         if idx >= 0:
             p_h0 = h0_source + idx * HV * K * V + i_hv * K * V + o_v[None, :] * K + o_k[:, None]
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+
+    if SAVE_ROLLBACK_TAPE:
+        p_saved = saved_initial_state + i_hv * K * V + o_v[None, :] * K + o_k[:, None]
+        tl.store(p_saved, b_h, mask=mask_h)
 
     # Preload tree attention data if needed
     if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
@@ -156,6 +165,16 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             b_a = tl.load(p_a).to(tl.float32)
             b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
 
+        if SAVE_ROLLBACK_TAPE:
+            row = saved_qkv + step_idx * (2 * H * K + HV * V)
+            if i_v == 0 and i_hv % (HV // H) == 0:
+                tl.store(row + i_h * K + o_k, b_q, mask=mask_k)
+                tl.store(row + H * K + i_h * K + o_k, b_k, mask=mask_k)
+            tl.store(row + 2 * H * K + i_hv * V + o_v, b_v, mask=mask_v)
+            if i_v == 0:
+                tl.store(saved_ba + step_idx * 2 * HV + i_hv, b_b)
+                tl.store(saved_ba + step_idx * 2 * HV + HV + i_hv, b_a)
+
         # Compute g = -exp(A_log) * softplus(a + dt_bias)
         x = b_a + b_dt_bias
         beta_x = softplus_beta * x
@@ -195,6 +214,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Compute output: o = sum(h * q, dim=0)
         b_o = tl.sum(b_h * b_q[:, None], 0)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+        # A single-token decode reloads this state from its storage dtype next call.
+        # Match that round-trip before carrying a multi-row sequence forward.
+        if USE_INITIAL_STATE:
+            b_h = b_h.to(h0_source.dtype.element_ty).to(tl.float32)
 
         # Cache intermediate states if enabled
         if CACHE_INTERMEDIATE_STATES:
@@ -253,6 +277,8 @@ def fused_sigmoid_gating_delta_rule_update(
         int
     ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    gate_batch_stride: int = 0,
+    rollback_tape: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -275,6 +301,9 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_a = a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
+    if rollback_tape is not None:
+        if is_kda or N != 1 or intermediate_states_buffer is not None:
+            raise ValueError("rollback tape requires one GDN sequence without row checkpoints")
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
@@ -348,6 +377,11 @@ def fused_sigmoid_gating_delta_rule_update(
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+        gate_batch_stride=gate_batch_stride,
+        saved_initial_state=rollback_tape[0] if rollback_tape is not None else None,
+        saved_qkv=rollback_tape[1] if rollback_tape is not None else None,
+        saved_ba=rollback_tape[2] if rollback_tape is not None else None,
+        SAVE_ROLLBACK_TAPE=rollback_tape is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )

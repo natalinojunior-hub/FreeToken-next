@@ -404,6 +404,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         image_token_id=getattr(shim, "image_token_id", None),
         slot_states=ple_slot_states(qwen4_args),
         mtp_row_state_commit=True,
+        mtp_residual_width=qwen4_args.hc_count * qwen4_args.hidden_size,
         attn_quant="gguf",
         dense_quant="gguf",
         lm_head_quant="gguf",

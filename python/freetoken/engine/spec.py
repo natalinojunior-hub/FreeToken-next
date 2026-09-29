@@ -30,6 +30,26 @@ def accept_drafts(sampled: Sequence[int], drafts: Sequence[int]) -> list[int]:
     return [int(token) for token in sampled[: accepted + 1]]
 
 
+def lookup_drafts(ids: torch.Tensor, k: int, max_ngram: int = 16) -> list[int]:
+    """Propose a continuation previously seen in the committed CPU token history."""
+    if k <= 0 or ids.numel() <= k or ids.device.type != "cpu":
+        return []
+    width = ids.element_size()
+    history = ids.contiguous().numpy().tobytes()
+    for n in range(min(max_ngram, ids.numel() - k), 1, -1):
+        suffix = history[-n * width :]
+        end = len(history) - k * width
+        while end >= len(suffix):
+            pos = history.rfind(suffix, 0, end)
+            if pos < 0:
+                break
+            if pos % width == 0:
+                start = pos // width + n
+                return ids[start : start + k].tolist()
+            end = pos + len(suffix) - 1
+    return []
+
+
 def pack_spec_message(result: SpecResult, k: int) -> torch.Tensor:
     """Pack a fixed-size rank message: count, accepted tokens, then next drafts."""
     count = len(result.accepted)

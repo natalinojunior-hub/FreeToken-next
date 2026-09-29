@@ -94,7 +94,7 @@ def _make_layer(ratio: int, output_gate: str = "sigmoid", seed: int = 0):
     return op, ref
 
 
-def _ctx(ratio: int, num_slots: int = 8) -> Context:
+def _ctx(ratio: int, num_slots: int = 8, spec_steps: int = 0) -> Context:
     import freetoken.core as core
     from freetoken.kvcache.linear_state_pool import LinearStatePool
 
@@ -111,7 +111,9 @@ def _ctx(ratio: int, num_slots: int = 8) -> Context:
     )
     core._GLOBAL_CTX = None
     ctx = Context(page_size=64)
-    ctx.linear_state_pool = LinearStatePool(group, num_slots, torch.bfloat16, DEV, tp_size=1)
+    ctx.linear_state_pool = LinearStatePool(
+        group, num_slots, torch.bfloat16, DEV, tp_size=1, spec_steps=spec_steps
+    )
     core.set_global_ctx(ctx)
     return ctx
 
@@ -349,16 +351,15 @@ def test_chunk_checkpoint_tracks_fp32_exactly_without_changing_outputs(width):
     )
 
 
-def test_spec_verify_graph_matches_eager():
-    """The 2-token spec-verify window (fused multi-row recurrence) captured once replays
-    bitwise-equal to the eager verify -- output and the slot's conv/recurrent state -- over
-    changing windows and slots."""
+@pytest.mark.parametrize("tokens", (2, 3, 4, 5, 6, 8))
+def test_spec_verify_graph_matches_eager(tokens):
+    """Captured multi-row recurrence and all row-checkpoint buffers match eager verify."""
     from freetoken.attention.linear import FLAMetadata
 
     op, _ = _make_layer(3, seed=3)
-    ctx = _ctx(3)
+    ctx = _ctx(3, spec_steps=tokens)
     _, reqs, _ = _prefill(op, ctx, [128, 37], seed=13)
-    pool, tokens = ctx.linear_state_pool, 2
+    pool = ctx.linear_state_pool
 
     def fla(slot: int) -> FLAMetadata:
         return FLAMetadata(
@@ -394,6 +395,11 @@ def test_spec_verify_graph_matches_eager():
         with ctx.forward_batch(eager_batch):
             eager = op.forward(x)
         expect = [t.clone() for t in state]
+        expect_spec = [
+            pool.spec_states[0, :tokens].clone(),
+            pool.spec_conv_in[0, :tokens].clone(),
+            pool.spec_conv_pre[0].clone(),
+        ]
         for t, b in zip(state, before):
             t.copy_(b)
         static_x.copy_(x)
@@ -401,3 +407,210 @@ def test_spec_verify_graph_matches_eager():
         graph.replay()
         assert torch.equal(captured, eager), f"verify output diverged at step {step}"
         assert all(torch.equal(t, e) for t, e in zip(state, expect)), f"state at step {step}"
+        actual_spec = [
+            pool.spec_states[0, :tokens],
+            pool.spec_conv_in[0, :tokens],
+            pool.spec_conv_pre[0],
+        ]
+        assert all(torch.equal(a, e) for a, e in zip(actual_spec, expect_spec)), (
+            f"row checkpoints at step {step}"
+        )
+
+
+@pytest.mark.parametrize("tokens", (2, 3, 4, 5, 6, 8))
+def test_gdn_row_checkpoints_equal_exact_prefix_recurrence(tokens):
+    """Use identical precomputed recurrence inputs to isolate checkpoint exactness from
+    shape-dependent input projection rounding. Rebuilding each conv window from its pre-window
+    and captured conv inputs must also exactly match the sequential kernel state."""
+    from freetoken.kernel.causal_conv1d import causal_conv1d_decode
+    from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla
+
+    ratio = 3
+    num_k, num_v = HEADS[ratio]
+    torch.manual_seed(103 + tokens)
+    q = torch.randn(1, tokens, num_k, HEAD_DIM, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn(1, tokens, num_v, HEAD_DIM, device=DEV, dtype=torch.bfloat16)
+    a = torch.randn(tokens, num_v, device=DEV, dtype=torch.float32)
+    b = torch.randn_like(a)
+    A_log = torch.randn(num_v, device=DEV, dtype=torch.float32)
+    dt_bias = torch.randn_like(A_log)
+    initial = torch.randn(1, num_v, HEAD_DIM, HEAD_DIM, device=DEV, dtype=torch.float32)
+    states = torch.empty(1, tokens, num_v, HEAD_DIM, HEAD_DIM, device=DEV, dtype=torch.float32)
+    indices = torch.zeros(1, dtype=torch.int32, device=DEV)
+    cu_seqlens = torch.tensor([0, tokens], dtype=torch.int32, device=DEV)
+
+    whole_state = initial.clone()
+    gdn_decode_fla(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_source=whole_state,
+        indices=indices,
+        cu_seqlens=cu_seqlens,
+        scale=HEAD_DIM**-0.5,
+        intermediate_states=states,
+        intermediate_indices=indices,
+    )
+    for stop in range(1, tokens + 1):
+        prefix_state = initial.clone()
+        gdn_decode_fla(
+            q[:, :stop],
+            k[:, :stop],
+            v[:, :stop],
+            a[:stop],
+            b[:stop],
+            A_log=A_log,
+            dt_bias=dt_bias,
+            state_source=prefix_state,
+            indices=indices,
+            cu_seqlens=torch.tensor([0, stop], dtype=torch.int32, device=DEV),
+            scale=HEAD_DIM**-0.5,
+        )
+        assert torch.equal(states[0, stop - 1], prefix_state[0]), (
+            f"recurrent checkpoint after row {stop}"
+        )
+
+    conv_dim = 32
+    conv_input = torch.randn(tokens, conv_dim, device=DEV, dtype=torch.bfloat16)
+    conv_weight = torch.randn(conv_dim, CONV_K, device=DEV, dtype=torch.bfloat16)
+    conv_pre = torch.randn(conv_dim, CONV_K - 1, device=DEV, dtype=torch.bfloat16)
+    conv_state = conv_pre.unsqueeze(0).clone()
+    conv_states = []
+    for row in range(tokens):
+        causal_conv1d_decode(
+            conv_input[row : row + 1].clone(),
+            conv_state,
+            conv_weight,
+            indices,
+        )
+        conv_states.append(conv_state[0].clone())
+    for stop, actual in enumerate(conv_states, start=1):
+        rebuilt = torch.cat([conv_pre, conv_input[:stop].transpose(0, 1)], dim=-1)[
+            :, -(CONV_K - 1) :
+        ]
+        assert torch.equal(actual, rebuilt), f"conv window after row {stop}"
+
+
+@pytest.mark.parametrize("state_dtype", (torch.float32, torch.bfloat16), ids=("fp32", "bf16"))
+@pytest.mark.parametrize("compact", (False, True), ids=("row-cache", "compact-replay"))
+def test_gdn_k4_commit_matches_raw_token_replay(state_dtype, compact, monkeypatch):
+    """Verify and commit every prefix against RAW T=1 state persistence."""
+    from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla
+    from freetoken.kvcache import linear_state_pool as pool_module
+    from freetoken.kvcache.linear_state_pool import LinearStatePool
+
+    monkeypatch.setenv("FREETOKEN_MTP_COMPACT_STATE", "1" if compact else "0")
+    monkeypatch.setattr(pool_module, "ssm_state_dtype", lambda: state_dtype)
+    num_k, num_v = HEADS[3]
+    torch.manual_seed(409)
+    q = torch.randn(1, 5, num_k, HEAD_DIM, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn(1, 5, num_v, HEAD_DIM, device=DEV, dtype=torch.bfloat16)
+    a = torch.randn(5, num_v, device=DEV, dtype=torch.bfloat16)
+    b = torch.randn_like(a)
+    A_log = torch.randn(num_v, device=DEV, dtype=torch.float32)
+    dt_bias = torch.randn_like(A_log)
+    group = LinearGatedDeltaGroupConfig(
+        name="linear",
+        layer_ids=(0,),
+        num_key_heads=num_k,
+        num_value_heads=num_v,
+        key_head_dim=HEAD_DIM,
+        value_head_dim=HEAD_DIM,
+        conv_kernel_dim=CONV_K,
+        output_gate="sigmoid",
+    )
+    pool = LinearStatePool(group, 2, torch.bfloat16, DEV, tp_size=1, spec_steps=5)
+    slot = 1
+    indices = torch.tensor([slot], dtype=torch.int32, device=DEV)
+    initial = torch.randn(num_v, HEAD_DIM, HEAD_DIM, device=DEV).to(state_dtype)
+    pool.recurrent_states[0, slot].copy_(initial)
+    pool.spec_conv_pre.zero_()
+    pool.spec_conv_in.zero_()
+    if compact:
+        pool.spec_gate_params[0] = (A_log, dt_bias)
+        pool.spec_qkv[0].copy_(
+            torch.cat([q[0].flatten(1), k[0].flatten(1), v[0].flatten(1)], dim=1)
+        )
+        pool.spec_ba[0].copy_(torch.cat([b, a], dim=1))
+
+    def run(start, stop, state, checkpoints=None, rollback_tape=None):
+        return gdn_decode_fla(
+            q[:, start:stop],
+            k[:, start:stop],
+            v[:, start:stop],
+            a[start:stop],
+            b[start:stop],
+            A_log=A_log,
+            dt_bias=dt_bias,
+            state_source=state,
+            indices=indices,
+            cu_seqlens=torch.tensor([0, stop - start], dtype=torch.int32, device=DEV),
+            scale=HEAD_DIM**-0.5,
+            intermediate_states=checkpoints,
+            intermediate_indices=pool.spec_index if checkpoints is not None else None,
+            rollback_tape=rollback_tape,
+        )
+
+    if compact:
+        tape = (pool.spec_states[0, 0], pool.spec_qkv[0], pool.spec_ba[0])
+        verify_out = run(0, 5, pool.recurrent_states[0], rollback_tape=tape)
+        saved_initial = pool.spec_states[0, 0].clone()
+    else:
+        verify_out = run(0, 5, pool.recurrent_states[0], pool.spec_states[0].unsqueeze(0))
+        saved_initial = None
+
+    raw_state = torch.zeros_like(pool.recurrent_states[0])
+    raw_state[slot].copy_(initial)
+    raw_prefix_states = []
+    raw_outputs = []
+    for row in range(5):
+        raw_outputs.append(run(row, row + 1, raw_state))
+        raw_prefix_states.append(raw_state[slot].clone())
+    raw_outputs = torch.cat(raw_outputs, dim=0)
+    assert torch.equal(verify_out, raw_outputs), (
+        f"verify outputs differ from RAW rows; "
+        f"max_abs={(verify_out.float() - raw_outputs.float()).abs().max().item():.8g}"
+    )
+
+    next_q = torch.randn(1, 1, num_k, HEAD_DIM, device=DEV, dtype=torch.bfloat16)
+    next_k = torch.randn_like(next_q)
+    next_v = torch.randn(1, 1, num_v, HEAD_DIM, device=DEV, dtype=torch.bfloat16)
+    next_a = torch.randn(1, num_v, device=DEV, dtype=torch.bfloat16)
+    next_b = torch.randn_like(next_a)
+    decode_args = dict(
+        A_log=A_log,
+        dt_bias=dt_bias,
+        indices=indices,
+        cu_seqlens=torch.tensor([0, 1], dtype=torch.int32, device=DEV),
+        scale=HEAD_DIM**-0.5,
+    )
+    for row, raw_prefix in enumerate(raw_prefix_states):
+        if compact:
+            pool.spec_states[0, 0].copy_(saved_initial)
+        pool.commit_spec_row(slot, row)
+        committed_state = pool.recurrent_states[0, slot].clone()
+        assert torch.equal(committed_state, raw_prefix), (
+            f"committed prefix {row} differs from RAW; "
+            f"max_abs={(committed_state.float() - raw_prefix.float()).abs().max().item():.8g}"
+        )
+
+        committed = torch.zeros_like(pool.recurrent_states[0])
+        committed[slot].copy_(committed_state)
+        raw = torch.zeros_like(pool.recurrent_states[0])
+        raw[slot].copy_(raw_prefix)
+        committed_out = gdn_decode_fla(
+            next_q, next_k, next_v, next_a, next_b, state_source=committed, **decode_args
+        )
+        raw_out = gdn_decode_fla(
+            next_q, next_k, next_v, next_a, next_b, state_source=raw, **decode_args
+        )
+        assert torch.equal(committed_out, raw_out), (
+            f"next decode after prefix {row} differs; "
+            f"max_abs={(committed_out.float() - raw_out.float()).abs().max().item():.8g}"
+        )

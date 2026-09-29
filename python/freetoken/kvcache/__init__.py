@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Protocol
 
 from freetoken.utils import Registry
@@ -257,6 +258,8 @@ def create_kvcache_pool(
             mrope=model_config.model_is_mrope,
             kv_format=kv_format,
             mtp_layer_id=mtp_layer_id,
+            preserve_mtp_prefix=bool(getattr(model_config, "mtp_residual_width", 0))
+            and os.getenv("FREETOKEN_MTP_PROMPT_WARMUP", "1") == "1",
             tcq_policy=getattr(model_config, "tcq_policy", None),
             host_pages=host_pages,
             host_dtype=host_dtype,

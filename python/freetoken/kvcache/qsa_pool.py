@@ -74,6 +74,7 @@ class QSAKVCache(BaseKVCachePool):
         tcq_policy=None,
         host_pages: int = 0,
         host_dtype: torch.dtype | str | None = None,
+        preserve_mtp_prefix: bool = False,
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -100,6 +101,7 @@ class QSAKVCache(BaseKVCachePool):
         self._ring_capacity = ring_capacity
         self._index_dtype = dtype
         self._page_size = page_size
+        self._head_dim = head_dim
         self._mrope = mrope
         compressed = kv_format in ["turbo3", "turbo4", "vbr", "tcq"] or tcq_policy is not None
         if host_pages and compressed:
@@ -152,6 +154,8 @@ class QSAKVCache(BaseKVCachePool):
                 host_dtype=host_dtype,
             )
         self.kv_format = kv_format
+        self._mtp_layer_id = mtp_layer_id
+        self.preserve_mtp_prefix = preserve_mtp_prefix
         self._mtp_slot: int | None = None
         if mtp_layer_id is not None and layer_ids is not None and mtp_layer_id in layer_ids:
             self._mtp_slot = list(layer_ids).index(mtp_layer_id)
@@ -502,13 +506,30 @@ class QSAKVCache(BaseKVCachePool):
                     zero_tier(tier[0, slot])
                     zero_tier(tier[1, slot])
 
+    def zero_mtp_first_token(self, out_loc: torch.Tensor) -> None:
+        """A fresh prompt has no preceding target residual; its first draft KV row is zero."""
+        layer = self._mtp_layer_id
+        if layer is None:
+            return
+        heads = getattr(self._pool, "_num_kv_heads", None)
+        if heads is None:
+            heads = self._pool._k_buffer.shape[-2]
+        shape = (heads, self._head_dim)
+        zero = torch.zeros((1, *shape), dtype=self.dtype, device=self.device)
+        physical = out_loc
+        if self.page_map is not None:
+            physical = self.page_map[out_loc // self._page_size] * self._page_size
+            physical = physical + out_loc % self._page_size
+        self.store_kv(zero.reshape(1, -1), zero.reshape(1, -1), physical, layer)
+
     def free_req(self, table_idx: int) -> None:
         """Zero the per-request pending ring and scratch cmp buffer when table_idx is released."""
         if self._pending_ring is not None and 0 <= table_idx < self._num_req_slots:
             self._pending_ring[table_idx].zero_()
         if self._cmp_k_buffer is not None and 0 <= table_idx < self._num_req_slots:
             self._cmp_k_buffer[:, self._cmp_scratch_base + table_idx].zero_()
-        self.clear_mtp_slot()
+        if not self.preserve_mtp_prefix:
+            self.clear_mtp_slot()
 
 
 __all__ = ["QSAKVCache"]

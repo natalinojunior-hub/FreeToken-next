@@ -103,7 +103,9 @@ class Qwen4ExpDecoderLayer(BaseOP):
         )
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
-    def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
+    def forward(
+        self, hidden: torch.Tensor, batch: Batch, *, last_only: bool = False
+    ) -> torch.Tensor:
         if self.ple is not None:
             hidden = hidden + self.ple.forward(hidden, batch)
         block_input, inject = self.attn_hyper_connection.mix(hidden)
@@ -113,6 +115,8 @@ class Qwen4ExpDecoderLayer(BaseOP):
             else:
                 block_output = self.self_attn.forward(block_input, batch)
             hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
+            if last_only:
+                hidden = hidden[-1:]
             block_input, inject = self.mlp_hyper_connection.mix(hidden)
             return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
 
@@ -131,6 +135,8 @@ class Qwen4ExpDecoderLayer(BaseOP):
             block_output = self.self_attn.forward(block_input, batch)
         mixer_end.record()
         hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
+        if last_only:
+            hidden = hidden[-1:]
         block_input, inject = self.mlp_hyper_connection.mix(hidden)
         moe_start.record()
         moe_out = self.mlp.forward(block_input)
@@ -142,6 +148,9 @@ class Qwen4ExpDecoderLayer(BaseOP):
         if int(_layer_timing_totals["calls"]) % 256 == 0:
             print(f"[layer-timing] totals_ms={_layer_timing_totals}", flush=True)
         return self.mlp_hyper_connection.combine(hidden, moe_out, inject)
+
+    def forward_last(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
+        return self.forward(hidden, batch, last_only=True)
 
 
 class _MTPQuantConfig(QuantConfig):
@@ -232,6 +241,29 @@ class Qwen4ExpMTP(BaseOP):
         )
 
     def forward(self, residual: torch.Tensor, next_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+        hidden = self._prepare_hidden(residual, next_ids)
+        return self.layers.op_list[0].forward(hidden, batch)
+
+    def forward_last(
+        self, residual: torch.Tensor, next_ids: torch.Tensor, batch: Batch
+    ) -> torch.Tensor:
+        """Run row-wise attention/state work for all inputs and the MLP for the last."""
+        hidden = self._prepare_hidden(residual, next_ids)
+        return self.layers.op_list[0].forward_last(hidden, batch)
+
+    def prime_kv(self, residual: torch.Tensor, next_ids: torch.Tensor, batch: Batch) -> None:
+        """Build exact target-fed head KV without unused attention outputs or expert work."""
+        if not hasattr(get_global_ctx().attn_backend, "store_qsa_kv"):
+            self.forward(residual, next_ids, batch)
+            return
+        hidden = self._prepare_hidden(residual, next_ids)
+        layer = self.layers.op_list[0]
+        if layer.ple is not None:
+            hidden = hidden + layer.ple.forward(hidden, batch)
+        block_input, _ = layer.attn_hyper_connection.mix(hidden)
+        layer.self_attn.prime_kv(block_input, batch)
+
+    def _prepare_hidden(self, residual: torch.Tensor, next_ids: torch.Tensor) -> torch.Tensor:
         from freetoken.mm import restore_placeholder
 
         tokens = residual.shape[0]
@@ -242,7 +274,7 @@ class Qwen4ExpMTP(BaseOP):
             next_ids = restore_placeholder(next_ids, self._image_token_id)
         embedded = self._embed_ref.forward(next_ids).to(residual.dtype)
         fe = self.fc_embedding.forward(self.pre_fc_norm_embedding.forward(embedded))
-        return self.layers.op_list[0].forward(fh + fe.repeat(1, self.hc_count), batch)
+        return fh + fe.repeat(1, self.hc_count)
 
     def mix(self, residual: torch.Tensor) -> torch.Tensor:
         return self.hyper_connection_mixer.mix(residual)[0]
@@ -293,7 +325,7 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             spec_out = None
-            if batch.spec_logits_indices is not None:
+            if getattr(batch, "spec_logits_indices", None) is not None:
                 buffers = getattr(get_global_ctx().linear_state_pool, "spec_slot_states", {})
                 if (
                     "ple_ngram_ctx" in buffers
@@ -303,7 +335,24 @@ class Qwen4ExpModel(BaseOP):
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None), spec_out=spec_out)
         if self._capture_mtp_residual:
             self._last_residual = hidden
+            commit_mtp_residual(hidden, batch)
         return self.hyper_connection_mixer.mix(hidden)[0]
+
+
+def commit_mtp_residual(hidden: torch.Tensor, batch: Batch) -> None:
+    """Cache the target residual at live and donated prefix boundaries for draft priming."""
+    pool = get_global_ctx().linear_state_pool
+    if pool is None or not pool.has_slot_state("mtp_residual"):
+        return
+    metadata = batch.fla_metadata
+    state = pool.slot_state("mtp_residual")
+    state.index_copy_(0, metadata.cache_indices.long(), hidden[metadata.cu_seqlens[1:].long() - 1])
+    if metadata.track_dst is not None:
+        state.index_copy_(0, metadata.track_dst, hidden[metadata.track_boundary_row - 1])
+    if batch.spec_logits_indices is not None:
+        rows = pool.spec_slot_states.get("mtp_residual")
+        if rows is not None and hidden.shape[0] <= rows.shape[1]:
+            rows[0, : hidden.shape[0]].copy_(hidden)
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):

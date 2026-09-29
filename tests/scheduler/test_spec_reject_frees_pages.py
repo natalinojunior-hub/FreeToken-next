@@ -576,6 +576,7 @@ def test_run_spec_step_k2_rejection_and_acceptance_positions():
             _spec_eligible_req=lambda: req,
             _flush_deferred_replays=lambda: None,
             _snapshot_qsa_state=lambda _req: None,
+            _retain_mtp_ring=lambda _req: None,
             _spec_snapshot_slot=lambda _req: 9,
             _linear_slot=lambda _req: 0,
             _restore_qsa_state=lambda _req: qsa_restores.append(name),

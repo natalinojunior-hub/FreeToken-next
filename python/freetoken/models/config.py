@@ -367,6 +367,7 @@ class ModelConfig:
     # serve with --spec-mtp; the expert types then cover the draft's own bank too.
     native_mtp_layers: int = 0
     mtp_row_state_commit: bool = False
+    mtp_residual_width: int = 0
     native_mtp_expert_types: tuple[int, int] | list[tuple[int, int]] | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
@@ -575,11 +576,18 @@ def with_mtp_layer(
     if group.num_index_layers:
         fields["num_index_layers"] = len(ids)
     extra = {}
+    if config.mtp_residual_width and not any(
+        state.name == "mtp_residual" for state in config.slot_states
+    ):
+        extra["slot_states"] = (
+            *config.slot_states,
+            SlotStateSpec("mtp_residual", (config.mtp_residual_width,)),
+        )
     if gguf_expert_types is not None:
         types = config.gguf_expert_types
         if not isinstance(types, dict):
             raise ValueError("an MTP GGUF expert bank needs the target's per-layer GGUF types")
-        extra = dict(
+        extra.update(
             mtp_expert_bank=True,
             gguf_expert_types={
                 "gate_up": [*types["gate_up"], gguf_expert_types[0]],

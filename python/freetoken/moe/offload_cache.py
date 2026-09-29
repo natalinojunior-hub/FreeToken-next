@@ -340,6 +340,7 @@ class OffloadMoeCache:
         self._staging: dict[int, tuple[tuple[torch.Tensor, ...], torch.Tensor]] = {}
         self._arenas: list[torch.Tensor] = []
         self._vmm_arenas: list = []
+        self._backing_cost_curve: tuple[int, ...] | None = None
         self.live_caps: list[int] = []
         self._staged: set[int] = set()
         self._bind_pool_state()
@@ -445,13 +446,19 @@ class OffloadMoeCache:
         sources: dict[str, list[torch.Tensor]],
         layer_residency: list[str] | None = None,
     ) -> None:
-        """Attach the host (CPU pinned) expert source banks and allocate a GPU slot
-        cache per bank, following the format's bank schema.
+        self._prepare_bank_sources(sources, layer_residency)
+        self._allocate_prepared_bank_sources()
+
+    def _prepare_bank_sources(
+        self,
+        sources: dict[str, list[torch.Tensor]],
+        layer_residency: list[str] | None = None,
+    ) -> None:
+        """Validate and attach source bank geometry without allocating device arenas.
 
         Every bank is a list of ``num_layers`` tensors, one ``[num_experts, ...]``
         per layer (independent allocations, so each layer can carry its own host
-        attributes); each slot cache mirrors the bank's row shape and dtype as one
-        unified GPU pool. The row layouts are produced by the weight loaders /
+        attributes). The row layouts are produced by the weight loaders /
         repackers (see ``_BANK_SCHEMAS`` and :mod:`freetoken.layers.quantization.moe.nvfp4`)
         -- the cache machinery is layout-agnostic and just moves rows.
 
@@ -512,7 +519,9 @@ class OffloadMoeCache:
                 key = (layer_id, name, qt)
                 self.expert_geometry[key] = (tuple(source.shape), source.dtype)
             self.bank_sources[name] = list(per_layer)
-        size = self._alloc_bank_caches(self.cache_size)
+
+    def _allocate_prepared_bank_sources(self, vmm_plan=None) -> None:
+        size = self._alloc_bank_caches(self.cache_size, precomputed_vmm_plan=vmm_plan)
         if size != self.cache_size:
             self._alloc_slot_state(size)
         self._bind_pool_state()
@@ -651,7 +660,7 @@ class OffloadMoeCache:
     def _is_prefill_pool(self, pool) -> bool:
         return any(layer < self.prefill_moe_layers for layer in pool.layers)
 
-    def _alloc_bank_caches(self, cache_size: int) -> int:
+    def _alloc_bank_caches(self, cache_size: int, precomputed_vmm_plan=None) -> int:
         """Allocate the GPU slot cache as one byte arena per bank, split into geometry pools.
 
         Layers with the same row geometry in every bank share a pool: a contiguous range of
@@ -667,13 +676,14 @@ class OffloadMoeCache:
 
         banks = {n: self.bank_sources[n] for n in self.bank_schema}
         self._release_vmm()
-        plan = None
-        if self.vmm_rows:
+        plan = precomputed_vmm_plan
+        if self.vmm_rows and plan is None:
             try:
                 plan = self._vmm_plan(cache_size)
             except ValueError as e:
                 logger.warning(f"expert cache stays fixed-size (no in-place residency): {e}")
                 from freetoken.tuning import diagnostics
+
                 diagnostics.log_event(
                     "fallback",
                     "expert_residency",
@@ -689,7 +699,8 @@ class OffloadMoeCache:
             arenas = [torch.empty((end,), dtype=torch.uint8, device=self.device) for end in ends]
             live = list(caps)
             self._staged = {
-                p for p, c in enumerate(caps)
+                p
+                for p, c in enumerate(caps)
                 if self._is_prefill_pool(pools[p]) and c < self.num_experts
             }
         self.live_caps = live
@@ -742,6 +753,12 @@ class OffloadMoeCache:
         self._pool_starts = starts
         self._arenas = arenas
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
+        if self._vmm_arenas:
+            granule = self._vmm_arenas[0].g
+            self._backing_cost_curve = tuple(
+                self._backed_bytes_for_live(self._live_caps_for(pools, caps, size), granule)
+                for size in range(cache_size + 1)
+            )
         return sum(caps)
 
     def _override_caps(self, pools, cache_size: int) -> list[int]:
@@ -847,6 +864,7 @@ class OffloadMoeCache:
         E = self.num_experts
         caps = self._caps_for(pools, min(size, sum(shape_caps)))
         live = []
+        floors = []
         for p, (c, cap) in enumerate(zip(caps, shape_caps)):
             lo = min(cap, self.min_pool_rows or E)
             if self._is_prefill_pool(pools[p]) and p not in self._staged:
@@ -860,28 +878,79 @@ class OffloadMoeCache:
                             lo = max(lo, -(-E * rb // rb0))
             if lo > cap:
                 raise ValueError(f"pool {p} shape {cap} rows cannot hold its prefill front {lo}")
+            floors.append(lo)
             live.append(min(cap, max(lo, c)))
+        # Floors are part of the requested budget, not extra rows added after splitting it.
+        excess = sum(live) - max(size, sum(floors))
+        while excess > 0:
+            movable = [p for p, (n, lo) in enumerate(zip(live, floors)) if n > lo]
+            share = max(1, excess // len(movable))
+            for p in movable:
+                take = min(share, live[p] - floors[p], excess)
+                live[p] -= take
+                excess -= take
         return live
+
+    def _effective_live_caps_for(self, size: int) -> list[int]:
+        """Return the live pool caps ``set_live`` can apply at ``size`` rows.
+
+        Shrinks clamp each pool to its current cap so largest-remainder rounding can never
+        turn a physical shrink into a per-pool grow.
+        """
+        live = self._live_caps_for(self.pools, self.pool_caps, size)
+        if size < sum(self.live_caps):
+            live = [min(n, old) for n, old in zip(live, self.live_caps)]
+        return live
+
+    def backed_bytes_for(self, size: int) -> int:
+        """Exact VMM backing bytes for the live pool geometry at ``size`` rows.
+
+        Match ``VirtualArena.set_backed``: each pool/bank region rounds independently to
+        the native CUDA granule. This prices the post-floor live split, not an average
+        byte price per logical row.
+        """
+        if not self._vmm_arenas:
+            raise RuntimeError("exact backing price requires VMM residency")
+        granule = self._vmm_arenas[0].g
+        if self._backing_cost_curve is not None and sum(self.live_caps) <= size < len(
+            self._backing_cost_curve
+        ):
+            return self._backing_cost_curve[size]
+        live = self._effective_live_caps_for(size)
+        return self._backed_bytes_for_live(live, granule)
+
+    def _backed_bytes_for_live(self, live: list[int], granule: int) -> int:
+        """Exact bank-granule price for an already-computed live split."""
+        return sum(
+            -(-(rows * row_bytes) // granule) * granule
+            for rows, pool in zip(live, self.pools)
+            for row_bytes in pool.row_bytes
+        )
 
     def _alloc_vmm_arenas(self, pools, caps, offsets, ends, live) -> list[torch.Tensor]:
         from freetoken.moe import vmm
 
         self._vmm_arenas = []
-        for b in range(len(self.bank_schema)):
-            regions = [
-                (
-                    offsets[p][b],
-                    (offsets[p + 1][b] if p + 1 < len(pools) else ends[b]) - offsets[p][b],
-                )
-                for p in range(len(pools))
-            ]
-            arena = vmm.VirtualArena(self.device, ends[b], regions)
-            for p, pool in enumerate(pools):
-                arena.set_backed(p, live[p] * pool.row_bytes[b])
-            self._vmm_arenas.append(arena)
-        return [a.tensor for a in self._vmm_arenas]
+        try:
+            for b in range(len(self.bank_schema)):
+                regions = [
+                    (
+                        offsets[p][b],
+                        (offsets[p + 1][b] if p + 1 < len(pools) else ends[b]) - offsets[p][b],
+                    )
+                    for p in range(len(pools))
+                ]
+                arena = vmm.VirtualArena(self.device, ends[b], regions)
+                self._vmm_arenas.append(arena)
+                for p, pool in enumerate(pools):
+                    arena.set_backed(p, live[p] * pool.row_bytes[b])
+            return [a.tensor for a in self._vmm_arenas]
+        except Exception:
+            self._release_vmm()
+            raise
 
     def _release_vmm(self) -> None:
+        self._backing_cost_curve = None
         if self._vmm_arenas:
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
@@ -914,15 +983,7 @@ class OffloadMoeCache:
         experts, and no address or shape changes, so captured graphs stay valid. The caller
         guarantees no forward is in flight."""
         assert self._vmm_arenas, "set_live needs VMM residency"
-        new = self._live_caps_for(self.pools, self.pool_caps, size)
-        if size < sum(self.live_caps):
-            # A whole-cache shrink must never GROW an individual pool: the split's
-            # largest-remainder rounding can hand a pool more rows than it holds, and
-            # growing needs fresh physical backing -- a cuMemCreate the memory pressure
-            # prompting the shrink may not have (killed the 128K certification worker).
-            # Clamped per pool, a shrink stays a pure unmap and always fits; both the ray
-            # split and the old live caps satisfy every pool floor, so the min does too.
-            new = [min(n, o) for n, o in zip(new, self.live_caps)]
+        new = self._effective_live_caps_for(size)
         flat = self.slot_for_id.view(-1)
         for p, ((ids, usage), old, nxt) in enumerate(zip(self._pool_state, self.live_caps, new)):
             if nxt < old:
@@ -934,10 +995,65 @@ class OffloadMoeCache:
         torch.cuda.synchronize(self.device)
         # rows whose bytes survived the re-map, per pool (min over banks)
         intact = list(new)
-        for b, arena in enumerate(self._vmm_arenas):
-            for p, (pool, nxt) in enumerate(zip(self.pools, new)):
-                rb = pool.row_bytes[b]
-                intact[p] = min(intact[p], arena.set_backed(p, nxt * rb) // rb)
+        # Free every shrinking region before mapping any growing one. Largest-remainder
+        # redistribution can lower one pool's cap as total logical rows increase; applying
+        # that transition shrink-first makes final-byte fit sufficient for the whole move.
+        try:
+            for growing in (False, True):
+                for b, arena in enumerate(self._vmm_arenas):
+                    for p, (pool, old, nxt) in enumerate(zip(self.pools, self.live_caps, new)):
+                        if (nxt > old) != growing or nxt == old:
+                            continue
+                        rb = pool.row_bytes[b]
+                        intact[p] = min(intact[p], arena.set_backed(p, nxt * rb) // rb)
+        except Exception as error:
+            from freetoken.moe.vmm import VMMResizeRollbackError
+
+            rollback_error = error if isinstance(error, VMMResizeRollbackError) else None
+            preserved = [min(old, nxt) for old, nxt in zip(self.live_caps, new)]
+            safe = [min(preserved[p], intact[p]) for p in range(len(new))]
+            for b, arena in enumerate(self._vmm_arenas):
+                for p, pool in enumerate(self.pools):
+                    safe[p] = min(safe[p], arena.backed[p] // pool.row_bytes[b])
+            if safe != preserved and rollback_error is None:
+                rollback_error = VMMResizeRollbackError(
+                    f"VMM resize left backing below the retained prefix: {preserved} -> {safe}"
+                )
+            for b, arena in enumerate(self._vmm_arenas):
+                for p, pool in enumerate(self.pools):
+                    target = safe[p] * pool.row_bytes[b]
+                    if arena.backed[p] > target:
+                        try:
+                            arena.set_backed(p, target)
+                        except Exception as cleanup_error:
+                            if rollback_error is None:
+                                rollback_error = VMMResizeRollbackError(
+                                    f"VMM resize failed ({error!r}); rollback failed "
+                                    f"({cleanup_error!r})"
+                                )
+            actual = safe.copy()
+            for b, arena in enumerate(self._vmm_arenas):
+                for p, pool in enumerate(self.pools):
+                    actual[p] = min(actual[p], arena.backed[p] // pool.row_bytes[b])
+            if actual != preserved and rollback_error is None:
+                rollback_error = VMMResizeRollbackError(
+                    f"VMM rollback left backing below the retained prefix: {preserved} -> {actual}"
+                )
+            safe = actual
+            for (ids, usage), old, keep in zip(self._pool_state, self.live_caps, safe):
+                if keep < old:
+                    held = ids[keep:old]
+                    gone = held[held >= 0].to(torch.int64)
+                    flat[gone] = -1
+                    held.fill_(-1)
+                    usage[keep:old].fill_(self._BLOCKED_USAGE)
+            self.live_caps = safe
+            self._block_unbacked()
+            if rollback_error is not None:
+                if rollback_error is error:
+                    raise
+                raise rollback_error from error
+            raise
         for (ids, usage), old, nxt, keep in zip(self._pool_state, self.live_caps, new, intact):
             lost = min(keep, old)  # below this row the slot still holds its expert
             if nxt > lost:

@@ -20,6 +20,77 @@ from .common import Fixture, requires_cuda, parsed_config, selection_spy
 QSA_LAYER = 3
 
 
+def test_qwen4_last_forward_keeps_attention_rows_and_slices_mlp_rows():
+    from freetoken.engine.graph import mtp_forward_last
+    from freetoken.models.qwen4_exp.model import Qwen4ExpDecoderLayer
+
+    class HyperConnection:
+        def mix(self, x):
+            return x * 0.5, x * 0.25
+
+        def combine(self, residual, output, inject):
+            return residual + output + inject
+
+    class Attention:
+        def __init__(self):
+            self.rows = []
+
+        def forward(self, x, batch):
+            self.rows.append(x.shape[0])
+            return x * 0.125
+
+    class MLP:
+        def __init__(self):
+            self.rows = []
+
+        def forward(self, x):
+            self.rows.append(x.shape[0])
+            return x * 0.25 + 0.5
+
+    layer = object.__new__(Qwen4ExpDecoderLayer)
+    layer._layer_id = 4
+    layer._is_linear = False
+    layer.ple = None
+    layer.self_attn = Attention()
+    layer.attn_hyper_connection = HyperConnection()
+    layer.mlp_hyper_connection = HyperConnection()
+    layer.mlp = MLP()
+    hidden = torch.arange(20, dtype=torch.float32).view(5, 4)
+    full = layer.forward(hidden, None)
+    assert layer.self_attn.rows == [5]
+    assert layer.mlp.rows == [5]
+
+    layer.self_attn.rows.clear()
+    layer.mlp.rows.clear()
+    fast = layer.forward_last(hidden, None)
+    assert layer.self_attn.rows == [5]
+    assert layer.mlp.rows == [1]
+    assert torch.equal(fast, full[-1:])
+
+    class GenericMTP:
+        def forward(self, residual, next_ids, batch):
+            return residual + next_ids[:, None]
+
+    residual = torch.arange(20, dtype=torch.float32).view(5, 4)
+    tokens = torch.arange(5, dtype=torch.float32)
+    expected = GenericMTP().forward(residual, tokens, None)[-1:]
+    assert torch.equal(mtp_forward_last(GenericMTP(), residual, tokens, None), expected)
+
+
+def test_mtp_forward_last_prefers_specialized_method():
+    from freetoken.engine.graph import mtp_forward_last
+
+    class MTP:
+        def forward(self, residual, next_ids, batch):
+            raise AssertionError("full forward should not be called")
+
+        def forward_last(self, residual, next_ids, batch):
+            return residual[-1:]
+
+    residual = torch.arange(10).view(5, 2)
+    assert torch.equal(mtp_forward_last(MTP(), residual, torch.empty(0), None), residual[-1:])
+
+
 @requires_cuda
 def test_turbo4_split_path_runs():
     """Exercise the separate TurboKV decompression and QSA attention path."""
@@ -34,6 +105,366 @@ def test_turbo4_split_path_runs():
 
     assert got.shape == x.shape
     assert torch.isfinite(got).all()
+
+
+@requires_cuda
+def test_kv_only_store_matches_normal_qsa_state():
+    """MTP KV-only priming must write the same KV/index state as QSA attention."""
+    config = parsed_config()
+    normal = Fixture(config, num_pages=16, max_running_req=1)
+    attn = normal.layer(QSA_LAYER)
+    length = 70  # close one compressed group and leave a nonempty pending ring
+    x = _inputs(normal, [length], seed=23)[0]
+    normal_batch = normal.batch([normal.req(0, 0, length)], "prefill")
+    q, k, v, index, _ = attn._project(x, normal_batch)
+    normal.backend.qsa_forward(
+        q.view(-1, attn.num_q, attn.head_dim), k, v, index, QSA_LAYER, normal_batch
+    )
+
+    # Fixture installs its context globally; finish normal metadata/forward before primed
+    # becomes the global context used by QSA's block-table snapshot.
+    primed = Fixture(config, num_pages=16, max_running_req=1)
+    prime_batch = primed.batch([primed.req(0, 0, length)], "prefill")
+    primed.backend.store_qsa_kv(k, v, index, QSA_LAYER, prime_batch, stage_host=False)
+
+    torch.cuda.synchronize(normal.device)
+    # out_loc is a flattened token slot; MHA-backed QSA caches expose [pages, page_size, ...].
+    torch.testing.assert_close(
+        normal.pool.k_cache(QSA_LAYER).flatten(0, 1).index_select(0, normal_batch.out_loc.long()),
+        primed.pool.k_cache(QSA_LAYER).flatten(0, 1).index_select(0, prime_batch.out_loc.long()),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        normal.pool.v_cache(QSA_LAYER).flatten(0, 1).index_select(0, normal_batch.out_loc.long()),
+        primed.pool.v_cache(QSA_LAYER).flatten(0, 1).index_select(0, prime_batch.out_loc.long()),
+        rtol=0,
+        atol=0,
+    )
+    slot = normal.backend._idx_slot[QSA_LAYER]
+    main_rows = normal.pool.cmp_scratch_base
+    assert torch.equal(
+        normal.pool.cmp_k_cache(slot)[:main_rows],
+        primed.pool.cmp_k_cache(slot)[:main_rows],
+    )
+    assert torch.equal(normal.pool.pending_ring(slot), primed.pool.pending_ring(slot))
+
+
+@requires_cuda
+def test_mtp_prime_fill_matches_full_head_across_chunks_and_mrope():
+    """Real MTP head parity, including its prompt warmup and the following decode."""
+    from freetoken.models.config import with_mtp_layer
+    from freetoken.models.qwen4_exp.model import Qwen4ExpMTP
+
+    from .common import hf_config
+
+    hf = hf_config(mtp={"num_hidden_layers": 1, "hybrid": True, "layer_types": ["full_attention"]})
+    hf.text_config.rope_parameters.update(
+        {"mrope_interleaved": True, "mrope_section": [11, 11, 10]}
+    )
+    hf.vision_config = SimpleNamespace(
+        hidden_size=128,
+        depth=1,
+        num_heads=2,
+        intermediate_size=256,
+        patch_size=16,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        num_position_embeddings=64,
+        out_hidden_size=128,
+        in_channels=3,
+    )
+    hf.image_token_id = 511
+    from freetoken.models.qwen4_exp.config import parse_config
+
+    config = with_mtp_layer(parse_config(hf), 4)
+    assert config.model_is_mrope
+    length = 137  # cross pages and compressed groups; leave pending index rows
+    device = torch.device("cuda")
+    seed = 912
+    gen = torch.Generator(device=device).manual_seed(seed)
+    residual = torch.randn(
+        length,
+        config.hidden_size * config.qwen4_args.hc_count,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=gen,
+    )
+    ids = torch.randint(config.vocab_size - 1, (length,), device=device, generator=gen)
+    next_residual = torch.randn(
+        1,
+        config.hidden_size * config.qwen4_args.hc_count,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=gen,
+    )
+    next_id = torch.randint(config.vocab_size - 1, (1,), device=device, generator=gen)
+    temporal = torch.arange(length + 1, dtype=torch.int32)
+    mrope = torch.stack((temporal, temporal // 4, temporal // 16))
+
+    # Build the real head while a QSA fixture owns the global context. Its toy MoE is
+    # irrelevant to KV writes; preserve the real MTP preparation, HC, and attention path.
+    owner = Fixture(config, num_pages=16, max_running_req=1)
+    embedding = torch.nn.Embedding(
+        config.vocab_size, config.hidden_size, device=device, dtype=torch.bfloat16
+    )
+    from freetoken.utils.torch_utils import torch_dtype
+
+    with torch.device(device), torch_dtype(torch.bfloat16):
+        mtp = Qwen4ExpMTP(config, config.mtp_layer_id, embedding=embedding)
+    for index, tensor in enumerate(mtp.state_dict().values()):
+        if tensor.is_floating_point():
+            tensor.normal_(
+                0.0,
+                0.05,
+                generator=torch.Generator(device=tensor.device).manual_seed(seed + index + 1),
+            )
+        else:
+            tensor.zero_()
+    with torch.no_grad():
+        embedding.weight.normal_(
+            0.0,
+            0.05,
+            generator=torch.Generator(device=device).manual_seed(seed + 2),
+        )
+    layer = mtp.layers.op_list[0]
+    assert layer.ple is None  # MTP is synthetic layer num_layers; PLE belongs to target layers.
+    layer.mlp.forward = lambda x: torch.zeros_like(x)
+
+    class DynamicReq(SimpleNamespace):
+        @property
+        def extend_len(self):
+            return self.device_len - self.cached_len
+
+        @extend_len.setter
+        def extend_len(self, value):
+            pass  # Fixture.step mirrors the production Req tuple update; the property is derived.
+
+    def make_run(kind: str, chunk: int | None):
+        fixture = Fixture(config, num_pages=16, max_running_req=1)
+        from freetoken.kvcache.linear_state_pool import LinearStatePool
+
+        fixture.ctx.linear_state_pool = LinearStatePool(
+            config.linear_attention_group(),
+            fixture.num_req_slots,
+            fixture.dtype,
+            fixture.device,
+            tp_size=1,
+            slot_states=config.slot_states,
+        )
+        for state in fixture.ctx.linear_state_pool.slot_states.values():
+            state.fill_(1 if not state.is_floating_point() else 0.125)
+        req = DynamicReq(**vars(fixture.req(0, 0, length)))
+        req.mrope_positions_full = mrope[:, :length].clone()
+        req.mrope_delta = 0
+        if kind == "full":
+            full_chunk = chunk or length
+            for offset in range(0, length, full_chunk):
+                stop = min(offset + full_chunk, length)
+                req.cached_len, req.device_len = offset, stop
+                batch = fixture.batch([req], "prefill")
+                batch.mrope_positions = mrope[:, offset:stop].to(device)
+                batch.get_attn_positions = lambda: batch.mrope_positions
+                with fixture.ctx.forward_batch(batch):
+                    mtp.forward(residual[offset:stop], ids[offset:stop], batch)
+            req.cached_len, req.device_len = 0, length
+        elif kind == "auto":
+            scheduler = SimpleNamespace(
+                device=device,
+                _model_is_mrope=True,
+                engine=SimpleNamespace(
+                    model=SimpleNamespace(mtp=mtp),
+                    attn_backend=fixture.backend,
+                    config=SimpleNamespace(max_extend_tokens=chunk),
+                    page_table=fixture.page_table,
+                    ctx=fixture.ctx,
+                ),
+            )
+            SchedulerSpecMixin._fill_mtp_kv(scheduler, req, 0, residual, ids)
+        else:
+            for offset in range(0, length, chunk):
+                stop = min(offset + chunk, length)
+                req.cached_len, req.device_len = offset, stop
+                batch = fixture.batch([req], "prefill")
+                batch.mrope_positions = mrope[:, offset:stop].to(device)
+                batch.get_attn_positions = lambda: batch.mrope_positions
+                with fixture.ctx.forward_batch(batch):
+                    mtp.prime_kv(residual[offset:stop], ids[offset:stop], batch)
+            req.cached_len, req.device_len = 0, length
+        return fixture, req
+
+    from freetoken.scheduler.spec import SchedulerSpecMixin
+    import freetoken.core as core
+
+    def activate(fixture):
+        core._GLOBAL_CTX = fixture.ctx
+
+    runs = [
+        make_run("full", 8),
+        make_run("auto", 8),
+        make_run("full", 128),
+        make_run("prime", 128),
+    ]
+
+    def assert_same_state(reference, candidate):
+        ref, ref_req = reference
+        got, got_req = candidate
+        extent = ref_req.device_len
+        layer_id = config.mtp_layer_id
+        slot = ref.backend._idx_slot[layer_id]
+        torch.testing.assert_close(
+            ref.pool.k_cache(layer_id)
+            .flatten(0, 1)
+            .index_select(0, ref.page_table[ref_req.table_idx, :extent].long()),
+            got.pool.k_cache(layer_id)
+            .flatten(0, 1)
+            .index_select(0, got.page_table[got_req.table_idx, :extent].long()),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            ref.pool.v_cache(layer_id)
+            .flatten(0, 1)
+            .index_select(0, ref.page_table[ref_req.table_idx, :extent].long()),
+            got.pool.v_cache(layer_id)
+            .flatten(0, 1)
+            .index_select(0, got.page_table[got_req.table_idx, :extent].long()),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            ref.pool.rope_positions.index_select(
+                0, ref.page_table[ref_req.table_idx, :extent].long()
+            ),
+            got.pool.rope_positions.index_select(
+                0, got.page_table[got_req.table_idx, :extent].long()
+            ),
+            rtol=0,
+            atol=0,
+        )
+        assert torch.equal(
+            ref.pool.cmp_k_cache(slot)[: ref.pool.cmp_scratch_base],
+            got.pool.cmp_k_cache(slot)[: got.pool.cmp_scratch_base],
+        )
+        assert torch.equal(ref.pool.pending_ring(slot), got.pool.pending_ring(slot))
+        for name, state in ref.ctx.linear_state_pool.slot_states.items():
+            assert torch.equal(state, got.ctx.linear_state_pool.slot_states[name])
+
+    for full, prime in ((0, 1), (2, 3)):
+        assert_same_state(runs[full], runs[prime])
+
+    # A subsequent decode consumes the primed cache; verify both emitted head state and writes.
+    decode_outputs = []
+    decode_writes = []
+    for fixture, req in runs:
+        writes = []
+        original_store = fixture.backend.store_qsa_kv
+
+        def capture_store(*args, **kwargs):
+            writes.append((args[0].clone(), args[1].clone()))
+            return original_store(*args, **kwargs)
+
+        fixture.backend.store_qsa_kv = capture_store
+        activate(fixture)
+        fixture.step(req)
+        batch = fixture.batch([req], "decode")
+        batch.mrope_positions = mrope[:, length : length + 1].to(device)
+        batch.get_attn_positions = lambda: batch.mrope_positions
+        with fixture.ctx.forward_batch(batch):
+            decode_outputs.append(mtp.forward(next_residual, next_id, batch))
+        decode_writes.append(writes)
+    for full, prime in ((0, 1), (2, 3)):
+        torch.testing.assert_close(
+            decode_writes[prime][0][0], decode_writes[full][0][0], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            decode_writes[prime][0][1], decode_writes[full][0][1], rtol=0, atol=0
+        )
+        torch.testing.assert_close(decode_outputs[prime], decode_outputs[full], rtol=0, atol=0)
+        assert_same_state(runs[full], runs[prime])
+
+    real_mlp = layer.mlp.forward
+    mlp_rows = []
+
+    def track_real_mlp(x):
+        mlp_rows.append(x.shape[0])
+        return real_mlp(x)
+
+    layer.mlp.forward = track_real_mlp
+
+    def draft_run(use_last):
+        fixture = Fixture(config, num_pages=16, max_running_req=1)
+        req = DynamicReq(**vars(fixture.req(0, 0, 5)))
+        req.mrope_positions_full = mrope[:, :6].clone()
+        req.mrope_delta = 0
+        batch = fixture.batch([req], "prefill")
+        batch.mrope_positions = mrope[:, :5].to(device)
+        batch.get_attn_positions = lambda: batch.mrope_positions
+        activate(fixture)
+        with fixture.ctx.forward_batch(batch):
+            result = (
+                mtp.forward_last(residual[:5], ids[:5], batch)
+                if use_last
+                else mtp.forward(residual[:5], ids[:5], batch)[-1:]
+            )
+        return fixture, req, result
+
+    full_run = draft_run(False)
+    last_run = draft_run(True)
+    torch.testing.assert_close(full_run[2], last_run[2], rtol=0, atol=0)
+    assert mlp_rows[:2] == [5, 1]
+
+    def assert_draft_state_equal(reference, candidate):
+        ref, ref_req, _ = reference
+        got, got_req, _ = candidate
+        extent = ref_req.device_len
+        layer_id = config.mtp_layer_id
+        slot = ref.backend._idx_slot[layer_id]
+        for cache_name in ("k_cache", "v_cache"):
+            ref_cache = getattr(ref.pool, cache_name)(layer_id)
+            got_cache = getattr(got.pool, cache_name)(layer_id)
+            torch.testing.assert_close(
+                ref_cache.flatten(0, 1).index_select(
+                    0, ref.page_table[ref_req.table_idx, :extent].long()
+                ),
+                got_cache.flatten(0, 1).index_select(
+                    0, got.page_table[got_req.table_idx, :extent].long()
+                ),
+                rtol=0,
+                atol=0,
+            )
+        torch.testing.assert_close(
+            ref.pool.rope_positions.index_select(
+                0, ref.page_table[ref_req.table_idx, :extent].long()
+            ),
+            got.pool.rope_positions.index_select(
+                0, got.page_table[got_req.table_idx, :extent].long()
+            ),
+            rtol=0,
+            atol=0,
+        )
+        assert torch.equal(
+            ref.pool.cmp_k_cache(slot)[: ref.pool.cmp_scratch_base],
+            got.pool.cmp_k_cache(slot)[: got.pool.cmp_scratch_base],
+        )
+        assert torch.equal(ref.pool.pending_ring(slot), got.pool.pending_ring(slot))
+
+    assert_draft_state_equal(full_run, last_run)
+    next_outputs = []
+    for fixture, req, previous in (full_run, last_run):
+        fixture.step(req)
+        batch = fixture.batch([req], "decode")
+        batch.mrope_positions = mrope[:, 5:6].to(device)
+        batch.get_attn_positions = lambda: batch.mrope_positions
+        activate(fixture)
+        with fixture.ctx.forward_batch(batch):
+            next_outputs.append(mtp.forward(previous, next_id, batch))
+    torch.testing.assert_close(next_outputs[0], next_outputs[1], rtol=0, atol=0)
+    assert mlp_rows == [5, 1, 1, 1]
+    assert_draft_state_equal(
+        (full_run[0], full_run[1], next_outputs[0]),
+        (last_run[0], last_run[1], next_outputs[1]),
+    )
 
 
 def _inputs(fixture: Fixture, lengths, extra: int = 0, seed: int = 11):

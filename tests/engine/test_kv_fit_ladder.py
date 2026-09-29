@@ -40,6 +40,17 @@ def test_mtp_is_shed_before_the_context_is_refused():
     assert eng._shed_mtp(cfg) is False  # nothing left to give: the caller refuses
 
 
+def test_precision_retry_is_once_per_kv_mtp_candidate(_clean_state_env):
+    cfg = _gdn_cfg(4)
+    cfg.kv_format = "fp8"
+    assert eng._mtp_state_precision_retry_candidate(cfg, True, None) == ("fp8", 4)
+    assert eng._mtp_state_precision_retry_candidate(cfg, True, ("fp8", 4)) is None
+    cfg.kv_format = "nvfp4"
+    assert eng._mtp_state_precision_retry_candidate(cfg, True, ("fp8", 4)) == ("nvfp4", 4)
+    cfg.spec_mtp = 0
+    assert eng._mtp_state_precision_retry_candidate(cfg, True, ("nvfp4", 4)) is None
+
+
 def _gdn_cfg(spec_mtp, has_group=True):
     mc = SimpleNamespace(linear_attention_group=lambda: object() if has_group else None)
     return SimpleNamespace(spec_mtp=spec_mtp, model_config=mc)
@@ -56,15 +67,22 @@ def _clean_state_env(monkeypatch):
     ENV.MAMBA_SSM_DTYPE.value = saved
 
 
-def test_resolver_autos_compact_and_bf16_for_gdn_mtp(_clean_state_env):
+def test_resolver_autos_compact_but_keeps_fp32_for_gdn_mtp(_clean_state_env):
     eng._resolve_mtp_state_precision(_gdn_cfg(4))
     assert os.environ["FREETOKEN_MTP_COMPACT_STATE"] == "1"
-    assert ENV.MAMBA_SSM_DTYPE.value == "bfloat16"
+    assert ENV.MAMBA_SSM_DTYPE.value == "float32"
 
 
 def test_resolver_noop_without_spec_mtp(_clean_state_env):
     eng._resolve_mtp_state_precision(_gdn_cfg(0))
     assert "FREETOKEN_MTP_COMPACT_STATE" not in os.environ
+    assert ENV.MAMBA_SSM_DTYPE.value == "float32"
+
+
+def test_raw_engine_does_not_inherit_an_automatic_mtp_precision_cut(_clean_state_env):
+    eng._resolve_mtp_state_precision(_gdn_cfg(4))
+    assert ENV.MAMBA_SSM_DTYPE.value == "float32"
+    eng._resolve_mtp_state_precision(_gdn_cfg(0))
     assert ENV.MAMBA_SSM_DTYPE.value == "float32"
 
 
@@ -81,8 +99,14 @@ def test_resolver_honors_explicit_fp32_override(_clean_state_env, monkeypatch):
     assert ENV.MAMBA_SSM_DTYPE.value == "float32"  # explicit dtype wins, no bf16 cut
 
 
+def test_resolver_honors_explicit_bf16_override(_clean_state_env, monkeypatch):
+    monkeypatch.setenv("FREETOKEN_MAMBA_SSM_DTYPE", "bfloat16")
+    eng._resolve_mtp_state_precision(_gdn_cfg(4))
+    assert ENV.MAMBA_SSM_DTYPE.value == "bfloat16"
+
+
 def test_resolver_honors_explicit_compact_off(_clean_state_env, monkeypatch):
     monkeypatch.setenv("FREETOKEN_MTP_COMPACT_STATE", "0")
     eng._resolve_mtp_state_precision(_gdn_cfg(4))
     assert os.environ["FREETOKEN_MTP_COMPACT_STATE"] == "0"  # setdefault honors the caller's "0"
-    assert ENV.MAMBA_SSM_DTYPE.value == "bfloat16"  # dtype still auto (unset)
+    assert ENV.MAMBA_SSM_DTYPE.value == "float32"  # pressure retry owns automatic dtype choice

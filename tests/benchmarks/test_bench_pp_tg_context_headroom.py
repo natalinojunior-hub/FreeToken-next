@@ -52,9 +52,7 @@ def test_parse_context_feasibility_takes_last():
 
 def test_extract_context_headroom(tmp_path):
     log_file = tmp_path / "server.log"
-    log_file.write_text(
-        "KV context feasibility (...): 128K fits, 256K fits, 512K 1.0 GB short\n"
-    )
+    log_file.write_text("KV context feasibility (...): 128K fits, 256K fits, 512K 1.0 GB short\n")
     res = bench_pp_tg.extract_context_headroom(str(log_file), 45.2)
     assert res["max_runnable_context"] == 262144
     assert res["method"] == "projected"
@@ -99,4 +97,7 @@ def test_print_context_headroom(capsys):
     assert "max runnable context: 262144 tokens (from engine KV feasibility)" in captured
     assert "simulated TG @  25% (  65536 tok):  42.50 tok/s [projected]" in captured
     assert "simulated TG @ 100% ( 262144 tok):  42.50 tok/s [projected]" in captured
-    assert "projected (decode TG is context-flat to the device hot-window; see --kv-reserve-tokens)" in captured
+    assert (
+        "projected (decode TG is context-flat to the device hot-window; see --kv-reserve-tokens)"
+        in captured
+    )

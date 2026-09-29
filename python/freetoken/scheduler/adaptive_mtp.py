@@ -151,6 +151,7 @@ class AdaptiveMtpController:
         self._discard_partial_stats = False
         self._auditing = False
         self._cycles_since_baseline = 0
+        self._baseline_interval = 32
 
     @property
     def selected_depth(self) -> int:
@@ -194,6 +195,7 @@ class AdaptiveMtpController:
         self._discard_partial_stats = False
         self._auditing = False
         self._cycles_since_baseline = 0
+        self._baseline_interval = 32
 
     def _best_depth(self) -> int:
         """Cheapest speculation depth, biased toward actually speculating.
@@ -266,6 +268,9 @@ class AdaptiveMtpController:
                 self._plan.clear()
                 self._selected_depth = self._profiled_depth
             else:
+                # A cold probe is a new campaign. Discard old measurements so drift-triggered
+                # recalibration compares depths using samples from the current regime.
+                self._stats = [_RatioWindow() for _ in range(self.safe_max_k + 1)]
                 # k=0 baseline first (contiguous), then the positive depths round-robin so the
                 # depth-vs-time confound does not bias which depth looks cheapest (see the
                 # _PROBE_REPEATS comment above).
@@ -316,15 +321,13 @@ class AdaptiveMtpController:
         window.add(float(elapsed_s), committed_tokens)
         calibration_finished = was_probing and not self._plan
         if calibration_finished:
+            if self._auditing:
+                # Validate a cached choice promptly, then amortize repeated counterfactuals.
+                self._baseline_interval = 128
             self._auditing = False
             self._profiled_depth = None
             self._cycles_since_baseline = 0
             self._observations_since_check = 0
-            if window.drifted(harmful_only=True):
-                # A drift this early (a fresh _PROBE_REPEATS-sample window) is not possible
-                # (drifted() needs >= 8 samples), but keep the policy uniform: drift only
-                # schedules a re-probe for the NEXT request, it never abandons this one.
-                self._needs_reprobe = True
             if not self._terminal_k0:
                 self._selected_depth = self._best_depth()
                 if self._selected_depth == 0:
@@ -342,12 +345,14 @@ class AdaptiveMtpController:
                 self._cycles_since_baseline += 1
             if self._observations_since_check >= 8:
                 self._observations_since_check = 0
-                if window.drifted(harmful_only=True):
+                if window.drifted(harmful_only=True) and self._best_depth() != depth:
+                    # A cost rise alone does not invalidate a depth that still wins the
+                    # measured comparison. Periodic fresh k0 audits remain active below.
                     self._profiled_depth = None
                     self._needs_reprobe = True
                 if not self._terminal_k0 and len(self._stats[0].samples) >= _MIN_BASELINE_SAMPLES:
                     self._reselect_with_hysteresis()
-            if not self._terminal_k0 and self._cycles_since_baseline >= 32:
+            if not self._terminal_k0 and self._cycles_since_baseline >= self._baseline_interval:
                 # Measure the counterfactual even when a bad cached depth never drifts.
                 self._stats[0] = _RatioWindow()
                 self._plan = deque([0] * _MIN_BASELINE_SAMPLES)

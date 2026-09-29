@@ -96,6 +96,229 @@ def test_normal_loop_executes_pending_rebuild_when_idle():
     assert sched._pending_rebuild is None
 
 
+def test_mtp_selects_normal_loop_without_an_environment_flag(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    import pytest
+
+    from freetoken.env import ENV
+    from freetoken.scheduler.scheduler import Scheduler
+
+    class Finished(Exception):
+        pass
+
+    def normal_loop():
+        raise Finished
+
+    monkeypatch.setattr(ENV.DISABLE_OVERLAP_SCHEDULING, "value", False)
+    sched = SimpleNamespace(
+        spec_mtp=4,
+        engine_stream_ctx=nullcontext(),
+        engine=SimpleNamespace(stream=SimpleNamespace(wait_stream=lambda _: None)),
+        stream=object(),
+        decode_manager=SimpleNamespace(
+            running_reqs=[SimpleNamespace(sampling_params=SimpleNamespace(is_greedy=True))]
+        ),
+        prefill_manager=SimpleNamespace(pending_list=[]),
+        normal_loop=normal_loop,
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: sched.stream)
+    sched._has_greedy_mtp_req = lambda data: Scheduler._has_greedy_mtp_req(sched, data)
+    with pytest.raises(Finished):
+        Scheduler.run_forever(sched)
+
+
+def test_sampling_mtp_uses_overlap_and_greedy_pending_uses_normal():
+    from types import SimpleNamespace
+
+    from freetoken.scheduler.scheduler import Scheduler
+
+    sched = SimpleNamespace(
+        spec_mtp=2,
+        decode_manager=SimpleNamespace(running_reqs=[]),
+        prefill_manager=SimpleNamespace(pending_list=[]),
+    )
+    sampling_req = SimpleNamespace(sampling_params=SimpleNamespace(is_greedy=False))
+    greedy_req = SimpleNamespace(sampling_params=SimpleNamespace(is_greedy=True))
+    sched.prefill_manager.pending_list = [
+        SimpleNamespace(sampling_params=sampling_req.sampling_params, chunked_req=greedy_req)
+    ]
+    assert Scheduler._has_greedy_mtp_req(sched, None) is False
+    sched.prefill_manager.pending_list[0].sampling_params.is_greedy = True
+    assert Scheduler._has_greedy_mtp_req(sched, None) is True  # includes chunked prefill
+    sched.prefill_manager.pending_list.clear()
+    pending_data = (SimpleNamespace(batch=SimpleNamespace(reqs=[greedy_req])), None)
+    assert Scheduler._has_greedy_mtp_req(sched, pending_data) is True
+
+
+def test_sampling_mtp_enters_overlap(monkeypatch):
+    from types import SimpleNamespace
+
+    import pytest
+
+    from freetoken.env import ENV
+    from freetoken.scheduler.scheduler import Scheduler
+
+    class Finished(Exception):
+        pass
+
+    stream = object()
+    sched = SimpleNamespace(
+        spec_mtp=2,
+        stream=stream,
+        engine=SimpleNamespace(stream=object()),
+        decode_manager=SimpleNamespace(running_reqs=[]),
+        prefill_manager=SimpleNamespace(pending_list=[]),
+        overlap_loop=lambda data: (_ for _ in ()).throw(Finished()),
+    )
+    sched._has_greedy_mtp_req = lambda data: Scheduler._has_greedy_mtp_req(sched, data)
+    monkeypatch.setattr(ENV.DISABLE_OVERLAP_SCHEDULING, "value", False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    with pytest.raises(Finished):
+        Scheduler.run_forever(sched)
+
+
+def test_disable_overlap_flag_keeps_sampling_on_normal_loop(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    import pytest
+
+    from freetoken.env import ENV
+    from freetoken.scheduler.scheduler import Scheduler
+
+    class Finished(Exception):
+        pass
+
+    stream = object()
+    sched = SimpleNamespace(
+        spec_mtp=2,
+        stream=stream,
+        engine_stream_ctx=nullcontext(),
+        engine=SimpleNamespace(stream=SimpleNamespace(wait_stream=lambda _stream: None)),
+        decode_manager=SimpleNamespace(running_reqs=[]),
+        prefill_manager=SimpleNamespace(pending_list=[]),
+        normal_loop=lambda: (_ for _ in ()).throw(Finished()),
+    )
+    sched._has_greedy_mtp_req = lambda data: False
+    monkeypatch.setattr(ENV.DISABLE_OVERLAP_SCHEDULING, "value", True)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    with pytest.raises(Finished):
+        Scheduler.run_forever(sched)
+
+
+def test_first_greedy_admission_drains_overlap_batch_once(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    import pytest
+
+    from freetoken.env import ENV
+    from freetoken.scheduler.scheduler import Scheduler
+
+    class Finished(Exception):
+        pass
+
+    events = []
+    stream = SimpleNamespace(wait_stream=lambda other: events.append(("wait", other)))
+    engine_stream = SimpleNamespace(wait_stream=lambda other: events.append(("engine_wait", other)))
+    greedy = SimpleNamespace(sampling_params=SimpleNamespace(is_greedy=True))
+    data = (SimpleNamespace(batch=SimpleNamespace(reqs=[])), "output")
+    sched = SimpleNamespace(
+        spec_mtp=2,
+        engine_stream_ctx=nullcontext(),
+        engine=SimpleNamespace(stream=engine_stream),
+        stream=stream,
+        decode_manager=SimpleNamespace(running_reqs=[]),
+        prefill_manager=SimpleNamespace(pending_list=[]),
+        _process_last_data=lambda item: events.append(("drain", item)),
+        _flush_oom=lambda: events.append(("oom",)),
+        _flush_abort_acks=lambda: events.append(("abort",)),
+        normal_loop=lambda: (_ for _ in ()).throw(Finished()),
+    )
+    sched._has_greedy_mtp_req = lambda pending: Scheduler._has_greedy_mtp_req(sched, pending)
+
+    def overlap_loop(last):
+        assert last is None
+        events.append(("overlap",))
+        sched.prefill_manager.pending_list.append(
+            SimpleNamespace(sampling_params=greedy.sampling_params, chunked_req=greedy)
+        )
+        return data
+
+    sched.overlap_loop = overlap_loop
+    monkeypatch.setattr(ENV.DISABLE_OVERLAP_SCHEDULING, "value", False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    with pytest.raises(Finished):
+        Scheduler.run_forever(sched)
+    assert [event[0] for event in events] == [
+        "overlap",
+        "wait",
+        "drain",
+        "oom",
+        "abort",
+        "engine_wait",
+    ]
+    assert events[2][1] is data
+
+
+def test_drain_rechecks_greedy_before_entering_normal_mode(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    import pytest
+
+    from freetoken.env import ENV
+    from freetoken.scheduler.scheduler import Scheduler
+
+    class Finished(Exception):
+        pass
+
+    events = []
+    stream = SimpleNamespace(wait_stream=lambda _stream: events.append("wait"))
+    req = SimpleNamespace(sampling_params=SimpleNamespace(is_greedy=True))
+    pending = SimpleNamespace(sampling_params=req.sampling_params, chunked_req=req)
+    data = (SimpleNamespace(batch=SimpleNamespace(reqs=[])), "output")
+    sched = SimpleNamespace(
+        spec_mtp=2,
+        stream=stream,
+        engine_stream_ctx=nullcontext(),
+        engine=SimpleNamespace(
+            stream=SimpleNamespace(wait_stream=lambda _stream: events.append("engine_wait"))
+        ),
+        decode_manager=SimpleNamespace(running_reqs=[]),
+        prefill_manager=SimpleNamespace(pending_list=[]),
+        _flush_oom=lambda: events.append("oom"),
+        _flush_abort_acks=lambda: events.append("abort"),
+        normal_loop=lambda: (_ for _ in ()).throw(AssertionError("stale greedy selection")),
+    )
+    sched._has_greedy_mtp_req = lambda last: Scheduler._has_greedy_mtp_req(sched, last)
+
+    launched = False
+
+    def overlap_loop(last):
+        nonlocal launched
+        if launched:
+            events.append("overlap_next")
+            raise Finished
+        launched = True
+        events.append("overlap_first")
+        sched.prefill_manager.pending_list.append(pending)
+        return data
+
+    sched.overlap_loop = overlap_loop
+    sched._process_last_data = lambda _data: (
+        events.append("drain"),
+        sched.prefill_manager.pending_list.clear(),
+    )
+    monkeypatch.setattr(ENV.DISABLE_OVERLAP_SCHEDULING, "value", False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    with pytest.raises(Finished):
+        Scheduler.run_forever(sched)
+    assert events == ["overlap_first", "wait", "drain", "oom", "abort", "overlap_next"]
+
+
 def test_normal_loop_defers_pending_rebuild_while_busy():
     # A queued rebuild must NOT run while prefill/decode is still in flight.
     from freetoken.scheduler.scheduler import Scheduler

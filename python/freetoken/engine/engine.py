@@ -278,51 +278,31 @@ def _shed_mtp(config) -> bool:
 
 
 def _resolve_mtp_state_precision(config) -> None:
-    """Resolver-side GDN state precision for speculative MTP (no hardcoded knobs; env overrides).
+    """Set the precision baseline and free compact MTP layout before memory planning."""
+    from freetoken.env import ENV
 
-    When ``--spec-mtp k`` runs on a GatedDeltaNet model the MTP verify state and the GDN
-    recurrent state compete with the MoE expert pool for VRAM. If their fp32 footprint pushes
-    the planned expert-pool cap below the prefill-front cliff (``offload_cache._live_caps_for``)
-    the whole VMM lazy-residency plan is rejected and the pool falls back to fixed-size
-    full-back -- the slow lever-3 locality regime (measured: k4 90.23 full-back vs 104.08
-    lazy). Two VRAM cuts keep the pool lazy, and the resolver turns both on automatically
-    rather than demanding an env incantation:
-
-    1. Compact verify state (``FREETOKEN_MTP_COMPACT_STATE=1``): ONE shared SSM verify row +
-       small ``spec_qkv``/``spec_ba`` reconstruction buffers instead of ``k+1`` full rows. A
-       numerically-equivalent reconstruction -- a pure VRAM cut, no precision cost.
-    2. bfloat16 SSM state (``FREETOKEN_MAMBA_SSM_DTYPE``): halves the GDN recurrent + spec
-       state bytes. This reduces precision on the WHOLE GDN recurrence, not just the verify
-       row, so it is a measured tradeoff: greedy output SHA is identical to fp32 through 16K
-       context (3 prompt offsets), but long-context (256K-1M) recurrence is an unvalidated
-       gate before bf16 is trusted there.
-
-    Scope: ``spec_mtp>0`` AND a linear-attention (GDN) group only; every other model keeps the
-    fp32 / per-row defaults. An explicit env always wins (``setdefault`` for compact, a
-    ``getenv``-None guard for the dtype), so a caller can pin fp32 or the per-row layout for an
-    A/B or a quality cert.
-    """
+    dtype_override = os.getenv("FREETOKEN_MAMBA_SSM_DTYPE")
+    # A later non-MTP engine in the same process must not inherit an earlier auto cut.
+    ENV.MAMBA_SSM_DTYPE.value = dtype_override if dtype_override is not None else "float32"
     if getattr(config, "spec_mtp", 0) <= 0:
         return
     if config.model_config.linear_attention_group() is None:
         return
     os.environ.setdefault("FREETOKEN_MTP_COMPACT_STATE", "1")
-    if os.getenv("FREETOKEN_MAMBA_SSM_DTYPE") is None:
-        # ssm_state_dtype() reads the ENV singleton (snapshotted from os.environ at import
-        # time), so setting os.environ now would be ignored -- mutate the snapshot instead.
-        from freetoken.env import ENV
 
-        ENV.MAMBA_SSM_DTYPE.value = "bfloat16"
-        logger.info_rank0(
-            "spec-mtp on a GDN model: auto-selected bfloat16 SSM state (halves GDN "
-            "recurrent+spec VRAM so the expert pool stays VMM-lazy); SHA-validated to 16K, "
-            "set FREETOKEN_MAMBA_SSM_DTYPE=float32 to keep fp32"
-        )
-    # ponytail: in-scope-global bf16, not pressure-aware. Ceiling: a model with VRAM headroom
-    # keeps the pool lazy at fp32 and pays the precision cut for zero TG gain. Upgrade path --
-    # cut only when the fp32 expert-pool plan actually falls back to full-back (catch the
-    # offload_cache._vmm_plan ValueError) and replan; and re-validate bf16 recurrence drift at
-    # 256K-1M before trusting it there (fp16 = more mantissa, less overflow headroom).
+
+def _mtp_state_precision_retry_candidate(
+    config, vmm_supported: bool, attempted: tuple[str, int] | None
+) -> tuple[str, int] | None:
+    if (
+        not vmm_supported
+        or os.getenv("FREETOKEN_MAMBA_SSM_DTYPE") is not None
+        or getattr(config, "spec_mtp", 0) <= 0
+        or config.model_config.linear_attention_group() is None
+    ):
+        return None
+    key = (config.kv_format, config.spec_mtp)
+    return key if key != attempted else None
 
 
 def _kv_fit_ladder(config) -> tuple[str, ...]:
@@ -1165,6 +1145,69 @@ class Engine:
     _VRAM_GUARD_CALM_WINDOWS = 3
 
     @torch.inference_mode()
+    def guard_vram_before_forward(self, *, prefill: bool = False) -> bool:
+        """Shrink VMM backing under live physical pressure; return unresolved pressure.
+
+        Synchronize only on pressure. Addresses, KV/GDN state and captured graphs stay
+        intact, so this also works between overlapped forwards. Regrowth stays idle-only.
+        """
+        if self.device.type != "cuda":
+            return False
+        reserve = (
+            int(getattr(self, "_prefill_transient_reserve", self._ledger_reserve_bytes()))
+            if prefill
+            else 0
+        )
+
+        def required_free() -> int:
+            reusable = (
+                torch.cuda.memory_reserved(self.device) - torch.cuda.memory_allocated(self.device)
+                if reserve
+                else 0
+            )
+            return self._VRAM_GUARD_MARGIN + max(0, reserve - reusable)
+
+        free, _ = torch.cuda.mem_get_info(self.device)
+        if free >= required_free():
+            return False
+        if not prefill and self._expert_decode_slots is not None:
+            baseline = self._decode_allocator_baseline
+            if baseline is not None:
+                allocator_growth = max(0, torch.cuda.memory_reserved(self.device) - baseline)
+                self._decode_reserve_learned = max(self._decode_reserve_learned, allocator_growth)
+        cache = self.moe_offload_cache
+        if not getattr(cache, "_vmm_arenas", None) or self.config.tp_info.size != 1:
+            return True  # a live request cannot safely rebuild a fixed-back cache
+        from freetoken.utils import div_ceil
+
+        torch.cuda.synchronize(self.device)
+        self._vram_guard_calm = 0
+        granules = len(cache._vmm_arenas) * len(cache.pools) * (2 << 20)
+        for _ in range(2):
+            free, _ = torch.cuda.mem_get_info(self.device)
+            required = required_free()
+            if free >= required:
+                break
+            before = cache.resident_rows
+            _, per_slot = self._target_moe_and_expert_bytes(None)
+            target = max(1, before - div_ceil(required - free + granules, per_slot))
+            with torch.cuda.stream(self.stream):
+                cache.set_live(target)  # pool geometry enforces its non-evictable floors
+            after = cache.resident_rows
+            if self._expert_decode_slots is not None:
+                self._expert_decode_slots = after
+                self._expert_prefill_slots = min(self._expert_prefill_slots, after)
+            self._charge_expert_cache(cache)
+            logger.info_rank0(
+                f"Physical VRAM pressure: {mem_GB(free)} free; expert rows {before} -> {after}"
+            )
+            if after >= before:
+                break
+        torch.cuda.reset_peak_memory_stats(self.device)
+        free, _ = torch.cuda.mem_get_info(self.device)
+        return free < required_free()
+
+    @torch.inference_mode()
     def guard_vram_at_idle(self) -> None:
         """Real-time VRAM guard, run while the scheduler is idle: measure how much device memory
         was still free at the peak of the last busy window and, when that fell under
@@ -1251,20 +1294,19 @@ class Engine:
             logger.warning_rank0(f"VRAM guard: expert cache resize refused ({e})")
             return
         except RuntimeError as e:
+            from freetoken.moe.vmm import VMMResizeRollbackError
+
+            if isinstance(e, VMMResizeRollbackError):
+                raise
             if short > 0:
                 raise  # a refused SHRINK stays fatal: nothing else can give memory back
-            # A speculative regrow hit the physical-backing wall (cuMemCreate OOM): keep the
-            # current size, reserve the shortfall so the next attempt asks for less, and
-            # unmap whatever the aborted grow already backed (best effort).
+            # A speculative regrow hit the physical-backing wall. VMM/cache rollback publishes
+            # the actual safe prefix; charge that backing and retry from measured free space.
             logger.warning_rank0(
                 f"VRAM guard: regrow to {target} slots refused by backing ({e!r}); "
                 f"staying at {cache.resident_rows} slots"
             )
-            self._decode_reserve_learned += max(1, target - cache.resident_rows) * per_slot
-            try:
-                cache.set_live(cache.resident_rows)
-            except Exception:  # noqa: BLE001 - cleanup only; the size is already consistent
-                pass
+            self._charge_expert_cache(cache)
             return
         self._charge_expert_cache(cache)
         # the rebuild's own transient (teardown, graph re-capture) is not the next window's peak
@@ -1288,12 +1330,16 @@ class Engine:
             self._decode_reserve_learned += n * per_slot
             self._expert_decode_slots = target
         self._resize_experts(target)
+        if self._expert_decode_slots is not None:
+            self._expert_decode_slots = cache.resident_rows
+            self._expert_prefill_slots = min(self._expert_prefill_slots, cache.resident_rows)
         self._charge_expert_cache(cache)
 
-    # Grown expert-cache size while only decode runs (None = at the prefill-safe plan) and the
+    # Expert-cache size for the current decode phase (None = prefill phase) and the
     # decode peak bytes learned from OOM recoveries on top of the modelled decode reserve.
     _expert_decode_slots: int | None = None
     _decode_reserve_learned = 0
+    _decode_allocator_baseline: int | None = None
 
     @property
     def decode_residency_supported(self) -> bool:
@@ -1332,6 +1378,7 @@ class Engine:
             if self._expert_decode_slots is None:
                 return
             self._expert_decode_slots = None
+            self._decode_allocator_baseline = None
             logger.info_rank0(
                 f"Decode residency: expert cache {cache.resident_rows} -> "
                 f"{self._expert_prefill_slots} slots"
@@ -1346,30 +1393,43 @@ class Engine:
         self._guard_window(self._window_free_at_peak())
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
+        self._decode_allocator_baseline = torch.cuda.memory_reserved(self.device)
         free, _ = torch.cuda.mem_get_info(self.device)
-        # each (bank, pool) region rounds its backing up to one granule
-        reserve = (
-            self._VRAM_GUARD_MARGIN
-            + self._decode_reserve_learned
-            + len(cache._vmm_arenas) * len(cache.pools) * (2 << 20)
-        )
-        target = cache.resident_rows
-        for _ in range(2):  # geometry pools price per slot non-linearly: refine once
-            _, per_slot = self._target_moe_and_expert_bytes(target)
-            target = min(cache.cache_size, cache.resident_rows + max(0, free - reserve) // per_slot)
+        reserve = self._VRAM_GUARD_MARGIN + self._decode_reserve_learned
+        prefill_rows = cache.resident_rows
+        current_backing = cache.expert_pool_bytes
+        available = max(0, free - reserve)
+        target = prefill_rows
+        # Geometry floors, largest-remainder splits, and granule rounding can make physical
+        # price non-linear (even non-monotone) in logical rows. Search from the largest shaped
+        # size downward so the first fit is the maximum exact fit without assuming monotonicity.
+        for candidate in range(cache.cache_size, prefill_rows, -1):
+            delta = cache.backed_bytes_for(candidate) - current_backing
+            if delta <= available:
+                target = candidate
+                break
+        self._expert_prefill_slots = cache.resident_rows
         if target <= cache.resident_rows:
+            self._expert_decode_slots = cache.resident_rows
             return
         logger.info_rank0(
             f"Decode residency: expert cache {cache.resident_rows} -> {target} slots "
             f"({mem_GB(free)} free, reserve {mem_GB(reserve)})"
         )
-        self._expert_prefill_slots = cache.resident_rows
         try:
             self._resize_experts(target)
         except Exception as e:  # noqa: BLE001 - backing refused: the prefill size fit a moment ago
-            logger.warning_rank0(f"Decode residency grow failed ({e!r}); back to prefill size")
-            self._decode_reserve_learned += (target - self._expert_prefill_slots) * per_slot
-            self._resize_experts(self._expert_prefill_slots)
+            from freetoken.moe.vmm import VMMResizeRollbackError
+
+            if isinstance(e, VMMResizeRollbackError):
+                raise
+            # set_live compensates to its allocation-free resident prefix before raising.
+            # Re-requesting the old prefill size can hit the same backing wall again.
+            self._expert_prefill_slots = min(self._expert_prefill_slots, cache.resident_rows)
+            logger.warning_rank0(
+                f"Decode residency grow failed ({e!r}); staying at {cache.resident_rows} rows"
+            )
+            self._expert_decode_slots = cache.resident_rows
             self._charge_expert_cache(cache)
             return
         self._expert_decode_slots = target
@@ -1682,6 +1742,68 @@ class Engine:
                 "MoE banks have non-uniform layer geometry; disabling prefill overlap"
             )
             object.__setattr__(config, "moe_prefill_overlap", False)
+        layout = max_slots = None
+        if method is not None:
+            if banks.kind is not None and (banks.kind, banks.kernel) != (
+                method.kind,
+                method.kernel.name,
+            ):
+                raise ValueError(
+                    f"expert banks were packed for {banks.kind} / {banks.kernel} but the model "
+                    f"binds {method.kind} / {method.kernel.name}; reconvert or select that kernel"
+                )
+            layout = method.layout()
+            max_slots = method.slot_limit()
+        prefill_moe_layers = (
+            config.model_config.num_layers - config.model_config.first_k_dense_replace
+        )
+        vmm_module = None
+        if config.moe_cache_auto and _decode_residency_enabled() and config.tp_info.size == 1:
+            from freetoken.moe import vmm
+
+            if vmm.supported(self.device):
+                vmm_module = vmm
+
+        def make_cache(cache_size: int, prefill_overlap: bool, vmm_rows: int):
+            return OffloadMoeCache(
+                num_layers=config.model_config.num_moe_layers,
+                num_experts=config.model_config.num_experts,
+                cache_size=cache_size,
+                device=self.device,
+                cache_policy=config.moe_cache_policy,
+                prefill_overlap=prefill_overlap,
+                prefill_hit_d2d=config.moe_prefill_hit_d2d,
+                quant_format=banks.quant_format,
+                gguf_expert_types=banks.gguf_expert_types,
+                decode_target=decode_target,
+                hybrid_max_fetch=config.moe_hybrid_max_fetch,
+                layout=layout,
+                max_slots=max_slots,
+                min_pool_rows=decode_pool_floor(
+                    config.model_config.num_experts,
+                    config.model_config.num_experts_per_tok,
+                    config.max_running_req,
+                ),
+                pool_caps_override=config.moe_pool_caps,
+                vmm_rows=vmm_rows,
+                prefill_moe_layers=prefill_moe_layers,
+            )
+
+        def candidate_vmm_rows(candidate) -> int:
+            if vmm_module is None:
+                return 0
+            per_slot = max(1, candidate.expert_bytes // max(1, candidate.expert_slots))
+            return candidate.expert_slots + candidate.transient_reserve * 5 // 4 // per_slot
+
+        precision_retry_candidate = None
+        from freetoken.env import ENV
+
+        def set_auto_ssm_dtype(dtype: str) -> None:
+            ENV.MAMBA_SSM_DTYPE.value = dtype
+            self.vram_ledger = self._open_vram_ledger(config)
+
+        prepared_cache = None
+        prepared_vmm_plan = None
         if config.moe_cache_auto:
             # Use new multi-stage memory planner
             logger.info_rank0("--moe-cache-auto: invoking multi-stage VRAM planner")
@@ -1719,6 +1841,26 @@ class Engine:
                         host_pages=self.host_pages,
                     )
                 except ContextInfeasible:
+                    retry_key = _mtp_state_precision_retry_candidate(
+                        config, vmm_module is not None, precision_retry_candidate
+                    )
+                    if retry_key is not None:
+                        precision_retry_candidate = retry_key
+                        logger.info_rank0(
+                            "FP32 GDN state makes the requested memory plan infeasible; "
+                            "retrying BF16 once before KV/MTP fallback"
+                        )
+                        set_auto_ssm_dtype("bfloat16")
+                        continue
+                    if (
+                        precision_retry_candidate == (config.kv_format, config.spec_mtp)
+                        and ENV.MAMBA_SSM_DTYPE.value == "bfloat16"
+                    ):
+                        logger.info_rank0(
+                            "BF16 GDN state did not produce a usable cache plan; restoring FP32"
+                        )
+                        set_auto_ssm_dtype("float32")
+                        continue
                     if ladder:
                         self._set_kv_format(config, ladder.pop(0))
                     elif not _shed_mtp(config):
@@ -1727,9 +1869,44 @@ class Engine:
                         self._set_kv_format(config, first_fmt)
                         ladder = list(_kv_fit_ladder(config))
                     continue
+                prepared_cache = None
+                prepared_vmm_plan = None
+                vmm_rows = candidate_vmm_rows(plan)
+                if vmm_rows:
+                    candidate = make_cache(plan.expert_slots, plan.prefill_overlap, vmm_rows)
+                    candidate.cpu_layer_ids = cpu_layer_ids
+                    candidate._prepare_bank_sources(
+                        banks.sources, layer_residency=banks.layer_residency
+                    )
+                    try:
+                        prepared_vmm_plan = candidate._vmm_plan(plan.expert_slots)
+                    except ValueError as exc:
+                        retry_key = _mtp_state_precision_retry_candidate(
+                            config, vmm_module is not None, precision_retry_candidate
+                        )
+                        if retry_key is not None:
+                            precision_retry_candidate = retry_key
+                            logger.info_rank0(
+                                f"FP32 GDN state rejects the VMM cache plan ({exc}); "
+                                "retrying BF16 once"
+                            )
+                            set_auto_ssm_dtype("bfloat16")
+                            continue
+                        if (
+                            precision_retry_candidate == (config.kv_format, config.spec_mtp)
+                            and ENV.MAMBA_SSM_DTYPE.value == "bfloat16"
+                        ):
+                            logger.info_rank0(
+                                "BF16 GDN state did not satisfy the VMM cache floor; restoring FP32"
+                            )
+                            set_auto_ssm_dtype("float32")
+                            continue
+                        prepared_vmm_plan = None
+                    prepared_cache = candidate
                 break
 
             object.__setattr__(config, "moe_cache_size", plan.expert_slots)
+            self._prefill_transient_reserve = plan.transient_reserve
             object.__setattr__(config, "moe_prefill_overlap", plan.prefill_overlap)
             if config.num_page_override is None:
                 object.__setattr__(config, "num_page_override", plan.kv_pages)
@@ -1745,60 +1922,17 @@ class Engine:
                 f"prefill_chunk={plan.prefill_chunk}, max_extend_tokens={config.max_extend_tokens})"
             )
         _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
-        layout = max_slots = None
-        if method is not None:
-            if banks.kind is not None and (banks.kind, banks.kernel) != (
-                method.kind,
-                method.kernel.name,
-            ):
-                raise ValueError(
-                    f"expert banks were packed for {banks.kind} / {banks.kernel} but the model "
-                    f"binds {method.kind} / {method.kernel.name}; reconvert or select that kernel"
-                )
-            layout = method.layout()
-            max_slots = method.slot_limit()
-        vmm_rows = 0
-        if config.moe_cache_auto and _decode_residency_enabled() and config.tp_info.size == 1:
-            from freetoken.moe import vmm
-
-            if vmm.supported(self.device):
-                # shape the cache for the most the decode phase can reclaim: the prefill
-                # transient the plan reserved (+25%); only the planned prefix is backed
-                per_slot = max(1, plan.expert_bytes // max(1, plan.expert_slots))
-                vmm_rows = config.moe_cache_size + plan.transient_reserve * 5 // 4 // per_slot
-        prefill_moe_layers = (
-            config.model_config.num_layers - config.model_config.first_k_dense_replace
-        )
-        cache = OffloadMoeCache(
-            # Models with leading dense layers (GLM-4) only have experts on the MoE
-            # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
-            num_layers=config.model_config.num_moe_layers,
-            num_experts=config.model_config.num_experts,
-            cache_size=config.moe_cache_size,
-            device=self.device,
-            cache_policy=config.moe_cache_policy,
-            prefill_overlap=config.moe_prefill_overlap,
-            prefill_hit_d2d=config.moe_prefill_hit_d2d,
-            quant_format=banks.quant_format,
-            # a GGUF bank's row stride is a property of the file, not of the "gguf" format
-            # tag, so the per-bank ggml types travel with the banks into the kernels.
-            gguf_expert_types=banks.gguf_expert_types,
-            decode_target=decode_target,
-            hybrid_max_fetch=config.moe_hybrid_max_fetch,
-            layout=layout,
-            max_slots=max_slots,
-            min_pool_rows=decode_pool_floor(
-                config.model_config.num_experts,
-                config.model_config.num_experts_per_tok,
-                config.max_running_req,
-            ),
-            pool_caps_override=config.moe_pool_caps,
-            vmm_rows=vmm_rows,
-            prefill_moe_layers=prefill_moe_layers,
+        cache = prepared_cache or make_cache(
+            config.moe_cache_size,
+            config.moe_prefill_overlap,
+            candidate_vmm_rows(plan) if config.moe_cache_auto else 0,
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
-        cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+        if prepared_cache is None:
+            cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+        else:
+            cache._allocate_prepared_bank_sources(prepared_vmm_plan)
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
@@ -2739,6 +2873,22 @@ def _adjust_config(config: EngineConfig):
             override("cache_type", "swa_radix")
 
     if has_linear_attention:
+        if getattr(config, "linear_state_cache_ratio", 2.0) <= 0:
+            from freetoken.models.gguf.dequant import GGML_IQ2_S, GGML_IQ4_NL
+            from freetoken.moe.cpu_executor import dominant_gguf_pair
+
+            pair = dominant_gguf_pair(getattr(model_config, "gguf_expert_types", None))
+            if (
+                pair == (GGML_IQ2_S, GGML_IQ4_NL)
+                and getattr(config, "cache_type", "radix") != "naive"
+            ):
+                # The tight snapshot pool diverges on the AD layout at 16K; avoid reuse
+                # until its CUDA boundary/eviction interaction has an exact proof.
+                logger.warning_rank0(
+                    "GDN IQ2_S/IQ4_NL with zero snapshot-cache budget: selecting naive "
+                    "cache to preserve cold/warm output determinism"
+                )
+                override("cache_type", "naive")
         override(
             "cache_type",
             _resolve_cache_type(True, getattr(config, "cache_type", "radix")),

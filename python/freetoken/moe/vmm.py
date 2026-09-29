@@ -44,6 +44,10 @@ class _AccessDesc(ctypes.Structure):
 _lib = None
 
 
+class VMMResizeRollbackError(RuntimeError):
+    """A failed resize could not restore its mapped ranges to a coherent prefix."""
+
+
 def _cu():
     global _lib
     if _lib is None:
@@ -147,24 +151,57 @@ class VirtualArena:
 
     def set_backed(self, region: int, nbytes: int) -> int:
         """Back exactly ``region``'s first ``nbytes`` (granule-rounded) and return how many of
-        them kept their contents. Growing maps one new chunk; shrinking unmaps whole chunks
-        from the tail and re-maps a chunk the new end cuts through, whose bytes are then new
-        memory. The caller has synchronized every kernel that could touch the range."""
+        them kept their contents. Physical handles cover one native granule each, so shrinking
+        only unmaps the tail and keeps the entire retained prefix warm without allocating.
+        The caller has synchronized every kernel that could touch the range."""
         off, cap = self.regions[region]
         want = min(cap, -(-nbytes // self.g) * self.g)
         chunks = self._chunks[region]
         intact = self.backed[region]
         while chunks and chunks[-1][0] + chunks[-1][1] > want:
-            c_off, size, handle = chunks.pop()
+            c_off, size, handle = chunks[-1]
             _check(
                 _cu().cuMemUnmap(ctypes.c_uint64(self.ptr + off + c_off), ctypes.c_size_t(size)),
                 "cuMemUnmap",
             )
-            _check(_cu().cuMemRelease(ctypes.c_uint64(handle)), "cuMemRelease")
+            chunks.pop()
+            self.backed[region] = c_off
+            try:
+                _check(_cu().cuMemRelease(ctypes.c_uint64(handle)), "cuMemRelease")
+            except Exception as error:
+                raise VMMResizeRollbackError(
+                    f"VMM shrink unmapped through {c_off} but could not release a handle: {error!r}"
+                ) from error
             intact = min(intact, c_off)
         have = chunks[-1][0] + chunks[-1][1] if chunks else 0
-        if want > have:
-            chunks.append((have, want - have, self._map(self.ptr + off + have, want - have)))
+        original_chunks = len(chunks)
+        try:
+            while want > have:
+                chunks.append((have, self.g, self._map(self.ptr + off + have, self.g)))
+                have += self.g
+        except Exception as error:
+            for c_off, size, handle in reversed(chunks[original_chunks:]):
+                try:
+                    _check(
+                        _cu().cuMemUnmap(
+                            ctypes.c_uint64(self.ptr + off + c_off), ctypes.c_size_t(size)
+                        ),
+                        "cuMemUnmap",
+                    )
+                except Exception as cleanup_error:
+                    self.backed[region] = chunks[-1][0] + chunks[-1][1]
+                    raise VMMResizeRollbackError(
+                        f"VMM growth failed ({error!r}); rollback unmap failed ({cleanup_error!r})"
+                    ) from error
+                chunks.pop()
+                self.backed[region] = chunks[-1][0] + chunks[-1][1] if chunks else 0
+                try:
+                    _check(_cu().cuMemRelease(ctypes.c_uint64(handle)), "cuMemRelease")
+                except Exception as cleanup_error:
+                    raise VMMResizeRollbackError(
+                        f"VMM growth failed ({error!r}); rollback release failed ({cleanup_error!r})"
+                    ) from error
+            raise
         self.backed[region] = want
         return min(intact, want)
 

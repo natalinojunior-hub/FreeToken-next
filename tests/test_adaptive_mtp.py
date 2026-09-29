@@ -160,6 +160,24 @@ def test_beneficial_drift_keeps_safe_positive_depth_without_reprobe():
     assert controller.next_depth() == 1
 
 
+def test_cost_rise_keeps_measured_winner_and_counterfactual_audits():
+    controller = AdaptiveMtpController(2)
+    _calibrate(controller, costs={0: [0.020] * 8, 1: [0.014] * 4, 2: [0.008] * 4})
+    for _ in range(8):
+        controller.observe(2, 0.010, 1)
+    assert controller._stats[2].drifted(harmful_only=True)
+    assert controller._best_depth() == 2
+
+    controller.begin_request("still-cheapest", "epoch-a")
+    assert not controller.probing
+    assert controller.next_depth() == 2
+    # The measured winner still receives fresh k0 comparisons on the normal audit schedule.
+    for _ in range(24):
+        controller.observe(2, 0.010, 1)
+    assert controller.probing
+    assert controller.next_depth() == 0
+
+
 @pytest.mark.parametrize("safe_max_k", [-1, 5, 1.0, True])
 def test_rejects_invalid_safe_depth(safe_max_k):
     with pytest.raises(ValueError):
@@ -382,12 +400,26 @@ def test_calibrated_controller_periodically_audits_fresh_k0():
         controller.observe(0, 0.020, 1)
     assert controller.selected_depth == 1
     assert controller.next_depth() == 1
-    for _ in range(31):
+    for _ in range(127):
         controller.observe(1, 0.008, 1)
         assert not controller.probing
     controller.observe(1, 0.008, 1)
-    assert controller.probing  # the positive-cycle counter restarted after the audit
+    assert controller.probing  # later audits amortize a validated counterfactual
     assert controller.next_depth() == 0
+
+
+def test_audit_cost_variation_does_not_invalidate_its_measured_winner():
+    controller = AdaptiveMtpController(1)
+    _calibrate(controller, costs={0: [0.020] * 8, 1: [0.008] * 4})
+    for _ in range(32):
+        controller.observe(1, 0.008, 1)
+    for elapsed in [0.020] * 4 + [0.030] * 4:
+        controller.observe(0, elapsed, 1)
+    assert controller._stats[0].drifted(harmful_only=True)
+    assert controller.selected_depth == 1
+    controller.begin_request("after-fresh-audit", "epoch-a")
+    assert not controller.probing
+    assert controller.next_depth() == 1
 
 
 def test_harmful_warm_drift_reprobes_next_request_but_beneficial_drift_does_not():

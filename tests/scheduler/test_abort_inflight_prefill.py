@@ -17,6 +17,7 @@ Tests drive the real (unbound) Scheduler methods against CPU-built hybrid manage
 
 from __future__ import annotations
 
+import contextlib
 from types import SimpleNamespace
 
 import torch
@@ -140,6 +141,73 @@ def test_abort_inflight_final_chunk_marks_then_drains():
     assert req in stub.finished_reqs
     assert sent == []  # no DetokenizeMsg: abort ack stays terminal
     cm.check_integrity()
+
+
+def test_overlap_decode_budget_checks_committed_host_length():
+    """The next forward may advance device_len before the previous token is drained.
+
+    That in-flight step must not make the preceding committed token look like the
+    final output token.
+    """
+    req = Req(
+        input_ids=torch.tensor([1, 2], dtype=torch.int32),
+        table_idx=0,
+        cached_len=0,
+        output_len=2,
+        uid=UID,
+        sampling_params=SamplingParams(max_tokens=2),
+        cache_handle=None,
+    )
+    req.complete_one()
+    req.complete_one()  # simulate two scheduled forwards before the first is drained
+    replies = []
+    finished = []
+    batch = SimpleNamespace(reqs=[req], is_prefill=False)
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.cache_manager = SimpleNamespace(lazy_free_region=lambda: contextlib.nullcontext())
+    scheduler.decode_manager = SimpleNamespace(
+        running_reqs=[req], remove_req=lambda _req: finished.append("removed")
+    )
+    scheduler.prefill_manager = SimpleNamespace(pending_list=[])
+    scheduler.finished_reqs = set()
+    scheduler.eos_token_ids = set()
+    scheduler.toolcall_anchor_id = None
+    scheduler.config = SimpleNamespace(page_size=1)
+    scheduler.status_reporter = SimpleNamespace(report_batch=lambda *_args, **_kwargs: None)
+    scheduler.send_result = replies.extend
+    scheduler._free_req_resources = lambda _req: finished.append("freed")
+    scheduler._kv_usage_pages = lambda: (0, 0)
+    scheduler._mamba_slot_usage = lambda: None
+    scheduler._swa_token_usage = lambda: None
+    scheduler._gpu_mem_bytes = lambda: 0
+    scheduler._match_stop_str = lambda _req: None
+
+    def drain(token):
+        return Scheduler._process_last_data(
+            scheduler,
+            (
+                SimpleNamespace(batch=batch),
+                (
+                    None,
+                    torch.tensor([token], dtype=torch.int32),
+                    SimpleNamespace(synchronize=lambda: None),
+                ),
+            ),
+        )
+
+    drain(10)
+    assert len(req.input_ids) == 3
+    assert req.device_len == req.max_device_len == 4
+    assert [(msg.next_token, msg.finished) for msg in replies] == [(10, False)]
+    assert finished == []
+
+    drain(11)
+    assert len(req.input_ids) == 4
+    assert [(msg.next_token, msg.finished, msg.finish_reason) for msg in replies] == [
+        (10, False, None),
+        (11, True, "length"),
+    ]
+    assert finished == ["removed", "freed"]
 
 
 def test_abort_inflight_intermediate_chunk_marks_then_drains():

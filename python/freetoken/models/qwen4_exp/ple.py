@@ -704,7 +704,7 @@ class PLELayer(BaseOP):
         if fla is not None and fla.track_boundary_row is not None:
             self._write_track_snapshot(states, x, fla)
         spec_out = None
-        if batch.spec_logits_indices is not None:
+        if getattr(batch, "spec_logits_indices", None) is not None:
             pool = get_global_ctx().linear_state_pool
             buffers = getattr(pool, "spec_slot_states", {})
             if PLE_CONV_STATE in buffers and x.shape[0] <= buffers[PLE_CONV_STATE].shape[1]:

@@ -210,9 +210,8 @@ def test_slot_state_bytes_for_the_real_geometry():
 
 def test_snapshot_cache_ratio_zero_lands_on_the_floor():
     """``--linear-state-cache-ratio 0`` drops the cross-request GDN snapshot cache and sizes
-    the pool exactly at the non-evictable floor, handing ~0.43 GiB back to the expert cache
-    on Flash-Next; any ratio > 0 keeps the historical 4-snapshot floor, so existing configs
-    are unchanged."""
+    the pool exactly at the non-evictable floor; positive ratios add ceil(ratio * max_running_req)
+    evictable prefix snapshots."""
     from freetoken.kvcache.linear_state_pool import (
         _linear_pool_min_slots,
         _linear_pool_num_slots,
@@ -223,14 +222,17 @@ def test_snapshot_cache_ratio_zero_lands_on_the_floor():
             max_running_req=mr, cache_type="hybrid_radix", linear_state_cache_ratio=ratio
         )
 
-    assert _linear_pool_num_slots(cfg(2.0)) == 9  # the default: 4 live + 4 snapshots + sink
+    assert _linear_pool_num_slots(cfg(2.0)) == 7  # 4 working + 2 snapshots + padding sink
+    assert _linear_pool_num_slots(cfg(0.5, mr=3)) == 15  # 12 working + ceil(1.5) + sink
     assert _linear_pool_num_slots(cfg(0.0)) == _linear_pool_min_slots(cfg(0.0)) == 5
     assert _linear_pool_num_slots(cfg(0.0, mr=4)) == _linear_pool_min_slots(cfg(0.0, mr=4)) == 17
 
 
 @pytest.mark.parametrize("cache_type,working_slots", [("naive", 1), ("hybrid_radix", 4)])
 @pytest.mark.parametrize("native_layers", [0, 1])
-def test_mtp_rollback_fits_after_non_evictable_slots_are_held(cache_type, working_slots, native_layers):
+def test_mtp_rollback_fits_after_non_evictable_slots_are_held(
+    cache_type, working_slots, native_layers
+):
     from freetoken.kvcache.linear_state_pool import _linear_pool_min_slots, _linear_pool_num_slots
 
     config = SimpleNamespace(

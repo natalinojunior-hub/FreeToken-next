@@ -155,8 +155,7 @@ class Qwen4ExpAttention(BaseOP):
         )
         self.indexer = Qwen4ExpIndexer(config, layer_id, prefix=f"{prefix}.indexer")
 
-    @nvtx_annotate("QSA")
-    def forward(self, x: torch.Tensor, batch: Batch) -> torch.Tensor:
+    def _project(self, x: torch.Tensor, batch: Batch):
         qg, k, v = self.qkv_proj.forward(x).split(self._qkv_split, dim=-1)
         qg = qg.view(-1, self.num_q, self.head_dim * 2)
         q = qg[..., : self.head_dim].contiguous()
@@ -169,6 +168,17 @@ class Qwen4ExpAttention(BaseOP):
             batch.get_attn_positions(), q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
         )
         index = self.indexer.forward(x)
+        return q, k, v, index, gate
+
+    def prime_kv(self, x: torch.Tensor, batch: Batch) -> None:
+        _, k, v, index, _ = self._project(x, batch)
+        get_global_ctx().attn_backend.store_qsa_kv(
+            k, v, index, self.layer_id, batch, stage_host=False
+        )
+
+    @nvtx_annotate("QSA")
+    def forward(self, x: torch.Tensor, batch: Batch) -> torch.Tensor:
+        q, k, v, index, gate = self._project(x, batch)
         o = get_global_ctx().attn_backend.qsa_forward(
             q.view(-1, self.num_q, self.head_dim), k, v, index, self.layer_id, batch
         )

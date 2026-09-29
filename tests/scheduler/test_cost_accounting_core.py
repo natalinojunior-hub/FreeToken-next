@@ -274,6 +274,68 @@ def test_offline_handler_ignores_online_prompt_accounting_signal():
     LLM.offline_send_result(offline, [PromptAdmittedMsg(uid=1, prompt_tokens=10)])
 
 
+def test_offline_generate_keeps_uids_monotonic_across_calls(monkeypatch):
+    from freetoken.llm.llm import LLM
+
+    class Tokenizer:
+        @staticmethod
+        def decode(tokens):
+            return str(tokens)
+
+    offline = LLM.__new__(LLM)
+    offline.counter = 0
+    offline.tokenizer = Tokenizer()
+    offline.prefill_budget = 100
+    offline._mm_processor = None
+    offline.eos_token_ids = set()
+    seen_uids = []
+
+    def run_forever():
+        for msg in offline.offline_receive_msg():
+            seen_uids.append(msg.uid)
+            offline.offline_send_result(
+                [DetokenizeMsg(uid=msg.uid, next_token=100 + msg.uid, finished=False)]
+            )
+
+    offline.run_forever = run_forever
+    first = offline.generate([[1], [2]], SamplingParams())
+    second = offline.generate([[3]], SamplingParams())
+    empty = offline.generate([], SamplingParams())
+
+    assert seen_uids == [0, 1, 2]
+    assert [result["token_ids"] for result in first] == [[100], [101]]
+    assert [result["token_ids"] for result in second] == [[102]]
+    assert empty == []
+
+
+@pytest.mark.parametrize(
+    ("native_layers", "kwargs", "expected_req", "expected_spec"),
+    [
+        (1, {}, 1, 4),
+        (0, {}, 4, 0),
+        (1, {"max_running_req": 2}, 2, 0),
+        (1, {"spec_mtp": 0}, 4, 0),
+        (1, {"max_running_req": 2, "spec_mtp": 0}, 2, 0),
+    ],
+)
+def test_llm_native_mtp_defaults_only_fill_omitted_values(
+    monkeypatch, native_layers, kwargs, expected_req, expected_spec
+):
+    from freetoken.llm.llm import LLM
+
+    monkeypatch.setattr("freetoken.server.args._native_mtp_layers", lambda _path: native_layers)
+    monkeypatch.setattr(
+        "freetoken.scheduler.scheduler.Scheduler.__init__",
+        lambda self, config: setattr(self, "config", config),
+    )
+    monkeypatch.setattr("freetoken.mm.processor.get_mm_processor", lambda *_args: None)
+
+    llm = LLM(model_path="unused", **kwargs)
+
+    assert llm.config.max_running_req == expected_req
+    assert llm.config.spec_mtp == expected_spec
+
+
 def test_frontend_manager_generates_unique_uuid_instance_ids():
     config = SimpleNamespace()
     first = FrontendManager(config=config, send_tokenizer=None, recv_tokenizer=None)
@@ -318,3 +380,40 @@ def test_listener_accounts_late_reply_after_ack_queue_was_removed():
     assert manager.stats.prompt_tokens_total == 5
     assert manager.stats.completion_tokens_total == 2
     assert manager.ack_map == {}
+
+
+@pytest.mark.parametrize("loop", ["normal", "overlap"])
+def test_physical_vram_pressure_falls_back_to_k0_before_forward(loop):
+    events = []
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.engine = SimpleNamespace(
+        decode_residency_supported=False,
+        guard_vram_before_forward=lambda **_kwargs: events.append("guard") or True,
+        stream=SimpleNamespace(wait_stream=lambda _stream: None),
+    )
+    scheduler._mtp_controller = SimpleNamespace(fallback_to_k0=lambda: events.append("k0"))
+    scheduler.prefill_manager = SimpleNamespace(runnable=True, pending_list=[])
+    scheduler.decode_manager = SimpleNamespace(runnable=False, running_reqs=[])
+    scheduler._pending_rebuild = None
+    scheduler.spec_mtp = 0
+    scheduler.receive_msg = lambda blocking: []
+    scheduler._switch_residency_if_due = lambda last: last
+    scheduler.stream = SimpleNamespace(wait_stream=lambda _stream: None)
+    scheduler.engine_stream_ctx = contextlib.nullcontext()
+    scheduler._rebalance_kv_tiers = lambda: None
+    scheduler._schedule_next_batch = lambda: (
+        events.append("schedule") or SimpleNamespace(batch=object())
+    )
+    scheduler._restore_linear_states = lambda _batch: None
+    scheduler._forward_or_fail = lambda _input: events.append("forward") or object()
+    scheduler._process_last_data = lambda _data: None
+    scheduler._flush_oom = lambda: None
+    scheduler._finish_mtp_cycle = lambda _sample: None
+    scheduler._flush_abort_acks = lambda: None
+
+    if loop == "normal":
+        Scheduler.normal_loop(scheduler)
+    else:
+        Scheduler.overlap_loop(scheduler, None)
+
+    assert events == ["guard", "k0", "schedule", "forward"]

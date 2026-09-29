@@ -29,6 +29,9 @@ class RequestStatus:
 
 class LLM(Scheduler):
     def __init__(self, model_path: str, dtype: torch.dtype = torch.bfloat16, **kwargs):
+        from freetoken.server.args import _resolve_mtp_defaults
+
+        _resolve_mtp_defaults(kwargs, model_path)
         config = SchedulerConfig(
             model_path=model_path,
             tp_info=DistributedInfo(0, 1),
@@ -104,9 +107,9 @@ class LLM(Scheduler):
         images: List[List[bytes] | None] | None = None,
     ) -> List[Dict[str, str | List[int]]]:
         """Offline generation; images is aligned with prompts: the raw image files of each prompt in placeholder order, or None."""
+        start_uid = self.counter
         self.pending_requests = []
         self.status_map = {}
-        self.counter = 0
         if isinstance(sampling_params, SamplingParams):
             sampling_params = [sampling_params] * len(prompts)
         if images is None:
@@ -119,7 +122,7 @@ class LLM(Scheduler):
             pass
         results: List[Dict[str, str | List[int]]] = []
         for i in range(len(prompts)):
-            status = self.status_map[i]
+            status = self.status_map[start_uid + i]
             output_text = self.tokenizer.decode(status.output_ids)
             results.append({"text": output_text, "token_ids": status.output_ids})
         return results

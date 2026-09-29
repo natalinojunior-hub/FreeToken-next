@@ -48,6 +48,16 @@ SPEC_DEFER_MAX = 2
 MTP_DRAFT_VOCAB_ENV = "FREETOKEN_MTP_DRAFT_VOCAB"
 
 
+def mtp_forward_last(
+    mtp, residual: torch.Tensor, next_ids: torch.Tensor, batch: Batch
+) -> torch.Tensor:
+    """Return the last MTP residual, using a model-specific narrow path when available."""
+    forward_last = getattr(mtp, "forward_last", None)
+    if forward_last is not None:
+        return forward_last(residual, next_ids, batch)
+    return mtp.forward(residual, next_ids, batch)[-1:]
+
+
 def mtp_draft_logits(model, residual: torch.Tensor) -> torch.Tensor:
     """Draft-step logits over the draft vocabulary (argmax index == token id)."""
     hidden = model.mtp.to_head(residual)
@@ -267,6 +277,18 @@ class GraphRunner:
                 for rows in range(1, max(verify_tokens) + 1):
                     self._capture_draft(model, vocab_size, rows)
                 self.draft = self.drafts.get(1)
+            state_pool = get_global_ctx().linear_state_pool
+            if (
+                getattr(state_pool, "compact_spec_state", False)
+                and state_pool.spec_qkv is not None
+                and len(state_pool.spec_gate_params) == state_pool.num_linear_layers
+            ):
+                state_pool.spec_states.zero_()
+                state_pool.spec_qkv.zero_()
+                state_pool.spec_ba.zero_()
+                # Compile each bounded rejection shape before real requests can encounter it.
+                for count in range(1, state_pool.spec_qkv.shape[1]):
+                    state_pool._replay_spec_recurrence(count)
 
     def _reset_moe_offload_cache(self) -> None:
         if self.moe_offload_cache is not None:
@@ -435,7 +457,7 @@ class GraphRunner:
         draft.bind(batch)
 
         def step():
-            r = model.mtp.forward(draft.residual, draft.input_ids, batch)[-1:]
+            r = mtp_forward_last(model.mtp, draft.residual, draft.input_ids, batch)
             logits = mtp_draft_logits(model, r)
             # Copy into the pre-allocated, externally-referenced buffers (see DraftGraph's
             # out_residual/logits/token docstring) instead of returning fresh tensors -- keeps

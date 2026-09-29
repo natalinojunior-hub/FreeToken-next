@@ -1,7 +1,7 @@
 """Native MTP (multi-token prediction) speculative decode: draft chain + verify + accept/reject.
 
 Single-request only. Verification uses a spec-indexed prefill Batch and captured target windows
-when available. Production chooses k0/k1/k2 from measured seconds per committed token.
+when available. Production chooses depths through k4 from measured seconds per committed token.
 Bypasses scheduler._forward /
 _process_last_data entirely: their single-token-per-request write logic cannot carry more than
 one accepted token per step. Design history: docs/freetoken-next/EXPERIMENTS.md EXP-023/024/025.
@@ -15,8 +15,8 @@ from typing import TYPE_CHECKING, Callable, List
 
 import torch
 from freetoken.core import Batch, Req
-from freetoken.engine.graph import DRAFT_GRAPH_CHECK_ENV, SPEC_DEFER_MAX
-from freetoken.engine.spec import accept_drafts, spec_rollback_lengths
+from freetoken.engine.graph import DRAFT_GRAPH_CHECK_ENV, SPEC_DEFER_MAX, mtp_forward_last
+from freetoken.engine.spec import accept_drafts, lookup_drafts, spec_rollback_lengths
 from freetoken.message import DetokenizeMsg
 from freetoken.debug.token_trace import enabled as trace_enabled
 from freetoken.debug.token_trace import record as trace_token
@@ -78,6 +78,12 @@ class SchedulerSpecMixin:
             return
         end = req.cached_len  # engine.complete_one has consumed the original target window
         start = end - n
+        if start == 0:
+            zero_first = getattr(
+                getattr(self.engine, "kv_cache", None), "zero_mtp_first_token", None
+            )
+            if zero_first is not None:
+                zero_first(self.engine.page_table[req.table_idx, :1])
         carry = getattr(self, "_mtp_prompt_carry", None)
         self._mtp_prompt_carry = (req.uid, end, r_last[-1:].clone())
         if carry is not None and carry[0] == req.uid and carry[1] == start:
@@ -91,14 +97,23 @@ class SchedulerSpecMixin:
         if tok_window.numel() == 0:
             return
 
+        self._fill_mtp_kv(req, start_pos, r_window, tok_window)
+
+    def _fill_mtp_kv(self, req: Req, start_pos: int, r_window, tok_window) -> None:
+        """Populate exact target-fed draft inputs without computing draft logits."""
         old_cached, old_device = req.cached_len, req.device_len
         from freetoken.moe.offload_cache import DECODE_PATH_MAX_TOKENS
 
+        mtp = self.engine.model.mtp
+        forward = mtp.forward
+        chunk = DECODE_PATH_MAX_TOKENS
+        if hasattr(mtp, "prime_kv") and hasattr(self.engine.attn_backend, "store_qsa_kv"):
+            forward = mtp.prime_kv
         try:
             # Draft-only expert banks have no full-prefill staging pool. Keep each warmup
             # window on the fixed-size on-demand expert path, including on a cold prompt.
-            for offset in range(0, tok_window.numel(), DECODE_PATH_MAX_TOKENS):
-                stop = min(offset + DECODE_PATH_MAX_TOKENS, tok_window.numel())
+            for offset in range(0, tok_window.numel(), chunk):
+                stop = min(offset + chunk, tok_window.numel())
                 lo, hi = start_pos + offset, start_pos + stop
                 req.cached_len, req.device_len = lo, hi
                 wb = Batch(reqs=[req], phase="prefill")
@@ -110,9 +125,17 @@ class SchedulerSpecMixin:
                 wb.input_ids = tok_window[offset:stop]
                 self.engine.attn_backend.prepare_metadata(wb)
                 with self.engine.ctx.forward_batch(wb):
-                    mtp.forward(r_window[offset:stop], wb.input_ids, wb)
+                    forward(r_window[offset:stop], wb.input_ids, wb)
         finally:
             req.cached_len, req.device_len = old_cached, old_device
+
+    def _queue_mtp_fill(self, req: Req, pos: int, residual, token) -> None:
+        rows = getattr(self, "_mtp_kv_rows", None)
+        if rows is not None and rows[0] == req.uid and rows[1] + rows[2].shape[0] == pos:
+            pos = rows[1]
+            residual = torch.cat([rows[2], residual])
+            token = torch.cat([rows[3], token])
+        self._mtp_kv_rows = (req.uid, pos, residual.clone(), token.clone())
 
     def _spec_eligible_req(self) -> Req | None:
         if self.spec_mtp <= 0:
@@ -137,8 +160,9 @@ class SchedulerSpecMixin:
         epoch = (
             req.device_len.bit_length(),
             getattr(cache, "cache_size", None),
-            # Minor residency churn is covered by cost audits; bucket real capacity changes.
-            tuple(cap.bit_length() for cap in getattr(cache, "live_caps", ())),
+            # Physical residency changes are measured by drift checks and baseline audits.
+            # A one-row shrink across a power of two must not discard learned economics.
+            bool(getattr(cache, "_vmm_arenas", ())),
             self.engine.num_pages,
         )
         controller.begin_request(req.uid, epoch)
@@ -148,6 +172,7 @@ class SchedulerSpecMixin:
             self._mtp_request_uid = req.uid
             self._mtp_distribution = {}
         self._mtp_cycle_depth = 0
+        self._mtp_cycle_observe = True
         return req, req.input_ids.numel(), time.perf_counter()
 
     def _finish_mtp_cycle(self, sample) -> None:
@@ -160,12 +185,13 @@ class SchedulerSpecMixin:
         elapsed = time.perf_counter() - started
         controller = self._mtp_controller
         depth = self._mtp_cycle_depth
-        controller.observe(depth, elapsed, committed)
-        # A calibration just converged -> persist the learned depth so the next serve of this
-        # fingerprint warm-starts at it (no probe). None on every non-calibration cycle.
-        learned = controller.consume_learned_depth()
-        if learned is not None:
-            self._save_mtp_depth_profile(learned)
+        if self._mtp_cycle_observe:
+            controller.observe(depth, elapsed, committed)
+            # A calibration just converged -> persist the learned depth so the next serve of
+            # this fingerprint warm-starts at it. None on non-calibration cycles.
+            learned = controller.consume_learned_depth()
+            if learned is not None:
+                self._save_mtp_depth_profile(learned)
         counts = self._mtp_distribution.setdefault(depth, [0, 0, 0.0])
         counts[0] += 1
         counts[1] += committed
@@ -192,6 +218,8 @@ class SchedulerSpecMixin:
             self.engine.linear_state_pool.free([slot])
         if hasattr(self, "_spec_qsa_snapshots"):
             self._spec_qsa_snapshots.pop(req.uid, None)
+        if hasattr(self, "_spec_ple_snapshots"):
+            self._spec_ple_snapshots.pop(req.uid, None)
         rows = getattr(self, "_mtp_kv_rows", None)
         if rows is not None and rows[0] == req.uid:
             self._mtp_kv_rows = None
@@ -237,10 +265,21 @@ class SchedulerSpecMixin:
             positions = torch.arange(capacity, device=ring.device)
             keep = (positions - keep_start) % capacity < keep_count
             ring.copy_(torch.where(keep[None, :, None], ring, snap_ring))
+            mtp_slot = getattr(kv, "_mtp_slot", None)
+            if mtp_slot is not None:
+                ring[mtp_slot].copy_(snap_ring[mtp_slot])
         else:
             ring.copy_(snap_ring)
         scratch_base = getattr(kv, "_cmp_scratch_base", 0)
         kv._cmp_k_buffer[:, scratch_base + req.table_idx].copy_(snap_scratch)
+
+    def _retain_mtp_ring(self, req: Req) -> None:
+        """Keep the first draft forward's exact target-fed inputs through target rollback."""
+        kv = getattr(self.engine, "kv_cache", None)
+        slot = getattr(kv, "_mtp_slot", None)
+        if slot is not None:
+            ring, _ = self._spec_qsa_snapshots[req.uid]
+            ring[slot].copy_(kv._pending_ring[req.table_idx, slot])
 
     def _verify_state(self, req: Req) -> List[torch.Tensor]:
         """Every state tensor a verify forward can write: the request's linear-state slot
@@ -307,8 +346,12 @@ class SchedulerSpecMixin:
         state = pool.slot_state("ple_ngram_ctx")[self._linear_slot(req)]
         if not hasattr(self, "_spec_ple_snapshots"):
             self._spec_ple_snapshots: dict[int, torch.Tensor] = {}
-        snapshot = state.clone()
-        self._spec_ple_snapshots[req.uid] = snapshot
+        snapshot = self._spec_ple_snapshots.get(req.uid)
+        if snapshot is None:
+            snapshot = state.clone()
+            self._spec_ple_snapshots[req.uid] = snapshot
+        else:
+            snapshot.copy_(state)
         return snapshot
 
     def _restore_ple_state(self, req: Req) -> None:
@@ -467,7 +510,7 @@ class SchedulerSpecMixin:
             got = [t.clone() for t in runner.replay_draft(db, residual, token)]
         model = self.engine.model
         with self.engine.ctx.forward_batch(db):
-            r = model.mtp.forward(residual, token, db)[-1:]
+            r = mtp_forward_last(model.mtp, residual, token, db)
             from freetoken.engine.graph import mtp_draft_logits
 
             logits = mtp_draft_logits(model, r)
@@ -502,13 +545,23 @@ class SchedulerSpecMixin:
         controller = getattr(self, "_mtp_controller", None)
         requested_k = controller.next_depth() if controller is not None else self.spec_mtp
         k = resolve_adaptive_k(req, requested_k)
-        if controller is not None and k != requested_k:
-            controller.fallback_to_k0()
-            k = 0
+        # Output-budget truncation is valid at the shallower depth, but is not a sample
+        # of the controller's planned depth. Keep its actual depth for economics reporting.
         self._mtp_cycle_depth = k
+        self._mtp_cycle_observe = k == requested_k
         if k <= 0:
             self._flush_deferred_replays()
-            self._mtp_kv_rows = None
+            if controller is None or not controller.probing:
+                self._mtp_kv_rows = None
+            return False
+        lookup = os.getenv("FREETOKEN_SPEC_LOOKUP", "0") == "1"
+        proposals = lookup_drafts(req.input_ids, k) if lookup else []
+        if lookup and not proposals:
+            if controller is not None:
+                controller.fallback_to_k0()
+            self._mtp_cycle_depth = 0
+            self._mtp_cycle_observe = True
+            self._flush_deferred_replays()
             return False
         # A k=1 rejection may defer target inputs. Flush before a wider depth would exceed
         # the pre-priced verify shapes or a model's per-row state buffers.
@@ -552,12 +605,20 @@ class SchedulerSpecMixin:
         residual_snapshot = model.model._last_residual[-1:].clone()
 
         fill = self._take_mtp_fill(req)
+        if fill is not None:
+            from freetoken.moe.offload_cache import DECODE_PATH_MAX_TOKENS
+
+            runner = self.engine.graph_runner
+            graph_rows = max(getattr(runner, "drafts", {}), default=DECODE_PATH_MAX_TOKENS)
+            if fill[0].shape[0] + 1 > min(graph_rows, DECODE_PATH_MAX_TOKENS):
+                self._fill_mtp_kv(req, d - 1 - fill[0].shape[0], *fill)
+                fill = None
 
         # ---- draft chain: k autoregressive steps through the draft head's own QSA slot ----
         r_prev = model.model._last_residual[-1:].clone()
         tok_prev = self.token_pool[req.table_idx, d - 1 : d]
 
-        for i in range(k):
+        for i in range(0 if lookup else k):
             # prepare_metadata (e.g. qsa_sparse) reads req.cached_len/device_len for
             # seqlens_k/extend_len; at i >= 1 the draft's own query must see its own prior
             # draft-step KV, which needs these advanced per step, not left at the entry value.
@@ -567,6 +628,8 @@ class SchedulerSpecMixin:
                 r_in, tok_in = torch.cat([fill[0], r_prev]), torch.cat([fill[1], tok_prev])
             req.cached_len, req.device_len = pos, d + i
             r_prev, logits, tok_prev = self._draft_step(req, pos, r_in, tok_in)
+            if i == 0:
+                self._retain_mtp_ring(req)
             self.token_pool[req.table_idx, d + i] = tok_prev
             if trace_enabled():
                 trace_token(
@@ -581,7 +644,13 @@ class SchedulerSpecMixin:
                 )
         # The chain depends on device tokens, not host ids. Read the saved token-pool
         # slice once after every draft has been enqueued, instead of synchronizing k times.
-        drafts = self.token_pool[req.table_idx, d : d + k].tolist()
+        if lookup:
+            drafts = proposals
+            self.token_pool[req.table_idx, d : d + k] = torch.tensor(
+                drafts, dtype=self.token_pool.dtype, device=self.device
+            )
+        else:
+            drafts = self.token_pool[req.table_idx, d : d + k].tolist()
         req.cached_len, req.device_len = c0, d
         mark("draft_chain")
 

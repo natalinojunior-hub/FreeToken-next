@@ -77,6 +77,12 @@ def test_mtp_construction_and_forward_contract(monkeypatch, enabled):
     monkeypatch.setattr(mod, "Qwen4ExpDecoderLayer", DecoderStub)
     device = torch.device("cuda")
     cfg = _mtp_config() if enabled else _config()
+    if enabled:
+        import freetoken.core as core
+        from freetoken.core import Context, set_global_ctx
+
+        monkeypatch.setattr(core, "_GLOBAL_CTX", None)
+        set_global_ctx(Context(page_size=64, linear_state_pool=None))
     with torch.device(device):
         model = mod.Qwen4ExpForCausalLM(cfg)
     _fill(model, torch.Generator(device=device).manual_seed(171))

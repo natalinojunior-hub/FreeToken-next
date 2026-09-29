@@ -349,27 +349,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
         mark("start")
 
-        md = batch.attn_metadata
-        assert isinstance(md, QSASparseMetadata)
-        slot = self._idx_slot[layer_id]
-        new_forward = md.cmp_rows is None or slot <= md.last_slot
-        if new_forward:
-            md.phys_loc = self._physical_loc(batch.out_loc)
-        self.kvcache.store_kv(k, v, md.phys_loc, layer_id)
+        md, slot = self.store_qsa_kv(k, v, index, layer_id, batch)
         mark("store_kv")
-        if md.block_table is None:
-            self._snapshot_decode(md, batch)
-        if new_forward:
-            # Rebuilt at the first QSA layer of every forward, not cached on the metadata: a
-            # capture batch runs its warmup and its capture through ONE metadata object, and a
-            # cached plan would bake the warmup's addresses into the graph. Layers run in
-            # ascending slot order, so a slot at or below the last one seen starts a new forward
-            # (the draft graph's single MTP layer sits at a non-zero slot).
-            self._plan_index_writes(md, batch)
-            self._plan_host_staging(md, q.shape[0])
-
-        md.last_slot = slot
-        self._update_index_cache(index, md, slot)
         mark("index_cache")
         indices = self._select(index, md, slot)
         self._record_heat(md, indices)
@@ -551,6 +532,26 @@ class QSASparseAttnBackend(BaseAttnBackend):
         gather_pages(host_kv[0], md.host_pages, stage_k)
         gather_pages(host_kv[1], md.host_pages, stage_v)
         return (stage_k, stage_v), md.staged_table
+
+    def store_qsa_kv(self, k, v, index, layer_id, batch, *, stage_host: bool = True):
+        """Update only KV and index state; target-fed MTP prefix rows need no attention."""
+        md = batch.attn_metadata
+        assert isinstance(md, QSASparseMetadata)
+        slot = self._idx_slot[layer_id]
+        new_forward = md.cmp_rows is None or slot <= md.last_slot
+        if new_forward:
+            md.phys_loc = self._physical_loc(batch.out_loc)
+        self.kvcache.store_kv(k, v, md.phys_loc, layer_id)
+        if md.block_table is None:
+            self._snapshot_decode(md, batch)
+        if new_forward:
+            # Capture and warmup share metadata, but their addresses must be replanned.
+            self._plan_index_writes(md, batch)
+            if stage_host:
+                self._plan_host_staging(md, k.shape[0])
+        md.last_slot = slot
+        self._update_index_cache(index, md, slot)
+        return md, slot
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it
