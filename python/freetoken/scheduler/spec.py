@@ -137,6 +137,8 @@ class SchedulerSpecMixin:
         epoch = (
             req.device_len.bit_length(),
             getattr(cache, "cache_size", None),
+            # Minor residency churn is covered by cost audits; bucket real capacity changes.
+            tuple(cap.bit_length() for cap in getattr(cache, "live_caps", ())),
             self.engine.num_pages,
         )
         controller.begin_request(req.uid, epoch)
