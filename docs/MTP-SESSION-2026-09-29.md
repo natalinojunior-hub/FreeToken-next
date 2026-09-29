@@ -29,6 +29,24 @@ QSA `[16,32,4]` vs `[32,16,4]` A/B/A produced about 100.06/99.90/100.30 tok/s; t
 4. Test AD and NVFP4 independently at their supported contexts. Pfeiffer has no MTP artifact and should be treated as automatic RAW. Unsloth weights were unavailable. No 512K decode certification was found in the archive.
 5. Revisit accepted-prefix QSA commit-vs-RAW proof across the compressed 128-row boundary before claiming complete state-transaction certification.
 
+## Bare automatic benchmark commands
+
+Run one GPU job at a time from the repository root. These benchmark-harness runs use model plus context length; the `serve-arg` only sets that context. Archive each JSON and log under `/models/desenvolvimento/old/freetoken-next/mtp-regression-20260929/`.
+
+```bash
+TMPDIR=/models/desenvolvimento/tmp CUDA_HOME=/models/outros/cuda-13.3 \
+PATH=/models/outros/cuda-13.3/bin:$PATH PYTHONPATH=python \
+.venv/bin/python benchmarks/bench_pp_tg.py \
+  --model /models/Qwen3.8-Flash-Next-ISTA-IQ3_XXS/IQ3_XXS \
+  --tokens 16384 --decode 256 --repeats 6 --warmups 1 \
+  --prompt-file /models/desenvolvimento/old/freetoken-next/external/ft-campaign2/campaign26/prompt-470k.txt \
+  --serve-arg=--max-seq-len --serve-arg=16704 \
+  --label auto-final16 --no-history \
+  --json /models/desenvolvimento/old/freetoken-next/mtp-regression-20260929/auto-final16.jsonl
+```
+
+Only after 16K passes its gates, repeat with `--tokens 261824`, `--serve-arg=262144`, and label `auto-final256`; use a distinct JSON path. Pair the 256K mean with the final 16K mean and enforce the 10% loss limit.
+
 ## Evidence and safeguards
 
 Archived session evidence is under `/models/desenvolvimento/old/freetoken-next/mtp-regression-20260929/`. `final-runtime.patch` contains the complete candidate runtime patch relative to checkpoint `c6ef2af`; all 15 changed runtime files match the candidate byte-for-byte. Candidate tests also match except for the unrelated IQ4 tolerance change, which was deliberately left untouched. The checkout had substantial pre-existing work, including archive/doc removals. Those unrelated changes were preserved and must not be swept into the MTP task commit. The local benchmark harness file `scripts/bench_runner.py` is pre-existing work.
