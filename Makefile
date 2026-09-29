@@ -54,13 +54,13 @@ rebuild:
 	uv run --no-sync python setup.py build_ext --inplace
 
 test:
-	TMPDIR=/models/desenvolvimento/tmp uv run --no-sync pytest tests -m "not slow" -q --basetemp=/models/desenvolvimento/tmp
+	TMPDIR=/models/desenvolvimento/tmp uv run --no-sync pytest tests -m "not slow" -q --basetemp=/models/desenvolvimento/tmp/pytest-freetoken
 
 test-safe:
-	TMPDIR=/models/desenvolvimento/tmp uv run --no-sync python scripts/test-runner.py --timeout $(TIMEOUT) -- uv run --no-sync pytest tests -m "not slow" -q --basetemp=/models/desenvolvimento/tmp
+	TMPDIR=/models/desenvolvimento/tmp uv run --no-sync python scripts/test-runner.py --timeout $(TIMEOUT) -- uv run --no-sync pytest tests -m "not slow" -q --basetemp=/models/desenvolvimento/tmp/pytest-freetoken
 
 test-all:
-	TMPDIR=/models/desenvolvimento/tmp uv run --no-sync pytest tests -q --basetemp=/models/desenvolvimento/tmp
+	TMPDIR=/models/desenvolvimento/tmp uv run --no-sync pytest tests -q --basetemp=/models/desenvolvimento/tmp/pytest-freetoken
 
 bench:
 	TMPDIR=/models/desenvolvimento/tmp FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1 \
