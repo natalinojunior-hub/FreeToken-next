@@ -69,6 +69,44 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
 class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
+    def _load_mtp_depth_profile(self, cap: int) -> int | None:
+        """Compute this serve's depth-profile key and load a previously learned optimal depth.
+
+        Returns ``None`` (calibrate this run) when a measurement force-depth is pinned, when no
+        profile matches the hardware+model+build+config fingerprint, or on ANY failure -- depth
+        profiling is a warm-start optimization and must never block serving. The key is stashed
+        on ``self`` so ``_save_mtp_depth_profile`` writes back to the same entry.
+        """
+        self._mtp_profile_key = None
+        if os.getenv("FREETOKEN_MTP_FORCE_DEPTH"):
+            return None  # a measurement pin owns the depth; do not read or write the cache
+        try:
+            from freetoken.tuning import mtp_profile
+
+            eff_ctx = (
+                getattr(self.engine, "max_seq_len", None)
+                or getattr(self.config, "max_seq_len_override", None)
+                or getattr(self.config, "max_seq_len", 0)
+            )
+            self._mtp_profile_key = mtp_profile.key_from_config(self.config, eff_ctx, cap)
+            return mtp_profile.load(self._mtp_profile_key)
+        except Exception as e:  # noqa: BLE001 -- best-effort; calibrate this run on any failure
+            logger.info_rank0(f"mtp depth profile load skipped ({e}); calibrating this run")
+            self._mtp_profile_key = None
+            return None
+
+    def _save_mtp_depth_profile(self, depth: int) -> None:
+        """Persist a freshly-learned depth so the next serve of this fingerprint warm-starts at
+        it and skips the calibration probe. Best-effort; never blocks serving."""
+        if self._mtp_profile_key is None:
+            return
+        try:
+            from freetoken.tuning import mtp_profile
+
+            mtp_profile.save(self._mtp_profile_key, depth)
+        except Exception as e:  # noqa: BLE001
+            logger.info_rank0(f"mtp depth profile save skipped ({e})")
+
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
 
@@ -158,10 +196,15 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         self.config = config
         self.spec_mtp = config.spec_mtp
         self._mtp_controller = None
+        self._mtp_profile_key: str | None = None
         if self.spec_mtp > 0 and os.getenv("FREETOKEN_MTP_FIXED_DEPTH", "0") != "1":
             from .adaptive_mtp import AdaptiveMtpController
 
-            self._mtp_controller = AdaptiveMtpController(min(self.spec_mtp, 2))
+            cap = min(self.spec_mtp, 4)
+            # Warm start from a previously learned depth (same hardware+model+build+config
+            # fingerprint) so this serve skips the calibration probe; None -> calibrate.
+            profiled = self._load_mtp_depth_profile(cap)
+            self._mtp_controller = AdaptiveMtpController(cap, profiled_depth=profiled)
         self._spec_snapshot_slots: dict[int, int] = {}
         if self.spec_mtp > 0:
             if not ENV.DISABLE_OVERLAP_SCHEDULING:

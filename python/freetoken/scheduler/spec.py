@@ -159,6 +159,11 @@ class SchedulerSpecMixin:
         controller = self._mtp_controller
         depth = self._mtp_cycle_depth
         controller.observe(depth, elapsed, committed)
+        # A calibration just converged -> persist the learned depth so the next serve of this
+        # fingerprint warm-starts at it (no probe). None on every non-calibration cycle.
+        learned = controller.consume_learned_depth()
+        if learned is not None:
+            self._save_mtp_depth_profile(learned)
         counts = self._mtp_distribution.setdefault(depth, [0, 0, 0.0])
         counts[0] += 1
         counts[1] += committed

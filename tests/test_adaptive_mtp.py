@@ -277,3 +277,85 @@ def test_provably_slower_deep_depth_is_not_picked():
         index = controller.cost_summaries[depth]["samples"]
         controller.observe(depth, costs[depth][index], 1)
     assert controller.selected_depth == 3
+
+
+# --- warm start from a persisted depth profile (tuning.mtp_profile) -----------------------
+
+
+def test_warm_start_skips_probe_and_holds_profiled_depth():
+    """A depth learned by a previous serve under the same fingerprint warm-starts the
+    controller: it uses that depth from the first token with NO 24-cycle calibration probe
+    (the entire point of the profile -- reach steady-state ~104 TG immediately). It must also
+    HOLD across requests: with no k=0 baseline, _best_depth() would return 0, so the warm path
+    has to keep the profiled depth rather than fall through to it."""
+    controller = AdaptiveMtpController(4, profiled_depth=4)
+    controller.begin_request("warm", "epoch-a")
+    assert not controller.probing
+    assert controller.next_depth() == 4
+    for _ in range(5):
+        controller.observe(4, 0.0096, 4)
+    controller.begin_request("warm2", "epoch-a")  # next request, same epoch
+    assert controller.next_depth() == 4  # still warm, not dropped to k0
+    assert controller.consume_learned_depth() is None  # a warm start learned nothing new
+
+
+def test_warm_start_survives_epoch_churn_without_reprobing():
+    """Pool warmup changes live_caps -> the epoch tuple changes -> a cold controller would
+    re-probe. A warm one must keep the profiled depth through the churn (the profile encodes
+    the steady-state optimum for this fingerprint), not pay the probe again."""
+    controller = AdaptiveMtpController(4, profiled_depth=4)
+    controller.begin_request("warm", "epoch-a")
+    assert controller.next_depth() == 4
+    controller.begin_request("warm", "epoch-b")  # epoch changed (residency grew)
+    assert not controller.probing
+    assert controller.next_depth() == 4
+
+
+def test_warm_start_drift_invalidates_profile_and_reprobes():
+    """Drift while trusting a profile means conditions moved: invalidate and run a full cold
+    calibration next request (the engine then re-saves the newly learned depth)."""
+    controller = AdaptiveMtpController(1, profiled_depth=1)
+    controller.begin_request("warm", "epoch-a")
+    assert controller.next_depth() == 1
+    for _ in range(8):
+        controller.observe(1, 0.008, 1)  # stable warm cost
+    for _ in range(8):
+        controller.observe(1, 0.030, 1)  # regime change: depth 1 got much slower -> drift
+    controller.begin_request("warm2", "epoch-a")
+    assert controller.probing  # profile invalidated -> cold calibration
+    assert controller.next_depth() == 0  # probe restarts at the k0 baseline
+
+
+def test_cold_calibration_exposes_learned_depth_exactly_once():
+    """The engine persists whatever a fresh calibration converges to (and only that)."""
+    controller = AdaptiveMtpController(4)
+    costs = {0: [0.0154] * 8, 1: [0.0140] * 4, 2: [0.0125] * 4, 3: [0.0108] * 4, 4: [0.0096] * 4}
+    controller.begin_request("cold", "epoch-a")
+    assert controller.consume_learned_depth() is None  # nothing learned before calibration
+    while controller.probing:
+        depth = controller.next_depth()
+        index = controller.cost_summaries[depth]["samples"]
+        controller.observe(depth, costs[depth][index], 1)
+    assert controller.selected_depth == 4
+    assert controller.consume_learned_depth() == 4  # surfaced for saving
+    assert controller.consume_learned_depth() is None  # consumed once
+
+
+def test_force_depth_overrides_profile_and_never_saves(monkeypatch):
+    """A measurement force-depth pin owns the depth: it wins over a profile and produces no
+    learned depth to persist (a forced run is an instrument, not a calibration)."""
+    monkeypatch.setenv("FREETOKEN_MTP_FORCE_DEPTH", "2")
+    controller = AdaptiveMtpController(4, profiled_depth=4)
+    controller.begin_request("forced", "epoch-a")
+    assert controller.next_depth() == 2  # force wins over the profiled 4
+    controller.observe(2, 0.010, 3)
+    assert controller.consume_learned_depth() is None
+
+
+@pytest.mark.parametrize("bad", [0, 5, -1])
+def test_invalid_profiled_depth_is_ignored(bad):
+    """Only 1..safe_max_k is honored; an out-of-range or zero profile falls back to a cold
+    calibration (a learned 0 is never cached, so it can never be warm-started)."""
+    controller = AdaptiveMtpController(4, profiled_depth=bad)
+    controller.begin_request("bad", "epoch-a")
+    assert controller.probing  # cold calibration, not a warm start

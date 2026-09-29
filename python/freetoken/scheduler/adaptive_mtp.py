@@ -118,11 +118,26 @@ class AdaptiveMtpController:
     there until ``begin_request`` starts a different request.
     """
 
-    def __init__(self, safe_max_k: int):
+    def __init__(self, safe_max_k: int, profiled_depth: int | None = None):
         if type(safe_max_k) is not int or not 0 <= safe_max_k <= 4:
             raise ValueError("safe_max_k must be an integer from 0 through 4")
         self.safe_max_k = safe_max_k
         self._force_depth = _forced_depth_or_none(safe_max_k)
+        # A depth learned by a previous serve under the SAME hardware+model+build+config
+        # fingerprint (tuning.mtp_profile). Warm-starts the controller so it skips the
+        # calibration probe. Ignored when a measurement force-depth is pinned (force wins) or
+        # the value is out of range. Only positive depths are honored: a learned 0 means
+        # "speculation hurts here", which is rare enough and cheap enough to re-probe that it
+        # is never cached, so a fluke k0 lock cannot get pinned across runs.
+        self._profiled_depth: int | None = None
+        if (
+            self._force_depth is None
+            and profiled_depth is not None
+            and isinstance(profiled_depth, int)
+            and 1 <= profiled_depth <= safe_max_k
+        ):
+            self._profiled_depth = profiled_depth
+        self._pending_learned_depth: int | None = None
         self._epoch = None
         self._request_uid = None
         self._stats = [_RatioWindow() for _ in range(safe_max_k + 1)]
@@ -140,6 +155,19 @@ class AdaptiveMtpController:
     @property
     def probing(self) -> bool:
         return bool(self._plan) and not self._terminal_k0
+
+    def consume_learned_depth(self) -> int | None:
+        """The depth from the most recent COMPLETED calibration, then clear it (or ``None``).
+
+        The engine persists this to ``tuning.mtp_profile`` so the next serve warm-starts and
+        skips the probe. Only a fresh cold calibration produces one: a warm start from a profile
+        learns nothing new, and a forced-depth measurement run never calibrates -- so neither
+        re-saves. Returns each converged depth exactly once (a drift-triggered re-calibration
+        will surface the newly learned depth on the next call).
+        """
+        learned = self._pending_learned_depth
+        self._pending_learned_depth = None
+        return learned
 
     @property
     def cost_summaries(self) -> dict[int, dict[str, float | int]]:
@@ -219,20 +247,34 @@ class AdaptiveMtpController:
         self._terminal_k0 = False
         self._observations_since_check = 0
         if self._needs_reprobe:
-            # k=0 baseline first (contiguous), then the positive depths round-robin so the
-            # depth-vs-time confound does not bias which depth looks cheapest (see the
-            # _PROBE_REPEATS comment above).
-            self._plan = deque(
-                [0] * _MIN_BASELINE_SAMPLES
-                + [d for _ in range(_PROBE_REPEATS) for d in range(1, self.safe_max_k + 1)]
-            )
+            if self._profiled_depth is not None:
+                # Warm start: a profile learned under this exact hardware+model+build+config
+                # fingerprint says this depth won, so skip the 24-cycle calibration probe.
+                # Epoch churn during pool warmup does NOT invalidate it (the profile encodes
+                # the steady-state optimum); only measured drift (in observe) or an explicit
+                # FREETOKEN_MTP_PROFILE=refresh does.
+                self._plan.clear()
+                self._selected_depth = self._profiled_depth
+            else:
+                # k=0 baseline first (contiguous), then the positive depths round-robin so the
+                # depth-vs-time confound does not bias which depth looks cheapest (see the
+                # _PROBE_REPEATS comment above).
+                self._plan = deque(
+                    [0] * _MIN_BASELINE_SAMPLES
+                    + [d for _ in range(_PROBE_REPEATS) for d in range(1, self.safe_max_k + 1)]
+                )
+                self._selected_depth = 0
             self._needs_reprobe = False
-            self._selected_depth = 0
         else:
             self._plan.clear()
-            self._selected_depth = self._best_depth()
-            if self._selected_depth == 0:
-                self._terminal_k0 = True
+            if self._profiled_depth is not None and len(self._stats[0].samples) < _MIN_BASELINE_SAMPLES:
+                # Still warm (no calibration has run this epoch): hold the profiled depth
+                # rather than _best_depth(), which has no k=0 baseline to compare against.
+                self._selected_depth = self._profiled_depth
+            else:
+                self._selected_depth = self._best_depth()
+                if self._selected_depth == 0:
+                    self._terminal_k0 = True
 
     def next_depth(self) -> int:
         if self._terminal_k0:
@@ -271,6 +313,12 @@ class AdaptiveMtpController:
                 self._selected_depth = self._best_depth()
                 if self._selected_depth == 0:
                     self.fallback_to_k0()
+            if self._selected_depth > 0 and not self._terminal_k0:
+                # A fresh calibration just converged: expose the learned depth so the engine can
+                # persist it (tuning.mtp_profile) and the next serve skip the probe. Only a
+                # positive depth is cached -- a learned 0 ("speculation hurts") is rare and cheap
+                # to re-probe, and never caching it means a fluke k0 lock cannot get pinned.
+                self._pending_learned_depth = self._selected_depth
         elif not was_probing:
             self._observations_since_check += 1
             if self._observations_since_check >= 8:
@@ -282,8 +330,17 @@ class AdaptiveMtpController:
                     # the drifted depth is now genuinely worse than the baseline; a depth
                     # that merely got cheaper (beneficial drift) is kept.
                     self._needs_reprobe = True
+                    if self._profiled_depth is not None:
+                        # Drift while trusting a profile: the profiled depth may no longer be
+                        # optimal for current conditions. Invalidate it so the re-probe is a
+                        # full cold calibration (and the engine re-saves the newly learned depth).
+                        self._profiled_depth = None
                 if not self._terminal_k0:
-                    self._reselect_with_hysteresis()
+                    if len(self._stats[0].samples) >= _MIN_BASELINE_SAMPLES:
+                        self._reselect_with_hysteresis()
+                    # else: warm-started from a profile with no k=0 baseline to compare
+                    # against; hold the profiled depth (drift above or an epoch change will
+                    # trigger a re-probe if conditions move).
 
     def _reselect_with_hysteresis(self) -> None:
         best = self._best_depth()
