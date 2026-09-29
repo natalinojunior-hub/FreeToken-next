@@ -673,6 +673,13 @@ class OffloadMoeCache:
                 plan = self._vmm_plan(cache_size)
             except ValueError as e:
                 logger.warning(f"expert cache stays fixed-size (no in-place residency): {e}")
+                from freetoken.tuning import diagnostics
+                diagnostics.log_event(
+                    "fallback",
+                    "expert_residency",
+                    f"expert pool fell back to fixed-size full-back (VMM lazy plan rejected): {e}",
+                    severity="warn",
+                )
                 self.vmm_rows = 0
         if plan is not None:
             pools, caps, offsets, ends, live = plan

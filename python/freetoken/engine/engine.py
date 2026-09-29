@@ -264,6 +264,14 @@ def _shed_mtp(config) -> bool:
         f"--spec-mtp {k} -> 0: {config.max_seq_len} tokens of context need the VRAM its verify "
         "state takes (speculative decoding off, context kept)"
     )
+    from freetoken.tuning import diagnostics
+    diagnostics.log_event(
+        "degrade",
+        "shed_mtp",
+        f"--spec-mtp {k} -> 0: {config.max_seq_len} tokens of context need the verify-state VRAM (speculation off)",
+        spec_mtp_before=k,
+        max_seq_len=config.max_seq_len,
+    )
     object.__setattr__(config, "spec_mtp", 0)
     return True
 
@@ -679,6 +687,17 @@ class Engine:
         # both the expert-cache memory planner (spec_state_bytes) and the GDN LinearStatePool
         # read the SSM dtype + compact-state env, so both must see the resolved values.
         _resolve_mtp_state_precision(config)
+        from freetoken.tuning import diagnostics
+        diagnostics.configure(
+            config.model_path,
+            {
+                "spec_mtp": getattr(config, "spec_mtp", 0),
+                "kv_format": str(getattr(config, "kv_format", "auto")),
+                "max_seq_len": int(getattr(config, "max_seq_len_override", 0) or getattr(config, "max_seq_len", 0)),
+                "moe_strategy": str(getattr(config, "moe_strategy", "")),
+                "max_running_req": int(getattr(config, "max_running_req", 1)),
+            },
+        )
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
             if self.moe_offload_cache is not None:
@@ -1396,6 +1415,14 @@ class Engine:
                 "Something allocates outside the model (a per-slot expert cost that omits the "
                 "kernel's side tables is the known case) -- find it or leave ratio headroom."
             )
+            from freetoken.tuning import diagnostics
+            diagnostics.log_event(
+                "warn",
+                "vram_ledger",
+                f"ledger under-modelled by {mem_GB(unexplained)}: allocator holds {mem_GB(held)} vs account {mem_GB(ledger.held_bytes())} (OOM risk)",
+                unexplained_bytes=unexplained,
+                **diagnostics.vram_snapshot(self.device),
+            )
         elif -unexplained > CALIBRATION_TOLERANCE:
             logger.info_rank0(
                 f"VRAM ledger over-modelled the account by {mem_GB(-unexplained)}: the pools it "
@@ -1453,6 +1480,14 @@ class Engine:
         turbo all run on the coded-KV backend chosen for fp8; QSA keeps qsa_sparse)."""
         why = why or f"{config.kv_format} does not fit {config.max_seq_len} tokens"
         logger.info_rank0(f"KV format auto: {config.kv_format} -> {fmt} ({why})")
+        from freetoken.tuning import diagnostics
+        diagnostics.log_event(
+            "degrade",
+            "kv_format",
+            f"KV format -> {fmt}" + (f" ({why})" if why else ""),
+            new_format=fmt,
+            reason=why,
+        )
         object.__setattr__(config, "kv_format", fmt)
         self._pool_cls = resolve_pool_class(config.model_config, fmt)
 
