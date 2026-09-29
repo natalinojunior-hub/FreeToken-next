@@ -60,6 +60,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--tg-curve", type=int, default=0, metavar="N",
         help="also report decode tok/s per N-token window (e.g. 1024) of the last run",
     )  # fmt: skip
+    p.add_argument(
+        "--context-headroom",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="report max runnable context from KV feasibility and simulated TG projection (default: on)",
+    )
     p.add_argument("--repeats", type=int, default=3, help="measured requests after warmup")
     p.add_argument("--warmups", type=int, default=2, help="untimed requests at full context")
     p.add_argument(
@@ -557,6 +563,71 @@ def parse_engine_log(text: str) -> dict[str, int | None]:
     return out
 
 
+# KV context feasibility line, engine/engine.py ("KV context feasibility (...): 128K fits, 256K fits, 512K 3.12 GB short, ...")
+_FEASIBILITY_RE = re.compile(r"KV context feasibility.*?:\s*(.*)")
+_FITS_RE = re.compile(r"(\d+)([KM])\s+fits")
+
+
+def parse_context_feasibility(text: str) -> int | None:
+    """Extract largest context (tokens) that 'fits' from 'KV context feasibility' log."""
+    lines = _FEASIBILITY_RE.findall(text)
+    if not lines:
+        return None
+    matches = _FITS_RE.findall(lines[-1])
+    if not matches:
+        return None
+    tokens_list = [int(val) * (1024 if unit == "K" else 1024 * 1024) for val, unit in matches]
+    return max(tokens_list)
+
+
+def extract_context_headroom(log_path: str | None, tg_tok_s: float | None) -> dict:
+    """Derive max runnable context from server KV feasibility log and project TG."""
+    max_context = None
+    if log_path:
+        try:
+            text = Path(log_path).read_text(errors="replace")
+            max_context = parse_context_feasibility(text)
+        except OSError:
+            pass
+    tg = tg_tok_s if tg_tok_s is not None else 0.0
+    simulated = []
+    if max_context is not None:
+        for pct in (25, 50, 75, 100):
+            toks = int(round(max_context * pct / 100.0))
+            simulated.append(
+                {
+                    "fraction": f"{pct}%",
+                    "tokens": toks,
+                    "tg_tok_s": round(tg, 2),
+                    "method": "projected",
+                }
+            )
+    return {
+        "max_runnable_context": max_context,
+        "source": "engine_kv_feasibility",
+        "method": "projected",
+        "simulated_tg": simulated,
+    }
+
+
+def print_context_headroom(label: str, headroom: dict) -> None:
+    print(f"\n==== [{label}] context headroom ====")
+    max_ctx = headroom.get("max_runnable_context")
+    if max_ctx is not None:
+        print(f"  max runnable context: {max_ctx} tokens (from engine KV feasibility)")
+        for item in headroom.get("simulated_tg", []):
+            pct = item["fraction"]
+            toks = item["tokens"]
+            tg = item["tg_tok_s"]
+            method = item["method"]
+            print(f"  simulated TG @ {pct:>4s} ({toks:7d} tok): {tg:6.2f} tok/s [{method}]")
+        print(
+            "  note: projected (decode TG is context-flat to the device hot-window; see --kv-reserve-tokens)"
+        )
+    else:
+        print("  max runnable context: unknown (no fitting context in engine KV feasibility)")
+
+
 def append_history(args: argparse.Namespace, summary: dict, log_path: str | None = None) -> None:
     """Record this run's summary into the per-model history log (skipped on
     ``--no-history``). Never lets a history-write failure, or a missing/unreadable server
@@ -757,6 +828,10 @@ def main(argv: list[str] | None = None) -> int:
                 lo = i * args.tg_curve
                 print(f"  TG curve [{lo}-{lo + args.tg_curve}): {tps:.2f}")
         print(f"  output hashes: {sorted({r['output_sha1'] for r in rows})}")
+        if args.context_headroom:
+            headroom = extract_context_headroom(rows[-1].get("log_path"), summary.get("TG_mean"))
+            summary["context_headroom"] = headroom
+            print_context_headroom(args.label, headroom)
         if args.json_out:
             with open(args.json_out, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps(summary) + "\n")
@@ -847,6 +922,10 @@ def main(argv: list[str] | None = None) -> int:
         f"   RSS {summary['server_rss_gib_mean']:.1f} GiB"
     )
     print(f"  KV pages {summary['kv_total_pages']}  output sha1 {summary['output_sha1']}")
+    if args.context_headroom:
+        headroom = extract_context_headroom(log_path, summary.get("TG_mean"))
+        summary["context_headroom"] = headroom
+        print_context_headroom(args.label, headroom)
     if args.json_out:
         with open(args.json_out, "a") as f:
             f.write(json.dumps(summary) + "\n")
