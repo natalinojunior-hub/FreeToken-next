@@ -635,10 +635,6 @@ class Engine:
                     "--kv-tiering force needs a host-tier capable KV pool; this model resolves to "
                     f"{self._pool_cls.__name__}"
                 )
-            if not getattr(config.model_config, "kv_ram_tier_certified", False):
-                raise NotImplementedError(
-                    "--kv-tiering force requires a model family certified for KV in RAM"
-                )
             if config.kv_format not in ("auto", "fp8"):
                 raise NotImplementedError(f"--kv-tiering force needs auto/FP8 device KV; got {config.kv_format!r}")
             if config.tp_info.size != 1:
@@ -647,6 +643,10 @@ class Engine:
                 )
             if self.device.type != "cuda":
                 raise NotImplementedError("--kv-tiering force needs a CUDA device")
+            if not getattr(config.model_config, "kv_ram_tier_certified", False):
+                logger.info_rank0(
+                    "KV RAM tiering: experimental forced FP8 host path; model family is not certified"
+                )
             ram_tokens = config.kv_ram_tokens or config.max_seq_len
             self.host_pages = -(-ram_tokens // config.page_size)  # ceil div to pages
             object.__setattr__(
