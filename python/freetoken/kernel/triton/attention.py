@@ -170,6 +170,8 @@ def _decode_grouped_stage1_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
+    k_host_ptr,
+    v_host_ptr,
     sm_scale,
     indptr_ptr,
     indices_ptr,
@@ -183,6 +185,10 @@ def _decode_grouped_stage1_kernel(
     stride_kh,
     stride_vs,
     stride_vh,
+    stride_khs,
+    stride_khhs,
+    stride_vhs,
+    stride_vhhs,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -209,6 +215,8 @@ def _decode_grouped_stage1_kernel(
     SLIDING_WINDOW: tl.constexpr,
     COMPRESSED: tl.constexpr = False,
     BOOK: tl.constexpr = 0,
+    NUM_DEVICE_SLOTS: tl.constexpr = 0,
+    HAS_HOST: tl.constexpr = False,
 ):
     batch_id = tl.program_id(0)
     head_block_id = tl.program_id(1)
@@ -280,11 +288,15 @@ def _decode_grouped_stage1_kernel(
                     q.dtype,
                 )
             else:
-                k = tl.load(
-                    k_ptr + slots[None, :] * stride_ks + k_base_offsets,
-                    mask=mask_n[None, :] & mask_d[:, None],
-                    other=0.0,
-                )
+                k_mask = mask_n[None, :] & mask_d[:, None]
+                if HAS_HOST:
+                    k_dev = tl.load(k_ptr + slots[None, :] * stride_ks + k_base_offsets,
+                                    mask=k_mask & (slots[None, :] < NUM_DEVICE_SLOTS), other=0.0)
+                    k_host = tl.load(k_host_ptr + (slots[None, :] - NUM_DEVICE_SLOTS) * stride_khs + kv_head * stride_khhs + offs_d[:, None],
+                                     mask=k_mask & (slots[None, :] >= NUM_DEVICE_SLOTS), other=0.0)
+                    k = tl.where((slots[None, :] >= NUM_DEVICE_SLOTS), k_host, k_dev)
+                else:
+                    k = tl.load(k_ptr + slots[None, :] * stride_ks + k_base_offsets, mask=k_mask, other=0.0)
             scores = tl.dot(q, k) * sm_scale
             scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
 
@@ -305,11 +317,15 @@ def _decode_grouped_stage1_kernel(
                     q.dtype,
                 )
             else:
-                v = tl.load(
-                    v_ptr + slots[:, None] * stride_vs + v_base_offsets,
-                    mask=mask_n[:, None] & mask_dv[None, :],
-                    other=0.0,
-                )
+                v_mask = mask_n[:, None] & mask_dv[None, :]
+                if HAS_HOST:
+                    v_dev = tl.load(v_ptr + slots[:, None] * stride_vs + v_base_offsets,
+                                    mask=v_mask & (slots[:, None] < NUM_DEVICE_SLOTS), other=0.0)
+                    v_host = tl.load(v_host_ptr + (slots[:, None] - NUM_DEVICE_SLOTS) * stride_vhs + kv_head * stride_vhhs + offs_dv[None, :],
+                                     mask=v_mask & (slots[:, None] >= NUM_DEVICE_SLOTS), other=0.0)
+                    v = tl.where((slots[:, None] >= NUM_DEVICE_SLOTS), v_host, v_dev)
+                else:
+                    v = tl.load(v_ptr + slots[:, None] * stride_vs + v_base_offsets, mask=v_mask, other=0.0)
 
             m_new = tl.maximum(tl.max(scores, axis=1), m_i)
             alpha = tl.exp(m_i - m_new)
@@ -424,6 +440,9 @@ def decode_paged_attention(
     sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     turbo: dict | None = None,
+    k_host: torch.Tensor | None = None,
+    v_host: torch.Tensor | None = None,
+    num_device_slots: int | None = None,
 ) -> torch.Tensor:
     """SGLang-style split-k grouped decode attention for one query per request.
 
@@ -433,6 +452,15 @@ def decode_paged_attention(
     """
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
+    if k_host is not None or v_host is not None:
+        if turbo is not None:
+            raise ValueError("host KV is supported only for uncompressed FP8 attention")
+        assert k_host is not None and v_host is not None
+        assert k_host.dim() == 3 and v_host.dim() == 3
+        assert k_host.shape[1:] == k_cache.shape[1:]
+        assert v_host.shape[1:] == v_cache.shape[1:]
+        assert num_device_slots is not None and num_device_slots > 0
+        assert k_host.is_cuda and v_host.is_cuda, "host KV must be mapped CUDA tensors"
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
     batch, num_q_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
@@ -457,6 +485,10 @@ def decode_paged_attention(
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
     compressed = turbo is not None
+    has_host = k_host is not None
+    k_host_arg = k_host if has_host else k_cache
+    v_host_arg = v_host if has_host else v_cache
+    num_device_slots_arg = int(num_device_slots or 0)
     kn_ptr = turbo["k_norm"] if compressed else k_cache
     vn_ptr = turbo["v_norm"] if compressed else v_cache
     cent_ptr = turbo["cent"] if compressed else k_cache
@@ -473,6 +505,8 @@ def decode_paged_attention(
         q,
         k_cache,
         v_cache,
+        k_host_arg,
+        v_host_arg,
         sm_scale,
         indptr,
         indices,
@@ -486,6 +520,10 @@ def decode_paged_attention(
         k_cache.stride(1),
         v_cache.stride(0),
         v_cache.stride(1),
+        k_host_arg.stride(0),
+        k_host_arg.stride(1),
+        v_host_arg.stride(0),
+        v_host_arg.stride(1),
         attn_logits.stride(0),
         attn_logits.stride(1),
         attn_logits.stride(2),
@@ -512,6 +550,8 @@ def decode_paged_attention(
         SLIDING_WINDOW=sliding_window or 0,
         COMPRESSED=compressed,
         BOOK=turbo["book"] if compressed else 0,
+        NUM_DEVICE_SLOTS=num_device_slots_arg,
+        HAS_HOST=has_host,
         num_warps=4,
         num_stages=2,
     )
@@ -548,6 +588,8 @@ def _extend_attention_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
+    k_host_ptr,
+    v_host_ptr,
     o_ptr,
     qo_indptr_ptr,
     kv_indptr_ptr,
@@ -562,6 +604,10 @@ def _extend_attention_kernel(
     stride_kh,
     stride_vs,
     stride_vh,
+    stride_khs,
+    stride_khhs,
+    stride_vhs,
+    stride_vhhs,
     stride_ot,
     stride_oh,
     kn_ptr,
@@ -582,6 +628,8 @@ def _extend_attention_kernel(
     HAS_BLOCKS: tl.constexpr,
     COMPRESSED: tl.constexpr = False,
     BOOK: tl.constexpr = 0,
+    NUM_DEVICE_SLOTS: tl.constexpr = 0,
+    HAS_HOST: tl.constexpr = False,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -658,11 +706,13 @@ def _extend_attention_kernel(
                     tl.bfloat16,
                 )
             else:
-                k = tl.load(
-                    k_ptr + slots[None, :] * stride_ks + kv_head * stride_kh + offs_d[:, None],
-                    mask=mask_n[None, :] & mask_d[:, None],
-                    other=0.0,
-                )
+                k_mask = mask_n[None, :] & mask_d[:, None]
+                if HAS_HOST:
+                    k_dev = tl.load(k_ptr + slots[None, :] * stride_ks + kv_head * stride_kh + offs_d[:, None], mask=k_mask & (slots[None, :] < NUM_DEVICE_SLOTS), other=0.0)
+                    k_host = tl.load(k_host_ptr + (slots[None, :] - NUM_DEVICE_SLOTS) * stride_khs + kv_head * stride_kh + offs_d[:, None], mask=k_mask & (slots[None, :] >= NUM_DEVICE_SLOTS), other=0.0)
+                    k = tl.where(slots[None, :] >= NUM_DEVICE_SLOTS, k_host, k_dev)
+                else:
+                    k = tl.load(k_ptr + slots[None, :] * stride_ks + kv_head * stride_kh + offs_d[:, None], mask=k_mask, other=0.0)
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
 
@@ -689,11 +739,13 @@ def _extend_attention_kernel(
                     tl.bfloat16,
                 )
             else:
-                v = tl.load(
-                    v_ptr + slots[:, None] * stride_vs + kv_head * stride_vh + offs_dv[None, :],
-                    mask=mask_n[:, None] & mask_dv[None, :],
-                    other=0.0,
-                )
+                v_mask = mask_n[:, None] & mask_dv[None, :]
+                if HAS_HOST:
+                    v_dev = tl.load(v_ptr + slots[:, None] * stride_vs + kv_head * stride_vh + offs_dv[None, :], mask=v_mask & (slots[:, None] < NUM_DEVICE_SLOTS), other=0.0)
+                    v_host = tl.load(v_host_ptr + (slots[:, None] - NUM_DEVICE_SLOTS) * stride_vhs + kv_head * stride_vh + offs_dv[None, :], mask=v_mask & (slots[:, None] >= NUM_DEVICE_SLOTS), other=0.0)
+                    v = tl.where(slots[:, None] >= NUM_DEVICE_SLOTS, v_host, v_dev)
+                else:
+                    v = tl.load(v_ptr + slots[:, None] * stride_vs + kv_head * stride_vh + offs_dv[None, :], mask=v_mask, other=0.0)
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
@@ -943,10 +995,20 @@ def extend_paged_attention(
     v_extend: torch.Tensor | None = None,
     block_ends: torch.Tensor | None = None,
     turbo: dict | None = None,
+    k_host: torch.Tensor | None = None,
+    v_host: torch.Tensor | None = None,
+    num_device_slots: int | None = None,
 ) -> torch.Tensor:
     """Block-tiled causal prefill/extend attention over paged KV cache; block_ends holds per query token the end of the multimodal span it sits in (0 for none), whose later keys the row also attends."""
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
+    if k_host is not None or v_host is not None:
+        if turbo is not None:
+            raise ValueError("host KV is supported only for uncompressed FP8 attention")
+        assert k_host is not None and v_host is not None
+        assert k_host.shape[1:] == k_cache.shape[1:] and v_host.shape[1:] == v_cache.shape[1:]
+        assert num_device_slots is not None and num_device_slots > 0
+        assert k_host.is_cuda and v_host.is_cuda, "host KV must be mapped CUDA tensors"
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
     num_q_tokens, num_q_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
@@ -972,6 +1034,9 @@ def extend_paged_attention(
     sinks_arg = sinks if sinks is not None else q
     block_ends_arg = block_ends if block_ends is not None else qo_indptr
     compressed = turbo is not None
+    has_host = k_host is not None
+    k_host_arg = k_host if has_host else k_cache
+    v_host_arg = v_host if has_host else v_cache
     kn_ptr = turbo["k_norm"] if compressed else k_cache
     vn_ptr = turbo["v_norm"] if compressed else v_cache
     cent_ptr = turbo["cent"] if compressed else k_cache
@@ -1050,6 +1115,8 @@ def extend_paged_attention(
         q,
         k_cache,
         v_cache,
+        k_host_arg,
+        v_host_arg,
         o,
         qo_indptr,
         kv_indptr,
@@ -1064,6 +1131,10 @@ def extend_paged_attention(
         k_cache.stride(1),
         v_cache.stride(0),
         v_cache.stride(1),
+        k_host_arg.stride(0),
+        k_host_arg.stride(1),
+        v_host_arg.stride(0),
+        v_host_arg.stride(1),
         o.stride(0),
         o.stride(1),
         kn_ptr,
@@ -1083,6 +1154,8 @@ def extend_paged_attention(
         HAS_SINKS=sinks is not None,
         HAS_BLOCKS=block_ends is not None,
         **turbo_kw,
+        NUM_DEVICE_SLOTS=int(num_device_slots or 0),
+        HAS_HOST=has_host,
         num_warps=8,
         num_stages=1,
     )
