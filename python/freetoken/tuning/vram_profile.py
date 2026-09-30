@@ -91,7 +91,7 @@ def save_calibration(key: str, calibration: Any, *, geometry: dict[str, Any]) ->
     if not isinstance(data, dict):
         data = {}
     values = {
-        name: int(getattr(calibration, name))
+        name: max(0, int(getattr(calibration, name)))
         for name in (
             "chunk_lo",
             "transient_lo",

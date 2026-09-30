@@ -85,16 +85,25 @@ def test_calibration_requires_two_matching_samples_and_geometry(tmp_path, monkey
     )
     geometry = {"driver_total": 16 * 1024 * MIB, "page_size": 64, "attention_backend": "triton"}
     vram_profile.save_calibration(key, calibration, geometry=geometry)
-    assert vram_profile.load_calibration(
-        key, driver_total=geometry["driver_total"], page_size=64, attention_backend="triton"
-    ) is None
+    assert (
+        vram_profile.load_calibration(
+            key, driver_total=geometry["driver_total"], page_size=64, attention_backend="triton"
+        )
+        is None
+    )
     vram_profile.save_calibration(key, calibration, geometry=geometry)
     assert vram_profile.load_calibration(
         key, driver_total=geometry["driver_total"], page_size=64, attention_backend="triton"
     ) == vars(calibration)
-    assert vram_profile.load_calibration(
-        key, driver_total=geometry["driver_total"] + 512 * MIB, page_size=64, attention_backend="triton"
-    ) is None
+    assert (
+        vram_profile.load_calibration(
+            key,
+            driver_total=geometry["driver_total"] + 512 * MIB,
+            page_size=64,
+            attention_backend="triton",
+        )
+        is None
+    )
 
 
 def test_calibration_change_resets_sample_hysteresis(tmp_path, monkeypatch):
@@ -114,6 +123,35 @@ def test_calibration_change_resets_sample_hysteresis(tmp_path, monkeypatch):
     geometry = {"driver_total": 16 * 1024 * MIB, "page_size": 64, "attention_backend": "triton"}
     vram_profile.save_calibration(key, base, geometry=geometry)
     vram_profile.save_calibration(key, base, geometry=geometry)
-    assert vram_profile.load_calibration(key, driver_total=geometry["driver_total"], page_size=64, attention_backend="triton")
+    assert vram_profile.load_calibration(
+        key, driver_total=geometry["driver_total"], page_size=64, attention_backend="triton"
+    )
     vram_profile.save_calibration(key, changed, geometry=geometry)
-    assert vram_profile.load_calibration(key, driver_total=geometry["driver_total"], page_size=64, attention_backend="triton") is None
+    assert (
+        vram_profile.load_calibration(
+            key, driver_total=geometry["driver_total"], page_size=64, attention_backend="triton"
+        )
+        is None
+    )
+
+
+def test_calibration_clamps_allocator_noise_before_persisting(tmp_path, monkeypatch):
+    monkeypatch.setattr(vram_profile, "_path", lambda key: str(tmp_path / f"{key}.json"))
+    calibration = SimpleNamespace(
+        chunk_lo=256,
+        transient_lo=-1,
+        chunk_hi=1024,
+        transient_hi=16 * MIB,
+        lazy_persistent=-8 * MIB,
+        graph_capture_peak=-1,
+        graph_pool_size=4 * MIB,
+        non_pytorch_growth=-2 * MIB,
+    )
+    geometry = {"driver_total": 16 * 1024 * MIB, "page_size": 64, "attention_backend": "triton"}
+    vram_profile.save_calibration("noise", calibration, geometry=geometry)
+    vram_profile.save_calibration("noise", calibration, geometry=geometry)
+    loaded = vram_profile.load_calibration(
+        "noise", driver_total=geometry["driver_total"], page_size=64, attention_backend="triton"
+    )
+    assert loaded is not None
+    assert all(value >= 0 for value in loaded.values())
