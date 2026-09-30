@@ -69,6 +69,31 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
 class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
+    def _mark_mtp_oom(self, depth: int | None = None) -> None:
+        """Make a speculative OOM sticky for this process and discard its warm start."""
+        if depth is None:
+            depth = getattr(self, "_mtp_cycle_depth", 0)
+        if depth > 0:
+            limit = max(0, int(depth) - 1)
+            current = getattr(self, "_mtp_unsafe_max_k", self.spec_mtp)
+            self._mtp_unsafe_max_k = min(current, limit)
+        self._mtp_profile_invalidated = True
+        key = getattr(self, "_mtp_profile_key", None)
+        if key is not None:
+            try:
+                from freetoken.tuning import mtp_profile
+
+                mtp_profile.invalidate(key)
+            except Exception as e:  # noqa: BLE001 -- cache invalidation never blocks serving
+                logger.info_rank0(f"mtp depth profile invalidation skipped ({e})")
+        controllers = [getattr(self, "_mtp_controller", None)] + list(
+            getattr(self, "_mtp_controllers", {}).values()
+        )
+        for controller in controllers:
+            if controller is not None:
+                controller.limit_depth(getattr(self, "_mtp_unsafe_max_k", 0))
+                controller.fallback_to_k0()
+
     def _load_mtp_depth_profile(self, cap: int) -> int | None:
         """Compute this serve's depth-profile key and load a previously learned optimal depth.
 
@@ -89,7 +114,9 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
                 or getattr(self.config, "max_seq_len", 0)
             )
             self._mtp_profile_key = mtp_profile.key_from_config(self.config, eff_ctx, cap)
-            return mtp_profile.load(self._mtp_profile_key)
+            profiled = mtp_profile.load(self._mtp_profile_key)
+            unsafe = getattr(self, "_mtp_unsafe_max_k", cap)
+            return min(profiled, unsafe) if profiled is not None else None
         except Exception as e:  # noqa: BLE001 -- best-effort; calibrate this run on any failure
             logger.info_rank0(f"mtp depth profile load skipped ({e}); calibrating this run")
             self._mtp_profile_key = None
@@ -98,7 +125,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
     def _save_mtp_depth_profile(self, depth: int) -> None:
         """Persist a freshly-learned depth so the next serve of this fingerprint warm-starts at
         it and skips the calibration probe. Best-effort; never blocks serving."""
-        if self._mtp_profile_key is None:
+        if self._mtp_profile_key is None or getattr(self, "_mtp_profile_invalidated", False):
             return
         try:
             from freetoken.tuning import mtp_profile
@@ -1299,6 +1326,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             note = getattr(self.engine, "note_decode_oom", None)
             if note is not None:
                 note(e)
+            self._mark_mtp_oom(getattr(self, "_mtp_cycle_depth", 0))
             self._fail_oom_reqs(list(self.decode_manager.running_reqs), e)
             return True
 

@@ -127,6 +127,7 @@ class AdaptiveMtpController:
         if type(safe_max_k) is not int or safe_max_k < 0:
             raise ValueError("safe_max_k must be a non-negative integer")
         self.safe_max_k = safe_max_k
+        self._runtime_max_k = safe_max_k
         self._force_depth = _forced_depth_or_none(safe_max_k)
         # A depth learned by a previous serve under the SAME hardware+model+build+config
         # fingerprint (tuning.mtp_profile). Warm-starts the controller so it skips the
@@ -229,7 +230,7 @@ class AdaptiveMtpController:
         if len(baseline.samples) < _MIN_BASELINE_SAMPLES:
             return 0
         eligible = []
-        for depth in range(1, self.safe_max_k + 1):
+        for depth in range(1, self._runtime_max_k + 1):
             window = self._stats[depth]
             if len(window.samples) < _MIN_DEPTH_SAMPLES:
                 continue
@@ -250,7 +251,7 @@ class AdaptiveMtpController:
 
     def _next_depth_challenger(self, *, exclude: int | None = None) -> int | None:
         current = self._stats[self._selected_depth]
-        for depth in range(self.safe_max_k, 0, -1):
+        for depth in range(self._runtime_max_k, 0, -1):
             if depth in (self._selected_depth, exclude) or depth in self._depth_audited:
                 continue
             candidate = self._stats[depth]
@@ -301,7 +302,7 @@ class AdaptiveMtpController:
                 # _PROBE_REPEATS comment above).
                 self._plan = deque(
                     [0] * _MIN_BASELINE_SAMPLES
-                    + [d for _ in range(_PROBE_REPEATS) for d in range(1, self.safe_max_k + 1)]
+                    + [d for _ in range(_PROBE_REPEATS) for d in range(1, self._runtime_max_k + 1)]
                 )
                 self._selected_depth = 0
             self._needs_reprobe = False
@@ -311,8 +312,8 @@ class AdaptiveMtpController:
                 self._baseline_interval = 512
                 self._depth_audit_interval = self._baseline_interval
                 self._depth_audit_depth = (
-                    self.safe_max_k
-                    if self._profiled_depth < self.safe_max_k
+                    self._runtime_max_k
+                    if self._profiled_depth < self._runtime_max_k
                     else self._profiled_depth - 1
                 ) or None
         else:
@@ -333,6 +334,17 @@ class AdaptiveMtpController:
         if self._terminal_k0:
             return 0
         return self._plan[0] if self._plan else self._selected_depth
+
+    def limit_depth(self, max_k: int) -> None:
+        """Apply a process-local safety ceiling after a speculative OOM."""
+        if type(max_k) is not int:
+            raise ValueError("max_k must be an integer")
+        self._runtime_max_k = max(0, min(self._runtime_max_k, max_k))
+        self._profiled_depth = (
+            self._profiled_depth if self._profiled_depth is not None and self._profiled_depth <= self._runtime_max_k else None
+        )
+        if self._selected_depth > self._runtime_max_k:
+            self._selected_depth = self._runtime_max_k
 
     def observe(self, depth: int, elapsed_s: float, committed_tokens: int) -> None:
         if type(depth) is not int or not 0 <= depth <= self.safe_max_k:

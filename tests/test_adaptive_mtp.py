@@ -185,6 +185,18 @@ def test_rejects_invalid_safe_depth(safe_max_k):
         AdaptiveMtpController(safe_max_k)
 
 
+def test_runtime_depth_limit_survives_fallback_after_oom():
+    controller = AdaptiveMtpController(6, profiled_depth=6)
+    controller.begin_request("oom", "epoch-a")
+    assert controller.next_depth() == 6
+    controller.limit_depth(5)
+    controller.fallback_to_k0()
+    controller.begin_request("next", "epoch-a")
+    assert controller.next_depth() == 0
+    assert controller._runtime_max_k == 5
+    assert max(controller._plan) <= 5
+
+
 @pytest.mark.parametrize("elapsed", [0, -1, float("inf"), float("nan")])
 def test_rejects_invalid_elapsed(elapsed):
     controller = AdaptiveMtpController(0)

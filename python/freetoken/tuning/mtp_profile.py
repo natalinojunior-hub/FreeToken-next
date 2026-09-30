@@ -210,6 +210,18 @@ def save(key: str, depth: int, evidence: DepthEvidence | None = None) -> str | N
     return dest
 
 
+def invalidate(key: str) -> None:
+    """Drop a depth learned under a VRAM regime that has since OOMed."""
+    try:
+        os.unlink(profile_path(key))
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        logger.info(f"mtp depth profile {profile_path(key)}: invalidate failed ({e})")
+    else:
+        logger.info(f"mtp depth profile: invalidated {profile_path(key)}")
+
+
 def load(key: str) -> int | None:
     """The cached optimal depth for ``key``, or ``None`` when there is no file, it fails to
     parse, its schema/key does not match, or the mode disables loading (``off``/``refresh``).

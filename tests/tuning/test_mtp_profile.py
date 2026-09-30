@@ -101,6 +101,13 @@ def test_save_load_roundtrip(isolated):
     assert mp.load(k) == 4  # warm: the learned depth comes back
 
 
+def test_invalidate_removes_depth_after_oom(isolated):
+    k = _key(isolated)
+    mp.save(k, 6)
+    mp.invalidate(k)
+    assert mp.load(k) is None
+
+
 def test_load_rejects_schema_and_key_mismatch(isolated):
     k = _key(isolated)
     mp.save(k, 4)
