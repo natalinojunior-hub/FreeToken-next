@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
@@ -240,17 +242,36 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 ]
             )
             # one request: fla.cu_seqlens is [0, total] (a static buffer under the graph)
-            core_out = self._recurrent(
-                mixed,
-                a,
-                b,
-                fla.cache_indices,
-                fla.cu_seqlens,
-                li,
-                pool,
-                dtype,
-                keep_rows=keep,
-            )
+            if os.getenv("FREETOKEN_GDN_VERIFY_SEQUENTIAL", "1") != "0":
+                one_seq = torch.tensor([0, 1], dtype=fla.cu_seqlens.dtype, device=mixed.device)
+                core_out = torch.cat(
+                    [
+                        self._recurrent(
+                            mixed[t : t + 1],
+                            a[t : t + 1],
+                            b[t : t + 1],
+                            fla.cache_indices,
+                            one_seq,
+                            li,
+                            pool,
+                            dtype,
+                            keep_rows=keep,
+                        )
+                        for t in range(total)
+                    ]
+                )
+            else:
+                core_out = self._recurrent(
+                    mixed,
+                    a,
+                    b,
+                    fla.cache_indices,
+                    fla.cu_seqlens,
+                    li,
+                    pool,
+                    dtype,
+                    keep_rows=keep,
+                )
         else:
             mixed = self._conv_prefill(
                 conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state

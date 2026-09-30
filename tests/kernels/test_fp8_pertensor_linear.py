@@ -69,6 +69,22 @@ def test_w8a16_matches_dequant_reference(M: int, K: int, part_rows: list[int]):
     assert rel.item() < 2e-2, rel.item()
 
 
+@pytest.mark.parametrize("M", [1, 2, 6])
+def test_batched_gemv_rows_matches_sequential_gemv_bitwise(M: int):
+    """Batched split-K GEMV preserves each row's M=1 arithmetic, including K tail masks."""
+    from freetoken.kernel.triton.e4m3_compat import e4m3_kernel_view
+    from freetoken.kernel.triton.fp8_pertensor_linear import _gemv, _gemv_rows
+
+    K = 259  # two full 128-wide chunks plus a masked tail
+    w8, scale = _quant_parts([19, 18], K, seed=M)
+    weight = e4m3_kernel_view(w8)
+    x = torch.randn(M, K, device=DEV, dtype=torch.bfloat16)
+
+    batched = _gemv_rows(x, weight, scale, x.dtype)
+    sequential = torch.stack([_gemv(row, weight, scale, x.dtype) for row in x])
+    assert torch.equal(batched, sequential)
+
+
 @pytest.mark.skipif(not e4m3_native(), reason="torch._scaled_mm needs sm_89+")
 @pytest.mark.parametrize("M", [1, 2, 4, 16, 64])
 @pytest.mark.parametrize(
