@@ -1,9 +1,7 @@
 """The modified and original QSA Triton kernels against pure-torch references.
 
-Only kernels FreeToken changed or wrote get unit tests: the compression kernel (re-addressed
-pending ring, its own torch check) and the block top-k (original radix select, checked against
-torch.topk and, through the expansion chain, against the vLLM reference semantics). score.py
-and attend.py are vendored from vLLM and are covered by the backend and e2e tests.
+The compression kernel, block top-k and coded sparse-attention readers are checked against
+small torch references.
 ``_qsa_mqa_paged_reference`` / ``_qsa_relative_topk_reference`` / ``_expand_qsa_indices_reference``
 are transcribed from ``vllm/tests/test_qsa_reference.py`` (Apache-2.0).
 """
@@ -22,6 +20,83 @@ RATIO = 4
 BUDGET = 2048
 INDEX_DIM = 128
 CMP_PAGE = PAGE_SIZE // RATIO
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("book", "atol"),
+    [("fp8", 0.025), ("turbo4", 0.08), ("turbo3", 0.25)],
+)
+def test_qsa_coded_attention_matches_dequantized_reference(book, atol):
+    from freetoken.kernel.triton.qsa.attend import qsa_sparse_paged_attention
+    from freetoken.kernel.triton.turbo_kv import (
+        CENTROIDS_3,
+        CENTROIDS_4,
+        CODE_BYTES,
+        decode,
+        is_rotated,
+        quantize,
+    )
+    from freetoken.kernel.triton.turbo_kv import inv_rotate, rotate
+
+    torch.manual_seed(29)
+    device, tokens, kv_heads, q_heads, dim = torch.device("cuda"), PAGE_SIZE, 2, 4, 128
+    k = torch.randn(tokens, kv_heads, dim, device=device, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q = torch.randn(1, q_heads, dim, device=device, dtype=torch.bfloat16)
+    k_codes, k_norm = quantize(k.reshape(-1, dim), book)
+    v_codes, v_norm = quantize(v.reshape(-1, dim), book)
+    groups = dim // 128
+    k_codes = k_codes.reshape(tokens, kv_heads, groups * CODE_BYTES[book])
+    v_codes = v_codes.reshape(tokens, kv_heads, groups * CODE_BYTES[book])
+    k_norm = k_norm.reshape(tokens, kv_heads, groups)
+    v_norm = v_norm.reshape(tokens, kv_heads, groups)
+    q_in = rotate(q.reshape(-1, dim)).reshape_as(q) if is_rotated(book) else q
+    indices = torch.arange(tokens, dtype=torch.int32, device=device).view(1, -1)
+    block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    token_to_req = torch.zeros(1, dtype=torch.int32, device=device)
+    got = qsa_sparse_paged_attention(
+        q_in,
+        k_codes,
+        v_codes,
+        indices,
+        block_table,
+        token_to_req,
+        kv_book=book,
+        kv_norms=(k_norm, v_norm),
+        cent=torch.tensor(
+            CENTROIDS_3 if book == "turbo3" else CENTROIDS_4,
+            dtype=torch.float32,
+            device=device,
+        ),
+        page_size=PAGE_SIZE,
+    )
+    if is_rotated(book):
+        got = inv_rotate(got.reshape(-1, dim)).reshape_as(got)
+    k_ref = decode(k_codes.reshape(-1, groups * CODE_BYTES[book]), k_norm.reshape(-1, groups), book)
+    v_ref = decode(v_codes.reshape(-1, groups * CODE_BYTES[book]), v_norm.reshape(-1, groups), book)
+    k_ref = k_ref.reshape(tokens, kv_heads, dim).float()
+    v_ref = v_ref.reshape(tokens, kv_heads, dim).float()
+    q_grouped = q.float().reshape(1, kv_heads, q_heads // kv_heads, dim)
+    logits = torch.einsum("bhgd,thd->bhgt", q_grouped, k_ref) / dim**0.5
+    expected = torch.einsum("bhgt,thd->bhgd", logits.softmax(-1), v_ref).reshape_as(q)
+    dense = qsa_sparse_paged_attention(
+        q,
+        k_ref.to(torch.bfloat16).unsqueeze(0),
+        v_ref.to(torch.bfloat16).unsqueeze(0),
+        indices,
+        block_table,
+        token_to_req,
+    )
+    assert torch.allclose(dense.float(), expected, atol=0.02, rtol=0.02)
+    delta = (got.float() - expected).abs()
+    assert torch.allclose(got.float(), expected, atol=atol, rtol=atol), (
+        book,
+        delta.max().item(),
+        (delta.square().mean().sqrt() / expected.square().mean().sqrt()).item(),
+        got.flatten()[:8].float().tolist(),
+        expected.flatten()[:8].tolist(),
+    )
 
 
 # --------------------------------------------------------------------------------------

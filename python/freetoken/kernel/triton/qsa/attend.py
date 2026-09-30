@@ -8,6 +8,11 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from freetoken.kernel.triton.turbo_attn import (
+    BOOK_CODE,
+    turbo_k_tile,
+    turbo_v_tile,
+)
 
 
 @triton.jit
@@ -15,6 +20,9 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    k_norm_ptr,
+    v_norm_ptr,
+    cent_ptr,
     k_host_ptr,
     v_host_ptr,
     indices_ptr,
@@ -28,9 +36,13 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     stride_k_block,
     stride_k_token,
     stride_k_head,
+    stride_kn_token,
+    stride_kn_head,
     stride_v_block,
     stride_v_token,
     stride_v_head,
+    stride_vn_token,
+    stride_vn_head,
     stride_indices_row,
     stride_table_req,
     stride_output_row,
@@ -41,6 +53,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     num_requests,
     TIERED: tl.constexpr,
     HOST_CAST: tl.constexpr,
+    CODED: tl.constexpr,
+    BOOK: tl.constexpr,
     TOPK: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     PAGE_TABLE_WIDTH: tl.constexpr,
@@ -122,7 +136,51 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 + kv_head * stride_v_head
                 + dim_offsets[None, :]
             )
-            if HOST_CAST:
+            if CODED:
+                slots = safe_page * PAGE_SIZE + page_offset
+                device_keys = turbo_k_tile(
+                    k_cache_ptr,
+                    k_norm_ptr,
+                    cent_ptr,
+                    slots,
+                    kv_head,
+                    stride_k_token,
+                    stride_k_head,
+                    stride_kn_token,
+                    stride_kn_head,
+                    dim_offsets,
+                    valid & on_device,
+                    BOOK,
+                    query.dtype,
+                )
+                device_values = turbo_v_tile(
+                    v_cache_ptr,
+                    v_norm_ptr,
+                    cent_ptr,
+                    slots,
+                    kv_head,
+                    stride_v_token,
+                    stride_v_head,
+                    stride_vn_token,
+                    stride_vn_head,
+                    dim_offsets,
+                    valid & on_device,
+                    BOOK,
+                    query.dtype,
+                )
+                host_keys = tl.load(
+                    k_host_ptr + key_offsets,
+                    mask=(valid & ~on_device)[None, :],
+                    other=0.0,
+                ).to(query.dtype)
+                host_values = tl.load(
+                    v_host_ptr + value_offsets,
+                    mask=(valid & ~on_device)[:, None],
+                    other=0.0,
+                ).to(query.dtype)
+                keys = device_keys + host_keys
+                values = device_values + host_values
+            elif HOST_CAST:
                 # Narrower RAM tier (FP8): two masked loads, the host one widened.
                 keys = tl.load(
                     k_cache_ptr + key_offsets, mask=(valid & on_device)[None, :], other=0.0
@@ -153,24 +211,57 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
             # physical_page * block stride can overflow int32 for large caches.
             safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-            keys = tl.load(
-                k_cache_ptr
-                + safe_page[None, :] * stride_k_block
-                + page_offset[None, :] * stride_k_token
-                + kv_head * stride_k_head
-                + dim_offsets[:, None],
-                mask=valid[None, :],
-                other=0.0,
-            )
-            values = tl.load(
-                v_cache_ptr
-                + safe_page[:, None] * stride_v_block
-                + page_offset[:, None] * stride_v_token
-                + kv_head * stride_v_head
-                + dim_offsets[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            )
+            if CODED:
+                slots = safe_page * PAGE_SIZE + page_offset
+                keys = turbo_k_tile(
+                    k_cache_ptr,
+                    k_norm_ptr,
+                    cent_ptr,
+                    slots,
+                    kv_head,
+                    stride_k_token,
+                    stride_k_head,
+                    stride_kn_token,
+                    stride_kn_head,
+                    dim_offsets,
+                    valid,
+                    BOOK,
+                    query.dtype,
+                )
+                values = turbo_v_tile(
+                    v_cache_ptr,
+                    v_norm_ptr,
+                    cent_ptr,
+                    slots,
+                    kv_head,
+                    stride_v_token,
+                    stride_v_head,
+                    stride_vn_token,
+                    stride_vn_head,
+                    dim_offsets,
+                    valid,
+                    BOOK,
+                    query.dtype,
+                )
+            else:
+                keys = tl.load(
+                    k_cache_ptr
+                    + safe_page[None, :] * stride_k_block
+                    + page_offset[None, :] * stride_k_token
+                    + kv_head * stride_k_head
+                    + dim_offsets[:, None],
+                    mask=valid[None, :],
+                    other=0.0,
+                )
+                values = tl.load(
+                    v_cache_ptr
+                    + safe_page[:, None] * stride_v_block
+                    + page_offset[:, None] * stride_v_token
+                    + kv_head * stride_v_head
+                    + dim_offsets[None, :],
+                    mask=valid[:, None],
+                    other=0.0,
+                )
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
@@ -187,12 +278,12 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         max_value = next_max
 
     has_values = normalizer > 0
+    output_mask = head_offsets[:, None] < GROUP_SIZE
     normalized_output = tl.where(
         has_values[:, None],
         accumulator / tl.maximum(normalizer[:, None], 1.0e-20),
         0.0,
     )
-    output_mask = head_offsets[:, None] < GROUP_SIZE
     if NUM_SPLITS == 1:
         tl.store(
             output_ptr
@@ -283,6 +374,10 @@ def qsa_sparse_paged_attention(
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
     host_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+    kv_book: str | None = None,
+    kv_norms: tuple[torch.Tensor, torch.Tensor] | None = None,
+    cent: torch.Tensor | None = None,
+    page_size: int | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16 K/V caches.
 
@@ -291,7 +386,8 @@ def qsa_sparse_paged_attention(
     copy of it; either way it must share the device slab's page layout.
     """
 
-    if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
+    coded = kv_book is not None
+    if q.ndim != 3 or k_cache.ndim != (3 if coded else 4) or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
     if logical_indices.ndim != 2 or logical_indices.shape[0] != q.shape[0]:
         raise ValueError("QSA indices must have one row per query")
@@ -299,36 +395,57 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention metadata has invalid shapes")
     if logical_indices.shape[1] <= 0:
         raise ValueError("QSA sparse attention requires a positive selection width")
-    if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
+    kv_heads = k_cache.shape[1] if coded else k_cache.shape[2]
+    if (not coded and q.shape[2] != k_cache.shape[3]) or q.shape[1] % kv_heads:
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype
+    if coded:
+        if kv_book not in BOOK_CODE or kv_norms is None or cent is None or page_size is None:
+            raise ValueError(
+                "coded QSA attention needs a supported format, norms, codebook, and page size"
+            )
+        assert k_cache.dtype == v_cache.dtype == torch.uint8
+        assert kv_norms[0].shape[:2] == kv_norms[1].shape[:2] == k_cache.shape[:2]
+    else:
+        assert q.dtype == k_cache.dtype == v_cache.dtype
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
-    assert q.stride(2) == k_cache.stride(3) == v_cache.stride(3) == 1
+    if not coded:
+        assert q.stride(2) == k_cache.stride(3) == v_cache.stride(3) == 1
     assert logical_indices.stride(1) == block_table.stride(1) == 1
     assert token_to_req.stride(0) == 1
     if out is None:
         out = torch.empty_like(q)
     assert out.shape == q.shape and out.dtype == q.dtype and out.stride(2) == 1
+    if host_kv is not None and coded and kv_book != "fp8":
+        raise ValueError("RAM tiering for coded QSA currently requires fp8")
     if host_kv is None:
         k_host, v_host, num_host_blocks = k_cache, v_cache, 0
     else:
         k_host, v_host = host_kv
-        if k_host.shape[1:] != k_cache.shape[1:] or v_host.shape != k_host.shape:
+        if coded:
+            if kv_book != "fp8" or k_host.ndim != 4 or k_host.shape[1] != int(page_size):
+                raise ValueError("coded QSA RAM tier requires page-major FP8 host KV")
+            if k_host.shape[2:] != (kv_heads, head_dim) or v_host.shape != k_host.shape:
+                raise ValueError("QSA FP8 host tier must share the device head geometry")
+        elif k_host.shape[1:] != k_cache.shape[1:] or v_host.shape != k_host.shape:
             raise ValueError("QSA host KV tier must share the device page layout")
-        if k_host.stride() != k_cache.stride() or v_host.stride() != v_cache.stride():
+        if not coded and (
+            k_host.stride() != k_cache.stride() or v_host.stride() != v_cache.stride()
+        ):
             raise ValueError("QSA host KV tier must share the device page strides")
         assert k_host.dtype == v_host.dtype
-        assert k_host.dtype in (k_cache.dtype, torch.float8_e4m3fn)
+        assert k_host.dtype in (
+            (torch.float8_e4m3fn,) if coded else (k_cache.dtype, torch.float8_e4m3fn)
+        )
         num_host_blocks = k_host.shape[0]
     if not q.shape[0]:
         return out
 
-    group_size = q.shape[1] // k_cache.shape[2]
+    group_size = q.shape[1] // kv_heads
     block_m = triton.next_power_of_2(group_size)
-    base_programs = q.shape[0] * k_cache.shape[2]
+    base_programs = q.shape[0] * kv_heads
     small_profile_limit = 8 if block_m <= 8 else 4
 
     # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
@@ -343,6 +460,10 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
+
+    if coded:
+        # Decoding packed bytes in the attention tile increases live registers/shared state.
+        block_n, partial_warps = 16, 4
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
@@ -363,11 +484,24 @@ def qsa_sparse_paged_attention(
             device=q.device,
         )
 
-    partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
+    partial_grid = (q.shape[0], kv_heads, num_splits)
+    if coded:
+        k_norm, v_norm = kv_norms
+        stride_k_block = int(page_size) * k_cache.stride(0)
+        stride_v_block = int(page_size) * v_cache.stride(0)
+        num_cache_blocks = k_cache.shape[0] // int(page_size)
+    else:
+        k_norm = v_norm = k_cache
+        stride_k_block = k_cache.stride(0)
+        stride_v_block = v_cache.stride(0)
+        num_cache_blocks = k_cache.shape[0]
     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
         q,
         k_cache,
         v_cache,
+        k_norm,
+        v_norm,
+        cent if cent is not None else k_cache,
         k_host,
         v_host,
         logical_indices,
@@ -378,24 +512,30 @@ def qsa_sparse_paged_attention(
         out,
         q.stride(0),
         q.stride(1),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        k_cache.stride(2),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        v_cache.stride(2),
+        stride_k_block,
+        k_cache.stride(0) if coded else k_cache.stride(1),
+        k_cache.stride(1) if coded else k_cache.stride(2),
+        k_norm.stride(0) if coded else 0,
+        k_norm.stride(1) if coded else 0,
+        stride_v_block,
+        v_cache.stride(0) if coded else v_cache.stride(1),
+        v_cache.stride(1) if coded else v_cache.stride(2),
+        v_norm.stride(0) if coded else 0,
+        v_norm.stride(1) if coded else 0,
         logical_indices.stride(0),
         block_table.stride(0),
         out.stride(0),
         out.stride(1),
         q.shape[0],
-        k_cache.shape[0],
+        num_cache_blocks,
         num_host_blocks,
         block_table.shape[0],
         TIERED=host_kv is not None,
         HOST_CAST=k_host.dtype != k_cache.dtype,
+        CODED=coded,
+        BOOK=BOOK_CODE[kv_book] if coded else 0,
         TOPK=logical_indices.shape[1],
-        PAGE_SIZE=k_cache.shape[1],
+        PAGE_SIZE=int(page_size) if coded else k_cache.shape[1],
         PAGE_TABLE_WIDTH=block_table.shape[1],
         GROUP_SIZE=group_size,
         HEAD_DIM=q.shape[2],
@@ -407,7 +547,7 @@ def qsa_sparse_paged_attention(
         num_warps=partial_warps,
         # The tiered gather cannot use the async-copy pipeline; two stages of it overflow
         # 100 KB/SM shared memory on the wide prefill tiles.
-        num_stages=1 if host_kv is not None and block_n > 16 else 2,
+        num_stages=1 if coded or (host_kv is not None and block_n > 16) else 2,
     )
     if num_splits == 1:
         return out

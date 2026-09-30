@@ -275,7 +275,6 @@ def _turbo_slots_kernel(
     BLOCK: tl.constexpr,
     GROUPS: tl.constexpr,
     BOOK3: tl.constexpr,
-    BOOK8: tl.constexpr,
 ) -> None:
     head = tl.program_id(1)
     entry = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -294,9 +293,6 @@ def _turbo_slots_kernel(
                 idx = ((low.to(tl.int32) >> ((dim % 4) * 2)[None, :]) & 3) | (
                     ((bit.to(tl.int32) >> (dim % 8)[None, :]) & 1) << 2
                 )
-            elif BOOK8:
-                byte = tl.load(base + (g * 128 + dim)[None, :], mask=live[:, None], other=0)
-                idx = byte.to(tl.int32)
             else:
                 byte = tl.load(base + (g * 64 + dim // 2)[None, :], mask=live[:, None], other=0)
                 idx = (byte.to(tl.int32) >> ((dim % 2) * 4)[None, :]) & 0x0F
@@ -349,7 +345,7 @@ def turbo_slots_to_bf16(
         codes, norm, cent, rotation, src_slots, dst_slots, out, n,
         codes.stride(0), codes.stride(1), norm.stride(0), norm.stride(1),
         out.stride(0), out.stride(1),
-        BLOCK=block, GROUPS=groups, BOOK3=book == "turbo3", BOOK8=book == "turbo8",
+        BLOCK=block, GROUPS=groups, BOOK3=book == "turbo3",
         num_warps=4,
     )  # fmt: skip
 

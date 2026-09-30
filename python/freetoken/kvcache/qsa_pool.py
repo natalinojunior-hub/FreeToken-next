@@ -71,7 +71,6 @@ class QSAKVCache(BaseKVCachePool):
         mrope: bool = False,
         kv_format: str = "auto",
         mtp_layer_id: int | None = None,
-        tcq_policy=None,
         host_pages: int = 0,
         host_dtype: torch.dtype | str | None = None,
         preserve_mtp_prefix: bool = False,
@@ -103,42 +102,41 @@ class QSAKVCache(BaseKVCachePool):
         self._page_size = page_size
         self._head_dim = head_dim
         self._mrope = mrope
-        compressed = kv_format in ["turbo3", "turbo4", "vbr", "tcq"] or tcq_policy is not None
-        if host_pages and compressed:
-            # The turbo decompress kernel addresses one device code/norm slab; fail closed.
-            raise NotImplementedError(
-                f"KV RAM tier supports the BF16 QSA layout only, not kv_format={kv_format!r}"
-            )
+        self._host_pages = host_pages
+        compressed = kv_format in ["fp8", "turbo3", "turbo4"]
+        if host_pages and compressed and kv_format != "fp8":
+            # Turbo4/3 need a decode staging path. FP8 is read directly from pinned RAM.
+            raise NotImplementedError(f"QSA KV RAM tier supports fp8, not kv_format={kv_format!r}")
         if compressed:
             from .turbo_pool import TurboMHAKVCache
-            from .tcq_policy import TCQPolicy
-
-            if tcq_policy is not None or kv_format in ["vbr", "tcq"]:
-                if isinstance(tcq_policy, TCQPolicy):
-                    policy = tcq_policy
-                else:
-                    vbr_pol = tcq_policy if isinstance(tcq_policy, str) else "balanced"
-                    policy = TCQPolicy(
-                        num_layers=num_layers, base_format="turbo4", vbr_policy=vbr_pol
-                    )
-            else:
-                policy = None
-            self.tcq_policy = policy
+            from .mha_pool import registered_host_empty
 
             self._pool = TurboMHAKVCache(
                 num_kv_heads=num_kv_heads,
                 num_layers=num_layers,
                 head_dim=head_dim,
-                num_pages=num_pages,
+                num_pages=num_pages - host_pages,
                 page_size=page_size,
                 dtype=dtype,
                 device=device,
                 layer_ids=layer_ids,
-                book="turbo4" if kv_format in ["vbr", "tcq"] else kv_format,
-                policy=policy,
+                book=kv_format,
             )
+            self._kv_host = None
+            if host_pages:
+                if host_dtype != torch.float8_e4m3fn:
+                    raise ValueError("FP8 QSA RAM tier requires float8_e4m3fn host storage")
+                shape = (
+                    2,
+                    self._pool._num_storage_layers,
+                    host_pages,
+                    page_size,
+                    self._pool._num_kv_heads,
+                    head_dim,
+                )
+                self._kv_host = registered_host_empty(shape, torch.float8_e4m3fn)
+                self._pool._host_pages = host_pages
         else:
-            self.tcq_policy = None
             from .mha_pool import MHAKVCache
 
             self._pool = MHAKVCache(
@@ -170,7 +168,7 @@ class QSAKVCache(BaseKVCachePool):
                 )
                 for _ in range(2)
             )
-            if host_pages
+            if host_pages and not compressed
             else None
         )
 
@@ -194,6 +192,11 @@ class QSAKVCache(BaseKVCachePool):
             self._pool._k_norm.zero_()
             self._pool._v_codes.zero_()
             self._pool._v_norm.zero_()
+            if self.kv_format == "fp8":
+                self._pool._k_norm.fill_(1)
+                self._pool._v_norm.fill_(1)
+        if getattr(self, "_kv_host", None) is not None:
+            self._kv_host.zero_()
 
     def _alloc_index_tiers(self, num_pages: int) -> None:
         # ZERO-initialized: the score kernel reads whole rows of blocks unmasked and relies on
@@ -226,8 +229,16 @@ class QSAKVCache(BaseKVCachePool):
         # stream-ordered, so the page table, radix tree and free list never see a move.
         if getattr(self._pool, "_host_pages", 0):
             ids = torch.arange(num_pages, dtype=torch.int32, device=self.device)
-            self.page_map = ids
-            self._page_owner = ids.clone()
+            if self._host_pages == num_pages - 1 and self.num_device_pages == 1:
+                # Scheduler slots start at page 0 and the dummy page is highest. Rotate the
+                # mapping so every usable context page is host-backed and the dummy lands on
+                # the one required device page.
+                self.page_map = (ids + 1) % num_pages
+                self._page_owner = torch.empty_like(ids)
+                self._page_owner[self.page_map.long()] = ids
+            else:
+                self.page_map = ids
+                self._page_owner = ids.clone()
             # Selections per physical page, halved every rebalance; the last entry sinks misses.
             self.page_heat = torch.zeros(num_pages + 1, dtype=torch.int32, device=self.device)
         else:
@@ -242,7 +253,10 @@ class QSAKVCache(BaseKVCachePool):
         self._cmp_k_buffer = None
         self._pending_ring = None
         self._rope_positions = None
-        self._pool.rebuild(num_pages)
+        if getattr(self._pool, "compressed", False):
+            self._pool._alloc(num_pages - self._host_pages)
+        else:
+            self._pool.rebuild(num_pages)
         self._zero_kv_slabs()
         try:
             self._alloc_index_tiers(num_pages)
@@ -278,11 +292,10 @@ class QSAKVCache(BaseKVCachePool):
 
     @classmethod
     def host_tier_device_bytes(cls, config, host_tokens: int) -> int:
-        """Device (VRAM) bytes the RAM tier still costs per host token even though its K/V
-        pages live in pinned host RAM: the compressed index row and rope row (``_cmp_k_buffer``
-        / ``_rope_positions`` are sized over ALL pages, RAM tier included -- see module
-        docstring) plus the ``host_staging`` double buffer (2 tensors of shape
-        ``[host_pages, page_size, kv_heads, head_dim]``, bf16)."""
+        """Device bytes for host-tier index/rope rows and any required staging buffer.
+
+        FP8 is read directly from pinned RAM, so it has no context-sized device staging copy.
+        """
         from freetoken.attention import AttnType
         from freetoken.utils import div_even
 
@@ -296,7 +309,8 @@ class QSAKVCache(BaseKVCachePool):
             if config.model_config.model_is_mrope:
                 per_token += _ROPE_POS_BYTES
             local_kv_heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-            per_token += 2 * local_kv_heads * spec.head_dim * config.dtype.itemsize
+            if getattr(config, "kv_ram_resolved_dtype", None) != torch.float8_e4m3fn:
+                per_token += 2 * local_kv_heads * spec.head_dim * config.dtype.itemsize
         return per_token * host_tokens
 
     @classmethod
@@ -313,7 +327,7 @@ class QSAKVCache(BaseKVCachePool):
             if spec.is_swa or spec.attn_type is not AttnType.QSA:
                 continue
             heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-            if dtype in ("turbo8", "turbo4", "turbo3"):
+            if dtype in ("turbo4", "turbo3"):
                 from freetoken.kernel.triton.turbo_kv import CODE_BYTES
 
                 groups = spec.head_dim // 128
@@ -385,14 +399,63 @@ class QSAKVCache(BaseKVCachePool):
         return getattr(self._pool, "cent_tensor", None)
 
     def store_kv(self, *args, **kwargs) -> None:
+        if self.kv_format == "fp8" and self._kv_host is not None:
+            from freetoken.kernel.triton.qsa.tiered import tiered_store_kv
+            from freetoken.kernel.triton.turbo_kv import _element_quantize
+
+            k, v, out_loc, layer_id = args[:4]
+            dense = self._pool._dense(layer_id)
+            rows = out_loc.numel()
+            kq, _ = _element_quantize(k.reshape(rows * self._pool._num_kv_heads, self._head_dim))
+            vq, _ = _element_quantize(v.reshape(rows * self._pool._num_kv_heads, self._head_dim))
+            kq = kq.view(torch.float8_e4m3fn).reshape(
+                rows, self._pool._num_kv_heads, self._head_dim
+            )
+            vq = vq.view(torch.float8_e4m3fn).reshape(
+                rows, self._pool._num_kv_heads, self._head_dim
+            )
+            tiered_store_kv(
+                kq,
+                vq,
+                out_loc,
+                (
+                    self._pool._k_codes[dense]
+                    .view(torch.float8_e4m3fn)
+                    .view(
+                        self.num_device_pages,
+                        self._page_size,
+                        self._pool._num_kv_heads,
+                        self._head_dim,
+                    ),
+                    self._pool._v_codes[dense]
+                    .view(torch.float8_e4m3fn)
+                    .view(
+                        self.num_device_pages,
+                        self._page_size,
+                        self._pool._num_kv_heads,
+                        self._head_dim,
+                    ),
+                ),
+                (self._kv_host[0, dense], self._kv_host[1, dense]),
+            )
+            return
         return self._pool.store_kv(*args, **kwargs)
 
     @property
     def num_device_pages(self) -> int:
         """Physical pages below this id are on the device; the rest are in the RAM tier."""
-        return getattr(self._pool, "num_device_pages", self._cmp_scratch_base)
+        return getattr(
+            self._pool,
+            "num_device_pages",
+            self._pool._tokens // self._page_size
+            if getattr(self._pool, "compressed", False)
+            else self._cmp_scratch_base,
+        )
 
     def host_kv(self, index: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if getattr(self, "_kv_host", None) is not None:
+            dense = self._pool._dense(index)
+            return self._kv_host[0, dense], self._kv_host[1, dense]
         host_kv = getattr(self._pool, "host_kv", None)
         return None if host_kv is None else host_kv(index)
 
@@ -412,6 +475,9 @@ class QSAKVCache(BaseKVCachePool):
         only when the RAM page was selected more than twice as often (hysteresis)."""
         from freetoken.kernel.triton.qsa.tiered import swap_pages
 
+        if self.compressed:
+            # Coded pools have no BF16 slab to swap; retain their host-backed page mapping.
+            return
         if getattr(self._pool, "host_book", None) is not None:
             # ponytail: turbo RAM pages stay put (no BF16<->turbo swap yet); the device hot
             # floor still serves the newest pages first. Add a quantizing swap if TG needs it.
@@ -496,6 +562,8 @@ class QSAKVCache(BaseKVCachePool):
             self._pool._k_norm[slot].zero_()
             self._pool._v_codes[slot].zero_()
             self._pool._v_norm[slot].zero_()
+            if getattr(self, "_kv_host", None) is not None:
+                self._kv_host[:, slot].zero_()
         elif hasattr(self._pool, "_kv_buffer") and self._pool._kv_buffer is not None:
             self._pool._kv_buffer[:, slot].zero_()
             from freetoken.kernel.triton.qsa.tiered import zero_tier

@@ -92,10 +92,11 @@ def test_mtp_forward_last_prefers_specialized_method():
 
 
 @requires_cuda
-def test_turbo4_split_path_runs():
-    """Exercise the separate TurboKV decompression and QSA attention path."""
+@pytest.mark.parametrize("kv_format", ["fp8", "turbo4", "turbo3"])
+def test_coded_kv_path_runs(kv_format):
+    """Exercise each coded KV reader inside sparse QSA attention."""
     config = parsed_config()
-    fixture = Fixture(config, num_pages=32, max_running_req=1, kv_format="turbo4")
+    fixture = Fixture(config, num_pages=32, max_running_req=1, kv_format=kv_format)
     attn = fixture.layer(QSA_LAYER)
     length = 65
     x = _inputs(fixture, [length])[0]
@@ -104,6 +105,19 @@ def test_turbo4_split_path_runs():
     got = attn.forward(x, fixture.batch([req], "prefill"))
 
     assert got.shape == x.shape
+    assert torch.isfinite(got).all()
+
+
+@requires_cuda
+def test_coded_qsa_attention_keeps_request_page_identity():
+    config = parsed_config()
+    fixture = Fixture(config, num_pages=32, max_running_req=2, kv_format="turbo4")
+    attn = fixture.layer(QSA_LAYER)
+    length = 65
+    reqs = [fixture.req(i, 0, length) for i in range(2)]
+    rows = torch.cat(_inputs(fixture, [length, length], seed=17))
+    got = attn.forward(rows, fixture.batch(reqs, "prefill"))
+    assert got.shape == rows.shape
     assert torch.isfinite(got).all()
 
 
@@ -684,12 +698,70 @@ def _verify_batch(fixture: Fixture, req, static: dict | None = None):
 
 
 @requires_cuda
-@pytest.mark.parametrize("kv_format", ["auto", "turbo3"])
+def test_qsa_accepted_prefix_matches_raw_across_compressed_row_128():
+    """Commit eight verify rows across compressed rows 127→128, then decode identically."""
+    from freetoken.scheduler.spec import SchedulerSpecMixin
+
+    config = parsed_config()
+    fixture = Fixture(config, num_pages=64, max_running_req=2, num_speculative_tokens=5)
+    attn = fixture.layer(QSA_LAYER)
+    prefix, accepted, rejected = 510, 6, 2
+    rows = _inputs(fixture, [prefix], extra=accepted + rejected + 1)[0]
+    spec_req = fixture.req(0, 0, prefix)
+    raw_req = fixture.req(1, 0, prefix)
+    spec_req.uid, raw_req.uid = 1, 2
+    attn.forward(rows[:prefix], fixture.batch([spec_req], "prefill"))
+    attn.forward(rows[:prefix], fixture.batch([raw_req], "prefill"))
+
+    scheduler = SimpleNamespace(
+        engine=SimpleNamespace(kv_cache=fixture.pool), _spec_qsa_snapshots={}
+    )
+    SchedulerSpecMixin._snapshot_qsa_state(scheduler, spec_req)
+    fixture.allocate(spec_req.table_idx, prefix, prefix + accepted + rejected)
+    spec_req.cached_len = prefix
+    spec_req.device_len = prefix + accepted + rejected
+    spec_req.extend_len = accepted + rejected
+    spec_out = attn.forward(
+        rows[prefix : prefix + accepted + rejected], _verify_batch(fixture, spec_req)
+    )
+    SchedulerSpecMixin._restore_qsa_state(
+        scheduler, spec_req, keep_start=prefix, keep_count=accepted
+    )
+
+    fixture.allocate(raw_req.table_idx, prefix, prefix + accepted)
+    raw_req.cached_len = prefix
+    raw_req.device_len = prefix + accepted
+    raw_req.extend_len = accepted
+    raw_out = attn.forward(rows[prefix : prefix + accepted], fixture.batch([raw_req], "prefill"))
+    torch.testing.assert_close(spec_out[:accepted], raw_out, rtol=2e-3, atol=1e-3)
+
+    index_slot = fixture.backend._idx_slot[QSA_LAYER]
+    ring = fixture.pool.pending_ring(index_slot)
+    assert torch.equal(ring[spec_req.table_idx], ring[raw_req.table_idx])
+    closed = torch.arange(3, prefix + accepted, fixture.pool.index_ratio, device=fixture.device)
+    spec_slots = fixture.page_table[spec_req.table_idx, closed].long() // fixture.pool.index_ratio
+    raw_slots = fixture.page_table[raw_req.table_idx, closed].long() // fixture.pool.index_ratio
+    cmp = fixture.pool.cmp_k_cache(index_slot)
+    assert torch.equal(cmp.index_select(0, spec_slots), cmp.index_select(0, raw_slots))
+
+    token = rows[prefix + accepted : prefix + accepted + 1]
+    for req in (spec_req, raw_req):
+        req.cached_len = req.device_len = prefix + accepted
+        req.extend_len = 0
+        fixture.step(req)
+        out = attn.forward(token, fixture.batch([req], "decode"))
+        if req is spec_req:
+            spec_next = out
+        else:
+            assert torch.equal(spec_next, out)
+
+
+@requires_cuda
+@pytest.mark.parametrize("kv_format", ["auto", "fp8", "turbo4", "turbo3"])
 def test_verify_graph_replay_matches_eager(kv_format):
     """A captured 2-token spec-verify window (stage_verify) reproduces the eager verify
     bitwise -- output and every pool tensor -- over accepted and rejected windows whose draft
-    rows change. Under capture the turbo path decompresses every page instead of the
-    selected ones; the attended values must not change."""
+    rows change. Coded attention reads only selected KV rows during eager and graph replay."""
     config = parsed_config()
     fixture = Fixture(config, num_pages=256, kv_format=kv_format)
     attn = fixture.layer(QSA_LAYER)

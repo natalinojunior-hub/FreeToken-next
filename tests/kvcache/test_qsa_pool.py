@@ -503,3 +503,44 @@ def test_zero_mtp_first_token_uses_page_map_for_fp8_host_tier():
     assert torch.equal(target_k, expected_k)
     assert torch.equal(target_v, expected_v)
     assert torch.equal(pool._kv_buffer, device_before)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_coded_fp8_qsa_store_routes_device_and_ram_pages():
+    pool = _gpu_mtp_pool(
+        kv_format="fp8",
+        host_pages=2,
+        host_dtype=torch.float8_e4m3fn,
+    )
+    loc = torch.tensor([0, 2 * 64 + 1], dtype=torch.int32, device=pool.device)
+    k = torch.tensor([[1.0] * 256, [2.0] * 256], dtype=torch.bfloat16, device=pool.device)
+    v = -k
+    pool.store_kv(k, v, loc, 0)
+
+    k_codes, _ = pool.k_slab(0)
+    v_codes, _ = pool.v_slab(0)
+    torch.testing.assert_close(
+        k_codes[0].view(torch.float8_e4m3fn).float(), k[0].reshape(2, 128).float()
+    )
+    host_k, host_v = pool.host_kv(0)
+    torch.testing.assert_close(host_k[0, 1].to(pool.device).float(), k[1].reshape(2, 128).float())
+    torch.testing.assert_close(
+        v_codes[0].view(torch.float8_e4m3fn).float(), v[0].reshape(2, 128).float()
+    )
+    torch.testing.assert_close(host_v[0, 1].to(pool.device).float(), v[1].reshape(2, 128).float())
+    page_map = pool.page_map.clone()
+    pool.rebalance(1)
+    assert torch.equal(pool.page_map, page_map)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_certified_fp8_context_pages_map_to_ram_and_dummy_maps_to_device():
+    pool = _gpu_mtp_pool(
+        kv_format="fp8",
+        host_pages=3,
+        host_dtype=torch.float8_e4m3fn,
+    )
+    assert pool.page_map.tolist() == [1, 2, 3, 0]
+    assert pool._page_owner.tolist() == [3, 0, 1, 2]
+    assert pool.num_device_pages == 1
+    assert int(pool.page_map[3]) < pool.num_device_pages

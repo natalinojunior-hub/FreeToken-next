@@ -161,8 +161,6 @@ class QSASparseAttnBackend(BaseAttnBackend):
         # static addressing for the spec-verify graph (stage_verify), keyed by window length
         self._verify: dict = {}
         self.capture_bs: List[int] = []
-        self._ws_k: torch.Tensor | None = None
-        self._ws_v: torch.Tensor | None = None
 
     @staticmethod
     def _qsa_group(config: ModelConfig):
@@ -359,68 +357,14 @@ class QSASparseAttnBackend(BaseAttnBackend):
             self.kvcache._pool, "compressed", False
         )
         if compressed:
-            from freetoken.kernel.triton.turbo_kv import rotate, inv_rotate
-            from freetoken.kernel.triton.qsa import decompress_turbo4_to_workspace
+            from freetoken.kernel.triton.turbo_kv import is_rotated, rotate, inv_rotate
 
-            q_in = rotate(q.reshape(-1, self.head_dim)).reshape(q.shape)
-            mark("rotate")
-            num_cache_blocks = self.kvcache._pool._tokens // self.page_size
-            num_kv_heads = self.kvcache._pool._num_kv_heads
-            if (
-                self._ws_k is None
-                or self._ws_k.shape[0] < num_cache_blocks
-                or self._ws_k.shape[2] != num_kv_heads
-            ):
-                self._ws_k = torch.empty(
-                    (num_cache_blocks, self.page_size, num_kv_heads, self.head_dim),
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-                self._ws_v = torch.empty(
-                    (num_cache_blocks, self.page_size, num_kv_heads, self.head_dim),
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-
+            book = self.kvcache._pool.book
+            q_in = rotate(q.reshape(-1, self.head_dim)).reshape(q.shape) if is_rotated(book) else q
             k_codes, k_norm = self.kvcache.k_slab(layer_id)
             v_codes, v_norm = self.kvcache.v_slab(layer_id)
-
-            selected_pages = None
-            capturing = torch.cuda.is_current_stream_capturing()
-            if (
-                not capturing
-                and (
-                    batch.is_decode
-                    or getattr(batch, "spec_logits_indices", None) is not None
-                    or q.shape[0] <= 8
-                )
-                and indices is not None
-            ):
-                valid = indices[indices >= 0]
-                if valid.numel() > 0:
-                    logical_p = valid // self.page_size
-                    req_idx = md.token_to_req[0] if md.token_to_req is not None else 0
-                    p_pages = md.block_table[req_idx.to(torch.int64), logical_p.to(torch.int64)]
-                    selected_pages = torch.unique(p_pages[p_pages >= 0]).to(torch.int32)
-
-            decompress_turbo4_to_workspace(
-                k_codes=k_codes,
-                k_norm=k_norm,
-                v_codes=v_codes,
-                v_norm=v_norm,
-                cent=self.kvcache.cent_tensor,
-                block_table=md.block_table,
-                seq_lens=md.seq_lens,
-                workspace_k=self._ws_k,
-                workspace_v=self._ws_v,
-                book3=self.kvcache.is_book3(layer_id, "k")
-                if hasattr(self.kvcache, "is_book3")
-                else self.kvcache.book3,
-                selected_pages=selected_pages,
-            )
-            mark("decompress")
-            k_cache = self._ws_k
-            v_cache = self._ws_v
+            k_cache, v_cache = k_codes, v_codes
+            mark("coded_kv")
         else:
             q_in = q
             k_cache = self.kvcache.k_cache(layer_id)
@@ -436,9 +380,13 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.token_to_req,
             torch.empty_like(q),
             host_kv=host_kv,
+            kv_book=book if compressed else None,
+            kv_norms=(k_norm, v_norm) if compressed else None,
+            cent=self.kvcache.cent_tensor if compressed else None,
+            page_size=self.page_size if compressed else None,
         )
         mark("attention")
-        if compressed:
+        if compressed and is_rotated(book):
             out = inv_rotate(out.reshape(-1, self.head_dim)).reshape(out.shape)
             mark("inverse_rotate")
         return out
@@ -762,24 +710,6 @@ class QSASparseAttnBackend(BaseAttnBackend):
         }
         if topk_scratch:
             self._graph["topk_scratch"] = empty(chunk, topk_scratch, dtype=torch.int32)
-
-        compressed = getattr(self.kvcache, "compressed", False) or getattr(
-            self.kvcache._pool, "compressed", False
-        )
-        if compressed:
-            num_cache_blocks = self.kvcache._pool._tokens // self.page_size
-            num_kv_heads = self.kvcache._pool._num_kv_heads
-            if (
-                self._ws_k is None
-                or self._ws_k.shape[0] < num_cache_blocks
-                or self._ws_k.shape[2] != num_kv_heads
-            ):
-                self._ws_k = empty(
-                    num_cache_blocks, self.page_size, num_kv_heads, self.head_dim, dtype=self.dtype
-                )
-                self._ws_v = empty(
-                    num_cache_blocks, self.page_size, num_kv_heads, self.head_dim, dtype=self.dtype
-                )
 
     def prepare_for_capture(self, batch: Batch) -> None:
         self.prepare_metadata(batch)
