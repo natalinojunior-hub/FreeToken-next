@@ -206,24 +206,29 @@ def _stop_server(proc: subprocess.Popen) -> None:
         proc.wait()
 
 
-def _run_suite(args, suite: str, bench, records: list[dict], log_path: Path) -> None:
-    port = bench.free_port()
-    origin = f"http://127.0.0.1:{port}"
-    max_tokens = args.needle_max_tokens if suite == "needle" else args.max_tokens
-    command = [
+def _serve_command(model: str, context: int, port: int, extra: list[str]) -> list[str]:
+    return [
         sys.executable,
         "-m",
         "freetoken.cli",
         "serve",
         "--model",
-        args.model,
+        model,
         "--host",
         "127.0.0.1",
         "--port",
         str(port),
         "--max-seq-len-override",
-        str(args.context),
+        str(context),
+        *extra,
     ]
+
+
+def _run_suite(args, suite: str, bench, records: list[dict], log_path: Path) -> None:
+    port = bench.free_port()
+    origin = f"http://127.0.0.1:{port}"
+    max_tokens = args.needle_max_tokens if suite == "needle" else args.max_tokens
+    command = _serve_command(args.model, args.context, port, args.serve_extra)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("wb") as log_file:
         proc = subprocess.Popen(
@@ -337,6 +342,8 @@ def main() -> int:
     parser.add_argument("--needle-max-tokens", type=int, default=1024)
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--server-timeout", type=float, default=1200)
+    parser.add_argument("--serve-extra", action="append", default=[],
+                      help="extra serve args, e.g. --serve-extra=--kv-format --serve-extra=turbo3")
     parser.add_argument("--request-timeout", type=float, default=900)
     args = parser.parse_args()
 
@@ -351,9 +358,10 @@ def main() -> int:
         model_type, architectures = _model_identity(args.model, args.worktree)
     except Exception as exc:
         parser.error(f"could not read model config for {args.model}: {exc}")
-    if model_type not in {"qwen4_exp", "qwen4exp"} and not {
+    if model_type not in {"qwen4_exp", "qwen4exp", "qwen3_5_moe", "qwen35moe"} and not {
         "Qwen4ExpForConditionalGeneration",
         "Qwen4ExpGGUFForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
     }.intersection(architectures):
         parser.error(
             "model config is outside the supported Qwen3.8 family "
@@ -396,7 +404,7 @@ def main() -> int:
             "runtime_dirty_paths": runtime_dirty_paths,
             "harness_source_sha256": _sha256(Path(__file__).read_text(encoding="utf-8")),
             "pythonpath": args.pythonpath,
-            "serve_args": [f"--max-seq-len-override={args.context}"],
+            "serve_args": [f"--max-seq-len-override={args.context}", *args.serve_extra],
             "needle_file": str(args.needle_file),
             "quality_source": str(args.quality_source),
             "quality_source_sha256": _sha256(quality_text),
