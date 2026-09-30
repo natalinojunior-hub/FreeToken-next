@@ -869,7 +869,8 @@ class Engine:
             ),
         )
         if self.host_pages:
-            pool = self.kv_cache._pool
+            # QSA wraps its storage in ``_pool``; plain MHA owns the host slabs itself.
+            pool = getattr(self.kv_cache, "_pool", self.kv_cache)
             ram_bytes = sum(
                 t.numel() * t.element_size()
                 for t in (
