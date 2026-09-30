@@ -57,6 +57,7 @@ def _chat_image(origin: str, model_id: str, png: bytes, max_tokens: int, timeout
         ],
         "max_tokens": max_tokens,
         "temperature": 0,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     request = urllib.request.Request(
         f"{origin}/v1/chat/completions",
@@ -75,7 +76,7 @@ def main() -> int:
     a.add_argument("--label", required=True)
     a.add_argument("--json", required=True, type=Path)
     a.add_argument("--context", type=int, default=8192)
-    a.add_argument("--max-tokens", type=int, default=32)
+    a.add_argument("--max-tokens", type=int, default=128)
     a.add_argument("--server-timeout", type=float, default=1800)
     a.add_argument("--request-timeout", type=float, default=600)
     a.add_argument("--serve-arg", action="append", default=[])
@@ -134,6 +135,8 @@ def main() -> int:
                 answer_sha256=hashlib.sha256(text.encode(errors="replace")).hexdigest()[:16],
                 completion_tokens=usage.get("completion_tokens"),
             )
+            record["finish_reason"] = response["choices"][0].get("finish_reason")
+            record["message_fields"] = sorted(response["choices"][0]["message"])
             if text and usage.get("completion_tokens"):
                 status = "PASS"
         except Exception as exc:  # noqa: BLE001 - certification harness reports, never raises

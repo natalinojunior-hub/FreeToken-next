@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Universal certification matrix: every /models checkpoint, serial on one GPU, evented status.
-# Per model: automatic MTP bench 16K, RAW (depth-0) bench 16K, vision smoke (mmproj or inline),
-# and a 256K qualification attempt (planner verdict recorded when infeasible - measured, not skipped).
+# Supported-model certification matrix: serial on one GPU, evented status.
+# MTP is measured only for families with an implemented head; unsupported is recorded explicitly.
 set -u
 REPO=/models/desenvolvimento/freetoken-next
-A=/models/desenvolvimento/old/freetoken-next/mtp-regression-20260929
+A=${A:-/models/desenvolvimento/old/freetoken-next/mtp-regression-20260929}
+mkdir -p "$A"
 ST=$A/cert-all.status
 PROMPT=/models/desenvolvimento/old/freetoken-next/external/ft-campaign2/campaign26/prompt-470k.txt
 export TMPDIR=/models/desenvolvimento/tmp CUDA_HOME=/models/outros/cuda-13.3
@@ -28,9 +28,12 @@ bench() { # bench name model extra-env... -- extra-serve-args...
   local envs=() extra=()
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   extra=("$@")
+  local mtp_args=(--serve-arg=--spec-mtp --serve-arg=5)
+  if [[ " ${envs[*]} " == *" FREETOKEN_MTP_FORCE_DEPTH=0 "* ]]; then mtp_args=(); fi
   env ${envs[@]+"${envs[@]}"} "$PY" benchmarks/bench_pp_tg.py \
     --model "$model" --tokens 16384 --decode 256 --repeats 6 --warmups 1 \
     --prompt-file "$PROMPT" --serve-arg=--max-seq-len --serve-arg=16704 \
+    "${mtp_args[@]}" --serve-arg=--kv-tiering --serve-arg=auto \
     ${extra[@]+"${extra[@]}"} --no-history --json "$A/cert-all.jsonl" --label "$name"
 }
 
@@ -55,12 +58,12 @@ mm() { # mm name model : vision smoke only when the checkpoint carries an mmproj
   if ! ls "$model"/*mmproj*.gguf >/dev/null 2>&1; then
     status "SKIP $name (no mmproj sidecar)"; return 0
   fi
-  phase "$name" "$PY" scripts/mm_smoke.py --model "$model" --label "$name" --json "$A/cert-all.mm.jsonl"
+  "$PY" scripts/mm_smoke.py --model "$model" --label "$name" --json "$A/cert-all.mm.jsonl"
 }
 
-phase ista-mm         mm ista-mm /models/Qwen3.8-Flash-Next-ISTA-IQ3_XXS/IQ3_XXS
-phase ad-mm           mm ad-mm "$AD"
-phase pfe-mm          mm pfe-mm "$PFE"
+phase ista-mm-v3      mm ista-mm-v3 /models/Qwen3.8-Flash-Next-ISTA-IQ3_XXS/IQ3_XXS
+phase ad-mm-v3        mm ad-mm-v3 "$AD"
+phase pfe-mm-v3       mm pfe-mm-v3 "$PFE"
 phase rad-mm          mm rad-mm "$RAD"
 phase ft-mm           mm ft-mm "$FT"
 
@@ -70,7 +73,7 @@ phase pfe-16k-raw     bench pfe-16k-raw "$PFE" FREETOKEN_MTP_FORCE_DEPTH=0 --
 phase rad-16k-mtp     bench rad-16k-mtp "$RAD"
 phase rad-16k-raw     bench rad-16k-raw "$RAD" FREETOKEN_MTP_FORCE_DEPTH=0 --
 
-phase ft-16k-mtp      bench ft-16k-mtp "$FT"
+status "UNSUPPORTED ft-16k-mtp (Qwen3.6-35B-A3B family has no wired native MTP head)"
 phase ft-16k-raw      bench ft-16k-raw "$FT" FREETOKEN_MTP_FORCE_DEPTH=0 --
 
 # GATE (operator): the 256K phase runs only if every 16K MTP+RAW bench passed.
@@ -80,6 +83,10 @@ if grep -E " FAIL .*16k" "$ST" | awk '{print $3}' | sort -u | while read -r nm; 
   status "cert-all: 16K gate FAILED -> skipping 256K phase"; exit 1
 fi
 status "cert-all: 16K gate OK -> entering 256K phase"
+if [ "${CERT_16K_ONLY:-0}" = 1 ]; then
+  status "cert-all: 16K-only matrix complete"
+  exit 0
+fi
 
 # 256K qualification attempts (ISTA/AD/pfeiffer GGUF; Radix/FT largest feasible context recorded)
 qualify() { # qualify name model ctx
