@@ -1326,7 +1326,9 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             note = getattr(self.engine, "note_decode_oom", None)
             if note is not None:
                 note(e)
-            self._mark_mtp_oom(getattr(self, "_mtp_cycle_depth", 0))
+            mark_oom = getattr(self, "_mark_mtp_oom", None)
+            if mark_oom is not None:
+                mark_oom(getattr(self, "_mtp_cycle_depth", 0))
             self._fail_oom_reqs(list(self.decode_manager.running_reqs), e)
             return True
 

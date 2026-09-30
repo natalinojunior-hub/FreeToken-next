@@ -509,8 +509,10 @@ class AdaptiveMtpController:
             # Tail raw steps are valid baseline samples; retain an unfinished audit.
             self._terminal_k0 = True
             return
+        # Always schedule a fresh bounded probe.  A profiled controller normally has
+        # no pending plan, but an OOM still invalidates that cached depth.
+        self._needs_reprobe = True
         if self._plan:
-            self._needs_reprobe = True
             self._discard_partial_stats = True
         self._terminal_k0 = True
         self._selected_depth = 0
