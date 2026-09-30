@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -120,7 +121,15 @@ class Qwen3_5MTP(BaseOP):
         self.eh_proj = LinearReplicated(
             2 * hidden, hidden, has_bias=False, quant_config=config.quant, prefix="mtp.eh_proj"
         )
-        self.layers = OPList([Qwen3_5DecoderLayer(config, layer_id, prefix="mtp.layers.0")])
+        # Standalone HF heads store their own BF16 experts. Keep them independent of the
+        # target's quantized/offloaded expert bank; the model memory planner prices these
+        # resident parameters from their actual shapes.
+        mtp_config = (
+            replace(config, quant=None, moe_strategy="fused")
+            if config.mtp_expert_resident
+            else config
+        )
+        self.layers = OPList([Qwen3_5DecoderLayer(mtp_config, layer_id, prefix="mtp.layers.0")])
         self.shared_head_norm = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
 
     def forward(self, residual: torch.Tensor, next_ids: torch.Tensor, batch) -> torch.Tensor:

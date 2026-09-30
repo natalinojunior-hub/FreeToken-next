@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from freetoken.layers.quantization import QuantConfig, QuantKind
@@ -11,6 +12,7 @@ from freetoken.models.config import (
     mrope_layout_from_rope_params,
 )
 from freetoken.models.qwen3_vl.config import parse_vision_config
+from .mtp import MTP_PATH_ENV, is_hf_mtp_head
 
 
 def _expert_quant(hf_config: Any, text: Any) -> tuple[str, tuple[int, int] | None]:
@@ -138,6 +140,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attention_groups=groups,
         expert_quant=expert_quant,
         weight_block_size=weight_block_size,
+        native_mtp_layers=int(is_hf_mtp_head(os.environ.get(MTP_PATH_ENV))),
     )
 
 

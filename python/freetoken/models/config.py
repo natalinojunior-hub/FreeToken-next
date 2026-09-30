@@ -363,6 +363,8 @@ class ModelConfig:
     # The draft layer owns a routed-expert bank, appended after the target's banks (so it
     # is MoE bank ``num_moe_layers - 1``); False = it reuses a target bank.
     mtp_expert_bank: bool = False
+    # Standalone HF MTP experts can remain in their checkpoint dtype as resident weights.
+    mtp_expert_resident: bool = False
     # In-file NextN/MTP draft blocks (GGUF ``nextn_predict_layers``) a non-qwen4 family can
     # serve with --spec-mtp; the expert types then cover the draft's own bank too.
     native_mtp_layers: int = 0

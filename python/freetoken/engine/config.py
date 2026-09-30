@@ -192,12 +192,27 @@ class EngineConfig:
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
         model_config = replace(model_config, quant=quant)
+        if model_config.model_type == "qwen3_5_moe" and model_config.native_mtp_layers == 0:
+            from freetoken.models.qwen3_5_moe.mtp import has_hf_mtp_weights
+
+            if has_hf_mtp_weights(self.model_path):
+                model_config = replace(model_config, native_mtp_layers=1, mtp_expert_resident=True)
         if self.spec_mtp > 0:
             mtp = getattr(getattr(model_config, "qwen4_args", None), "mtp", None)
             if (mtp is None or not mtp.enabled) and model_config.native_mtp_layers == 1:
                 from freetoken.models.config import with_mtp_layer
 
                 model_config = with_mtp_layer(model_config, model_config.num_layers)
+                if model_config.model_type == "qwen3_5_moe":
+                    import os
+
+                    from freetoken.models.qwen3_5_moe.mtp import (
+                        MTP_PATH_ENV,
+                        is_hf_mtp_head,
+                    )
+
+                    if is_hf_mtp_head(os.environ.get(MTP_PATH_ENV)):
+                        model_config = replace(model_config, mtp_expert_resident=True)
                 if model_config.native_mtp_expert_types is not None:
                     model_config = replace(
                         model_config,

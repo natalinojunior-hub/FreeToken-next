@@ -2126,7 +2126,11 @@ class Engine:
         # also finds; without its own bank (mtp_expert_bank) it aliases a target bank.
         mc = config.model_config
         expected_moe_layers = mc.num_moe_layers
-        if getattr(mc, "mtp_layer_id", None) is not None and not mc.mtp_expert_bank:
+        if (
+            getattr(mc, "mtp_layer_id", None) is not None
+            and not mc.mtp_expert_bank
+            and not mc.mtp_expert_resident
+        ):
             expected_moe_layers += 1
         assert len(layers) == expected_moe_layers
         if cache.decode_target in ("cpu", "hybrid"):
