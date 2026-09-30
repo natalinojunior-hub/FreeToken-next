@@ -146,6 +146,53 @@ def test_rollback_tape_matches_normal_and_is_cuda_graph_safe(steps):
     assert torch.equal(graph_ba, expected_ba)
 
 
+@pytest.mark.parametrize("state_dtype", (torch.float32, torch.bfloat16))
+def test_two_row_recurrence_matches_successive_single_rows(state_dtype):
+    """MTP verify must leave the same continuation state as RAW decode."""
+    q, k, v, a, b, A_log, dt_bias, initial = _inputs(2, 811)
+    initial = initial.to(state_dtype)
+    batched_state = initial.clone()
+    batched_rows = torch.empty(
+        1, 2, VALUE_HEADS, KEY_DIM, VALUE_DIM, device=DEVICE, dtype=torch.float32
+    )
+    batched_out = _run(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        batched_state,
+        intermediate=batched_rows,
+    )
+
+    sequential_state = initial.clone()
+    sequential_out = []
+    sequential_rows = []
+    for row in range(2):
+        checkpoints = torch.empty(
+            1, 1, VALUE_HEADS, KEY_DIM, VALUE_DIM, device=DEVICE, dtype=torch.float32
+        )
+        output = _run(
+            q[:, row : row + 1],
+            k[:, row : row + 1],
+            v[:, row : row + 1],
+            a[row : row + 1],
+            b[row : row + 1],
+            A_log,
+            dt_bias,
+            sequential_state,
+            intermediate=checkpoints,
+        )
+        sequential_out.append(output)
+        sequential_rows.append(checkpoints[:, 0])
+
+    assert torch.equal(batched_out, torch.cat(sequential_out, dim=1))
+    assert torch.equal(batched_rows, torch.stack(sequential_rows, dim=1)[0:1])
+    assert torch.equal(batched_state, sequential_state)
+
+
 @pytest.mark.parametrize("steps", (2, 3, 5))
 def test_batched_layer_prefix_replay_matches_row_checkpoints(steps):
     """Replay every target-layer prefix from its taped S0 in one batch. Each batch item has
