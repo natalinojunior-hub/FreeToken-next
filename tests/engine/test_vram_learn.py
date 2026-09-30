@@ -17,13 +17,13 @@ def _oom(text):
 def test_note_oom_folds_attempted_bytes_into_reserve():
     eng = SimpleNamespace(_decode_reserve_learned=0, _vram_profile_key=None)
     attempted = Engine.note_decode_oom(eng, _oom("CUDA OOM. Tried to allocate 64.00 MiB."))
-    assert attempted == 64 * MIB + 4 * MIB
+    assert attempted == 64 * MIB
     assert eng._decode_reserve_learned == attempted
 
 
 def test_note_oom_never_shrinks_and_ignores_unparseable():
     eng = SimpleNamespace(_decode_reserve_learned=100 * MIB, _vram_profile_key=None)
-    assert Engine.note_decode_oom(eng, _oom("Tried to allocate 8.00 MiB")) == 8 * MIB + 4 * MIB
+    assert Engine.note_decode_oom(eng, _oom("Tried to allocate 8.00 MiB")) == 8 * MIB
     assert eng._decode_reserve_learned == 100 * MIB
     assert Engine.note_decode_oom(eng, _oom("no number here")) == 0
     assert eng._decode_reserve_learned == 100 * MIB
@@ -55,8 +55,11 @@ def test_scheduler_seed_warms_engine_from_profile(tmp_path, monkeypatch):
     sched = SimpleNamespace(
         engine=eng,
         config=SimpleNamespace(
-            max_seq_len_override=None, max_seq_len=0, spec_mtp=4,
-            active_encoders=[], model_config=SimpleNamespace(mtp_layer_id=None),
+            max_seq_len_override=None,
+            max_seq_len=0,
+            spec_mtp=4,
+            active_encoders=[],
+            model_config=SimpleNamespace(mtp_layer_id=None),
         ),
     )
     # find the saved file under its computed key, not "x"

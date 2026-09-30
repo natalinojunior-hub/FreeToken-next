@@ -74,6 +74,17 @@ from freetoken.kvcache.linear_state_pool import (
 logger = init_logger(__name__)
 
 
+def _pool_name(pool_cls) -> str:
+    return getattr(pool_cls, "__name__", type(pool_cls).__name__)
+
+
+def _vmm_resize_slack(cache) -> int:
+    """One native VMM granule per backing region, based on the active driver geometry."""
+    arenas = getattr(cache, "_vmm_arenas", None) or ()
+    pools = getattr(cache, "pools", None) or ()
+    return sum(int(getattr(arena, "g", 0)) for arena in arenas) * len(pools)
+
+
 def _decode_residency_enabled() -> bool:
     return os.environ.get("FREETOKEN_DECODE_RESIDENCY", "1") != "0"  # A/B kill switch
 
@@ -112,13 +123,13 @@ def _sgl_flash_attn_available() -> bool:
 
 def _kv_ram_tier_unsupported(config, pool_cls, device) -> str | None:
     """Why this engine cannot host KV pages in RAM, or None when it can."""
-    if pool_cls.__name__ != "QSAKVCache":
-        return f"{pool_cls.__name__} KV pool"
+    if _pool_name(pool_cls) != "QSAKVCache":
+        return f"{_pool_name(pool_cls)} KV pool"
     if not getattr(config.model_config, "kv_ram_tier_certified", False):
         # Auto RAM tiering is a measured win only for the families that declared it; others stay
         # all-VRAM until certified on real hardware (--kv-tiering force is unaffected).
         return "model family not certified for KV in RAM"
-    if config.kv_format != "auto":
+    if config.kv_format not in ("auto", "fp8"):
         return f"kv_format={config.kv_format}"
     if config.tp_info.size != 1:
         return "tensor parallelism"
@@ -127,9 +138,26 @@ def _kv_ram_tier_unsupported(config, pool_cls, device) -> str | None:
     return None
 
 
+def _auto_kv_host_pages(config) -> int:
+    context_pages = -(-config.max_seq_len // config.page_size)
+    hot_pages = -(-min(config.max_seq_len, config.kv_reserve_tokens) // config.page_size)
+    return context_pages - hot_pages
+
+
+def _qsa_ram_context_fully_hosted(
+    config, pool_cls, host_pages: int, tokens: int, auto: bool
+) -> bool:
+    return (
+        auto
+        and _pool_name(pool_cls) == "QSAKVCache"
+        and getattr(config, "kv_format", None) == "fp8"
+        and getattr(getattr(config, "model_config", None), "kv_ram_tier_certified", False)
+        and host_pages * config.page_size >= tokens
+    )
+
+
 # earlyoom (and the kernel) start killing near 10% free RAM; stay clear of that line.
 _RAM_KILL_MARGIN = 0.10
-_RAM_SAFETY_BYTES = 2 << 30
 
 
 def _meminfo() -> dict[str, int]:
@@ -142,7 +170,6 @@ def _meminfo() -> dict[str, int]:
 _KV_RAM_DTYPES: dict[str, torch.dtype | str] = {
     "bf16": torch.bfloat16,
     "fp8": torch.float8_e4m3fn,
-    "turbo8": "turbo8",
     "turbo4": "turbo4",
     "turbo3": "turbo3",
 }
@@ -150,23 +177,25 @@ _KV_RAM_DTYPES: dict[str, torch.dtype | str] = {
 
 # Auto RAM-tier ladder, widest first ("native" = the KV dtype); a narrower step is only taken
 # when RAM requires it.
-_KV_RAM_LADDER = ("native", "fp8", "turbo8", "turbo4", "turbo3")
+_KV_RAM_LADDER = ("native", "fp8", "turbo4", "turbo3")
 # Measured dominance (campaign 15, ISTA 64K/128K/256K forced tier): a key format is dropped
 # from the auto ladder because its value is at least as good (quality: usage 20/20, needle
 # pass) and faster (FP8 vs BF16 TG +5.1/+3.5/+3.8%): the RAM tier is read over PCIe, so
-# fewer bytes per page win while quality holds. Turbo8 (campaign 16, same protocol, after the
-# selected-token decode): equal quality, TG 50.5/50.5/47.5 vs FP8 59.2/57.9/52.4, and not
-# smaller than FP8. Turbo4/turbo3 are also slower but half/less the RAM, so they stay.
-_KV_RAM_DOMINATED_BY = {"native": "fp8", "turbo8": "fp8"}
+# fewer bytes per page win while quality holds. Turbo4/turbo3 trade quality for capacity.
+_KV_RAM_DOMINATED_BY = {"native": "fp8"}
 
 
 def _kv_ram_dtype(config, pool_cls, host_pages: int) -> torch.dtype | str | None:
     """RAM-tier storage format: the widest non-dominated step of the auto ladder that fits the
-    safe RAM budget (only the cold tier is narrowed; device KV stays exact), or the explicit
-    --kv-ram-dtype. None: nothing fits."""
+    safe RAM budget, or the explicit --kv-ram-dtype. None: nothing fits."""
     choice = getattr(config, "kv_ram_dtype", "auto")
+    qsa_fp8_only = _pool_name(pool_cls) == "QSAKVCache" and getattr(
+        getattr(config, "model_config", None), "kv_ram_tier_certified", False
+    )
     candidates = (
-        [
+        [_KV_RAM_DTYPES["fp8"]]
+        if choice == "auto" and qsa_fp8_only
+        else [
             config.dtype if f == "native" else _KV_RAM_DTYPES[f]
             for f in _KV_RAM_LADDER
             if f not in _KV_RAM_DOMINATED_BY
@@ -175,7 +204,7 @@ def _kv_ram_dtype(config, pool_cls, host_pages: int) -> torch.dtype | str | None
         else [_KV_RAM_DTYPES[choice]]
     )
     info = _meminfo()
-    budget = info["MemAvailable"] - int(info["MemTotal"] * _RAM_KILL_MARGIN) - _RAM_SAFETY_BYTES
+    budget = info["MemAvailable"] - int(info["MemTotal"] * _RAM_KILL_MARGIN)
     for dtype in candidates:
         if pool_cls.host_tier_ram_bytes(config, host_pages * config.page_size, dtype) <= budget:
             return dtype
@@ -194,9 +223,15 @@ def _check_kv_ram_budget(config, pool_cls, host_pages: int) -> None:
         object.__setattr__(config, "kv_ram_resolved_dtype", dtype)
         return
     info = _meminfo()
-    budget = info["MemAvailable"] - int(info["MemTotal"] * _RAM_KILL_MARGIN) - _RAM_SAFETY_BYTES
+    budget = info["MemAvailable"] - int(info["MemTotal"] * _RAM_KILL_MARGIN)
     choice = getattr(config, "kv_ram_dtype", "auto")
-    narrowest = "turbo3" if choice == "auto" else _KV_RAM_DTYPES[choice]
+    narrowest = (
+        "fp8"
+        if choice == "auto" and _pool_name(pool_cls) == "QSAKVCache"
+        else "turbo3"
+        if choice == "auto"
+        else _KV_RAM_DTYPES[choice]
+    )
     per_token = pool_cls.host_tier_ram_bytes(config, 1, narrowest)
     need = per_token * host_pages * config.page_size
     ram_tokens = max(0, budget) // per_token
@@ -235,12 +270,10 @@ def _page_table_width(max_seq_len: int, page_size: int) -> int:
 # Shortest context where fp8 KV measured faster than bf16 for a full-attention MoE (campaign 18).
 
 
-# Auto KV fit ladder per KV family, least to most compressed: the requested context is served
-# in the first format whose pool fits it (operator rule: the user sets only the context).
-# nvfp4 replaces turbo4 on the full-attention slab (same bytes, 2.7x faster decode, campaign 18).
+# Auto KV fit ladder per KV family, least to most compressed.
 _KV_FIT_LADDER = {
-    frozenset({AttnType.FULL}): ("fp8", "nvfp4", "turbo3"),
-    "qsa": ("auto", "turbo4", "turbo3"),
+    frozenset({AttnType.FULL}): ("fp8", "turbo4", "turbo3"),
+    "qsa": ("fp8", "turbo4", "turbo3"),
 }
 
 
@@ -308,6 +341,12 @@ def _mtp_state_precision_retry_candidate(
 def _kv_fit_ladder(config) -> tuple[str, ...]:
     """KV formats still to try after ``config.kv_format`` (empty: explicit format or none left)."""
     if not getattr(config, "kv_format_auto", False):
+        return ()
+    # Certified Qwen 3.8 RAM-tiering has a deliberate FP8 floor. If it cannot fit,
+    # report the context limit instead of silently buying capacity with lossy KV.
+    if getattr(
+        config.model_config, "kv_ram_tier_certified", False
+    ) and AttnType.QSA in _required_attn_types(config.model_config):
         return ()
     types = _required_attn_types(config.model_config)
     ladder = _KV_FIT_LADDER["qsa"] if AttnType.QSA in types else _KV_FIT_LADDER.get(types, ())
@@ -563,20 +602,23 @@ class Engine:
                     "tiles are read by our own kernels, and every other backend takes a bf16 KV "
                     f"slab (backend is {config.attention_backend!r})."
                 )
-        # KV RAM tiering (--kv-tiering force): opt-in, and only the QSA BF16 pool wires the
-        # host-RAM tier through its kernels -- everything else fails closed here rather than
-        # silently ignoring --kv-ram-tokens.
+        # Auto RAM tiering is enabled only for model families certified by measured results;
+        # every other family keeps its existing VRAM path.
         self.host_pages = 0
         self._host_reserve_bytes = 0
         self._kv_tier_auto = False
         if config.kv_tiering == "auto":
-            # Measured (campaign 16, ISTA k0): RAM-tier KV ties VRAM at 16K and beats it from
-            # 64K (+4..+22%), so auto tiers whenever the family is certified, the pool supports
-            # it, and RAM holds it. Uncertified families fall through to all-VRAM.
+            # Qwen3.8 Flash Next is certified for FP8 RAM-backed context. Other families remain
+            # on VRAM until their own RAM-tier quality/performance evidence exists.
             reason = _kv_ram_tier_unsupported(config, self._pool_cls, self.device)
             if reason is None:
                 self._kv_tier_auto = True
-                self.host_pages = -(-config.max_seq_len // config.page_size)
+                self.host_pages = _auto_kv_host_pages(config)
+                object.__setattr__(
+                    config,
+                    "kv_ram_resolved_dtype",
+                    _kv_ram_dtype(config, self._pool_cls, self.host_pages),
+                )
                 self._host_reserve_bytes = self._pool_cls.host_tier_device_bytes(
                     config, self.host_pages * config.page_size
                 )
@@ -585,13 +627,16 @@ class Engine:
         elif config.kv_tiering == "force":
             if self._pool_cls.__name__ != "QSAKVCache":
                 raise NotImplementedError(
-                    "--kv-tiering force needs a QSA BF16 KV pool; this model resolves to "
+                    "--kv-tiering force needs a QSA KV pool; this model resolves to "
                     f"{self._pool_cls.__name__}"
                 )
-            if config.kv_format != "auto":
+            if not getattr(config.model_config, "kv_ram_tier_certified", False):
                 raise NotImplementedError(
-                    f"--kv-tiering force needs BF16 QSA KV (--kv-format auto); got "
-                    f"{config.kv_format!r}"
+                    "--kv-tiering force requires a model family certified for KV in RAM"
+                )
+            if config.kv_format not in ("auto", "fp8"):
+                raise NotImplementedError(
+                    f"--kv-tiering force needs QSA KV in auto/FP8; got {config.kv_format!r}"
                 )
             if config.tp_info.size != 1:
                 raise NotImplementedError(
@@ -601,6 +646,11 @@ class Engine:
                 raise NotImplementedError("--kv-tiering force needs a CUDA device")
             ram_tokens = config.kv_ram_tokens or config.max_seq_len
             self.host_pages = -(-ram_tokens // config.page_size)  # ceil div to pages
+            object.__setattr__(
+                config,
+                "kv_ram_resolved_dtype",
+                _kv_ram_dtype(config, self._pool_cls, self.host_pages),
+            )
             self._host_reserve_bytes = self._pool_cls.host_tier_device_bytes(
                 config, self.host_pages * config.page_size
             )
@@ -741,14 +791,27 @@ class Engine:
         if self.host_pages:
             self._fit_kv_ram_tier(config)
         available_memory -= self._host_reserve_bytes
-        device_pages = self._pool_cls.solve_num_pages(config, available_memory)
         want = getattr(config, "max_seq_len_override", None) or config.max_seq_len
+        ram_context_fully_hosted = _qsa_ram_context_fully_hosted(
+            config, self._pool_cls, self.host_pages, want, self._kv_tier_auto
+        )
+        # The host tier owns every context page; the device pool needs only its dummy sink.
+        # The generic solver's two-usable-page floor would reject this valid layout at low VRAM.
+        device_pages = (
+            0
+            if ram_context_fully_hosted
+            else self._pool_cls.solve_num_pages(config, available_memory)
+        )
         first_fmt = config.kv_format
         for fmt in _kv_fit_ladder(config):
             if (device_pages + self.host_pages) * config.page_size >= want:
                 break
             self._set_kv_format(config, fmt)
-            device_pages = self._pool_cls.solve_num_pages(config, available_memory)
+            device_pages = (
+                0
+                if ram_context_fully_hosted
+                else self._pool_cls.solve_num_pages(config, available_memory)
+            )
         fits = (device_pages + self.host_pages) * config.page_size >= want
         if getattr(config, "spec_mtp", 0) > 0 and (not fits or config.kv_format != first_fmt):
             # MTP must not cost a KV rung: price the context without its verify states and
@@ -806,7 +869,12 @@ class Engine:
             pool = self.kv_cache._pool
             ram_bytes = sum(
                 t.numel() * t.element_size()
-                for t in (pool._kv_host, pool._host_codes, pool._host_norm)
+                for t in (
+                    getattr(self.kv_cache, "_kv_host", None),
+                    getattr(pool, "_kv_host", None),
+                    getattr(pool, "_host_codes", None),
+                    getattr(pool, "_host_norm", None),
+                )
                 if t is not None
             )
             logger.info_rank0(
@@ -933,7 +1001,12 @@ class Engine:
         try:
             _check_kv_ram_budget(config, self._pool_cls, self.host_pages)
         except RuntimeError as err:
-            if not self._kv_tier_auto:
+            strict_fp8_ram = (
+                self._kv_tier_auto
+                and getattr(getattr(config, "model_config", None), "kv_ram_tier_certified", False)
+                and _pool_name(self._pool_cls) == "QSAKVCache"
+            )
+            if not self._kv_tier_auto or strict_fp8_ram:
                 raise
             logger.info_rank0(f"KV RAM tier does not fit RAM, KV stays in VRAM: {err}")
             self.host_pages = self._host_reserve_bytes = 0
@@ -1152,14 +1225,8 @@ class Engine:
         self._charge_expert_cache(cache)
         self._calibrate_vram_ledger()
 
-    # Free memory the runtime peak must still have left over (driver/fragmentation slack).
-    _VRAM_GUARD_MARGIN = 256 << 20
     # Consecutive idle windows whose peak left room before a shrunken expert cache regrows.
     _VRAM_GUARD_CALM_WINDOWS = 3
-    # Absolute OOM floor for the in-place decode residency grow. The prefill fold reclaims
-    # that expansion synchronously and the prefill-time guard enforces _VRAM_GUARD_MARGIN at
-    # the spike, so decode-grow only needs to cover driver/fragmentation between folds.
-    _VRAM_DECODE_GROW_MIN = 32 << 20
 
     @torch.inference_mode()
     def guard_vram_before_forward(self, *, prefill: bool = False) -> bool:
@@ -1170,11 +1237,13 @@ class Engine:
         """
         if self.device.type != "cuda":
             return False
-        reserve = (
+        cache = self.moe_offload_cache
+        modeled = (
             int(getattr(self, "_prefill_transient_reserve", self._ledger_reserve_bytes()))
             if prefill
-            else 0
+            else int(getattr(self, "_decode_reserve_learned", 0))
         )
+        reserve = max(modeled, _vmm_resize_slack(cache))
 
         def required_free() -> int:
             reusable = (
@@ -1182,9 +1251,12 @@ class Engine:
                 if reserve
                 else 0
             )
-            return self._VRAM_GUARD_MARGIN + max(0, reserve - reusable)
+            return max(0, reserve - reusable)
 
         free, _ = torch.cuda.mem_get_info(self.device)
+        low_attr = "_prefill_low_free" if prefill else "_decode_low_free"
+        previous_low = getattr(self, low_attr, None)
+        setattr(self, low_attr, free if previous_low is None else min(free, previous_low))
         if free >= required_free():
             return False
         if not prefill and self._expert_decode_slots is not None:
@@ -1192,14 +1264,13 @@ class Engine:
             if baseline is not None:
                 allocator_growth = max(0, torch.cuda.memory_reserved(self.device) - baseline)
                 self._decode_reserve_learned = max(self._decode_reserve_learned, allocator_growth)
-        cache = self.moe_offload_cache
         if not getattr(cache, "_vmm_arenas", None) or self.config.tp_info.size != 1:
             return True  # a live request cannot safely rebuild a fixed-back cache
         from freetoken.utils import div_ceil
 
         torch.cuda.synchronize(self.device)
         self._vram_guard_calm = 0
-        granules = len(cache._vmm_arenas) * len(cache.pools) * (2 << 20)
+        granules = _vmm_resize_slack(cache)
         for _ in range(2):
             free, _ = torch.cuda.mem_get_info(self.device)
             required = required_free()
@@ -1207,7 +1278,15 @@ class Engine:
                 break
             before = cache.resident_rows
             _, per_slot = self._target_moe_and_expert_bytes(None)
-            target = max(1, before - div_ceil(required - free + granules, per_slot))
+            bytes_to_release = required - free + granules
+            target = max(1, before - div_ceil(bytes_to_release, per_slot))
+            exact_price = getattr(cache, "backed_bytes_for", None)
+            if exact_price is not None:
+                current_bytes = cache.expert_pool_bytes
+                for candidate in range(before - 1, 0, -1):
+                    if current_bytes - exact_price(candidate) >= bytes_to_release:
+                        target = candidate
+                        break
             with torch.cuda.stream(self.stream):
                 cache.set_live(target)  # pool geometry enforces its non-evictable floors
             after = cache.resident_rows
@@ -1228,11 +1307,10 @@ class Engine:
     def guard_vram_at_idle(self) -> None:
         """Real-time VRAM guard, run while the scheduler is idle: measure how much device memory
         was still free at the peak of the last busy window and, when that fell under
-        ``_VRAM_GUARD_MARGIN``, give the shortfall back from the expert cache (the one elastic
-        consumer) before the next request can hit an OOM; a pure shrink always fits. After
-        ``_VRAM_GUARD_CALM_WINDOWS`` windows in a row whose peak left more than two margins free,
-        a cache shrunk earlier (guard, OOM recovery) grows back by that surplus, never past the
-        startup plan and only through the rebuild's own budget check. The peak counter is reset
+        measured next-phase reserve, give the shortfall back from expert backing before the next
+        request. A pure shrink always fits. After
+        ``_VRAM_GUARD_CALM_WINDOWS`` calm windows, a cache shrunk earlier grows by the measured
+        surplus up to the exact VMM-priced capacity. The peak counter is reset
         so each window is judged on its own."""
         cache = self.moe_offload_cache
         if self.device.type != "cuda":
@@ -1259,11 +1337,26 @@ class Engine:
             f"VRAM guard window: reserved now {mem_GB(now)}, peak {mem_GB(peak)}, "
             f"free now {mem_GB(free)}, free at peak {mem_GB(free_at_peak)}"
         )
-        return free_at_peak
+        sampled = [
+            value
+            for value in (
+                getattr(self, "_prefill_low_free", None),
+                getattr(self, "_decode_low_free", None),
+            )
+            if value is not None
+        ]
+        self._prefill_low_free = None
+        self._decode_low_free = None
+        return min([free_at_peak, *sampled]) if sampled else free_at_peak
 
     def _guard_window(self, free_at_peak: int) -> None:
         cache = self.moe_offload_cache
-        short = self._VRAM_GUARD_MARGIN - free_at_peak
+        # Prefill transients are already included in the measured window. Charging their full
+        # reserve again here shrinks the planned prefill cache after every successful request;
+        # the next prefill guard and planner already protect that transient. This window only
+        # needs the learned decode headroom and the active VMM resize geometry.
+        required = max(int(getattr(self, "_decode_reserve_learned", 0)), _vmm_resize_slack(cache))
+        short = required - free_at_peak
         if cache is None:
             if short > 0:
                 logger.warning_rank0(
@@ -1277,21 +1370,28 @@ class Engine:
         if short > 0:
             self._vram_guard_calm = 0
             target = cache.resident_rows - div_ceil(short, per_slot)
+            exact_price = getattr(cache, "backed_bytes_for", None)
+            if exact_price is not None and getattr(cache, "_vmm_arenas", None):
+                current_bytes = cache.expert_pool_bytes
+                for candidate in range(cache.resident_rows - 1, 0, -1):
+                    if current_bytes - exact_price(candidate) >= short:
+                        target = candidate
+                        break
             logger.info_rank0(
                 f"VRAM guard: {mem_GB(free_at_peak)} free at the last peak (< "
-                f"{mem_GB(self._VRAM_GUARD_MARGIN)}): expert cache {cache.resident_rows} -> "
+                f"{mem_GB(required)}): expert cache {cache.resident_rows} -> "
                 f"{target} slots"
             )
         else:
-            plan = getattr(self, "_expert_plan_slots", cache.resident_rows)
+            # The startup plan is an initial split, not a permanent cap. Let the
+            # measured physical headroom reclaim any VMM-backed slot already in the
+            # cache's reserved geometry; set_live and rollback enforce its real limit.
+            plan = cache.cache_size
             # Growing the backing rounds every (bank, pool) region up to one VMM granule;
             # keep that out of the spendable surplus, same as the decode-phase grow does.
-            granules = (
-                len(getattr(cache, "_vmm_arenas", None) or ())
-                * len(getattr(cache, "pools", None) or ())
-                * (2 << 20)
-            )
-            surplus = free_at_peak - 2 * self._VRAM_GUARD_MARGIN - granules
+            exact_price = getattr(cache, "backed_bytes_for", None)
+            granules = 0 if exact_price is not None else _vmm_resize_slack(cache)
+            surplus = free_at_peak - required - granules
             if cache.resident_rows >= plan or surplus < per_slot:
                 self._vram_guard_calm = 0
                 return
@@ -1300,6 +1400,16 @@ class Engine:
                 return
             self._vram_guard_calm = 0
             target = min(plan, cache.resident_rows + surplus // per_slot)
+            if exact_price is not None and getattr(cache, "_vmm_arenas", None):
+                current_bytes = cache.expert_pool_bytes
+                target = cache.resident_rows
+                for candidate in range(plan, cache.resident_rows, -1):
+                    if exact_price(candidate) - current_bytes <= surplus:
+                        target = candidate
+                        break
+                if target == cache.resident_rows:
+                    self._vram_guard_calm = 0
+                    return
             logger.info_rank0(
                 f"VRAM guard: {mem_GB(free_at_peak)} free at the last "
                 f"{self._VRAM_GUARD_CALM_WINDOWS} peaks: expert cache {cache.resident_rows} -> "
@@ -1341,29 +1451,43 @@ class Engine:
         if not m:
             return 0
         units = {"GiB": 1 << 30, "MiB": 1 << 20, "KiB": 1 << 10, "B": 1}
-        attempted = int(float(m.group(1)) * units[m.group(2)]) + (4 << 20)
-        if attempted > self._decode_reserve_learned:
-            self._decode_reserve_learned = attempted
-            key = getattr(self, "_vram_profile_key", None)
-            if key:
-                try:
-                    from freetoken.tuning import vram_profile
-
-                    vram_profile.save(key, attempted)
-                except Exception:  # noqa: BLE001 -- persistence is best-effort
-                    pass
+        attempted = int(float(m.group(1)) * units[m.group(2)])
+        Engine._learn_decode_reserve(self, attempted)
         return attempted
 
-    def shrink_after_oom(self, fraction: float = 0.05) -> None:
-        """A forward ran out of memory: give back ``fraction`` of the expert cache (at least the
-        guard margin) so the next attempt fits; the idle guard keeps it honest afterwards."""
+    def _learn_decode_reserve(self, observed_bytes: int) -> None:
+        if observed_bytes <= self._decode_reserve_learned:
+            return
+        self._decode_reserve_learned = observed_bytes
+        key = getattr(self, "_vram_profile_key", None)
+        if key:
+            try:
+                from freetoken.tuning import vram_profile
+
+                vram_profile.save(key, observed_bytes)
+            except Exception:  # noqa: BLE001 -- persistence is best-effort
+                pass
+
+    def _learn_decode_peak(self) -> int:
+        """Learn allocator growth actually observed during the active decode phase."""
+        baseline = self._decode_allocator_baseline
+        if baseline is None:
+            return 0
+        peak = int(torch.cuda.max_memory_reserved(self.device))
+        observed = max(0, peak - baseline)
+        Engine._learn_decode_reserve(self, observed)
+        return observed
+
+    def shrink_after_oom(self) -> None:
+        """A forward ran out of memory: release backing sized from the failed allocation."""
         cache = self.moe_offload_cache
         if cache is None:
             return
         from freetoken.utils import div_ceil
 
         _, per_slot = self._target_moe_and_expert_bytes(None)
-        n = max(int(cache.resident_rows * fraction), div_ceil(self._VRAM_GUARD_MARGIN, per_slot))
+        needed = max(self._decode_reserve_learned, _vmm_resize_slack(cache))
+        n = max(1, div_ceil(needed, per_slot))
         target = max(1, cache.resident_rows - n)
         logger.info_rank0(f"OOM recovery: expert cache {cache.resident_rows} -> {target} slots")
         self._vram_guard_calm = 0
@@ -1409,7 +1533,7 @@ class Engine:
         self.rebuild_runtime_cache(moe_cache_size=target)
 
     @torch.inference_mode()
-    def set_decode_residency(self, grow: bool) -> None:
+    def set_decode_residency(self, grow: bool, *, stream_drained: bool = False) -> None:
         """Phase-aware expert residency. The plan sizes the expert cache so a full prefill chunk
         fits; while only decode runs that prefill transient is idle, so the cache grows in place
         into the device memory actually free (minus the guard margin), and folds back to the
@@ -1419,6 +1543,7 @@ class Engine:
         if not grow:
             if self._expert_decode_slots is None:
                 return
+            self._learn_decode_peak()
             self._expert_decode_slots = None
             self._decode_allocator_baseline = None
             logger.info_rank0(
@@ -1433,21 +1558,19 @@ class Engine:
         # the prefill window that just ended is the plan's real test: judge it before the
         # grow resets the peak counter
         self._guard_window(self._window_free_at_peak())
-        torch.cuda.synchronize(self.device)
+        if not stream_drained:
+            torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         self._decode_allocator_baseline = torch.cuda.memory_reserved(self.device)
         free, _ = torch.cuda.mem_get_info(self.device)
-        # the decode-grow floor is fragmentation, not the prefill spike: the fold reclaims
-        # this expansion synchronously before the next burst and guard_vram_before_forward
-        # prices _VRAM_GUARD_MARGIN at prefill -- charging the full margin again here double-
-        # counted it and stranded ~190 MiB under the 256K usable ceiling. The granules term
-        # is VMM rounding the grow cannot spend (same price _guard_window's regrow uses).
-        granules = (
-            len(getattr(cache, "_vmm_arenas", None) or ())
-            * len(getattr(cache, "pools", None) or ())
-            * (2 << 20)
-        )
-        reserve = max(self._VRAM_DECODE_GROW_MIN, self._decode_reserve_learned + granules)
+        # The prefill fold reclaims this expansion synchronously. The reserve comes from an
+        # observed decode allocation failure or the active driver's VMM granularity.
+        granules = _vmm_resize_slack(cache)
+        exact_price = getattr(cache, "backed_bytes_for", None)
+        # Exact expert backing prices the VMM growth, not scratch consumed by the
+        # next forward. Keep the measured allocator reserve and native VMM runway
+        # in either sizing path.
+        reserve = max(self._decode_reserve_learned, granules)
         prefill_rows = cache.resident_rows
         current_backing = cache.expert_pool_bytes
         available = max(0, free - reserve)
@@ -1456,7 +1579,11 @@ class Engine:
         # price non-linear (even non-monotone) in logical rows. Search from the largest shaped
         # size downward so the first fit is the maximum exact fit without assuming monotonicity.
         for candidate in range(cache.cache_size, prefill_rows, -1):
-            delta = cache.backed_bytes_for(candidate) - current_backing
+            delta = (
+                exact_price(candidate) - current_backing
+                if exact_price is not None
+                else (candidate - prefill_rows) * self._target_moe_and_expert_bytes(None)[1]
+            )
             if delta <= available:
                 target = candidate
                 break
@@ -1601,8 +1728,7 @@ class Engine:
             torch.cuda.empty_cache()
 
     def _set_kv_format(self, config: EngineConfig, fmt: str, why: str | None = None) -> None:
-        """Step the auto KV format down one rung (same attention backend family: fp8, nvfp4 and
-        turbo all run on the coded-KV backend chosen for fp8; QSA keeps qsa_sparse)."""
+        """Step the auto KV format down one rung within its attention backend family."""
         why = why or f"{config.kv_format} does not fit {config.max_seq_len} tokens"
         logger.info_rank0(f"KV format auto: {config.kv_format} -> {fmt} ({why})")
         from freetoken.tuning import diagnostics
@@ -2983,19 +3109,16 @@ def _adjust_config(config: EngineConfig):
         override("kv_format_auto", True)
     if (
         getattr(config, "kv_format", "auto") == "auto"
-        and config.attention_backend == "auto"
-        and required_attn_types == frozenset({AttnType.FULL})
+        and required_attn_types in (frozenset({AttnType.FULL}), frozenset({AttnType.QSA}))
         and specs_fn is not None
         and all(spec.head_dim % 128 == 0 for spec in specs_fn() if not spec.is_swa)
     ):
-        # fp8 is the auto KV format for every full-attention model (bf16 only by explicit
-        # --kv-format bf16; operator decision, campaign 19). Measured (campaign 18, Tiel 35B):
-        # half the KV bytes -> more expert slots / longer contexts; TG 64K +6%, 256K +30%, 4K -4%
-        # vs bf16; quality equal (needle 64K/256K, usage 20/20).
+        # Auto starts at FP8; BF16 remains explicit. It uses half the bytes and has
+        # measured near-lossless quality with higher TG on the project's certified models.
         override("kv_format", "fp8")
         logger.info_rank0("KV format auto -> fp8")
     if (
-        getattr(config, "kv_format", "auto") in ("turbo3", "turbo4", "fp8", "nvfp4")
+        getattr(config, "kv_format", "auto") in ("turbo3", "turbo4", "fp8")
         and config.attention_backend == "auto"
     ):
         if AttnType.QSA in required_attn_types:

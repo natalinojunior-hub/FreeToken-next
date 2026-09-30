@@ -27,7 +27,9 @@ from freetoken.tuning.mtp_profile import _profile_dir  # noqa: F401  (cache-root
 SCHEMA = "vram1"
 
 
-def compute_key(config, effective_max_seq_len: int, spec_mtp_cap: int, has_vision: bool, has_mtp_head: bool) -> str:
+def compute_key(
+    config, effective_max_seq_len: int, spec_mtp_cap: int, has_vision: bool, has_mtp_head: bool
+) -> str:
     base = key_from_config(config, effective_max_seq_len, spec_mtp_cap)
     axes = f"{SCHEMA}|{base}|v={int(bool(has_vision))}|m={int(bool(has_mtp_head))}"
     return hashlib.sha1(axes.encode()).hexdigest()[:24]
