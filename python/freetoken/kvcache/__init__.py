@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import torch
+
 import os
 from typing import TYPE_CHECKING, Protocol
 
@@ -123,6 +125,8 @@ def create_kv_pool(
     max_running_req = getattr(config, "max_running_req", 1)
     cache_type = getattr(config, "cache_type", "naive")
     host_capable = (QSAKVCache, MHAKVCache)
+    if host_pages and dtype == torch.bfloat16 and not hasattr(model_config, "kv_cache_group_specs"):
+        raise NotImplementedError("QSA BF16 KV pool requires a certified pool configuration")
     if host_pages and resolve_pool_class(model_config, kv_format) not in host_capable:
         raise NotImplementedError(
             "KV RAM tiering needs a host-tier capable KV pool; this model resolves to "
@@ -183,7 +187,7 @@ def create_kvcache_pool(
     # The registered MTP layer (with_mtp_layer) sits one past the target stack and rides
     # the full-attention group's layer_ids; every pool's dense-slot remap needs it in range.
     mtp_layer_id = getattr(model_config, "mtp_layer_id", None)
-    num_layers = max(model_config.num_layers, (mtp_layer_id or -1) + 1)
+    num_layers = max(getattr(model_config, "num_layers", 1), (mtp_layer_id or -1) + 1)
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
 
