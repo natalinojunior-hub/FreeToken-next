@@ -24,6 +24,16 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _safe_spec_mtp_depth(model_type: str, requested: int) -> int:
+    """Keep the Qwen3.5 MTP path disabled until target-state parity is proven."""
+    if model_type == "qwen3_5_moe" and requested > 0:
+        logger.warning(
+            "qwen3_5_moe MTP is disabled: speculative target/GDN state parity is unproven"
+        )
+        return 0
+    return max(0, requested)
+
+
 @dataclass(frozen=True)
 class EngineConfig:
     model_path: str
@@ -121,8 +131,8 @@ class EngineConfig:
     distributed_timeout: float = 60.0
     use_dummy_weight: bool = False
     use_pynccl: bool = True
-    # Native checkpoint MTP draft depth. Runtime execution remains disabled until the model
-    # and scheduler expose the matching draft/verify/rollback path.
+    # Native checkpoint MTP draft depth. Unsafe family paths are clamped during model
+    # resolution so an incorrect speculative response can never reach production.
     spec_mtp: int = 0
     max_seq_len_override: int | None = None
     max_extend_tokens: int = 8192
@@ -195,6 +205,9 @@ class EngineConfig:
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
         model_config = replace(model_config, quant=quant)
+        safe_spec_mtp = _safe_spec_mtp_depth(model_config.model_type, self.spec_mtp)
+        if safe_spec_mtp != self.spec_mtp:
+            object.__setattr__(self, "spec_mtp", safe_spec_mtp)
         if model_config.model_type == "qwen3_5_moe" and model_config.native_mtp_layers == 0:
             from freetoken.models.qwen3_5_moe.mtp import has_hf_mtp_weights
 

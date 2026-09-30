@@ -10,6 +10,13 @@ from freetoken.models.qwen3_5_moe.mtp import (
     is_hf_mtp_head,
     iter_hf_mtp_weights,
 )
+from freetoken.engine.config import _safe_spec_mtp_depth
+
+
+def test_qwen35_mtp_is_fail_closed_until_state_parity():
+    assert _safe_spec_mtp_depth("qwen3_5_moe", 6) == 0
+    assert _safe_spec_mtp_depth("qwen4_exp", 6) == 6
+    assert _safe_spec_mtp_depth("qwen3_5_moe", 0) == 0
 
 
 def test_standalone_mtp_sidecar_maps_to_model_state(tmp_path):
