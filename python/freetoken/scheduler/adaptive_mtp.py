@@ -341,7 +341,9 @@ class AdaptiveMtpController:
             raise ValueError("max_k must be an integer")
         self._runtime_max_k = max(0, min(self._runtime_max_k, max_k))
         self._profiled_depth = (
-            self._profiled_depth if self._profiled_depth is not None and self._profiled_depth <= self._runtime_max_k else None
+            self._profiled_depth
+            if self._profiled_depth is not None and self._profiled_depth <= self._runtime_max_k
+            else None
         )
         if self._selected_depth > self._runtime_max_k:
             self._selected_depth = self._runtime_max_k
@@ -509,9 +511,11 @@ class AdaptiveMtpController:
             # Tail raw steps are valid baseline samples; retain an unfinished audit.
             self._terminal_k0 = True
             return
-        # Always schedule a fresh bounded probe.  A profiled controller normally has
-        # no pending plan, but an OOM still invalidates that cached depth.
-        self._needs_reprobe = True
+        # A profiled controller can have no pending plan and no live samples; its
+        # cached depth is invalid after OOM.  A calibrated controller keeps its
+        # measured winner and remains terminal for the next request.
+        if self._plan or not any(window.samples for window in self._stats):
+            self._needs_reprobe = True
         if self._plan:
             self._discard_partial_stats = True
         self._terminal_k0 = True
