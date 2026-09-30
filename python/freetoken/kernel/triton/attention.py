@@ -460,7 +460,7 @@ def decode_paged_attention(
         assert k_host.shape[1:] == k_cache.shape[1:]
         assert v_host.shape[1:] == v_cache.shape[1:]
         assert num_device_slots is not None and num_device_slots > 0
-        assert k_host.is_cuda and v_host.is_cuda, "host KV must be mapped CUDA tensors"
+        assert k_host.device.type in ("cpu", "cuda") and v_host.device.type in ("cpu", "cuda")
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
     batch, num_q_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
@@ -1008,7 +1008,7 @@ def extend_paged_attention(
         assert k_host is not None and v_host is not None
         assert k_host.shape[1:] == k_cache.shape[1:] and v_host.shape[1:] == v_cache.shape[1:]
         assert num_device_slots is not None and num_device_slots > 0
-        assert k_host.is_cuda and v_host.is_cuda, "host KV must be mapped CUDA tensors"
+        assert k_host.device.type in ("cpu", "cuda") and v_host.device.type in ("cpu", "cuda")
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
     num_q_tokens, num_q_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
@@ -1058,6 +1058,8 @@ def extend_paged_attention(
     grid = (qo_indptr.numel() - 1, num_q_heads, triton.cdiv(max_q_len, block_m))
     if k_extend is not None or v_extend is not None:
         assert k_extend is not None and v_extend is not None
+        if has_host:
+            raise RuntimeError("FULL host KV extend split path is not capture-safe yet")
         assert k_extend.is_cuda and v_extend.is_cuda
         assert k_extend.dim() == 3 and v_extend.dim() == 3
         assert k_extend.shape[0] == num_q_tokens and v_extend.shape[0] == num_q_tokens

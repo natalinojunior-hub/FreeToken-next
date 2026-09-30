@@ -222,6 +222,17 @@ class TritonAttentionBackend(BaseAttnBackend):
             kv_heads, head_dim = k_raw.shape[-2], k_raw.shape[-1]
             k_cache = k_raw.view(-1, kv_heads, head_dim)
             v_cache = v_raw.view(-1, kv_heads, head_dim)
+        # FULL host-tier pages use the same flattened slot numbering as the device slab.
+        # Graph capture is intentionally fail-closed until host pointers are made capture-safe.
+        k_host = v_host = None
+        num_device_slots = None
+        if turbo is None and hasattr(self.kvcache, "host_kv"):
+            host_pair = self.kvcache.host_kv(layer_id)
+            if host_pair is not None:
+                if self.capture is not None:
+                    raise RuntimeError("FULL host KV is incompatible with Triton graph capture")
+                k_host, v_host = (x.reshape(-1, kv_heads, head_dim) for x in host_pair)
+                num_device_slots = int(k_cache.shape[0])
         assert head_dim == q.shape[-1]
 
         spec = attn_spec or AttentionSpec()
@@ -251,6 +262,9 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
                 turbo=turbo,
+                k_host=k_host,
+                v_host=v_host,
+                num_device_slots=num_device_slots,
             )
         if (
             metadata.fi_prefill
@@ -294,6 +308,9 @@ class TritonAttentionBackend(BaseAttnBackend):
                 v_extend=v.view(q.shape[0], kv_heads, head_dim),
                 block_ends=block_ends,
                 turbo=turbo,
+                k_host=k_host,
+                v_host=v_host,
+                num_device_slots=num_device_slots,
             )
         if block_ends is not None:
             raise NotImplementedError("bidirectional multimodal blocks need the extend kernel path")
@@ -302,6 +319,8 @@ class TritonAttentionBackend(BaseAttnBackend):
                 "the non-grouped paged_attention kernel has no coded arm; a turbo KV slab needs "
                 "the grouped decode or the extend path"
             )
+        if k_host is not None:
+            raise NotImplementedError("FULL host KV requires grouped decode or extend attention")
         return paged_attention(
             q=q,
             k_cache=k_cache,
