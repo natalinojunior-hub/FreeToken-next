@@ -355,6 +355,12 @@ class SchedulerSpecMixin:
         rows = getattr(self, "_mtp_kv_rows", None)
         if rows is not None and rows[0] == req.uid:
             self._mtp_kv_rows = None
+        # Request UIDs are recycled.  Do not feed a later request a residual or
+        # committed-row fill produced by this request's speculative window.
+        for name in ("_mtp_residual_by_uid", "_mtp_kv_rows_map"):
+            table = getattr(self, name, None)
+            if table is not None:
+                table.pop(req.uid, None)
         carry = getattr(self, "_mtp_prompt_carry", None)
         if carry is not None and carry[0] == req.uid:
             self._mtp_prompt_carry = None

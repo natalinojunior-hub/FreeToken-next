@@ -501,6 +501,20 @@ def test_free_request_discards_only_its_pending_draft_kv():
     assert scheduler._mtp_kv_rows[0] == req.uid + 1
 
 
+def test_free_request_discards_recycled_uid_residual_and_row_map():
+    req = _req(3, prompt_len=4)
+    scheduler = SimpleNamespace(
+        _spec_snapshot_slots={},
+        _mtp_residual_by_uid={req.uid: object(), req.uid + 1: object()},
+        _mtp_kv_rows_map={req.uid: object(), req.uid + 1: object()},
+    )
+    SchedulerSpecMixin.free_spec_snapshot_slot(scheduler, req)
+    assert req.uid not in scheduler._mtp_residual_by_uid
+    assert req.uid not in scheduler._mtp_kv_rows_map
+    assert req.uid + 1 in scheduler._mtp_residual_by_uid
+    assert req.uid + 1 in scheduler._mtp_kv_rows_map
+
+
 def test_run_spec_step_k2_rejection_and_acceptance_positions():
     """Run the production k=2 scheduler path over deterministic CPU fakes."""
     cases = (
