@@ -926,10 +926,17 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             if req.mamba_restore_src is not None:
                 pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
                 if pool.has_slot_state("mtp_residual"):
+                    residual = pool.slot_state("mtp_residual")[req.linear_slot_idx].unsqueeze(0).clone()
+                    # Prefix hits restore the slot on the engine stream. Keep the model's
+                    # scalar MTP seed in sync too; otherwise a recycled request can start
+                    # its first draft from the previous request's residual.
+                    model = getattr(getattr(self.engine, "model", None), "model", None)
+                    if model is not None:
+                        model._last_residual = residual
                     self._mtp_prompt_carry = (
                         req.uid,
                         req.cached_len,
-                        pool.slot_state("mtp_residual")[req.linear_slot_idx].unsqueeze(0).clone(),
+                        residual,
                     )
                 req.mamba_restore_src = None  # consumed: restore exactly once
 

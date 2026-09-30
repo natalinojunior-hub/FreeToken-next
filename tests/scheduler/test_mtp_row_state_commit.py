@@ -549,8 +549,10 @@ def test_restore_linear_prefix_primes_cloned_mtp_prompt_carry():
             return live
 
     req = SimpleNamespace(uid=42, mamba_restore_src=5, linear_slot_idx=2, cached_len=16)
+    model = SimpleNamespace(_last_residual=torch.full((1, 3), -1.0))
     scheduler = SimpleNamespace(
-        engine=SimpleNamespace(linear_state_pool=Pool()), _mtp_prompt_carry=None
+        engine=SimpleNamespace(linear_state_pool=Pool(), model=SimpleNamespace(model=model)),
+        _mtp_prompt_carry=None,
     )
     Scheduler._restore_linear_states(scheduler, SimpleNamespace(is_prefill=True, reqs=[req]))
 
@@ -559,6 +561,7 @@ def test_restore_linear_prefix_primes_cloned_mtp_prompt_carry():
     uid, cached_len, carry = scheduler._mtp_prompt_carry
     assert (uid, cached_len) == (42, 16)
     assert carry.shape == (1, 3) and carry.tolist() == [[1.0, 2.0, 3.0]]
+    assert model._last_residual.tolist() == [[1.0, 2.0, 3.0]]
     live[2].fill_(99)
     assert carry.tolist() == [[1.0, 2.0, 3.0]]
 
