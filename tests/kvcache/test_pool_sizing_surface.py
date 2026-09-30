@@ -68,6 +68,15 @@ def test_turbo_dispatch_ignores_linear_attention_group(kv_format):
     assert pool is TurboMHAKVCache
 
 
+def test_force_fp8_host_tiering_selects_plain_mha():
+    from freetoken.kvcache.mha_pool import MHAKVCache
+    from freetoken.kvcache.turbo_pool import TurboMHAKVCache
+
+    mc = _model_config((_spec("full", AttnType.FULL),))
+    assert resolve_pool_class(mc, "fp8") is TurboMHAKVCache
+    assert resolve_pool_class(mc, "fp8", host_tiering=True) is MHAKVCache
+
+
 def _generic_config(num_page_override=None):
     mc = _model_config((_spec("full", AttnType.FULL),))
     mc.linear_attention_group = lambda: None

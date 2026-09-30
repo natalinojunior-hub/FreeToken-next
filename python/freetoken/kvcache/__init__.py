@@ -30,7 +30,9 @@ SUPPORTED_CACHE_MANAGER = Registry[CacheManagerCreator]("Cache Manager")
 TURBO_BOOKS = ("fp8", "turbo4", "turbo3")
 
 
-def resolve_pool_class(model_config: ModelConfig, kv_format: str = "auto") -> type[BaseKVCachePool]:
+def resolve_pool_class(
+    model_config: ModelConfig, kv_format: str = "auto", *, host_tiering: bool = False
+) -> type[BaseKVCachePool]:
     """attn_type -> KV pool family, the dispatch shared by ``create_kv_pool`` and the
     engine's pre-pool sizing calls (the classmethod cost/solve surface). Driven by the
     group-spec walk (same source as the backend capability matrix); getattr fallbacks
@@ -96,6 +98,10 @@ def resolve_pool_class(model_config: ModelConfig, kv_format: str = "auto") -> ty
         return BSAKVCache
     from .mha_pool import MHAKVCache
 
+    # FP8 host tiering needs the plain MHA layout: Turbo pools have coded slabs and
+    # deliberately remain all-VRAM.  The override is opt-in; auto/all-VRAM stays unchanged.
+    if host_tiering and kv_format == "fp8":
+        return MHAKVCache
     if kv_format in TURBO_BOOKS:
         from .turbo_pool import TurboMHAKVCache
 
@@ -127,10 +133,15 @@ def create_kv_pool(
     host_capable = (QSAKVCache, MHAKVCache)
     if host_pages and dtype == torch.bfloat16 and not hasattr(model_config, "kv_cache_group_specs"):
         raise NotImplementedError("QSA BF16 KV pool requires a certified pool configuration")
-    if host_pages and resolve_pool_class(model_config, kv_format) not in host_capable:
+    resolved_cls = resolve_pool_class(
+        model_config,
+        kv_format,
+        host_tiering=bool(host_pages and kv_format == "fp8"),
+    )
+    if host_pages and resolved_cls not in host_capable:
         raise NotImplementedError(
             "KV RAM tiering needs a host-tier capable KV pool; this model resolves to "
-            f"{resolve_pool_class(model_config, kv_format).__name__}"
+            f"{resolved_cls.__name__}"
         )
     if resolve_pool_class(model_config) is DSV4PagedKVCache:
         # DSV4 is driven by the generic CacheManager over the shared page table; the pool is
@@ -315,7 +326,12 @@ def create_kvcache_pool(
     spec = kv_specs[0] if len(kv_specs) == 1 else None
     heads = spec.num_kv_heads if spec is not None else model_config.num_kv_heads
     dim = spec.head_dim if spec is not None else model_config.head_dim
-    if resolve_pool_class(model_config, kv_format) is TurboMHAKVCache:
+    pool_cls = resolve_pool_class(
+        model_config,
+        kv_format,
+        host_tiering=bool(host_pages and kv_format == "fp8"),
+    )
+    if pool_cls is TurboMHAKVCache:
         return TurboMHAKVCache(
             num_kv_heads=heads,
             num_layers=num_layers,

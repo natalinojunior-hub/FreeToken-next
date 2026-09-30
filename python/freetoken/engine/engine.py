@@ -595,7 +595,9 @@ class Engine:
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
         self._pool_cls = resolve_pool_class(
-            config.model_config, getattr(config, "kv_format", "auto")
+            config.model_config,
+            getattr(config, "kv_format", "auto"),
+            host_tiering=(config.kv_tiering == "force" and config.kv_format == "fp8"),
         )
         if self._pool_cls.__name__ == "TurboMHAKVCache":
             parts = [p.strip() for p in str(config.attention_backend).split(",")]
