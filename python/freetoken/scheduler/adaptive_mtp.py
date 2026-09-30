@@ -426,7 +426,7 @@ class AdaptiveMtpController:
                 # positive depth is cached -- a learned 0 ("speculation hurts") is rare and cheap
                 # to re-probe, and never caching it means a fluke k0 lock cannot get pinned.
                 self._pending_learned_depth = self._selected_depth
-            if was_depth_audit:
+            if not was_auditing or was_depth_audit:
                 self._depth_audit_interval = self._baseline_interval
             if not was_auditing and self._depth_audit_depth is None:
                 self._depth_audit_depth = self._next_depth_challenger()

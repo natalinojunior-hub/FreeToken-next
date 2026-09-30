@@ -293,6 +293,7 @@ def test_warmed_depth_audit_recovers_k5_without_promoting_k6():
     )
     assert controller.selected_depth == 3
     assert controller._depth_audit_depth == 5
+    assert controller._depth_audit_interval == controller._baseline_interval == 512
 
     for _ in range(4):
         for _ in range(2 * controller._baseline_interval + 16):
