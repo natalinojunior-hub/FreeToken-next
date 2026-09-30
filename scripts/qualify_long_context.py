@@ -467,6 +467,10 @@ def main() -> int:
             "needle_pass": sum(bool(row.get("pass")) for row in needle_rows),
             "usage_pass": sum(bool(row.get("pass")) for row in usage_rows),
             "usage_total": len(usage_rows),
+            "needle_usage_total": len(needle_rows),
+            "needle_completion_tokens": [
+                row.get("usage", {}).get("completion_tokens") for row in needle_rows
+            ],
             "gates": gates,
             "passed": passed,
             "runner_errors": [row for row in records if row["kind"] == "runner_error"],
