@@ -694,7 +694,14 @@ class MemoryPlanner:
                     t_lo if c_hi == c_lo else self._measure_prefill_transient(model, config, c_hi)
                 )
                 break
-            except torch.cuda.OutOfMemoryError as oom:
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as oom:
+                # Some backend allocators surface CUDA OOM as a plain RuntimeError.
+                # Keep unrelated runtime failures on their original path.
+                if (
+                    not isinstance(oom, torch.cuda.OutOfMemoryError)
+                    and "out of memory" not in str(oom).lower()
+                ):
+                    raise
                 # Even the minimal pools leave no room for this chunk: halve it.
                 # A genuine search step, bounded below by _MIN_CHUNK.
                 gc.collect()

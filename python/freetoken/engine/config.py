@@ -186,7 +186,10 @@ class EngineConfig:
         if "vision_config" in built and hasattr(hf_config, "vision_config") and self.mm.mmproj_path:
             from freetoken.models.qwen4_exp.mmproj import read_mmproj_vision_config
 
-            hf_config.vision_config = read_mmproj_vision_config(self.mm.mmproj_path)
+            # Keep the normalized value object for the family parser.  HF's
+            # strict setter rejects this internal type, so bypass validation
+            # only on this private, pre-parse copy.
+            object.__setattr__(hf_config, "vision_config", read_mmproj_vision_config(self.mm.mmproj_path))
         spec = self.model_spec
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
