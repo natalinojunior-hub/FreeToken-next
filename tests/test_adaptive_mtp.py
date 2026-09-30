@@ -295,8 +295,11 @@ def test_warmed_depth_audit_recovers_k5_without_promoting_k6():
     assert controller._depth_audit_depth == 5
 
     for _ in range(4):
-        for _ in range(64):
-            controller.observe(3, 0.010, 1)
+        for _ in range(2 * controller._baseline_interval + 16):
+            depth = controller.next_depth()
+            if depth == 5:
+                break
+            controller.observe(depth, 0.020 if depth == 0 else 0.010, 1)
         assert controller.next_depth() == 5
         controller.observe(5, 0.007, 1)
         assert controller.selected_depth != 6

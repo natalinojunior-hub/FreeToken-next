@@ -112,7 +112,6 @@ _MIN_DEPTH_SAMPLES = 4
 _PROBE_REPEATS = 4
 # Cap for the amortized k=0 audit cadence (see observe(): doubles on each confirming audit).
 _MAX_BASELINE_INTERVAL = 4096
-_DEPTH_AUDIT_INTERVAL = 64
 _DEPTH_AUDIT_SAMPLES = 4
 
 
@@ -157,6 +156,7 @@ class AdaptiveMtpController:
         self._cycles_since_baseline = 0
         self._baseline_interval = 32
         self._cycles_since_depth_audit = 0
+        self._depth_audit_interval = self._baseline_interval
         self._depth_audit_depth: int | None = None
         self._depth_audit_samples = 0
         self._depth_audit_inflight = False
@@ -206,6 +206,7 @@ class AdaptiveMtpController:
         self._cycles_since_baseline = 0
         self._baseline_interval = 32
         self._cycles_since_depth_audit = 0
+        self._depth_audit_interval = self._baseline_interval
         self._depth_audit_depth = None
         self._depth_audit_samples = 0
         self._depth_audit_inflight = False
@@ -308,6 +309,7 @@ class AdaptiveMtpController:
                 # The profile already came from a full calibration; defer k=0 validation and
                 # probe an adjacent positive depth to detect prompt-regime changes cheaply.
                 self._baseline_interval = 512
+                self._depth_audit_interval = self._baseline_interval
                 self._depth_audit_depth = (
                     self.safe_max_k
                     if self._profiled_depth < self.safe_max_k
@@ -424,6 +426,8 @@ class AdaptiveMtpController:
                 # positive depth is cached -- a learned 0 ("speculation hurts") is rare and cheap
                 # to re-probe, and never caching it means a fluke k0 lock cannot get pinned.
                 self._pending_learned_depth = self._selected_depth
+            if was_depth_audit:
+                self._depth_audit_interval = self._baseline_interval
             if not was_auditing and self._depth_audit_depth is None:
                 self._depth_audit_depth = self._next_depth_challenger()
         elif not was_probing:
@@ -456,7 +460,7 @@ class AdaptiveMtpController:
                 not self._terminal_k0
                 and self._depth_audit_depth is not None
                 and len(self._stats[0].samples) >= _MIN_BASELINE_SAMPLES
-                and self._cycles_since_depth_audit >= _DEPTH_AUDIT_INTERVAL
+                and self._cycles_since_depth_audit >= self._depth_audit_interval
             ):
                 if self._depth_audit_samples == 0:
                     self._stats[self._depth_audit_depth] = _RatioWindow()
