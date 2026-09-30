@@ -931,7 +931,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
                     # scalar MTP seed in sync too; otherwise a recycled request can start
                     # its first draft from the previous request's residual.
                     model = getattr(getattr(self.engine, "model", None), "model", None)
-                    if model is not None:
+                    if model is not None and getattr(self, "spec_mtp", 0) > 0:
                         model._last_residual = residual
                     self._mtp_prompt_carry = (
                         req.uid,
