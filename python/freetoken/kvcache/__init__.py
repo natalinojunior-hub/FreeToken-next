@@ -115,12 +115,14 @@ def create_kv_pool(
     from .hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens
     from .dsv4_paged_pool import DSV4PagedKVCache
     from .qsa_pool import QSAKVCache
+    from .mha_pool import MHAKVCache
 
     model_config = config.model_config
     kv_format = getattr(config, "kv_format", "auto")
-    if host_pages and resolve_pool_class(model_config, kv_format) is not QSAKVCache:
+    host_capable = (QSAKVCache, MHAKVCache)
+    if host_pages and resolve_pool_class(model_config, kv_format) not in host_capable:
         raise NotImplementedError(
-            "KV RAM tiering needs a QSA BF16 KV pool; this model resolves to "
+            "KV RAM tiering needs a host-tier capable KV pool; this model resolves to "
             f"{resolve_pool_class(model_config, kv_format).__name__}"
         )
     if resolve_pool_class(model_config) is DSV4PagedKVCache:

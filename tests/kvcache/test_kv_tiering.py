@@ -193,6 +193,32 @@ def test_certified_qsa_ram_tier_never_auto_compresses_below_fp8(monkeypatch):
     assert eng._kv_ram_dtype(config, pool, 1024) is None
 
 
+def test_certified_mha_ram_tier_accepts_35b_formats():
+    """35B FULL attention uses the same bounded host-page contract as QSA."""
+    from freetoken.engine import engine as eng
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(kv_ram_tier_certified=True),
+        kv_format="fp8",
+        tp_info=SimpleNamespace(size=1),
+    )
+    assert eng._kv_ram_tier_unsupported(config, MHAKVCache, torch.device("cuda")) is None
+
+
+@pytest.mark.parametrize("kv_format", ("auto", "fp8"))
+def test_certified_mha_ram_tier_accepts_ladder_formats(kv_format):
+    from freetoken.engine import engine as eng
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(kv_ram_tier_certified=True),
+        kv_format=kv_format,
+        tp_info=SimpleNamespace(size=1),
+    )
+    assert eng._kv_ram_tier_unsupported(config, MHAKVCache, torch.device("cuda")) is None
+
+
 def test_force_tiering_rejects_negative_kv_ram_tokens():
     with pytest.raises(ValueError, match="kv-ram-tokens"):
         EngineConfig.__post_init__(SimpleNamespace(kv_tiering="force", kv_ram_tokens=-1))

@@ -123,13 +123,16 @@ def _sgl_flash_attn_available() -> bool:
 
 def _kv_ram_tier_unsupported(config, pool_cls, device) -> str | None:
     """Why this engine cannot host KV pages in RAM, or None when it can."""
-    if _pool_name(pool_cls) != "QSAKVCache":
+    # QSA and regular MHA pools both implement the same pinned-host/page-table
+    # contract.  Keep the capability gate here so families opt in explicitly;
+    # unsupported pools still fail closed and retain the all-VRAM path.
+    if _pool_name(pool_cls) not in {"QSAKVCache", "MHAKVCache"}:
         return f"{_pool_name(pool_cls)} KV pool"
     if not getattr(config.model_config, "kv_ram_tier_certified", False):
         # Auto RAM tiering is a measured win only for the families that declared it; others stay
         # all-VRAM until certified on real hardware (--kv-tiering force is unaffected).
         return "model family not certified for KV in RAM"
-    if config.kv_format not in ("auto", "fp8"):
+    if config.kv_format not in ("auto", "fp8", "turbo4", "turbo3"):
         return f"kv_format={config.kv_format}"
     if config.tp_info.size != 1:
         return "tensor parallelism"
@@ -625,9 +628,9 @@ class Engine:
             else:
                 logger.info_rank0(f"KV RAM tier unavailable ({reason}); KV stays in VRAM")
         elif config.kv_tiering == "force":
-            if self._pool_cls.__name__ != "QSAKVCache":
+            if self._pool_cls.__name__ not in {"QSAKVCache", "MHAKVCache"}:
                 raise NotImplementedError(
-                    "--kv-tiering force needs a QSA KV pool; this model resolves to "
+                    "--kv-tiering force needs a host-tier capable KV pool; this model resolves to "
                     f"{self._pool_cls.__name__}"
                 )
             if not getattr(config.model_config, "kv_ram_tier_certified", False):
@@ -635,9 +638,7 @@ class Engine:
                     "--kv-tiering force requires a model family certified for KV in RAM"
                 )
             if config.kv_format not in ("auto", "fp8"):
-                raise NotImplementedError(
-                    f"--kv-tiering force needs QSA KV in auto/FP8; got {config.kv_format!r}"
-                )
+                raise NotImplementedError(f"--kv-tiering force needs auto/FP8 device KV; got {config.kv_format!r}")
             if config.tp_info.size != 1:
                 raise NotImplementedError(
                     "--kv-tiering force is not supported under tensor parallelism"
