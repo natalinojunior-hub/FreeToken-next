@@ -119,7 +119,7 @@ def _tuned_spec_mtp(kwargs: dict, native_mtp_layers: int | None = None) -> int:
     if kwargs.get("max_running_req") not in (None, 1):
         return ServerArgs.spec_mtp
     if native_mtp_layers is None:
-        native_mtp_layers = _native_mtp_layers(kwargs["model_path"])
+        native_mtp_layers = _native_mtp_layers(kwargs["model_path"], kwargs.get("mtp"))
     return 6 if native_mtp_layers == 1 else ServerArgs.spec_mtp
 
 
@@ -131,7 +131,13 @@ def _resolve_mtp_defaults(kwargs: dict, model_path: str | None = None) -> None:
     if (max_running_req is None and spec_mtp != 0) or (
         spec_mtp is None and max_running_req in (None, 1)
     ):
-        native_mtp_layers = _native_mtp_layers(kwargs.get("model_path", model_path))
+        native_path = kwargs.get("model_path", model_path)
+        native_override = kwargs.get("mtp")
+        native_mtp_layers = (
+            _native_mtp_layers(native_path)
+            if native_override is None
+            else _native_mtp_layers(native_path, native_override)
+        )
     if max_running_req is None:
         kwargs["max_running_req"] = (
             1 if native_mtp_layers == 1 and spec_mtp != 0 else ServerArgs.max_running_req
@@ -156,7 +162,7 @@ def _native_nextn_layers(model_path: str) -> int:
         return 0
 
 
-def _native_mtp_layers(model_path: str) -> int:
+def _native_mtp_layers(model_path: str, mtp_path: str | None = None) -> int:
     """Return the loaded checkpoint's native MTP layer count, including discovered GGUF heads."""
     try:
         from freetoken.utils import cached_load_hf_config
@@ -170,6 +176,11 @@ def _native_mtp_layers(model_path: str) -> int:
             return _native_nextn_layers(model_path)
 
         raw = config.to_dict()
+        if raw.get("model_type") == "qwen3_5_moe":
+            from freetoken.models.qwen3_5_moe.mtp import has_hf_mtp_weights
+
+            if has_hf_mtp_weights(mtp_path or model_path):
+                return 1
         text_config = raw.get("text_config") or raw
         mtp = text_config.get("mtp") or {}
         return int(mtp.get("num_hidden_layers", 0) or 0)
@@ -597,8 +608,7 @@ def parse_args(
         "--mtp",
         type=str,
         default=None,
-        help="Path to an external MTP draft-head GGUF file. Default: <model>-mtp.gguf next to "
-        "the model, else the GGUF in an MTP/ directory beside it.",
+        help="Path to an external MTP draft-head GGUF or supported Qwen3.5-MoE safetensors file.",
     )
 
     parser.add_argument(
