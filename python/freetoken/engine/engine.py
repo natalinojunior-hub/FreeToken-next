@@ -132,7 +132,7 @@ def _kv_ram_tier_unsupported(config, pool_cls, device) -> str | None:
         # Auto RAM tiering is a measured win only for the families that declared it; others stay
         # all-VRAM until certified on real hardware (--kv-tiering force is unaffected).
         return "model family not certified for KV in RAM"
-    if config.kv_format not in ("auto", "fp8", "turbo4", "turbo3"):
+    if _pool_name(pool_cls) == "QSAKVCache" and config.kv_format not in ("auto", "fp8"):
         return f"kv_format={config.kv_format}"
     if config.tp_info.size != 1:
         return "tensor parallelism"
