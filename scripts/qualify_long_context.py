@@ -353,8 +353,12 @@ def main() -> int:
     parser.add_argument("--needle-max-tokens", type=int, default=1024)
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--server-timeout", type=float, default=1200)
-    parser.add_argument("--serve-extra", action="append", default=[],
-                      help="extra serve args, e.g. --serve-extra=--kv-format --serve-extra=turbo3")
+    parser.add_argument(
+        "--serve-extra",
+        action="append",
+        default=[],
+        help="extra serve args, e.g. --serve-extra=--kv-format --serve-extra=turbo3",
+    )
     parser.add_argument("--request-timeout", type=float, default=900)
     args = parser.parse_args()
 
