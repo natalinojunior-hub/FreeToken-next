@@ -553,6 +553,7 @@ def test_restore_linear_prefix_primes_cloned_mtp_prompt_carry():
     scheduler = SimpleNamespace(
         engine=SimpleNamespace(linear_state_pool=Pool(), model=SimpleNamespace(model=model)),
         _mtp_prompt_carry=None,
+        spec_mtp=1,
     )
     Scheduler._restore_linear_states(scheduler, SimpleNamespace(is_prefill=True, reqs=[req]))
 
