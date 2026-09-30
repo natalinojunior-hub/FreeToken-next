@@ -187,7 +187,7 @@ def main() -> None:
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--tokens", type=int, default=261824)
     parser.add_argument("--decode", type=int, default=256)
-    parser.add_argument("--spec-mtp", type=int, choices=(0, 4), default=None)
+    parser.add_argument("--spec-mtp", type=int, default=None)
     parser.add_argument("--prompt-file", default=str(PROMPT_FILE))
     parser.add_argument("--runtime-repo", default=str(Path.cwd()))
     args = parser.parse_args()

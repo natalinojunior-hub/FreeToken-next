@@ -126,6 +126,29 @@ def test_probe_trim_explains_non_vmm_cache_rejection():
     )
 
 
+def test_probe_trim_releases_exact_vmm_rows_for_observed_allocation(monkeypatch):
+    from types import SimpleNamespace
+
+    targets = []
+    cache = SimpleNamespace(
+        _vmm_arenas=[object()],
+        resident_rows=2048,
+        set_live=targets.append,
+    )
+    planner = MemoryPlanner.__new__(MemoryPlanner)
+    planner.config = SimpleNamespace(tp_info=SimpleNamespace(size=1))
+    planner.model_config = SimpleNamespace(num_experts=4096)
+    planner.static_model = SimpleNamespace(expert_bytes_for_slots=lambda _count: MIB)
+    planner.min_pool_rows = lambda _num_experts: 1024
+    planner._probe_expert_cache = cache
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    assert planner._trim_probe_experts_for_scratch(
+        torch.cuda.OutOfMemoryError("Tried to allocate 64.00 MiB")
+    )
+    assert targets == [1984]
+
+
 def test_speculative_state_is_charged_once_across_request_slots():
     from dataclasses import replace
 
@@ -217,6 +240,9 @@ def test_ram_tier_keeps_only_the_hot_floor_on_device():
     assert planner._device_kv_pages(config) == 4096
     planner._host_pages = 4096  # whole context has a RAM page
     assert planner._device_kv_pages(config) == 128
+    config.model_config = SimpleNamespace(kv_ram_tier_certified=True)
+    config.kv_format = "fp8"
+    assert planner._device_kv_pages(config) == 0
     planner._host_pages = 1024  # RAM covers part: the device holds the remainder
     assert planner._device_kv_pages(config) == 3072
     short = SimpleNamespace(max_seq_len=4096, kv_reserve_tokens=8192)

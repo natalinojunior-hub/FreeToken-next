@@ -330,12 +330,18 @@ class MemoryPlanner:
 
     def _device_kv_pages(self, config: EngineConfig) -> int:
         """Device KV pages the context needs. With a KV RAM tier every token already has a RAM
-        page, so the device keeps only the hot floor (``kv_reserve_tokens``); the rest of the
-        budget goes to expert slots."""
+        page, so the device keeps only the hot floor (``kv_reserve_tokens``); certified QSA
+        FP8/RAM configurations place the whole request context on the host."""
         sm = self.static_model
         context_pages = sm.kv_pages_for_context(config.max_seq_len)
         if not self._host_pages:
             return context_pages
+        if (
+            getattr(getattr(config, "model_config", None), "kv_ram_tier_certified", False)
+            and getattr(config, "kv_format", None) == "fp8"
+            and self._host_pages >= context_pages
+        ):
+            return 0
         hot = sm.kv_pages_for_context(min(config.max_seq_len, config.kv_reserve_tokens))
         return max(hot, context_pages - self._host_pages)
 
@@ -746,7 +752,9 @@ class MemoryPlanner:
             return False
         m = re.search(r"Tried to allocate ([\d.]+)\s*(KiB|MiB|GiB|B)", str(oom))
         if not m:
-            logger.warning_rank0("  Probe OOM trim skipped: allocation size is absent from OOM text")
+            logger.warning_rank0(
+                "  Probe OOM trim skipped: allocation size is absent from OOM text"
+            )
             return False
         mult = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}[m.group(2)]
         attempted = int(float(m.group(1)) * mult)
@@ -754,7 +762,7 @@ class MemoryPlanner:
         from freetoken.utils import div_ceil
 
         floor = self.min_pool_rows(self.model_config.num_experts)
-        target = max(floor, cache.resident_rows - div_ceil(attempted + (16 << 20), per_slot))
+        target = max(floor, cache.resident_rows - div_ceil(attempted, per_slot))
         if target >= cache.resident_rows:
             logger.warning_rank0(
                 f"  Probe OOM trim skipped: {cache.resident_rows} resident rows are at "

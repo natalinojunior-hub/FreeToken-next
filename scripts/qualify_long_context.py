@@ -122,6 +122,12 @@ def _load_quality_tasks(path: Path):
                 selected.append(node)
     namespace: dict = {"__file__": str(path), "__name__": "_archived_quality_data"}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(path), "exec"), namespace)
+
+    def numeric_check(answer: str, expected: float) -> bool:
+        numbers = namespace["re"].findall(r"-?\d+(?:[.,]\d+)?", answer)
+        return bool(numbers) and abs(float(numbers[-1].replace(",", ".")) - expected) < 1e-6
+
+    namespace["_num"] = numeric_check
     tasks = namespace.get("TASKS")
     if not isinstance(tasks, list) or tuple(row[0] for row in tasks) != QUALITY_TASK_NAMES:
         raise ValueError(f"{path} does not contain the expected 20 archived quality tasks")
@@ -156,6 +162,9 @@ def _self_test(quality_source: Path) -> None:
     for name, _prompt, check in tasks:
         assert check(good[name]), f"positive validator fixture failed: {name}"
         assert not check("incorrect"), f"negative validator fixture passed: {name}"
+    checks = {name: check for name, _prompt, check in tasks}
+    assert checks["math4"]("Maria: 29. 29")
+    assert not checks["math4"]("29.29")
     assert NEEDLE in "answer: " + NEEDLE
     assert NEEDLE not in "wrong sentinel"
 
@@ -273,6 +282,7 @@ def _run_suite(args, suite: str, bench, records: list[dict], log_path: Path) -> 
                         {
                             "pass": NEEDLE in text,
                             "completion": text,
+                            "finish_reason": response["choices"][0].get("finish_reason"),
                             "usage": usage,
                             "context_fit": (
                                 prompt_tokens is not None
@@ -308,6 +318,7 @@ def _run_suite(args, suite: str, bench, records: list[dict], log_path: Path) -> 
                             {
                                 "pass": bool(check(text)),
                                 "completion": text,
+                                "finish_reason": response["choices"][0].get("finish_reason"),
                                 "usage": usage,
                                 "context_fit": (
                                     usage.get("prompt_tokens") is not None
@@ -340,7 +351,7 @@ def main() -> int:
         "--pythonpath", help="server PYTHONPATH; default is worktree/python:worktree/benchmarks"
     )
     parser.add_argument("--needle-max-tokens", type=int, default=1024)
-    parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--server-timeout", type=float, default=1200)
     parser.add_argument("--serve-extra", action="append", default=[],
                       help="extra serve args, e.g. --serve-extra=--kv-format --serve-extra=turbo3")
