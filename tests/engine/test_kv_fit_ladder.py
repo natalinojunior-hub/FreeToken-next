@@ -81,6 +81,17 @@ def test_certified_qsa_ram_context_needs_only_device_dummy_page():
     assert not eng._qsa_ram_context_fully_hosted(config, qsa, 256, 16384, True)
 
 
+def test_forced_mha_fp8_ram_context_can_be_fully_hosted():
+    mha = type("MHAKVCache", (), {})
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(kv_ram_tier_certified=False),
+        kv_format="fp8",
+        kv_tiering="force",
+        page_size=64,
+    )
+    assert eng._qsa_ram_context_fully_hosted(config, mha, 256, 16384, False)
+
+
 def test_mtp_is_shed_before_the_context_is_refused():
     cfg = SimpleNamespace(spec_mtp=2, max_seq_len=65856)
     assert eng._shed_mtp(cfg) is True and cfg.spec_mtp == 0

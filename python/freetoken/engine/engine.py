@@ -150,11 +150,14 @@ def _auto_kv_host_pages(config) -> int:
 def _qsa_ram_context_fully_hosted(
     config, pool_cls, host_pages: int, tokens: int, auto: bool
 ) -> bool:
+    force = getattr(config, "kv_tiering", "auto") == "force"
+    certified = getattr(getattr(config, "model_config", None), "kv_ram_tier_certified", False)
+    host_capable = _pool_name(pool_cls) in {"QSAKVCache", "MHAKVCache"}
     return (
-        auto
-        and _pool_name(pool_cls) == "QSAKVCache"
+        (auto or force)
+        and host_capable
         and getattr(config, "kv_format", None) == "fp8"
-        and getattr(getattr(config, "model_config", None), "kv_ram_tier_certified", False)
+        and (certified or force)
         and host_pages * config.page_size >= tokens
     )
 
