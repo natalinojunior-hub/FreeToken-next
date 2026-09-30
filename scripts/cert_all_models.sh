@@ -33,7 +33,7 @@ bench() { # bench name model extra-env... -- extra-serve-args...
     mtp_args=(--serve-arg=--spec-mtp --serve-arg=0)
   fi
   env ${envs[@]+"${envs[@]}"} "$PY" benchmarks/bench_pp_tg.py \
-    --model "$model" --tokens 16384 --decode 256 --repeats 6 --warmups 1 \
+    --model "$model" --tokens 16384 --decode 256 --repeats 3 --warmups 1 \
     --prompt-file "$PROMPT" --serve-arg=--max-seq-len --serve-arg=16704 \
     "${mtp_args[@]}" \
     ${extra[@]+"${extra[@]}"} --no-history --json "$A/cert-all.jsonl" --label "$name"

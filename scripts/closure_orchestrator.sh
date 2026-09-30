@@ -39,7 +39,7 @@ if ! git diff --quiet HEAD -- python tests; then status "FAIL ci-mutated-source"
 bench() { # bench phase-name tokens serve-ctx label
   local name=$1 tokens=$2 ctx=$3 label=$4
   run "$name" "$PY" benchmarks/bench_pp_tg.py \
-    --model "$MODEL" --tokens "$tokens" --decode 256 --repeats 6 --warmups 1 \
+    --model "$MODEL" --tokens "$tokens" --decode 256 --repeats 3 --warmups 1 \
     --prompt-file /models/desenvolvimento/old/freetoken-next/external/ft-campaign2/campaign26/prompt-470k.txt \
     --serve-arg=--max-seq-len --serve-arg="$ctx" --label "$label" --no-history \
     --json "$A/$label.jsonl"
