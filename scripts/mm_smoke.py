@@ -30,7 +30,7 @@ def _solid_png(rgb: tuple[int, int, int], size: int = 64) -> bytes:
 
     def chunk(tag: bytes, data: bytes) -> bytes:
         body = tag + data
-        return len(body).to_bytes(4, "big") + body + zlib.crc32(body).to_bytes(4, "big")
+        return len(data).to_bytes(4, "big") + body + zlib.crc32(body).to_bytes(4, "big")
 
     ihdr = size.to_bytes(4, "big") * 2 + b"\x08\x02\x00\x00\x00"
     raw = row * size

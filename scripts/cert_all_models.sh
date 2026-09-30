@@ -22,6 +22,9 @@ phase() { # phase name cmd... : record rc, keep going on failure (verdicts are d
 
 bench() { # bench name model extra-env... -- extra-serve-args...
   local name=$1 model=$2; shift 2
+  if [ -f "$A/cert-all.jsonl" ] && grep -q "\"label\": \"$name\"" "$A/cert-all.jsonl"; then
+    status "CACHED $name (verdict already in cert-all.jsonl)"; return 0
+  fi
   local envs=() extra=()
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   extra=("$@")
@@ -38,25 +41,52 @@ FT=/models/Qwen3.6-35B-A3B-NVFP4-FT
 
 status "cert-all begin pid=$$"
 
+ISTA=/models/Qwen3.8-Flash-Next-ISTA-IQ3_XXS/IQ3_XXS
+phase ista-16k-mtp    bench ista-16k-mtp "$ISTA"
+phase ista-16k-raw    bench ista-16k-raw "$ISTA" FREETOKEN_MTP_FORCE_DEPTH=0 --
+
 phase ad-16k-mtp      bench ad-16k-mtp "$AD"
 phase ad-16k-raw      bench ad-16k-raw "$AD" FREETOKEN_MTP_FORCE_DEPTH=0 --
-phase ad-mm           "$PY" scripts/mm_smoke.py --model "$AD" --label ad-mm --json "$A/cert-all.mm.jsonl"
+mm() { # mm name model : vision smoke only when the checkpoint carries an mmproj sidecar
+  local name=$1 model=$2
+  if [ -f "$A/cert-all.mm.jsonl" ] && grep -q "\"label\": \"$name\"" "$A/cert-all.mm.jsonl"; then
+    status "CACHED $name"; return 0
+  fi
+  if ! ls "$model"/*mmproj*.gguf >/dev/null 2>&1; then
+    status "SKIP $name (no mmproj sidecar)"; return 0
+  fi
+  phase "$name" "$PY" scripts/mm_smoke.py --model "$model" --label "$name" --json "$A/cert-all.mm.jsonl"
+}
+
+phase ista-mm         mm ista-mm /models/Qwen3.8-Flash-Next-ISTA-IQ3_XXS/IQ3_XXS
+phase ad-mm           mm ad-mm "$AD"
+phase pfe-mm          mm pfe-mm "$PFE"
+phase rad-mm          mm rad-mm "$RAD"
+phase ft-mm           mm ft-mm "$FT"
 
 phase pfe-16k-mtp     bench pfe-16k-mtp "$PFE"
 phase pfe-16k-raw     bench pfe-16k-raw "$PFE" FREETOKEN_MTP_FORCE_DEPTH=0 --
-phase pfe-mm          "$PY" scripts/mm_smoke.py --model "$PFE" --label pfe-mm --json "$A/cert-all.mm.jsonl"
 
 phase rad-16k-mtp     bench rad-16k-mtp "$RAD"
 phase rad-16k-raw     bench rad-16k-raw "$RAD" FREETOKEN_MTP_FORCE_DEPTH=0 --
-phase rad-mm          "$PY" scripts/mm_smoke.py --model "$RAD" --label rad-mm --json "$A/cert-all.mm.jsonl"
 
 phase ft-16k-mtp      bench ft-16k-mtp "$FT"
 phase ft-16k-raw      bench ft-16k-raw "$FT" FREETOKEN_MTP_FORCE_DEPTH=0 --
-phase ft-mm           "$PY" scripts/mm_smoke.py --model "$FT" --label ft-mm --json "$A/cert-all.mm.jsonl"
+
+# GATE (operator): the 256K phase runs only if every 16K MTP+RAW bench passed.
+if grep -E " FAIL .*16k" "$ST" | awk '{print $3}' | sort -u | while read -r nm; do
+    grep -q "\"label\": \"$nm\"" "$A/cert-all.jsonl" || echo UNCACHED
+  done | grep -q UNCACHED; then
+  status "cert-all: 16K gate FAILED -> skipping 256K phase"; exit 1
+fi
+status "cert-all: 16K gate OK -> entering 256K phase"
 
 # 256K qualification attempts (ISTA/AD/pfeiffer GGUF; Radix/FT largest feasible context recorded)
 qualify() { # qualify name model ctx
   local name=$1 model=$2 ctx=$3
+  if [ -f "$A/cert-all.qual.jsonl" ] && grep -q "\"label\": \"$name\"" "$A/cert-all.qual.jsonl"; then
+    status "CACHED $name"; return 0
+  fi
   phase "$name" "$PY" scripts/qualify_long_context.py --model "$model" --worktree "$REPO" \
     --context "$ctx" --mode usage --out "$A/cert-all.qual.jsonl"
 }
