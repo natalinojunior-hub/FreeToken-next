@@ -124,7 +124,8 @@ def create_kv_pool(
     page_size = getattr(config, "page_size", 1)
     max_running_req = getattr(config, "max_running_req", 1)
     cache_type = getattr(config, "cache_type", "naive")
-    host_capable = (QSAKVCache, MHAKVCache)
+    from .turbo_pool import TurboMHAKVCache
+    host_capable = (QSAKVCache, MHAKVCache, TurboMHAKVCache)
     if host_pages and dtype == torch.bfloat16 and not hasattr(model_config, "kv_cache_group_specs"):
         raise NotImplementedError("QSA BF16 KV pool requires a certified pool configuration")
     if host_pages and resolve_pool_class(model_config, kv_format) not in host_capable:
@@ -326,6 +327,8 @@ def create_kvcache_pool(
             device=device,
             layer_ids=layer_ids,
             book=kv_format,
+            host_pages=host_pages,
+            host_dtype=getattr(config, "kv_ram_resolved_dtype", None),
         )
     return MHAKVCache(
         num_kv_heads=heads,

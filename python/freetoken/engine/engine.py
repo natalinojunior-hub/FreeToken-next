@@ -126,7 +126,7 @@ def _kv_ram_tier_unsupported(config, pool_cls, device) -> str | None:
     # QSA and regular MHA pools both implement the same pinned-host/page-table
     # contract.  Keep the capability gate here so families opt in explicitly;
     # unsupported pools still fail closed and retain the all-VRAM path.
-    if _pool_name(pool_cls) not in {"QSAKVCache", "MHAKVCache"}:
+    if _pool_name(pool_cls) not in {"QSAKVCache", "MHAKVCache", "TurboMHAKVCache"}:
         return f"{_pool_name(pool_cls)} KV pool"
     if not getattr(config.model_config, "kv_ram_tier_certified", False):
         # Auto RAM tiering is a measured win only for the families that declared it; others stay
