@@ -8,6 +8,7 @@ infeasibility report, and the two-point transient model.
 from __future__ import annotations
 
 import pytest
+import torch
 
 from freetoken.engine.memory_planner import (
     MemoryPlanner,
@@ -79,6 +80,50 @@ def test_transient_is_linear_between_measured_points_and_floored_below():
     assert c.transient_at(6144) == 1250 * MIB
     with pytest.raises(AssertionError):
         c.transient_at(16384)  # never extrapolate past what was measured
+
+
+def test_phase_d_probe_reduces_chunk_below_256_after_measured_oom(monkeypatch):
+    from types import SimpleNamespace
+
+    planner = MemoryPlanner.__new__(MemoryPlanner)
+    planner.device = torch.device("cuda")
+    planner._probe_kv_pool = object()
+    observed = []
+
+    def prefill(_model, _config, chunk, _pool):
+        observed.append(chunk)
+        if chunk >= 256:
+            raise torch.cuda.OutOfMemoryError("Tried to allocate 64.00 MiB")
+
+    planner._run_validation_prefill = prefill
+    planner._measure_prefill_transient = lambda model, config, chunk: (
+        prefill(model, config, chunk, planner._probe_kv_pool) or chunk * MIB
+    )
+    planner._measure_graph_capture = lambda _config, _model: (0, 0)
+    planner._trim_probe_experts_for_scratch = lambda _oom: pytest.fail(
+        "a smaller measured chunk should fit before expert trimming"
+    )
+    for name in ("synchronize", "empty_cache", "reset_peak_memory_stats"):
+        monkeypatch.setattr(torch.cuda, name, lambda *_args: None)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *_args: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *_args: 0)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *_args: (8 * MIB, 16 * MIB))
+
+    calibration = planner.phase_d_runtime_calibration(
+        SimpleNamespace(max_extend_tokens=8192, max_seq_len=16384), object()
+    )
+    assert (calibration.chunk_lo, calibration.chunk_hi) == (64, 128)
+    assert min(observed) < 256
+
+
+def test_probe_trim_explains_non_vmm_cache_rejection():
+    from types import SimpleNamespace
+
+    planner = MemoryPlanner.__new__(MemoryPlanner)
+    planner._probe_expert_cache = SimpleNamespace(_vmm_arenas=[])
+    assert not planner._trim_probe_experts_for_scratch(
+        torch.cuda.OutOfMemoryError("Tried to allocate 64.00 MiB")
+    )
 
 
 def test_speculative_state_is_charged_once_across_request_slots():

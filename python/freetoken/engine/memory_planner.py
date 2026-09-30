@@ -67,7 +67,7 @@ class ContextInfeasible(RuntimeError):
 
 _MIB = 1 << 20
 _GIB = 1 << 30
-_MIN_CHUNK = 256
+_MIN_CHUNK = 1
 _MAX_PROBE_CHUNK = 8192
 _CHUNK_LADDER = (256, 512, 1024, 2048, 4096, 8192)
 
@@ -672,6 +672,7 @@ class MemoryPlanner:
         """
         c_hi = min(config.max_extend_tokens, config.max_seq_len, _MAX_PROBE_CHUNK)
         logger.info_rank0(f"Phase D: Runtime calibration up to chunk={c_hi}...")
+        trimmed_probe_experts = False
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         pre_alloc = torch.cuda.memory_allocated(self.device)
@@ -687,13 +688,20 @@ class MemoryPlanner:
                     t_lo if c_hi == c_lo else self._measure_prefill_transient(model, config, c_hi)
                 )
                 break
-            except torch.cuda.OutOfMemoryError:
+            except torch.cuda.OutOfMemoryError as oom:
                 # Even the minimal pools leave no room for this chunk: halve it.
                 # A genuine search step, bounded below by _MIN_CHUNK.
                 gc.collect()
                 torch.cuda.empty_cache()
                 if c_hi <= _MIN_CHUNK:
-                    raise
+                    # Chunk search is spent: the failing block is a fixed workspace the
+                    # backend still has to pay for on top of the pools. Evict probe
+                    # expert rows to cover it and retry once -- expert residency does
+                    # not change what phase D measures, only how slowly the probe runs.
+                    if trimmed_probe_experts or not self._trim_probe_experts_for_scratch(oom):
+                        raise
+                    trimmed_probe_experts = True
+                    continue
                 logger.warning_rank0(f"  Probe OOM at chunk={c_hi}; halving")
                 c_hi //= 2
         torch.cuda.synchronize(self.device)
@@ -716,6 +724,51 @@ class MemoryPlanner:
         )
         logger.info_rank0(f"  Calibration: {self.runtime_calibration}")
         return self.runtime_calibration
+
+    def _trim_probe_experts_for_scratch(self, oom: BaseException) -> bool:
+        """Pay for the allocation the probe OOM attempted by giving expert rows back.
+
+        The bytes are read from the driver's own message (never guessed per model),
+        so any backend's fixed workspace is covered by whatever the probe actually
+        needed. Only VMM-backed caches can shrink in place; everything else keeps
+        the original hard failure."""
+        import re
+
+        cache = getattr(self, "_probe_expert_cache", None)
+        if cache is None:
+            logger.warning_rank0("  Probe OOM trim skipped: no probe expert cache")
+            return False
+        if not getattr(cache, "_vmm_arenas", None):
+            logger.warning_rank0("  Probe OOM trim skipped: probe expert cache is not VMM-backed")
+            return False
+        if self.config.tp_info.size != 1:
+            logger.warning_rank0("  Probe OOM trim skipped: multi-rank VMM resize is unsupported")
+            return False
+        m = re.search(r"Tried to allocate ([\d.]+)\s*(KiB|MiB|GiB|B)", str(oom))
+        if not m:
+            logger.warning_rank0("  Probe OOM trim skipped: allocation size is absent from OOM text")
+            return False
+        mult = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}[m.group(2)]
+        attempted = int(float(m.group(1)) * mult)
+        per_slot = max(1, self.static_model.expert_bytes_for_slots(1))
+        from freetoken.utils import div_ceil
+
+        floor = self.min_pool_rows(self.model_config.num_experts)
+        target = max(floor, cache.resident_rows - div_ceil(attempted + (16 << 20), per_slot))
+        if target >= cache.resident_rows:
+            logger.warning_rank0(
+                f"  Probe OOM trim skipped: {cache.resident_rows} resident rows are at "
+                f"the non-evictable floor {floor} for a {attempted >> 20} MiB allocation"
+            )
+            return False
+        logger.warning_rank0(
+            f"  Probe OOM learned: expert rows {cache.resident_rows} -> {target} "
+            f"to cover {attempted >> 20} MiB backend workspace"
+        )
+        cache.set_live(target)
+        gc.collect()
+        torch.cuda.empty_cache()
+        return True
 
     def _measure_graph_capture(self, config: EngineConfig, model) -> Tuple[int, int]:
         """Measure CUDA graph capture memory cost."""

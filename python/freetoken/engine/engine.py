@@ -630,7 +630,20 @@ class Engine:
         from freetoken.layers.gguf import set_fp8_prefill
 
         set_fp8_prefill(not (getattr(config.model_config, "num_experts", 0) or 0))
-        self.model.load_state_dict(self._load_weight_state_dict(config))
+        try:
+            self.model.load_state_dict(self._load_weight_state_dict(config))
+        except Exception as exc:  # noqa: BLE001 -- a registered NextN head must never kill the serve
+            if getattr(config.model_config, "mtp_layer_id", None) is None:
+                raise
+            logger.warning(
+                f"Model load failed with the registered NextN layer ({exc!r}); "
+                "rebuilding without speculation"
+            )
+            object.__setattr__(config, "spec_mtp", 0)
+            object.__setattr__(config.model_config, "mtp_layer_id", None)
+            with torch.device("meta"), torch_dtype(config.dtype):
+                self.model = create_model(config.model_config)
+            self.model.load_state_dict(self._load_weight_state_dict(config))
         finalize_quant(self.model)
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
@@ -1315,6 +1328,31 @@ class Engine:
         self._charge_expert_cache(cache)
         # the rebuild's own transient (teardown, graph re-capture) is not the next window's peak
         torch.cuda.reset_peak_memory_stats(self.device)
+
+    def note_decode_oom(self, error: BaseException) -> int:
+        """Fold a refused forward allocation into the learned decode reserve and persist
+        it under the serve's VRAM fingerprint, so expansion never re-occupies the
+        footprint that just OOMed and the next serve of the same fingerprint (model,
+        kv_format, ctx, vision, MTP head, GPU) starts already protected. Self-adaptive:
+        no per-model guard constants anywhere."""
+        import re
+
+        m = re.search(r"Tried to allocate ([\d.]+)\s*(GiB|MiB|KiB|B)", str(error))
+        if not m:
+            return 0
+        units = {"GiB": 1 << 30, "MiB": 1 << 20, "KiB": 1 << 10, "B": 1}
+        attempted = int(float(m.group(1)) * units[m.group(2)]) + (4 << 20)
+        if attempted > self._decode_reserve_learned:
+            self._decode_reserve_learned = attempted
+            key = getattr(self, "_vram_profile_key", None)
+            if key:
+                try:
+                    from freetoken.tuning import vram_profile
+
+                    vram_profile.save(key, attempted)
+                except Exception:  # noqa: BLE001 -- persistence is best-effort
+                    pass
+        return attempted
 
     def shrink_after_oom(self, fraction: float = 0.05) -> None:
         """A forward ran out of memory: give back ``fraction`` of the expert cache (at least the

@@ -107,10 +107,35 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         except Exception as e:  # noqa: BLE001
             logger.info_rank0(f"mtp depth profile save skipped ({e})")
 
+    def _seed_vram_learned(self) -> None:
+        """Warm-start the decode reserve from the persisted VRAM profile and stash the
+        fingerprint key on the engine so future OOMs fold back into it. Best-effort."""
+        try:
+            from freetoken.tuning import vram_profile
+
+            eff_ctx = (
+                getattr(self.engine, "max_seq_len", None)
+                or getattr(self.config, "max_seq_len_override", None)
+                or getattr(self.config, "max_seq_len", 0)
+            )
+            self.engine._vram_profile_key = vram_profile.compute_key(
+                self.config,
+                eff_ctx,
+                self.config.spec_mtp,
+                bool(getattr(self.config, "active_encoders", None)),
+                getattr(self.config.model_config, "mtp_layer_id", None) is not None,
+            )
+            learned = vram_profile.load(self.engine._vram_profile_key)
+            if learned > self.engine._decode_reserve_learned:
+                self.engine._decode_reserve_learned = learned
+        except Exception:  # noqa: BLE001 -- warm start must never block serving
+            pass
+
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
 
         self.engine = Engine(config)
+        self._seed_vram_learned()
 
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
@@ -1218,7 +1243,41 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         except Exception as e:  # noqa: BLE001 -- only OOM is handled, everything else re-raised
             if not _is_oom(e):
                 raise
+            note = getattr(self.engine, "note_decode_oom", None)
+            attempted = note(e) if note is not None else 0
+            # One idempotent retry after paying the reserve back: a recomputed forward
+            # writes identical KV/GDN values into the same slots, and sampling/commit
+            # live outside forward, so re-issuing the exact batch is side-effect free.
+            oom_retry = getattr(self, "_oom_retry", None)
+            retry = oom_retry(forward_input, e, attempted) if oom_retry is not None else None
+            if retry is not None:
+                return retry
             self._oom_failed = ([r for r in forward_input.batch.reqs if r.uid >= 0], e)
+            return None
+
+    def _oom_retry(self, forward_input: ForwardInput, error: BaseException, attempted: int):
+        if getattr(self, "_oom_retried_input", None) is forward_input:
+            return None  # never loop: one retry per forward input
+        self._oom_retried_input = forward_input
+        try:
+            torch.cuda.synchronize(self.device)
+        except Exception:  # noqa: BLE001 -- sync is best-effort (stubs/cpu fallbacks)
+            pass
+        shrink = getattr(self.engine, "shrink_after_oom", None)
+        if shrink is not None:
+            try:
+                shrink(0.1)
+            except Exception:  # noqa: BLE001 -- shrink failure must not mask the retry
+                pass
+        try:
+            out = self._forward(forward_input)
+            logger.warning(
+                f"OOM recovered: retried forward after reserving {attempted >> 20} MiB"
+            )
+            return out
+        except Exception as e2:  # noqa: BLE001 -- second OOM falls through to fail path
+            if not _is_oom(e2):
+                raise
             return None
 
     def _flush_oom(self) -> None:

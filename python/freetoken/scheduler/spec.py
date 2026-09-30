@@ -788,7 +788,10 @@ class SchedulerSpecMixin:
         try:
             out = self.engine.forward_batch(vb, fi.sample_args)
             out.copy_done_event.synchronize()
-        except torch.cuda.OutOfMemoryError:
+        except torch.cuda.OutOfMemoryError as oom:
+            note = getattr(self.engine, "note_decode_oom", None)
+            if note is not None:
+                note(oom)
             if os.getenv("FREETOKEN_OOM_SNAPSHOT") and not getattr(
                 self, "_oom_snap_done", False
             ):

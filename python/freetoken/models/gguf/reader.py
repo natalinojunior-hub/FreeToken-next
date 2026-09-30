@@ -311,7 +311,12 @@ def is_gguf_path(model_path: str) -> bool:
     if os.path.isdir(model_path):
         pattern = os.path.join(model_path, "*-00001-of-?????.gguf")
         candidates = glob.glob(pattern)
-        return len(candidates) == 1
+        if len(candidates) == 1:
+            return True
+        # Single-file main next to companion ggufs (mmproj/mtp/ngram sidecars):
+        # e.g. pfeiffer 3.5bit layout. resolve_gguf_path already knows how to
+        # pick the main model file; if it finds one, this IS a gguf directory.
+        return resolve_gguf_path(model_path) is not None
 
     return False
 
