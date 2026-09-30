@@ -242,7 +242,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 ]
             )
             # one request: fla.cu_seqlens is [0, total] (a static buffer under the graph)
-            if os.getenv("FREETOKEN_GDN_VERIFY_SEQUENTIAL", "1") != "0":
+            if os.getenv("FREETOKEN_GDN_VERIFY_SEQUENTIAL") == "1":
                 one_seq = torch.tensor([0, 1], dtype=fla.cu_seqlens.dtype, device=mixed.device)
                 core_out = torch.cat(
                     [
