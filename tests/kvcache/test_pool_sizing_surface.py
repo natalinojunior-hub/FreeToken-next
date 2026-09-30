@@ -58,6 +58,16 @@ def test_resolve_pool_class_follows_attn_type():
     assert resolve_pool_class(SimpleNamespace()) is MHAKVCache
 
 
+@pytest.mark.parametrize("kv_format", ("fp8", "turbo4", "turbo3"))
+def test_turbo_dispatch_ignores_linear_attention_group(kv_format):
+    from freetoken.kvcache.mha_pool import MHAKVCache
+    from freetoken.kvcache.turbo_pool import TurboMHAKVCache
+
+    specs = (_spec("full", AttnType.FULL), _spec("linear", AttnType.LINEAR))
+    pool = resolve_pool_class(_model_config(specs), kv_format)
+    assert pool is TurboMHAKVCache
+
+
 def _generic_config(num_page_override=None):
     mc = _model_config((_spec("full", AttnType.FULL),))
     mc.linear_attention_group = lambda: None

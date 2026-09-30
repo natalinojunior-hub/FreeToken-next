@@ -52,7 +52,12 @@ def resolve_pool_class(model_config: ModelConfig, kv_format: str = "auto") -> ty
         return MHAKVCache
     specs = list(specs_fn())
     types = {spec.attn_type for spec in specs}
-    if kv_format in TURBO_BOOKS and AttnType.QSA not in types and types != {AttnType.FULL}:
+    backend_types = {attn_type for attn_type in types if attn_type.backend_driven}
+    if (
+        kv_format in TURBO_BOOKS
+        and AttnType.QSA not in backend_types
+        and backend_types != {AttnType.FULL}
+    ):
         raise NotImplementedError(
             f"--kv-format {kv_format} compresses the full-attention KV slab only; this model's "
             f"KV groups are {sorted(t.value for t in types)}, whose pool families address latent, "
