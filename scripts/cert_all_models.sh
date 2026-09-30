@@ -29,7 +29,9 @@ bench() { # bench name model extra-env... -- extra-serve-args...
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   extra=("$@")
   local mtp_args=(--serve-arg=--spec-mtp --serve-arg=5)
-  if [[ " ${envs[*]} " == *" FREETOKEN_MTP_FORCE_DEPTH=0 "* ]]; then mtp_args=(); fi
+  if [[ " ${envs[*]} " == *" FREETOKEN_MTP_FORCE_DEPTH=0 "* ]]; then
+    mtp_args=(--serve-arg=--spec-mtp --serve-arg=0)
+  fi
   env ${envs[@]+"${envs[@]}"} "$PY" benchmarks/bench_pp_tg.py \
     --model "$model" --tokens 16384 --decode 256 --repeats 6 --warmups 1 \
     --prompt-file "$PROMPT" --serve-arg=--max-seq-len --serve-arg=16704 \
