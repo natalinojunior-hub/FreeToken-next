@@ -31,7 +31,10 @@ def compute_key(
     config, effective_max_seq_len: int, spec_mtp_cap: int, has_vision: bool, has_mtp_head: bool
 ) -> str:
     base = key_from_config(config, effective_max_seq_len, spec_mtp_cap)
-    axes = f"{SCHEMA}|{base}|v={int(bool(has_vision))}|m={int(bool(has_mtp_head))}"
+    # Attention backend changes transient workspace and graph geometry.  Keep it in the
+    # fingerprint so a profile learned by Triton cannot silently warm-start another backend.
+    attention = str(getattr(config, "attention_backend", ""))
+    axes = f"{SCHEMA}|{base}|a={attention}|v={int(bool(has_vision))}|m={int(bool(has_mtp_head))}"
     return hashlib.sha1(axes.encode()).hexdigest()[:24]
 
 
@@ -40,18 +43,30 @@ def _path(key: str) -> str:
     return os.path.join(d, f"{key}.json")
 
 
-def save(key: str, learned_bytes: int) -> None:
-    if learned_bytes <= 0:
-        return
+def _write(key: str, data: dict[str, Any]) -> None:
     path = _path(key)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"schema": SCHEMA, "learned_bytes": int(learned_bytes)}, f)
+            json.dump(data, f)
         os.replace(tmp, path)
     except OSError:
         pass  # profile persistence must never block serving
+
+
+def save(key: str, learned_bytes: int) -> None:
+    if learned_bytes <= 0:
+        return
+    try:
+        with open(_path(key)) as f:
+            data: Any = json.load(f)
+    except (OSError, ValueError, TypeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data.update(schema=SCHEMA, learned_bytes=int(learned_bytes))
+    _write(key, data)
 
 
 def load(key: str) -> int:
@@ -64,3 +79,108 @@ def load(key: str) -> int:
         return value if value > 0 else 0
     except (OSError, ValueError, TypeError):
         return 0
+
+
+def save_calibration(key: str, calibration: Any, *, geometry: dict[str, Any]) -> None:
+    """Persist measured planner calibration; callers keep physical validation in the planner."""
+    try:
+        with open(_path(key)) as f:
+            data: Any = json.load(f)
+    except (OSError, ValueError, TypeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    values = {
+        name: int(getattr(calibration, name))
+        for name in (
+            "chunk_lo",
+            "transient_lo",
+            "chunk_hi",
+            "transient_hi",
+            "lazy_persistent",
+            "graph_capture_peak",
+            "graph_pool_size",
+            "non_pytorch_growth",
+        )
+    }
+    previous = data.get("calibration")
+    history = data.get("calibration_history", [])
+    if not isinstance(history, list):
+        history = []
+    samples = int(data.get("calibration_samples", 0)) if isinstance(data, dict) else 0
+    # A single boot can be disturbed by another process.  Require two matching successful
+    # planner observations before the fast path trusts the measurement.
+    if isinstance(previous, dict):
+        deltas = [abs(int(previous.get(k, 0)) - values[k]) for k in values]
+        if any(delta > max(4 << 20, values[k] // 10) for k, delta in zip(values, deltas)):
+            samples = 0
+            history = []
+    history.append(values)
+    history = history[-5:]
+    data.update(
+        schema=SCHEMA,
+        calibration=values,
+        geometry=dict(geometry),
+        calibration_history=history,
+        calibration_samples=max(samples + 1, len(history)),
+    )
+    _write(key, data)
+
+
+def load_calibration(
+    key: str, *, driver_total: int, page_size: int, attention_backend: str
+) -> dict[str, Any] | None:
+    """Return a calibration only when its physical geometry still matches this serve."""
+    try:
+        with open(_path(key)) as f:
+            data: Any = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(data, dict) or data.get("schema") != SCHEMA:
+        return None
+    geometry = data.get("geometry")
+    calibration = data.get("calibration")
+    history = data.get("calibration_history", [])
+    if (
+        not isinstance(geometry, dict)
+        or not isinstance(calibration, dict)
+        or not isinstance(history, list)
+        or int(data.get("calibration_samples", 0)) < 2
+    ):
+        return None
+    saved_total = int(geometry.get("driver_total", 0))
+    # Permit small driver-reporting drift, but never reuse a plan across a materially
+    # different device or page/attention geometry.
+    if saved_total <= 0 or abs(saved_total - int(driver_total)) > max(64 << 20, saved_total // 100):
+        return None
+    if int(geometry.get("page_size", 0)) != int(page_size):
+        return None
+    if str(geometry.get("attention_backend", "")) != str(attention_backend):
+        return None
+    fields = (
+        "chunk_lo",
+        "transient_lo",
+        "chunk_hi",
+        "transient_hi",
+        "lazy_persistent",
+        "graph_capture_peak",
+        "graph_pool_size",
+        "non_pytorch_growth",
+    )
+    try:
+        samples = [
+            {name: int(sample[name]) for name in fields}
+            for sample in history
+            if isinstance(sample, dict)
+        ]
+        if len(samples) < 2:
+            samples = [{name: int(calibration[name]) for name in fields}]
+        result = {
+            name: sorted(sample[name] for sample in samples)[len(samples) // 2]
+            for name in fields
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+    if result["chunk_lo"] <= 0 or result["chunk_hi"] < result["chunk_lo"]:
+        return None
+    return result

@@ -68,3 +68,52 @@ def test_scheduler_seed_warms_engine_from_profile(tmp_path, monkeypatch):
     Scheduler._seed_vram_learned(sched)
     assert eng._vram_profile_key == key
     assert eng._decode_reserve_learned == 512 * MIB
+
+
+def test_calibration_requires_two_matching_samples_and_geometry(tmp_path, monkeypatch):
+    monkeypatch.setattr(vram_profile, "_path", lambda key: str(tmp_path / f"{key}.json"))
+    key = "calibration-key"
+    calibration = SimpleNamespace(
+        chunk_lo=256,
+        transient_lo=8 * MIB,
+        chunk_hi=1024,
+        transient_hi=16 * MIB,
+        lazy_persistent=2 * MIB,
+        graph_capture_peak=32 * MIB,
+        graph_pool_size=4 * MIB,
+        non_pytorch_growth=1 * MIB,
+    )
+    geometry = {"driver_total": 16 * 1024 * MIB, "page_size": 64, "attention_backend": "triton"}
+    vram_profile.save_calibration(key, calibration, geometry=geometry)
+    assert vram_profile.load_calibration(
+        key, driver_total=geometry["driver_total"], page_size=64, attention_backend="triton"
+    ) is None
+    vram_profile.save_calibration(key, calibration, geometry=geometry)
+    assert vram_profile.load_calibration(
+        key, driver_total=geometry["driver_total"], page_size=64, attention_backend="triton"
+    ) == vars(calibration)
+    assert vram_profile.load_calibration(
+        key, driver_total=geometry["driver_total"] + 512 * MIB, page_size=64, attention_backend="triton"
+    ) is None
+
+
+def test_calibration_change_resets_sample_hysteresis(tmp_path, monkeypatch):
+    monkeypatch.setattr(vram_profile, "_path", lambda key: str(tmp_path / f"{key}.json"))
+    key = "calibration-key"
+    base = SimpleNamespace(
+        chunk_lo=256,
+        transient_lo=8 * MIB,
+        chunk_hi=1024,
+        transient_hi=16 * MIB,
+        lazy_persistent=2 * MIB,
+        graph_capture_peak=32 * MIB,
+        graph_pool_size=4 * MIB,
+        non_pytorch_growth=1 * MIB,
+    )
+    changed = SimpleNamespace(**{**vars(base), "transient_hi": 64 * MIB})
+    geometry = {"driver_total": 16 * 1024 * MIB, "page_size": 64, "attention_backend": "triton"}
+    vram_profile.save_calibration(key, base, geometry=geometry)
+    vram_profile.save_calibration(key, base, geometry=geometry)
+    assert vram_profile.load_calibration(key, driver_total=geometry["driver_total"], page_size=64, attention_backend="triton")
+    vram_profile.save_calibration(key, changed, geometry=geometry)
+    assert vram_profile.load_calibration(key, driver_total=geometry["driver_total"], page_size=64, attention_backend="triton") is None

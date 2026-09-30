@@ -1211,6 +1211,7 @@ class MemoryPlanner:
         weights_bytes: Optional[int] = None,
         host_reserve_bytes: int = 0,
         host_pages: int = 0,
+        cached_runtime_calibration: Optional[dict[str, int]] = None,
     ) -> PlanCandidate:
         """Execute multi-stage planning. ``host_pages`` is the KV RAM tier (0 = none)."""
         self._host_pages = host_pages
@@ -1276,9 +1277,19 @@ class MemoryPlanner:
             f"  Probe scaffolding overhead (reclaimed before final pools): {mem_GB(probe_overhead)}"
         )
 
-        # Phase D: warm-up + two-point prefill transient + graph capture,
-        # measured against the minimal probe pools.
-        self.phase_d_runtime_calibration(config, model)
+        # Phase D: warm-up + two-point prefill transient + graph capture.  A calibration that
+        # survived the profile's repeated-sample and physical-geometry checks is safe to reuse;
+        # phases A-C and I still allocate/validate the real candidate, so this is only a startup
+        # shortcut and never a correctness bypass.
+        if cached_runtime_calibration is None:
+            self.phase_d_runtime_calibration(config, model)
+        else:
+            try:
+                self.runtime_calibration = RuntimeCalibration(**cached_runtime_calibration)
+            except (TypeError, ValueError):
+                self.phase_d_runtime_calibration(config, model)
+            else:
+                logger.info_rank0("Phase D: reusing validated VRAM profile calibration")
 
         # The budget is measured ONCE, after the probe scaffolding is gone: it
         # already reflects CUDA context, modules, lmem and every persistent

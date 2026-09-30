@@ -1997,6 +1997,27 @@ class Engine:
             ladder = list(_kv_fit_ladder(config))
             first_fmt = config.kv_format
             while True:
+                cached_runtime_calibration = None
+                profile_key = None
+                try:
+                    from freetoken.tuning import vram_profile
+
+                    profile_key = vram_profile.compute_key(
+                        config,
+                        config.max_seq_len,
+                        config.spec_mtp,
+                        bool(getattr(config, "active_encoders", None)),
+                        getattr(config.model_config, "mtp_layer_id", None) is not None,
+                    )
+                    driver_total = int(torch.cuda.mem_get_info(self.device)[1])
+                    cached_runtime_calibration = vram_profile.load_calibration(
+                        profile_key,
+                        driver_total=driver_total,
+                        page_size=config.page_size,
+                        attention_backend=config.attention_backend,
+                    )
+                except Exception:  # noqa: BLE001 -- profile is only a startup optimization
+                    profile_key = None
                 planner = create_memory_planner(
                     config=config,
                     device=self.device,
@@ -2024,6 +2045,7 @@ class Engine:
                         weights_bytes=self._weights_bytes,
                         host_reserve_bytes=self._host_reserve_bytes,
                         host_pages=self.host_pages,
+                        cached_runtime_calibration=cached_runtime_calibration,
                     )
                 except ContextInfeasible:
                     retry_key = _mtp_state_precision_retry_candidate(
@@ -2093,6 +2115,24 @@ class Engine:
                         prepared_vmm_plan = None
                     prepared_cache = candidate
                 break
+
+            # Persist only a plan that completed the normal in-situ validation.  The profile
+            # loader requires two matching observations before skipping Phase D on a later boot.
+            if profile_key is not None and getattr(planner, "runtime_calibration", None) is not None:
+                try:
+                    from freetoken.tuning import vram_profile
+
+                    vram_profile.save_calibration(
+                        profile_key,
+                        planner.runtime_calibration,
+                        geometry={
+                            "driver_total": int(torch.cuda.mem_get_info(self.device)[1]),
+                            "page_size": int(config.page_size),
+                            "attention_backend": str(config.attention_backend),
+                        },
+                    )
+                except Exception:  # noqa: BLE001 -- persistence is best-effort
+                    pass
 
             object.__setattr__(config, "moe_cache_size", plan.expert_slots)
             self._prefill_transient_reserve = plan.transient_reserve
