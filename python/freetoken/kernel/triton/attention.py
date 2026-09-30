@@ -297,6 +297,10 @@ def _decode_grouped_stage1_kernel(
                     k = tl.where((slots[None, :] >= NUM_DEVICE_SLOTS), k_host, k_dev)
                 else:
                     k = tl.load(k_ptr + slots[None, :] * stride_ks + k_base_offsets, mask=k_mask, other=0.0)
+            # Host KV may use a wider staging dtype (currently FP32) than the
+            # query.  Triton requires equal operand dtypes for dot; normalize
+            # after the device/host merge so both paths are identical.
+            k = k.to(q.dtype)
             scores = tl.dot(q, k) * sm_scale
             scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
 
