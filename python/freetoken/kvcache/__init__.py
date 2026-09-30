@@ -195,6 +195,8 @@ def create_kvcache_pool(
     host_pages: int = 0,
     host_dtype: torch.dtype | str | None = None,
 ) -> BaseKVCachePool:
+    if host_pages and not hasattr(model_config, "num_layers"):
+        raise NotImplementedError("KV RAM tier requires a complete model configuration")
     # The registered MTP layer (with_mtp_layer) sits one past the target stack and rides
     # the full-attention group's layer_ids; every pool's dense-slot remap needs it in range.
     mtp_layer_id = getattr(model_config, "mtp_layer_id", None)
