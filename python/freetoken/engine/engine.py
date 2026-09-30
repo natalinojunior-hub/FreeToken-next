@@ -2724,12 +2724,23 @@ def _ensure_expandable_segments() -> None:
     logger.info_rank0("Enabled expandable_segments (override via PYTORCH_ALLOC_CONF)")
 
 
-def _resolve_cache_type(has_linear_attention: bool, requested: str) -> str:
+def _resolve_cache_type(
+    has_linear_attention: bool, requested: str, model_type: str | None = None
+) -> str:
     # Hybrid GDN models default to the HybridRadixCache (snapshots GDN state at chunk
     # boundaries -> cross-request prefix reuse). An explicit ``--cache-type naive`` opts out
     # to the old no-reuse path (debugging / parity baseline / lower GDN-state memory).
     if has_linear_attention:
-        return "naive" if requested == "naive" else "hybrid_radix"
+        if requested == "naive":
+            return "naive"
+        # Qwen3.5's GDN snapshot reuse still has an unclosed warm-prefix parity issue.
+        # Keep the family correct by default; the generic/Qwen3.8 paths retain HybridRadix.
+        if model_type == "qwen3_5_moe":
+            logger.warning_rank0(
+                "qwen3_5_moe HybridRadix warm-prefix is quarantined; using naive cache"
+            )
+            return "naive"
+        return "hybrid_radix"
     return requested
 
 
@@ -3124,7 +3135,11 @@ def _adjust_config(config: EngineConfig):
                 override("cache_type", "naive")
         override(
             "cache_type",
-            _resolve_cache_type(True, getattr(config, "cache_type", "radix")),
+            _resolve_cache_type(
+                True,
+                getattr(config, "cache_type", "radix"),
+                getattr(model_config, "model_type", None),
+            ),
         )
 
     # Type x backend capability matrix: resolve auto from the per-type priority

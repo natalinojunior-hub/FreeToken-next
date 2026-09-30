@@ -458,3 +458,4 @@ def test_linear_attention_defaults_to_hybrid_radix():
 
     assert _resolve_cache_type(True, "radix") == "hybrid_radix"
     assert _resolve_cache_type(True, "naive") == "naive"
+    assert _resolve_cache_type(True, "radix", "qwen3_5_moe") == "naive"
