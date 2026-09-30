@@ -80,7 +80,7 @@ class MHAKVCache(BaseKVCachePool):
         self._v_buffer = self._kv_buffer[1]
         # RAM tier: element-wise (BF16/FP8, read in place) or turbo codes + norms (decoded page
         # by page into device staging before attention reads them).
-        self.host_book = host_dtype if host_dtype in ("turbo8", "turbo4", "turbo3") else None
+        self.host_book = host_dtype if host_dtype in ("turbo4", "turbo3") else None
         self._kv_host = self._host_codes = self._host_norm = None
         if host_pages and self.host_book is not None:
             from freetoken.kernel.triton.turbo_kv import CODE_BYTES

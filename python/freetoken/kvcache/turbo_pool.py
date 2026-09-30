@@ -22,18 +22,6 @@ from .base import BaseKVCachePool
 _ROTATED = "stored rotated-domain; the fused read path consumes k_slab()/v_slab()"
 
 
-class LayeredCodes(list):
-    """Holds per-layer compressed KV codes allowing mixed-tier (turbo3/turbo4) storage."""
-
-    def zero_(self):
-        for t in self:
-            t.zero_()
-        return self
-
-    def numel(self) -> int:
-        return sum(t.numel() for t in self)
-
-
 def packed_bytes_per_token(head_dim: int, num_kv_heads: int, book: str, slabs: int = 2) -> int:
     from freetoken.kernel.triton.turbo_kv import CODE_BYTES, QK_TURBO
 
@@ -63,16 +51,10 @@ class TurboMHAKVCache(BaseKVCachePool):
         device: torch.device,
         layer_ids: Sequence[int] | None = None,
         book: str = "turbo4",
-        policy=None,
     ) -> None:
         from freetoken.kernel.triton.turbo_kv import CODE_BYTES, QK_TURBO, BOOKS
 
-        if book in ("vbr", "tcq") and policy is None:
-            from freetoken.kvcache.tcq_policy import TCQPolicy
-
-            policy = TCQPolicy(num_layers, base_format="turbo4", vbr_policy="balanced")
-
-        if book not in BOOKS and book not in ("vbr", "tcq"):
+        if book not in BOOKS:
             raise ValueError(f"unknown turbo book {book!r} (known: {', '.join(BOOKS)})")
         if head_dim % QK_TURBO:
             raise ValueError(
@@ -83,15 +65,7 @@ class TurboMHAKVCache(BaseKVCachePool):
             raise ValueError(f"turbo KV supports head_dim <= 512, got {head_dim}")
         if dtype not in (torch.bfloat16, torch.float16):
             raise ValueError(f"turbo KV quantizes {dtype} activations; expected bf16/fp16")
-        if book == "nvfp4" and (
-            device.type != "cuda" or torch.cuda.get_device_capability(device)[0] < 10
-        ):
-            raise ValueError(
-                "--kv-format nvfp4 needs a Blackwell GPU (sm_100+/sm_120): the attention kernel "
-                "decodes e2m1 with the hardware F2FP.E2M1 conversion"
-            )
-        self.book = "turbo4" if book in ("vbr", "tcq") else book
-        self.policy = policy
+        self.book = book
         self._dtype = dtype
         self._device = device
         self._num_layers = num_layers
@@ -101,9 +75,6 @@ class TurboMHAKVCache(BaseKVCachePool):
         self._groups = head_dim // QK_TURBO
         self._code_bytes = CODE_BYTES[self.book]
         self._layer_map: list[int] | None = None
-        self._storage_layer_ids = (
-            list(layer_ids) if layer_ids is not None else list(range(num_layers))
-        )
         num_storage_layers = num_layers
         if layer_ids is not None:
             num_storage_layers = len(layer_ids)
@@ -129,13 +100,8 @@ class TurboMHAKVCache(BaseKVCachePool):
     def book3(self) -> bool:
         return self.book == "turbo3"
 
-    def get_tier(self, layer_id: int, side: str = "k") -> str:
-        if self.policy is not None:
-            return self.policy.get_tier(layer_id, side)
-        return self.book
-
     def is_book3(self, layer_id: int, side: str = "k") -> bool:
-        return self.get_tier(layer_id, side) == "turbo3"
+        return self.book == "turbo3"
 
     @property
     def cent_tensor(self) -> torch.Tensor:
@@ -151,39 +117,14 @@ class TurboMHAKVCache(BaseKVCachePool):
         self._k_norm = torch.zeros(nshape, device=self._device, dtype=torch.float16)
         self._v_norm = torch.zeros(nshape, device=self._device, dtype=torch.float16)
 
-        if self.policy is not None and getattr(self.policy, "has_mixed_tiers", True):
-            k_list, v_list = [], []
-            for dense in range(self._num_storage_layers):
-                gid = self._storage_layer_ids[dense]
-                kt = self.get_tier(gid, "k")
-                vt = self.get_tier(gid, "v")
-                kb = CODE_BYTES[kt]
-                vb = CODE_BYTES[vt]
-                k_list.append(
-                    torch.zeros(
-                        (tokens, self._num_kv_heads, self._groups * kb),
-                        device=self._device,
-                        dtype=torch.uint8,
-                    )
-                )
-                v_list.append(
-                    torch.zeros(
-                        (tokens, self._num_kv_heads, self._groups * vb),
-                        device=self._device,
-                        dtype=torch.uint8,
-                    )
-                )
-            self._k_codes = LayeredCodes(k_list)
-            self._v_codes = LayeredCodes(v_list)
-        else:
-            shape = (
-                self._num_storage_layers,
-                tokens,
-                self._num_kv_heads,
-                self._groups * self._code_bytes,
-            )
-            self._k_codes = torch.zeros(shape, device=self._device, dtype=torch.uint8)
-            self._v_codes = torch.zeros(shape, device=self._device, dtype=torch.uint8)
+        shape = (
+            self._num_storage_layers,
+            tokens,
+            self._num_kv_heads,
+            self._groups * self._code_bytes,
+        )
+        self._k_codes = torch.zeros(shape, device=self._device, dtype=torch.uint8)
+        self._v_codes = torch.zeros(shape, device=self._device, dtype=torch.uint8)
 
     # ---- interface the backends use ----------------------------------------------
 
@@ -222,14 +163,12 @@ class TurboMHAKVCache(BaseKVCachePool):
         rows = out_loc.numel()
         # the page table hands us int32 slots and index_copy_ demands int64
         slots = out_loc if out_loc.dtype is torch.long else out_loc.long()
-        k_book = self.get_tier(layer_id, "k")
-        v_book = self.get_tier(layer_id, "v")
-        k_stride = CODE_BYTES[k_book] * self._groups
-        v_stride = CODE_BYTES[v_book] * self._groups
+        k_stride = self._code_bytes * self._groups
+        v_stride = self._code_bytes * self._groups
         k2 = k.reshape(rows, self._num_kv_heads, self._head_dim)
         v2 = v.reshape(rows, self._num_kv_heads, self._head_dim)
-        kq, kn = quantize(k2.reshape(-1, self._head_dim).to(self._dtype), k_book)
-        vq, vn = quantize(v2.reshape(-1, self._head_dim).to(self._dtype), v_book)
+        kq, kn = quantize(k2.reshape(-1, self._head_dim).to(self._dtype), self.book)
+        vq, vn = quantize(v2.reshape(-1, self._head_dim).to(self._dtype), self.book)
         self._k_codes[dense].index_copy_(0, slots, kq.reshape(rows, self._num_kv_heads, k_stride))
         self._k_norm[dense].index_copy_(
             0, slots, kn.reshape(rows, self._num_kv_heads, self._groups)
@@ -263,7 +202,7 @@ class TurboMHAKVCache(BaseKVCachePool):
             codes.shape[1] if hasattr(codes, "shape") else codes[dense].shape[0],
             codes.shape[2] if hasattr(codes, "shape") else codes[dense].shape[1],
         )
-        book = self.get_tier(layer_id, which)
+        book = self.book
         code_b = CODE_BYTES[book]
         flat = codes[dense].reshape(-1, code_b)
         nflat = norm[dense].reshape(-1, 1)
@@ -275,7 +214,7 @@ class TurboMHAKVCache(BaseKVCachePool):
     @classmethod
     def kv_cost(cls, config, **kwargs) -> tuple[int, int, int, int]:
         book = kwargs.get("book") or getattr(config, "kv_format", "auto")
-        if book not in ("turbo3", "turbo4", "fp8", "nvfp4"):
+        if book not in ("turbo3", "turbo4", "fp8"):
             raise ValueError(f"TurboMHAKVCache priced with book {book!r}")
         per_token = 0
         for spec in config.model_config.kv_cache_group_specs():

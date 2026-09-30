@@ -25,7 +25,7 @@ class CacheManagerCreator(Protocol):
 SUPPORTED_CACHE_MANAGER = Registry[CacheManagerCreator]("Cache Manager")
 
 
-TURBO_BOOKS = ("turbo3", "turbo4", "fp8", "nvfp4")
+TURBO_BOOKS = ("fp8", "turbo4", "turbo3")
 
 
 def resolve_pool_class(model_config: ModelConfig, kv_format: str = "auto") -> type[BaseKVCachePool]:
@@ -57,11 +57,6 @@ def resolve_pool_class(model_config: ModelConfig, kv_format: str = "auto") -> ty
             f"--kv-format {kv_format} compresses the full-attention KV slab only; this model's "
             f"KV groups are {sorted(t.value for t in types)}, whose pool families address latent, "
             "index and window tiers of their own. Use --kv-format auto."
-        )
-    if kv_format in ("fp8", "nvfp4") and AttnType.QSA in types:
-        raise NotImplementedError(
-            f"--kv-format {kv_format} is wired for the full-attention slab only; the QSA pool "
-            "stores bf16 or turbo codes. Use --kv-format auto/turbo3/turbo4."
         )
     if AttnType.DSV4 in types:
         from .dsv4_paged_pool import DSV4PagedKVCache
@@ -260,7 +255,6 @@ def create_kvcache_pool(
             mtp_layer_id=mtp_layer_id,
             preserve_mtp_prefix=bool(getattr(model_config, "mtp_residual_width", 0))
             and os.getenv("FREETOKEN_MTP_PROMPT_WARMUP", "1") == "1",
-            tcq_policy=getattr(model_config, "tcq_policy", None),
             host_pages=host_pages,
             host_dtype=host_dtype,
         )

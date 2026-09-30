@@ -34,11 +34,9 @@ def test_transcribed_constants_are_complete():
     assert sum(tk.SIGNS2) == -12
     assert len(tk.CENTROIDS_3) == 8 and len(tk.MID_3) == 7
     assert len(tk.CENTROIDS_4) == 16 and len(tk.MID_4) == 15
-    assert len(tk.CENTROIDS_8) == 256 and len(tk.MID_8) == 255
     for book, cent, mid in (
         ("turbo3", tk.CENTROIDS_3, tk.MID_3),
         ("turbo4", tk.CENTROIDS_4, tk.MID_4),
-        ("turbo8", tk.CENTROIDS_8, tk.MID_8),
     ):
         assert sorted(cent) == list(cent), book
         assert sorted(mid) == list(mid), book
@@ -136,9 +134,8 @@ def test_multi_group_row_quantizes_and_decodes_elementwise(book):
 @pytest.mark.parametrize("book", BOOKS)
 def test_deduped_norm_costs_the_stated_bytes(book):
     """turbo3 stores one fp16 norm per group where the reference stores four identical copies:
-    that is 6 B/row, and the accounting has to say so. turbo8 has no llama-turbo-optimal
-    reference to compare against, so only the byte/BPV bookkeeping is pinned for it."""
-    expected = {"turbo3": 50, "turbo4": 66, "turbo8": 130}
+    that is 6 B/row, and the accounting has to say so."""
+    expected = {"turbo3": 50, "turbo4": 66}
     ours = tk.CODE_BYTES[book] + 2
     assert ours == expected[book]
     if book in ("turbo3", "turbo4"):
@@ -162,7 +159,7 @@ def test_quantize_decode_recovers_the_group_energy(book):
 
 @pytest.mark.parametrize(
     ("book", "bound", "lloyd_max"),
-    [("turbo3", 0.036, 0.0345), ("turbo4", 0.010, 0.0095), ("turbo8", 0.00006, 0.000022)],
+    [("turbo3", 0.036, 0.0345), ("turbo4", 0.010, 0.0095)],
 )
 def test_gaussian_nmse_matches_the_lloyd_max_table(book, bound, lloyd_max):
     """The books are Lloyd-Max for a Gaussian source at 8 / 16 / 256 levels, whose normalized MSE
@@ -255,7 +252,7 @@ def test_value_side_error_is_a_floor_that_attention_sharpness_does_not_change(bo
 @pytest.mark.parametrize("book", BOOKS)
 def test_key_side_error_grows_with_logit_scale_and_only_with_it(book):
     """K enters through exp(), so its damage depends on how much the scores matter. Pinning the
-    direction (not a magic constant) is what tells the VBR scheduler to protect peaked layers."""
+    direction (not a magic constant) is what tells the quantizer to protect peaked layers."""
     errs = []
     for scale in (0.05, 0.5, 2.0):
         q, k, v = _synth(scale=scale)
@@ -298,9 +295,3 @@ def test_rejects_a_head_dim_that_is_not_a_group_multiple():
         tk.quantize(torch.randn(4, 96, device=DEVICE), "turbo4")
     with pytest.raises(ValueError, match="unknown turbo book"):
         tk.quantize(torch.randn(4, 128, device=DEVICE), "turbo9")
-
-
-def test_e2m1_rounds_half_to_even_and_saturates():
-    mag = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 0.3, 5.1, 9.0])
-    got = [tk.E2M1[i] for i in tk.e2m1_round(mag).tolist()]
-    assert got == [0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0, 0.5, 6.0, 6.0]

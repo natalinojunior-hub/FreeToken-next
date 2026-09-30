@@ -118,11 +118,10 @@ def test_kv_ram_budget_refuses_with_max_context(monkeypatch):
     from freetoken.engine import engine as eng
 
     gib = 1 << 30
-    monkeypatch.setattr(eng, "_meminfo", lambda: {"MemTotal": 96 * gib, "MemAvailable": 16 * gib})
+    monkeypatch.setattr(eng, "_meminfo", lambda: {"MemTotal": 96 * gib, "MemAvailable": 14 * gib})
     per_token = {
         torch.bfloat16: 25_600,
         torch.float8_e4m3fn: 12_800,
-        "turbo8": 13_000,
         "turbo4": 6_800,
     }
     pool = SimpleNamespace(
@@ -159,7 +158,6 @@ def test_kv_ram_budget_narrows_format_after_model_load(monkeypatch):
     per_token = {
         torch.bfloat16: 25_600,
         torch.float8_e4m3fn: 12_800,
-        "turbo8": 13_000,
         "turbo4": 6_800,
     }
     pool = SimpleNamespace(
@@ -168,9 +166,31 @@ def test_kv_ram_budget_narrows_format_after_model_load(monkeypatch):
     config = SimpleNamespace(max_seq_len=1 << 18, page_size=64, dtype=torch.bfloat16)
     config.kv_ram_resolved_dtype = eng._kv_ram_dtype(config, pool, (1 << 18) // 64)
     assert config.kv_ram_resolved_dtype is torch.float8_e4m3fn
-    avail["MemAvailable"] = 14 * gib  # experts pinned: 10 GiB gone
+    avail["MemAvailable"] = 12 * gib  # experts pinned: 12 GiB remains free
     eng._check_kv_ram_budget(config, pool, (1 << 18) // 64)
     assert config.kv_ram_resolved_dtype == "turbo4"
+
+
+def test_certified_qsa_ram_tier_never_auto_compresses_below_fp8(monkeypatch):
+    from freetoken.engine import engine as eng
+
+    gib = 1 << 30
+    avail = {"MemTotal": 96 * gib, "MemAvailable": 12 * gib}
+    monkeypatch.setattr(eng, "_meminfo", lambda: avail)
+    pool = type(
+        "QSAKVCache",
+        (),
+        {"host_tier_ram_bytes": staticmethod(lambda config, tokens, dtype=None: 2 * gib)},
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(kv_ram_tier_certified=True),
+        kv_ram_dtype="auto",
+        dtype=torch.bfloat16,
+        page_size=64,
+    )
+    assert eng._kv_ram_dtype(config, pool, 1024) is torch.float8_e4m3fn
+    avail["MemAvailable"] = 11 * gib  # FP8 no longer fits above the 10% kill margin
+    assert eng._kv_ram_dtype(config, pool, 1024) is None
 
 
 def test_force_tiering_rejects_negative_kv_ram_tokens():
@@ -196,6 +216,15 @@ def test_off_tiering_ignores_kv_ram_tokens():
     config = _config(kv_tiering="off", kv_ram_tokens=4096)
     assert config.kv_tiering == "off"
     assert config.kv_ram_tokens == 4096  # stored but has no effect (off keeps the all-VRAM path)
+
+
+def test_auto_tier_keeps_configured_hot_floor_on_device():
+    from freetoken.engine.engine import _auto_kv_host_pages
+
+    config = SimpleNamespace(max_seq_len=16704, page_size=64, kv_reserve_tokens=8192)
+    assert _auto_kv_host_pages(config) == 133
+    config.max_seq_len = 4096
+    assert _auto_kv_host_pages(config) == 0
 
 
 def test_force_tiering_accepts_positive_kv_ram_tokens():
@@ -237,7 +266,7 @@ def test_auto_tier_falls_back_to_vram_when_ram_is_short(monkeypatch):
     from freetoken.engine import engine as eng
 
     gib = 1 << 30
-    monkeypatch.setattr(eng, "_meminfo", lambda: {"MemTotal": 96 * gib, "MemAvailable": 16 * gib})
+    monkeypatch.setattr(eng, "_meminfo", lambda: {"MemTotal": 96 * gib, "MemAvailable": 14 * gib})
     pool = SimpleNamespace(host_tier_ram_bytes=lambda config, tokens, dtype=None: 5_200 * tokens)
     config = SimpleNamespace(
         max_seq_len=1 << 20, page_size=64, dtype=torch.bfloat16, kv_ram_resolved_dtype="turbo3"
@@ -251,6 +280,26 @@ def test_auto_tier_falls_back_to_vram_when_ram_is_short(monkeypatch):
     with pytest.raises(RuntimeError, match="o máximo possível é"):
         eng.Engine._fit_kv_ram_tier(engine, config)
     assert eng.EngineConfig.kv_tiering == "auto"
+
+
+def test_certified_auto_tier_refuses_when_fp8_ram_does_not_fit(monkeypatch):
+    from freetoken.engine import engine as eng
+
+    def fail(*args):
+        raise RuntimeError("context does not fit FP8 RAM tier")
+
+    monkeypatch.setattr(eng, "_check_kv_ram_budget", fail)
+    pool = type("QSAKVCache", (), {})
+    config = SimpleNamespace(model_config=SimpleNamespace(kv_ram_tier_certified=True))
+    engine = SimpleNamespace(
+        _pool_cls=pool,
+        host_pages=12,
+        _host_reserve_bytes=34,
+        _kv_tier_auto=True,
+    )
+    with pytest.raises(RuntimeError, match="does not fit FP8 RAM"):
+        eng.Engine._fit_kv_ram_tier(engine, config)
+    assert (engine.host_pages, engine._host_reserve_bytes) == (12, 34)
 
 
 def test_auto_kv_ram_tier_requires_certified_family():

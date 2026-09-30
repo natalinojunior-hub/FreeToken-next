@@ -26,7 +26,7 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     ``index_ratio`` > 1 (QSA) stores one index key per token group, not per token; that slab's
     ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
     fmt = getattr(config, "kv_format", "auto")
-    if fmt in ["turbo3", "turbo4", "fp8", "nvfp4"]:
+    if fmt in ["turbo3", "turbo4", "fp8"]:
         from .turbo_pool import packed_bytes_per_token
 
         per_token = (
@@ -38,23 +38,6 @@ def spec_kv_bytes_per_token(spec, config) -> int:
             )
             * spec.num_layers
         )
-    elif fmt in ["vbr", "tcq"] or getattr(config, "tcq_policy", None) is not None:
-        from freetoken.kernel.triton.turbo_kv import CODE_BYTES, QK_TURBO
-        from .tcq_policy import plan_vbr_schedule
-
-        vbr_pol = getattr(config, "tcq_policy", "balanced")
-        sched = plan_vbr_schedule(
-            spec.num_layers,
-            base_format="turbo4",
-            vbr_policy=vbr_pol if isinstance(vbr_pol, str) else "balanced",
-        )
-        heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        groups = spec.head_dim // QK_TURBO
-        per_token = 0
-        for i in range(spec.num_layers):
-            k_b = CODE_BYTES[sched.get_tier(i, "k")] + 2
-            v_b = CODE_BYTES[sched.get_tier(i, "v")] + 2
-            per_token += heads * groups * (k_b if spec.mla else (k_b + v_b))
     else:
         per_token = (
             (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)

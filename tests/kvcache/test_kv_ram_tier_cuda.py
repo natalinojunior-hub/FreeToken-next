@@ -562,7 +562,7 @@ def test_fp8_ram_tier_store_attend_stage_and_swap_track_bf16_reference():
     assert torch.equal(b[0, 1], kd[0].cpu().to(fp8))
 
 
-@pytest.mark.parametrize("book", ["turbo8", "turbo4", "turbo3"])
+@pytest.mark.parametrize("book", ["turbo4", "turbo3"])
 def test_turbo_ram_tier_store_decode_and_attention_track_reference(book):
     from freetoken.kernel.triton import turbo_kv as tk
     from freetoken.kernel.triton.qsa.tiered import turbo_inverse_rotation, turbo_pages_to_bf16
@@ -621,7 +621,7 @@ def test_turbo_ram_tier_store_decode_and_attention_track_reference(book):
     assert torch.allclose(got.float(), ref.float(), atol=3e-2, rtol=3e-2)
 
 
-@pytest.mark.parametrize("book", ["turbo8", "turbo4", "turbo3"])
+@pytest.mark.parametrize("book", ["turbo4", "turbo3"])
 def test_turbo_slots_decode_only_listed_rows(book):
     from freetoken.kernel.triton import turbo_kv as tk
     from freetoken.kernel.triton.qsa.tiered import turbo_inverse_rotation, turbo_slots_to_bf16
@@ -645,3 +645,39 @@ def test_turbo_slots_decode_only_listed_rows(book):
     untouched = torch.ones(rows, dtype=torch.bool, device=DEV)
     untouched[live] = False
     assert out[untouched].abs().max() == 0
+
+
+def test_coded_fp8_qsa_attention_reads_pinned_host_pages():
+    page_size, head_dim = 64, 128
+    gen = torch.Generator(device=DEV).manual_seed(19)
+    q = torch.randn(1, 1, head_dim, device=DEV, dtype=DTYPE, generator=gen)
+    kv = torch.randn(2 * page_size, 1, head_dim, device=DEV, dtype=DTYPE, generator=gen)
+    fp8 = kv.to(torch.float8_e4m3fn)
+    k_cache = fp8[:page_size].view(torch.uint8).contiguous()
+    v_cache = k_cache.clone()
+    k_norm = torch.ones(page_size, 1, 1, device=DEV, dtype=torch.float16)
+    v_norm = torch.ones_like(k_norm)
+    k_host = registered_host_empty((1, page_size, 1, head_dim), torch.float8_e4m3fn)
+    v_host = registered_host_empty((1, page_size, 1, head_dim), torch.float8_e4m3fn)
+    k_host[0].copy_(fp8[page_size:].cpu())
+    v_host[0].copy_(fp8[page_size:].cpu())
+    indices = torch.arange(2 * page_size, device=DEV, dtype=torch.int32)[None, :]
+    table = torch.tensor([[0, 1]], device=DEV, dtype=torch.int32)
+    token_to_req = torch.zeros(1, device=DEV, dtype=torch.int32)
+    got = qsa_sparse_paged_attention(
+        q,
+        k_cache,
+        v_cache,
+        indices,
+        table,
+        token_to_req,
+        kv_book="fp8",
+        kv_norms=(k_norm, v_norm),
+        cent=torch.zeros(1, device=DEV),
+        page_size=page_size,
+        host_kv=(k_host, v_host),
+    )
+    materialized = fp8.to(DTYPE).squeeze(1).float()
+    scores = q[0, 0].float() @ materialized.T / head_dim**0.5
+    expected = torch.softmax(scores, dim=-1) @ materialized
+    torch.testing.assert_close(got[0, 0].float(), expected, atol=3e-2, rtol=3e-2)

@@ -12,7 +12,7 @@ triton = pytest.importorskip("triton")
 import triton.language as tl  # noqa: E402
 
 from freetoken.kernel.triton import turbo_kv as tk  # noqa: E402
-from freetoken.kernel.triton.turbo_attn import turbo_k_tile, turbo_v_tile  # noqa: E402
+from freetoken.kernel.triton.turbo_attn import BOOK_CODE, turbo_k_tile, turbo_v_tile  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 
@@ -31,7 +31,7 @@ def _probe_tiles(
     D: tl.constexpr,
     N: tl.constexpr,
     CB: tl.constexpr,
-    BOOK3: tl.constexpr,
+    BOOK: tl.constexpr,
     NREAL: tl.constexpr,
 ):
     offs_d = tl.arange(0, D)
@@ -49,7 +49,7 @@ def _probe_tiles(
         stride_nh,
         offs_d,
         mask,
-        BOOK3,
+        BOOK,
         tl.float32,
     )
     vt = turbo_v_tile(
@@ -64,16 +64,14 @@ def _probe_tiles(
         stride_nh,
         offs_d,
         mask,
-        BOOK3,
+        BOOK,
         tl.float32,
     )
     tl.store(k_out_ptr + offs_d[:, None] * N + slots[None, :], kt)
     tl.store(v_out_ptr + slots[:, None] * D + offs_d[None, :], vt)
 
 
-# turbo_k_tile/turbo_v_tile only know the BOOK3 flag (turbo3 vs turbo4); turbo8 is RAM-tier only
-# for now (decoded to bf16 before attention, see qsa/tiered.py's turbo_pages_to_bf16).
-@pytest.mark.parametrize("book", ["turbo3", "turbo4"])
+@pytest.mark.parametrize("book", ["turbo3", "turbo4", "fp8"])
 @pytest.mark.parametrize("head_dim", [128, 256])
 def test_tile_readers_reconstruct_exactly_what_the_codec_stored(book, head_dim):
     device = torch.device("cuda")
@@ -88,7 +86,7 @@ def test_tile_readers_reconstruct_exactly_what_the_codec_stored(book, head_dim):
     # pool layout is [tokens, heads=head_dim//head_dim... ] -- one head here, so head axis = 1
     codes4 = codes.reshape(tokens, 1, groups * tk.CODE_BYTES[book])
     norm2 = norm.reshape(tokens, 1, groups)
-    cent = tk.CENTROIDS_3 if book == "turbo3" else tk.CENTROIDS_4
+    cent = tk._CENT_TABLE.get(book, (0.0,))
     cent_t = torch.tensor(cent, device=device, dtype=torch.float32)
 
     k_out = torch.empty(head_dim, tokens, device=device, dtype=torch.float32)
@@ -106,7 +104,7 @@ def test_tile_readers_reconstruct_exactly_what_the_codec_stored(book, head_dim):
         D=head_dim,
         N=tokens,
         CB=tk.CODE_BYTES[book],
-        BOOK3=book == "turbo3",
+        BOOK=BOOK_CODE[book],
         NREAL=tokens,
     )
     want = tk.decode_rotated(codes, norm, book)  # [tokens, head_dim]
@@ -141,7 +139,7 @@ def test_masked_lanes_read_zero(book):
         D=tk.QK_TURBO,
         N=tokens,
         CB=tk.CODE_BYTES[book],
-        BOOK3=book == "turbo3",
+        BOOK=BOOK_CODE[book],
         NREAL=real,
     )
     want = tk.decode_rotated(codes, norm, book)

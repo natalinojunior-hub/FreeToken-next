@@ -17,89 +17,11 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-# ``BOOK`` constexpr of the tile readers; ``cent`` is the centroid book (unused by fp8/nvfp4).
+# ``BOOK`` constexpr of the tile readers; ``cent`` is unused by fp8.
 BOOK_TURBO4 = tl.constexpr(0)
 BOOK_TURBO3 = tl.constexpr(1)
 BOOK_FP8 = tl.constexpr(2)
-BOOK_NVFP4 = tl.constexpr(3)
-BOOK_CODE = {"turbo4": 0, "turbo3": 1, "fp8": 2, "nvfp4": 3}
-
-
-@triton.jit
-def _e2m1(byte, odd):
-    """The e2m1 nibble of ``byte`` picked by ``odd`` (high nibble), as fp32. Decoded by Blackwell's
-    F2FP.E2M1 unit (cvt.rn.f16x2.e2m1x2); the nibble is isolated first, so only the low half of the
-    f16x2 result is used."""
-    nib = (byte.to(tl.int32) >> (odd.to(tl.int32) * 4)) & 15
-    pair = tl.inline_asm_elementwise(
-        "{ .reg .b8 b0, b1, b2, b3; mov.b32 {b0, b1, b2, b3}, $1; cvt.rn.f16x2.e2m1x2 $0, b0; }",
-        "=r,r",
-        [nib],
-        dtype=tl.int32,
-        is_pure=True,
-        pack=1,
-    )
-    return (pair & 0xFFFF).to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
-
-
-@triton.jit
-def _e2m1_f32(nib):
-    """e2m1 codes (0..15, one per element) -> fp32 through Blackwell's F2FP.E2M1 unit
-    (cvt.rn.f16x2.e2m1x2). The nibble is isolated by the caller: fed a whole byte under runtime
-    row strides the conversion came back wrong (reproduced; constexpr strides were fine)."""
-    pair = tl.inline_asm_elementwise(
-        "{ .reg .b8 b0, b1, b2, b3; mov.b32 {b0, b1, b2, b3}, $1; cvt.rn.f16x2.e2m1x2 $0, b0; }",
-        "=r,r",
-        [nib],
-        dtype=tl.int32,
-        is_pure=True,
-        pack=1,
-    )
-    # sign-extend the low half so the int16 narrowing is exact
-    return ((pair << 16) >> 16).to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
-
-
-@triton.jit
-def _e2m1_arith(nib, SCALED: tl.constexpr = True):
-    """e2m1 codes (int32, 0..15) -> fp32 with integer ops only: place sign/exponent/mantissa into
-    fp16 bits (the e2m1 grid is fp16's subnormal/low-normal range scaled by 2^-14), then * 2^14.
-    Exact for all 16 codes; no inline PTX (the b8 operand of cvt.rn.f16x2.e2m1x2 miscompiles
-    under runtime strides whichever way it is unpacked, campaign 19)."""
-    bits = ((nib & 8) << 12) | ((nib & 7) << 9)
-    v = bits.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
-    return v * 16384.0 if SCALED else v  # unscaled: the caller folds 2^14 into its block scale
-
-
-@triton.jit
-def nvfp4_halves(codes_ptr, norm_ptr, row, nrow, mask_n, D: tl.constexpr):
-    """([N, D/2], [N, D/2]) fp32 NVFP4 values at the even / odd elements (low / high nibble of
-    each code byte), block scale and group norm applied. ``row``/``nrow``: [N, 1] code / norm
-    row offsets. Each byte is loaded once; consumers that split their dot into even and odd
-    halves never interleave the two (a register shuffle per element)."""
-    j2 = tl.arange(0, D // 2)
-    byte = tl.load(
-        codes_ptr + row + ((j2 // 64) * 72 + j2 % 64)[None, :], mask=mask_n[:, None], other=0
-    ).to(tl.int32)
-    lo = _e2m1_arith(byte & 15, False)
-    hi = _e2m1_arith((byte >> 4) & 15, False)
-    N: tl.constexpr = lo.shape[0]
-    js = tl.arange(0, D // 16)
-    sc = tl.load(
-        codes_ptr + row + ((js // 8) * 72 + 64 + js % 8)[None, :], mask=mask_n[:, None], other=0
-    )
-    nrm = tl.load(norm_ptr + nrow + (js // 8)[None, :], mask=mask_n[:, None], other=0.0)
-    scale = sc.to(tl.float8e4nv, bitcast=True).to(tl.float32) * (nrm.to(tl.float32) * 16384.0)
-    lo = tl.reshape(tl.reshape(lo, (N, D // 16, 8)) * scale[:, :, None], (N, D // 2))
-    hi = tl.reshape(tl.reshape(hi, (N, D // 16, 8)) * scale[:, :, None], (N, D // 2))
-    return lo, hi
-
-
-@triton.jit
-def _nvfp4_v(codes_ptr, norm_ptr, row, nrow, mask_n, D: tl.constexpr):
-    """[N, D] NVFP4 tile, fp32 (element 2i = low nibble of byte i)."""
-    lo, hi = nvfp4_halves(codes_ptr, norm_ptr, row, nrow, mask_n, D)
-    N: tl.constexpr = lo.shape[0]
-    return tl.reshape(tl.join(lo, hi), (N, D))
+BOOK_CODE = {"turbo4": 0, "turbo3": 1, "fp8": 2}
 
 
 @triton.jit
@@ -126,17 +48,6 @@ def turbo_k_tile(
     if BOOK == BOOK_FP8:
         raw = tl.load(codes_ptr + col + (grp * 128 + jj)[:, None], mask=mask_n[None, :], other=0)
         return raw.to(tl.float8e4nv, bitcast=True).to(out_dtype)  # fp8 norm is always 1
-    if BOOK == BOOK_NVFP4:
-        # built row-major and transposed: a [D, N] gather of packed bytes measured 1.9x slower
-        rows = _nvfp4_v(
-            codes_ptr,
-            norm_ptr,
-            slots[:, None] * stride_ct + kv_head * stride_ch,
-            slots[:, None] * stride_nt + kv_head * stride_nh,
-            mask_n,
-            offs_d.shape[0],
-        )
-        return tl.trans(rows).to(out_dtype)
     nrm = tl.load(norm_ptr + ncol + grp[:, None], mask=mask_n[None, :], other=0.0).to(tl.float32)
     if BOOK == BOOK_TURBO3:
         low = tl.load(
@@ -181,8 +92,6 @@ def turbo_v_tile(
     if BOOK == BOOK_FP8:
         raw = tl.load(codes_ptr + row + (grp * 128 + jj)[None, :], mask=mask_n[:, None], other=0)
         return raw.to(tl.float8e4nv, bitcast=True).to(out_dtype)  # fp8 norm is always 1
-    if BOOK == BOOK_NVFP4:
-        return _nvfp4_v(codes_ptr, norm_ptr, row, nrow, mask_n, offs_d.shape[0]).to(out_dtype)
     nrm = tl.load(norm_ptr + nrow + grp[None, :], mask=mask_n[:, None], other=0.0).to(tl.float32)
     if BOOK == BOOK_TURBO3:
         low = tl.load(

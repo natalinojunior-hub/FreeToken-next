@@ -24,9 +24,7 @@ def _splits(batch, num_q_heads, max_kv_splits, head_dim, device):
     )
 
 
-# decode_paged_attention's fused code path only knows the BOOK3 flag (turbo3 vs turbo4); turbo8
-# is RAM-tier only for now (decoded to bf16 before attention, see qsa/tiered.py).
-@pytest.mark.parametrize("book", ["turbo3", "turbo4", "fp8", "nvfp4"])
+@pytest.mark.parametrize("book", ["turbo3", "turbo4", "fp8"])
 @pytest.mark.parametrize(("q_heads", "kv_heads"), [(16, 4), (8, 8)])
 def test_decode_on_codes_matches_decode_on_decoded_kv(book, q_heads, kv_heads):
     from freetoken.kernel.triton.attention import decode_paged_attention
@@ -214,33 +212,7 @@ def test_bf16_extend_is_untouched_by_the_branch():
     assert torch.equal(a, b)
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
-    reason="needs Blackwell (hardware e2m1 conversion)",
-)
-def test_nvfp4_tile_uses_the_hardware_e2m1_unit():
-    """The NVFP4 read path must be the Blackwell F2FP.E2M1 conversion, not a lookup table."""
-    import triton
-    import triton.language as tl
-
-    from freetoken.kernel.triton.turbo_attn import _e2m1
-
-    @triton.jit
-    def probe(x_ptr, o_ptr, N: tl.constexpr):
-        offs = tl.arange(0, N // 2)
-        b = tl.load(x_ptr + offs)
-        tl.store(o_ptr + offs * 2, _e2m1(b, offs < 0))
-        tl.store(o_ptr + offs * 2 + 1, _e2m1(b, offs >= 0))
-
-    x = torch.arange(256, dtype=torch.uint8, device="cuda")
-    out = torch.empty(512, dtype=torch.float32, device="cuda")
-    handle = probe[(1,)](x, out, N=512)
-    ref = torch.tensor([[tk.E2M1[i & 15], tk.E2M1[i >> 4]] for i in range(256)]).flatten()
-    assert torch.equal(out.cpu(), ref)
-    assert "cvt.rn.f16x2.e2m1x2" in handle.asm["ptx"]
-
-
-@pytest.mark.parametrize("book", ["nvfp4", "turbo4", "turbo3"])
+@pytest.mark.parametrize("book", ["turbo4", "turbo3"])
 def test_dequant_rows_matches_decode_rotated(book):
     """The prefix gather for the FlashInfer prefill: slots in any order, into a head-strided
     view of a wider scratch (runtime strides), bit-equal to the torch decode."""
@@ -264,7 +236,7 @@ def test_dequant_rows_matches_decode_rotated(book):
     )
 
 
-@pytest.mark.parametrize("book", ["nvfp4", "turbo4"])
+@pytest.mark.parametrize("book", ["turbo4"])
 def test_segmented_fi_prefill_matches_extend_on_codes(book):
     """FlashInfer over dequantized prefix segments (several per request) + the causal chunk,
     merged by LSE == the triton extend kernel reading the codes."""
