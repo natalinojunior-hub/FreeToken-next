@@ -51,8 +51,6 @@ class TurboMHAKVCache(BaseKVCachePool):
         device: torch.device,
         layer_ids: Sequence[int] | None = None,
         book: str = "turbo4",
-        host_pages: int = 0,
-        host_dtype: torch.dtype | str | None = None,
     ) -> None:
         from freetoken.kernel.triton.turbo_kv import CODE_BYTES, QK_TURBO, BOOKS
 
@@ -74,10 +72,6 @@ class TurboMHAKVCache(BaseKVCachePool):
         self._num_kv_heads = num_kv_heads
         self._head_dim = head_dim
         self._page_size = page_size
-        if not 0 <= host_pages < num_pages:
-            raise ValueError(f"host_pages ({host_pages}) must leave device pages of {num_pages}")
-        self._host_pages = host_pages
-        self._host_dtype = host_dtype
         self._groups = head_dim // QK_TURBO
         self._code_bytes = CODE_BYTES[self.book]
         self._layer_map: list[int] | None = None
@@ -117,9 +111,7 @@ class TurboMHAKVCache(BaseKVCachePool):
     def _alloc(self, num_pages: int) -> None:
         from freetoken.kernel.triton.turbo_kv import CODE_BYTES
 
-        device_pages = num_pages - self._host_pages
-        tokens = device_pages * self._page_size
-        self._device_pages = device_pages
+        tokens = num_pages * self._page_size
         self._tokens = tokens
         nshape = (self._num_storage_layers, tokens, self._num_kv_heads, self._groups)
         self._k_norm = torch.zeros(nshape, device=self._device, dtype=torch.float16)
@@ -133,23 +125,6 @@ class TurboMHAKVCache(BaseKVCachePool):
         )
         self._k_codes = torch.zeros(shape, device=self._device, dtype=torch.uint8)
         self._v_codes = torch.zeros(shape, device=self._device, dtype=torch.uint8)
-        self._host_codes = self._host_norm = None
-        if self._host_pages:
-            from .mha_pool import registered_host_empty
-
-            host_shape = (
-                self._num_storage_layers,
-                self._host_pages * self._page_size,
-                self._num_kv_heads,
-                self._groups * self._code_bytes,
-            )
-            norm_shape = host_shape[:-1] + (self._groups,)
-            self._host_codes = tuple(
-                registered_host_empty(host_shape, torch.uint8) for _ in range(2)
-            )
-            self._host_norm = tuple(
-                registered_host_empty(norm_shape, torch.float16) for _ in range(2)
-            )
 
     # ---- interface the backends use ----------------------------------------------
 
@@ -179,16 +154,6 @@ class TurboMHAKVCache(BaseKVCachePool):
         dense = self._dense(index)
         return self._v_codes[dense], self._v_norm[dense]
 
-    def host_turbo(self, index: int) -> tuple[torch.Tensor, ...] | None:
-        """Return the page-locked turbo RAM tier for one layer, if enabled."""
-        if self._host_codes is None:
-            return None
-        dense = self._dense(index)
-        return (
-            self._host_codes[0][dense], self._host_norm[0][dense],
-            self._host_codes[1][dense], self._host_norm[1][dense],
-        )
-
     def store_kv(
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
     ) -> None:
@@ -204,18 +169,14 @@ class TurboMHAKVCache(BaseKVCachePool):
         v2 = v.reshape(rows, self._num_kv_heads, self._head_dim)
         kq, kn = quantize(k2.reshape(-1, self._head_dim).to(self._dtype), self.book)
         vq, vn = quantize(v2.reshape(-1, self._head_dim).to(self._dtype), self.book)
-        qcodes = (kq.reshape(rows, self._num_kv_heads, k_stride), vq.reshape(rows, self._num_kv_heads, v_stride))
-        qnorms = (kn.reshape(rows, self._num_kv_heads, self._groups), vn.reshape(rows, self._num_kv_heads, self._groups))
-        on_dev = slots < self._device_pages * self._page_size
-        on_host = ~on_dev
-        for side, (codes, norms) in enumerate(zip(qcodes, qnorms)):
-            if bool(on_dev.any()):
-                self._k_codes[dense].index_copy_(0, slots[on_dev], codes[on_dev]) if side == 0 else self._v_codes[dense].index_copy_(0, slots[on_dev], codes[on_dev])
-                self._k_norm[dense].index_copy_(0, slots[on_dev], norms[on_dev]) if side == 0 else self._v_norm[dense].index_copy_(0, slots[on_dev], norms[on_dev])
-            if self._host_codes is not None and bool(on_host.any()):
-                hs = slots[on_host] - self._device_pages * self._page_size
-                self._host_codes[side][dense].index_copy_(0, hs, codes[on_host].cpu())
-                self._host_norm[side][dense].index_copy_(0, hs, norms[on_host].cpu())
+        self._k_codes[dense].index_copy_(0, slots, kq.reshape(rows, self._num_kv_heads, k_stride))
+        self._k_norm[dense].index_copy_(
+            0, slots, kn.reshape(rows, self._num_kv_heads, self._groups)
+        )
+        self._v_codes[dense].index_copy_(0, slots, vq.reshape(rows, self._num_kv_heads, v_stride))
+        self._v_norm[dense].index_copy_(
+            0, slots, vn.reshape(rows, self._num_kv_heads, self._groups)
+        )
 
     def attach_staging(self, binding: object) -> None:
         """Attach stable logical-page indirection for opt-in tiered launches."""
@@ -262,22 +223,6 @@ class TurboMHAKVCache(BaseKVCachePool):
             heads = _local_heads(spec, config)
             per_token += packed_bytes_per_token(spec.head_dim, heads, book) * spec.num_layers
         return per_token * config.page_size, 0, config.page_size, 0
-
-    @classmethod
-    def host_tier_device_bytes(cls, config, host_tokens: int) -> int:
-        # The attention backend may add a bounded staging slab; the pool itself is host-resident.
-        return 0
-
-    @classmethod
-    def host_tier_ram_bytes(cls, config, host_tokens: int, dtype=None) -> int:
-        total = 0
-        for spec in config.model_config.kv_cache_group_specs():
-            if spec.is_swa:
-                continue
-            heads = _local_heads(spec, config)
-            book = dtype if dtype in ("turbo3", "turbo4") else getattr(config, "kv_format", "turbo4")
-            total += 2 * spec.num_layers * packed_bytes_per_token(spec.head_dim, heads, book)
-        return total * host_tokens
 
     def rebuild_from_config(
         self, config, num_pages: int, *, num_swa_pages: int | None = None
