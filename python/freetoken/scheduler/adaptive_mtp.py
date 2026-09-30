@@ -112,6 +112,8 @@ _MIN_DEPTH_SAMPLES = 4
 _PROBE_REPEATS = 4
 # Cap for the amortized k=0 audit cadence (see observe(): doubles on each confirming audit).
 _MAX_BASELINE_INTERVAL = 4096
+_DEPTH_AUDIT_INTERVAL = 64
+_DEPTH_AUDIT_SAMPLES = 4
 
 
 class AdaptiveMtpController:
@@ -154,6 +156,11 @@ class AdaptiveMtpController:
         self._auditing = False
         self._cycles_since_baseline = 0
         self._baseline_interval = 32
+        self._cycles_since_depth_audit = 0
+        self._depth_audit_depth: int | None = None
+        self._depth_audit_samples = 0
+        self._depth_audit_inflight = False
+        self._depth_audited: set[int] = set()
 
     @property
     def selected_depth(self) -> int:
@@ -198,6 +205,11 @@ class AdaptiveMtpController:
         self._auditing = False
         self._cycles_since_baseline = 0
         self._baseline_interval = 32
+        self._cycles_since_depth_audit = 0
+        self._depth_audit_depth = None
+        self._depth_audit_samples = 0
+        self._depth_audit_inflight = False
+        self._depth_audited.clear()
 
     def _best_depth(self) -> int:
         """Cheapest speculation depth, biased toward actually speculating.
@@ -235,6 +247,18 @@ class AdaptiveMtpController:
         cheapest = min(eligible, key=lambda d: self._stats[d].cost)
         return cheapest
 
+    def _next_depth_challenger(self, *, exclude: int | None = None) -> int | None:
+        current = self._stats[self._selected_depth]
+        for depth in range(self.safe_max_k, 0, -1):
+            if depth in (self._selected_depth, exclude) or depth in self._depth_audited:
+                continue
+            candidate = self._stats[depth]
+            if len(candidate.samples) < _MIN_DEPTH_SAMPLES:
+                continue
+            if candidate.cost - 2 * candidate.se <= current.cost + 2 * current.se:
+                return depth
+        return None
+
     def begin_request(self, request_uid, epoch) -> None:
         if request_uid == self._request_uid and epoch == self._epoch:
             return
@@ -256,6 +280,7 @@ class AdaptiveMtpController:
             return
         elif incomplete_probe or self._discard_partial_stats:
             self._stats = [_RatioWindow() for _ in range(self.safe_max_k + 1)]
+            self._depth_audited.clear()
             self._needs_reprobe = True
             self._discard_partial_stats = False
         self._request_uid = request_uid
@@ -269,6 +294,7 @@ class AdaptiveMtpController:
                 # A cold probe is a new campaign. Discard old measurements so drift-triggered
                 # recalibration compares depths using samples from the current regime.
                 self._stats = [_RatioWindow() for _ in range(self.safe_max_k + 1)]
+                self._depth_audited.clear()
                 # k=0 baseline first (contiguous), then the positive depths round-robin so the
                 # depth-vs-time confound does not bias which depth looks cheapest (see the
                 # _PROBE_REPEATS comment above).
@@ -278,6 +304,15 @@ class AdaptiveMtpController:
                 )
                 self._selected_depth = 0
             self._needs_reprobe = False
+            if self._profiled_depth is not None:
+                # The profile already came from a full calibration; defer k=0 validation and
+                # probe an adjacent positive depth to detect prompt-regime changes cheaply.
+                self._baseline_interval = 512
+                self._depth_audit_depth = (
+                    self.safe_max_k
+                    if self._profiled_depth < self.safe_max_k
+                    else self._profiled_depth - 1
+                ) or None
         else:
             self._plan.clear()
             if (
@@ -320,13 +355,39 @@ class AdaptiveMtpController:
         calibration_finished = was_probing and not self._plan
         if calibration_finished:
             was_auditing = self._auditing
+            was_depth_audit = self._depth_audit_inflight
             depth_before_audit = self._selected_depth
             self._auditing = False
+            self._depth_audit_inflight = False
             self._profiled_depth = None
-            self._cycles_since_baseline = 0
-            self._observations_since_check = 0
+            if not was_depth_audit:
+                self._cycles_since_baseline = 0
+                self._observations_since_check = 0
             if not self._terminal_k0:
-                if was_auditing:
+                if was_depth_audit:
+                    candidate = self._depth_audit_depth
+                    if candidate is not None:
+                        self._depth_audit_samples = len(self._stats[candidate].samples)
+                        self._reselect_with_hysteresis()
+                        if self._selected_depth != depth_before_audit:
+                            self._pending_learned_depth = self._selected_depth
+                            self._depth_audit_depth = self._next_depth_challenger(exclude=candidate)
+                            self._depth_audit_samples = 0
+                        elif (
+                            self._depth_audit_samples >= 8
+                            or self._stats[candidate].cost - 2 * self._stats[candidate].se
+                            > self._stats[self._selected_depth].cost
+                            + 2 * self._stats[self._selected_depth].se
+                        ):
+                            self._depth_audited.add(candidate)
+                            self._depth_audit_depth = self._next_depth_challenger(exclude=candidate)
+                            if self._depth_audit_depth is None and candidate > 1:
+                                next_depth = candidate - 1
+                                self._depth_audit_depth = (
+                                    next_depth if next_depth != self._selected_depth else None
+                                )
+                            self._depth_audit_samples = 0
+                elif was_auditing:
                     # An audit is an insurance re-check of a cached depth, not a fresh
                     # campaign: keep the current depth unless it is clearly beaten or
                     # unsafe. The old direct _best_depth() call let probe noise flip the
@@ -334,11 +395,15 @@ class AdaptiveMtpController:
                     # the whole 103.6 -> 101.6 auto deficit measured on the cert model.
                     self._reselect_with_hysteresis()
                 else:
-                    self._selected_depth = self._best_depth()
+                    # Cold samples are noisy, especially at the requested maximum depth. Keep
+                    # that depth unless another positive depth clearly beats it; a short probe
+                    # must not replace a good requested cap with a lower point estimate.
+                    self._selected_depth = self.safe_max_k
+                    self._reselect_with_hysteresis()
                 if self._selected_depth == 0:
                     self.fallback_to_k0()
                     self._needs_reprobe = True
-            if was_auditing:
+            if was_auditing and not was_depth_audit:
                 # Amortized counterfactual insurance: each audit that CONFIRMS the same
                 # depth is new evidence of a stable regime, so the cadence quadruples
                 # (capped). A changed pick resets it -- a contested choice must be
@@ -348,7 +413,7 @@ class AdaptiveMtpController:
                     if self._selected_depth != depth_before_audit
                     else min(4 * max(self._baseline_interval, 32), _MAX_BASELINE_INTERVAL)
                 )
-            else:
+            elif not was_auditing:
                 # A fresh campaign just measured every depth against a brand-new k=0
                 # baseline; the counterfactual is proven current, so the first audit can
                 # wait a full amortized interval instead of taxing the next served burst.
@@ -359,17 +424,25 @@ class AdaptiveMtpController:
                 # positive depth is cached -- a learned 0 ("speculation hurts") is rare and cheap
                 # to re-probe, and never caching it means a fluke k0 lock cannot get pinned.
                 self._pending_learned_depth = self._selected_depth
+            if not was_auditing and self._depth_audit_depth is None:
+                self._depth_audit_depth = self._next_depth_challenger()
         elif not was_probing:
             self._observations_since_check += 1
             if depth > 0:
                 self._cycles_since_baseline += 1
+                self._cycles_since_depth_audit += 1
             if self._observations_since_check >= 8:
                 self._observations_since_check = 0
-                if window.drifted(harmful_only=True) and self._best_depth() != depth:
+                if (
+                    len(self._stats[0].samples) >= _MIN_BASELINE_SAMPLES
+                    and window.drifted(harmful_only=True)
+                    and self._best_depth() != depth
+                ):
                     # A cost rise alone does not invalidate a depth that still wins the
                     # measured comparison. Periodic fresh k0 audits remain active below.
                     self._profiled_depth = None
                     self._needs_reprobe = True
+                    self._depth_audited.clear()
                     # A contested regime earns its counterfactual promptly again.
                     self._baseline_interval = 64
                 if not self._terminal_k0 and len(self._stats[0].samples) >= _MIN_BASELINE_SAMPLES:
@@ -379,6 +452,18 @@ class AdaptiveMtpController:
                 self._stats[0] = _RatioWindow()
                 self._plan = deque([0] * _MIN_BASELINE_SAMPLES)
                 self._auditing = True
+            elif (
+                not self._terminal_k0
+                and self._depth_audit_depth is not None
+                and len(self._stats[0].samples) >= _MIN_BASELINE_SAMPLES
+                and self._cycles_since_depth_audit >= _DEPTH_AUDIT_INTERVAL
+            ):
+                if self._depth_audit_samples == 0:
+                    self._stats[self._depth_audit_depth] = _RatioWindow()
+                self._plan = deque([self._depth_audit_depth])
+                self._auditing = True
+                self._depth_audit_inflight = True
+                self._cycles_since_depth_audit = 0
 
     def _reselect_with_hysteresis(self) -> None:
         best = self._best_depth()

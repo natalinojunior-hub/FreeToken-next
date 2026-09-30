@@ -179,7 +179,7 @@ def test_cost_rise_keeps_measured_winner_and_counterfactual_audits():
     assert controller.next_depth() == 0
 
 
-@pytest.mark.parametrize("safe_max_k", [-1, 5, 1.0, True])
+@pytest.mark.parametrize("safe_max_k", [-1, 1.0, True])
 def test_rejects_invalid_safe_depth(safe_max_k):
     with pytest.raises(ValueError):
         AdaptiveMtpController(safe_max_k)
@@ -259,13 +259,8 @@ def test_noisy_but_cheaper_depth_is_not_locked_out_on_noise():
     assert controller.selected_depth == 1
 
 
-def test_deepest_within_noise_of_cheapest_wins():
-    """campaign37 reality: at calibration k4 (the --spec-mtp cap) measured *more* expensive
-    than k3 over 4 noisy samples (a cold outlier inflates its cost and se), but the two are
-    within noise of each other (k4's cost lower bound sits below k3's upper bound). The cap
-    the user asked for must win -- plain min-cost picked k3 (~102 TG) and left k4 (~104 TG,
-    'always max TG') on the table. A depth that is PROVABLY slower (low se, above the
-    ceiling) is still correctly skipped, so a real residency cliff is not mistaken for noise."""
+def test_cold_calibration_keeps_requested_cap_when_candidate_win_is_uncertain():
+    """A short cold probe retains the requested cap unless a lower depth clearly wins."""
     controller = AdaptiveMtpController(4)
     costs = {
         0: [0.0154] * 8,
@@ -280,6 +275,34 @@ def test_deepest_within_noise_of_cheapest_wins():
         index = controller.cost_summaries[depth]["samples"]
         controller.observe(depth, costs[depth][index], 1)
     assert controller.selected_depth == 4
+
+
+def test_warmed_depth_audit_recovers_k5_without_promoting_k6():
+    controller = AdaptiveMtpController(6)
+    _calibrate(
+        controller,
+        costs={
+            0: [0.020] * 8,
+            1: [0.015] * 4,
+            2: [0.013] * 4,
+            3: [0.010] * 4,
+            4: [0.012] * 4,
+            5: [0.040, 0.005, 0.020, 0.020],  # noisy cold measurements
+            6: [0.030] * 4,  # proven slower; never promote from one cheap outlier
+        },
+    )
+    assert controller.selected_depth == 3
+    assert controller._depth_audit_depth == 5
+
+    for _ in range(4):
+        for _ in range(64):
+            controller.observe(3, 0.010, 1)
+        assert controller.next_depth() == 5
+        controller.observe(5, 0.007, 1)
+        assert controller.selected_depth != 6
+
+    assert controller.selected_depth == 5
+    assert controller.consume_learned_depth() == 5
 
 
 def test_provably_slower_deep_depth_is_not_picked():
@@ -335,9 +358,9 @@ def test_costly_initial_profile_audits_k0_then_falls_back():
     controller = AdaptiveMtpController(1, profiled_depth=1)
     controller.begin_request("warm", "epoch-a")
     assert controller.next_depth() == 1
-    for i in range(32):
+    for i in range(512):
         controller.observe(1, 0.030, 1)
-        if i < 31:
+        if i < 511:
             assert controller.next_depth() == 1
     assert controller.probing
     assert controller.next_depth() == 0
@@ -354,7 +377,7 @@ def test_costly_initial_profile_audits_k0_then_falls_back():
 def test_warm_k0_audit_retains_beneficial_seed_and_never_selects_unmeasured_depth():
     controller = AdaptiveMtpController(3, profiled_depth=2)
     controller.begin_request("warm", "epoch-a")
-    for _ in range(32):
+    for _ in range(512):
         controller.observe(2, 0.008, 1)
     assert controller.probing
     assert controller.next_depth() == 0
@@ -369,10 +392,10 @@ def test_warm_k0_audit_retains_beneficial_seed_and_never_selects_unmeasured_dept
 def test_warm_audit_accumulates_across_requests_and_keeps_partial_baseline():
     controller = AdaptiveMtpController(1, profiled_depth=1)
     controller.begin_request("one", "epoch-a")
-    for _ in range(20):
+    for _ in range(256):
         controller.observe(1, 0.008, 1)
     controller.begin_request("two", "epoch-a")
-    for _ in range(12):
+    for _ in range(256):
         controller.observe(1, 0.008, 1)
     assert controller.probing
     assert controller.next_depth() == 0
@@ -427,17 +450,17 @@ def test_audit_cost_variation_does_not_invalidate_its_measured_winner():
     assert controller.next_depth() == 1
 
 
-def test_harmful_warm_drift_reprobes_next_request_but_beneficial_drift_does_not():
+def test_warm_drift_without_raw_baseline_does_not_discard_profile():
     controller = AdaptiveMtpController(1, profiled_depth=1)
-    controller.begin_request("harmful", "epoch-a")
+    controller.begin_request("profiled", "epoch-a")
     for _ in range(8):
         controller.observe(1, 0.008, 1)
     for _ in range(8):
         controller.observe(1, 0.012, 1)
     assert controller.next_depth() == 1  # never changes depth mid-request
-    controller.begin_request("after-harmful", "epoch-a")
-    assert controller.probing
-    assert controller.next_depth() == 0
+    controller.begin_request("after-profiled", "epoch-a")
+    assert not controller.probing  # drift has no meaning without a current k=0 comparison
+    assert controller.next_depth() == 1
 
     beneficial = AdaptiveMtpController(1, profiled_depth=1)
     beneficial.begin_request("beneficial", "epoch-a")
@@ -475,6 +498,21 @@ def test_cold_calibration_exposes_learned_depth_exactly_once():
     assert controller.selected_depth == 4
     assert controller.consume_learned_depth() == 4  # surfaced for saving
     assert controller.consume_learned_depth() is None  # consumed once
+
+
+def test_cold_calibration_keeps_requested_cap_when_lower_depth_is_not_a_clear_win():
+    controller = AdaptiveMtpController(5)
+    costs = {
+        0: [0.023] * 8,
+        1: [0.017] * 4,
+        2: [0.014] * 4,
+        3: [0.00905, 0.0090, 0.0091, 0.00907],
+        4: [0.012] * 4,
+        5: [0.008, 0.009, 0.014, 0.018],
+    }
+    _calibrate(controller, costs=costs)
+    assert controller.selected_depth == 5
+    assert controller.consume_learned_depth() == 5
 
 
 def test_force_depth_overrides_profile_and_never_saves(monkeypatch):

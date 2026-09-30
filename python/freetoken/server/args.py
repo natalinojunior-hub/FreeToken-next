@@ -497,7 +497,7 @@ def parse_args(
     parser.add_argument(
         "--kv-format",
         type=str,
-        choices=["auto", "bf16", "turbo3", "turbo4", "fp8", "nvfp4"],
+        choices=["auto", "bf16", "fp8", "turbo4", "turbo3"],
         default=ServerArgs.kv_format,
         help="KV slab format. turbo3/turbo4 store the full-attention group as rotated 3/4-bit "
         "codes (~4x fewer bytes per token), which is what makes a long context affordable "
@@ -821,10 +821,10 @@ def parse_args(
     )
     parser.add_argument(
         "--kv-ram-dtype",
-        choices=("auto", "bf16", "fp8", "turbo8", "turbo4", "turbo3"),
+        choices=("auto", "bf16", "fp8", "turbo4", "turbo3"),
         default=ServerArgs.kv_ram_dtype,
         help=(
-            "KV RAM tier storage: auto picks the widest of bf16, fp8, turbo8, turbo4, turbo3 "
+            "KV RAM tier storage: auto picks the widest of bf16, fp8, turbo4, turbo3 "
             "that fits the safe RAM budget."
         ),
     )

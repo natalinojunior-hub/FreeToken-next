@@ -441,7 +441,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             grow = self.decode_manager.runnable and not self.prefill_manager.runnable
         engine.stream.synchronize()
         try:
-            engine.set_decode_residency(grow)
+            engine.set_decode_residency(grow, stream_drained=True)
         except CacheRebuildRejected as e:
             logger.warning(f"decode residency resize refused: {e}")
         return last_data
@@ -1266,14 +1266,12 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         shrink = getattr(self.engine, "shrink_after_oom", None)
         if shrink is not None:
             try:
-                shrink(0.1)
+                shrink()
             except Exception:  # noqa: BLE001 -- shrink failure must not mask the retry
                 pass
         try:
             out = self._forward(forward_input)
-            logger.warning(
-                f"OOM recovered: retried forward after reserving {attempted >> 20} MiB"
-            )
+            logger.warning(f"OOM recovered: retried forward after reserving {attempted >> 20} MiB")
             return out
         except Exception as e2:  # noqa: BLE001 -- second OOM falls through to fail path
             if not _is_oom(e2):
@@ -1298,6 +1296,9 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
 
                 logger.error("[spec-trace]\n" + traceback.format_exc())
                 raise
+            note = getattr(self.engine, "note_decode_oom", None)
+            if note is not None:
+                note(e)
             self._fail_oom_reqs(list(self.decode_manager.running_reqs), e)
             return True
 

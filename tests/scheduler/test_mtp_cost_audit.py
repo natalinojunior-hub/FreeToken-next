@@ -72,9 +72,9 @@ def test_cost_audit_carries_tail_raw_sample_across_requests(monkeypatch):
             scheduler.finished_reqs.add(req)
         SchedulerSpecMixin._finish_mtp_cycle(scheduler, sample)
 
-    # Accumulate the 32 positive observations across two requests in one context epoch.
-    first, second = _req(1, 40), _req(2, 40)
-    for req in (first, second):
+    # Accumulate the 512 positive observations across short requests in one context epoch.
+    for uid in range(32):
+        req = _req(uid, 40)
         for _ in range(16):
             decode_cycle(req, 0.03)
     assert controller.probing
@@ -194,14 +194,18 @@ def test_k0_audit_cadence_doubles_while_cached_depth_keeps_winning():
             depth = controller.next_depth()
             controller.observe(depth, elapsed_per_step, committed)
 
-    run(32, 0.010, 5)  # prompt validation of the cached depth: first audit at 32
-    run(8, 0.040, 1)
-    assert controller._baseline_interval == 128
-    run(128, 0.010, 5)
-    run(8, 0.040, 1)
-    assert controller._baseline_interval == 512
-    run(512, 0.010, 5)
+    def run_to_audit(elapsed_per_step, committed):
+        while controller._cycles_since_baseline < controller._baseline_interval:
+            run(1, elapsed_per_step, committed)
+
+    run(512, 0.010, 5)  # cached profile: delay the first raw audit until the calibrated window
     run(8, 0.040, 1)
     assert controller._baseline_interval == 2048
+    run_to_audit(0.010, 5)
+    run(8, 0.040, 1)
+    assert controller._baseline_interval == 4096
+    run_to_audit(0.010, 5)
+    run(8, 0.040, 1)
+    assert controller._baseline_interval == 4096
     assert controller.selected_depth == 4
     assert controller.consume_learned_depth() == 4

@@ -109,15 +109,17 @@ def compute_key(
     moe_strategy: str,
     compact_state: bool,
     ssm_dtype: str,
+    kv_tiering: str = "off",
+    kv_ram_tokens: int = 0,
+    kv_reserve_tokens: int = 0,
 ) -> str:
     """The lookup key: everything that can change which depth wins.
 
     Hardware + model + build identity (GPU uuid, model weights, engine version, and the
     calibration-source content hash) plus the serve-config axes that shift depth economics:
     the spec cap, batch size, MoE strategy, KV format, a context-length bucket (ceil pow2),
-    and the two residency reducers the engine resolver may have auto-enabled or the caller may
-    have pinned (compact verify state, SSM dtype). Any change invalidates the entry -- a fresh
-    key, no file, recalibrate.
+    the KV tier policy and its RAM/hot-page geometry, plus compact verify state and SSM dtype.
+    Any change invalidates the entry -- a fresh key, no file, recalibrate.
     """
     fingerprint: dict[str, Any] = {
         "schema": SCHEMA_VERSION,
@@ -132,6 +134,9 @@ def compute_key(
         "moe_strategy": moe_strategy,
         "compact_state": bool(compact_state),
         "ssm_dtype": str(ssm_dtype).lower(),
+        "kv_tiering": str(kv_tiering),
+        "kv_ram_tokens": int(kv_ram_tokens),
+        "kv_reserve_tokens": int(kv_reserve_tokens),
     }
     return hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()[:24]
 
@@ -150,6 +155,9 @@ def key_from_config(config, effective_max_seq_len: int, spec_mtp_cap: int) -> st
         moe_strategy=str(getattr(config, "moe_strategy", "")),
         compact_state=os.getenv("FREETOKEN_MTP_COMPACT_STATE", "0") == "1",
         ssm_dtype=str(ENV.MAMBA_SSM_DTYPE),
+        kv_tiering=str(getattr(config, "kv_tiering", "off")),
+        kv_ram_tokens=int(getattr(config, "kv_ram_tokens", 0)),
+        kv_reserve_tokens=int(getattr(config, "kv_reserve_tokens", 0)),
     )
 
 

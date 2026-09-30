@@ -68,6 +68,39 @@ def test_oom_skips_request_finished_in_the_drained_batch(monkeypatch):
     assert sent == [] and freed == [] and shrinks == [1]
 
 
+def test_oom_retry_shrinks_before_replaying_exact_forward(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda d=None: None)
+    shrinks = []
+    attempts = []
+    stub = SimpleNamespace(
+        device=None,
+        engine=SimpleNamespace(shrink_after_oom=lambda: shrinks.append(True)),
+        _forward=lambda forward_input: attempts.append(forward_input) or "replayed",
+    )
+    item = object()
+    result = Scheduler._oom_retry(
+        stub, item, torch.OutOfMemoryError("Tried to allocate 2.00 MiB"), 2 << 20
+    )
+    assert result == "replayed"
+    assert shrinks == [True] and attempts == [item]
+
+
+def test_spec_oom_learns_driver_request_before_dropping_nontransactional_batch():
+    errors = []
+    stub = SimpleNamespace(
+        engine=SimpleNamespace(note_decode_oom=errors.append),
+        decode_manager=SimpleNamespace(running_reqs=["active"]),
+        run_spec_step=lambda: (_ for _ in ()).throw(
+            torch.OutOfMemoryError("Tried to allocate 2.00 MiB")
+        ),
+        _fail_oom_reqs=lambda reqs, error: errors.append((reqs, error)),
+    )
+
+    assert Scheduler._spec_step_or_fail(stub) is True
+    assert str(errors[0]) == "Tried to allocate 2.00 MiB"
+    assert errors[1][0] == ["active"]
+
+
 def test_other_errors_still_raise():
     stub, *_ = _stub()
 

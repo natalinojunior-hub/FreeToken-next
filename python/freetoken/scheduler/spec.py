@@ -792,9 +792,7 @@ class SchedulerSpecMixin:
             note = getattr(self.engine, "note_decode_oom", None)
             if note is not None:
                 note(oom)
-            if os.getenv("FREETOKEN_OOM_SNAPSHOT") and not getattr(
-                self, "_oom_snap_done", False
-            ):
+            if os.getenv("FREETOKEN_OOM_SNAPSHOT") and not getattr(self, "_oom_snap_done", False):
                 self._oom_snap_done = True
                 torch.cuda.memory._record_memory_history(max_entries=100000)
                 torch.cuda.memory._dump_snapshot(os.environ["FREETOKEN_OOM_SNAPSHOT"])

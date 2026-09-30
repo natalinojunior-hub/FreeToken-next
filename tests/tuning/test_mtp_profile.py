@@ -35,6 +35,9 @@ def _key(model, **over):
         moe_strategy="offload",
         compact_state=True,
         ssm_dtype="bfloat16",
+        kv_tiering="off",
+        kv_ram_tokens=0,
+        kv_reserve_tokens=0,
     )
     base.update(over)
     return mp.compute_key(**base)
@@ -65,6 +68,9 @@ def test_source_fingerprint_includes_state_pool_implementation(monkeypatch, tmp_
         ("moe_strategy", "hybrid"),
         ("compact_state", False),
         ("ssm_dtype", "float32"),
+        ("kv_tiering", "auto"),
+        ("kv_ram_tokens", 8192),
+        ("kv_reserve_tokens", 4096),
         ("max_seq_len", 262144),  # a different ceil-pow2 context bucket
     ],
 )
