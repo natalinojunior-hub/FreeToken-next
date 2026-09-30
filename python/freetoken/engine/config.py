@@ -24,13 +24,21 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _safe_spec_mtp_depth(model_type: str, requested: int) -> int:
-    """Keep the Qwen3.5 MTP path disabled until target-state parity is proven."""
-    if model_type == "qwen3_5_moe" and requested > 0:
-        logger.warning(
-            "qwen3_5_moe MTP is disabled: speculative target/GDN state parity is unproven"
-        )
+def _safe_spec_mtp_depth(model_config, requested: int) -> int:
+    """Disable only MTP paths whose deterministic token parity is unproven."""
+    if requested > 0 and model_config.model_type == "qwen3_5_moe":
+        logger.warning("qwen3_5_moe MTP is disabled until target/GDN state parity is proven")
         return 0
+    if requested > 0 and model_config.model_type == "qwen4_exp":
+        from freetoken.models.gguf.dequant import GGML_IQ2_S, GGML_IQ4_NL
+        from freetoken.moe.cpu_executor import dominant_gguf_pair
+
+        if dominant_gguf_pair(getattr(model_config, "gguf_expert_types", None)) == (
+            GGML_IQ2_S,
+            GGML_IQ4_NL,
+        ):
+            logger.warning("qwen4_exp IQ2_S/IQ4_NL MTP is disabled until token parity is proven")
+            return 0
     return max(0, requested)
 
 
@@ -205,7 +213,7 @@ class EngineConfig:
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
         model_config = replace(model_config, quant=quant)
-        safe_spec_mtp = _safe_spec_mtp_depth(model_config.model_type, self.spec_mtp)
+        safe_spec_mtp = _safe_spec_mtp_depth(model_config, self.spec_mtp)
         if safe_spec_mtp != self.spec_mtp:
             object.__setattr__(self, "spec_mtp", safe_spec_mtp)
         if model_config.model_type == "qwen3_5_moe" and model_config.native_mtp_layers == 0:
