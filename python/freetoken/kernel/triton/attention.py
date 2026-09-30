@@ -1056,10 +1056,11 @@ def extend_paged_attention(
         pre_ampere=torch.cuda.get_device_capability(q.device.index)[0] < 8,
     )
     grid = (qo_indptr.numel() - 1, num_q_heads, triton.cdiv(max_q_len, block_m))
-    if k_extend is not None or v_extend is not None:
+    # Host-tier FULL uses the unified cache after store_kv; the split kernel has separate
+    # prefix/current pointers and cannot select RAM slots.  The unsplit kernel preserves the
+    # same causal masks while reading the mapped host pages directly.
+    if (k_extend is not None or v_extend is not None) and not has_host:
         assert k_extend is not None and v_extend is not None
-        if has_host:
-            raise RuntimeError("FULL host KV extend split path is not capture-safe yet")
         assert k_extend.is_cuda and v_extend.is_cuda
         assert k_extend.dim() == 3 and v_extend.dim() == 3
         assert k_extend.shape[0] == num_q_tokens and v_extend.shape[0] == num_q_tokens
