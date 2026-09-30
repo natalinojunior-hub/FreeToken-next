@@ -119,6 +119,9 @@ def create_kv_pool(
 
     model_config = config.model_config
     kv_format = getattr(config, "kv_format", "auto")
+    page_size = getattr(config, "page_size", 1)
+    max_running_req = getattr(config, "max_running_req", 1)
+    cache_type = getattr(config, "cache_type", "naive")
     host_capable = (QSAKVCache, MHAKVCache)
     if host_pages and resolve_pool_class(model_config, kv_format) not in host_capable:
         raise NotImplementedError(
@@ -135,9 +138,9 @@ def create_kv_pool(
             device=device,
             dtype=dtype,
             P=model_config.dsv4_args.window_size,
-            n_scratch=config.max_running_req + 1,
+            n_scratch=max_running_req + 1,
         )
-        pool._init_paged_state(config.max_running_req, config.cache_type != "naive")
+        pool._init_paged_state(max_running_req, cache_type != "naive")
         return pool
 
     num_swa_tokens = None
@@ -146,17 +149,17 @@ def create_kv_pool(
     if model_config.has_swa_attention:
         num_swa_tokens = (
             _swa_paged_num_tokens(config, num_pages + 1)
-            if config.cache_type == "swa_radix"
+            if cache_type == "swa_radix"
             else _naive_swa_num_tokens(config)
         )
     return create_kvcache_pool(
         model_config=model_config,
         num_pages=num_pages + 1,  # +1 for dummy page
-        page_size=config.page_size,
+        page_size=page_size,
         num_swa_tokens=num_swa_tokens,
         device=device,
         dtype=dtype,
-        num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        num_req_slots=max_running_req + 1,  # + 1 for the dummy request row
         kv_format=getattr(config, "kv_format", "auto"),
         num_speculative_tokens=getattr(config, "spec_mtp", 0),
         host_pages=host_pages,
