@@ -214,6 +214,15 @@ def _gemv(
     return out
 
 
+def _gemv_rows(
+    a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
+    """Apply the exact M=1 GEMV contract to each decode row."""
+    if a.ndim != 2:
+        raise ValueError(f"expected [M, K] activations, got {tuple(a.shape)}")
+    return torch.stack([_gemv(row, weight, weight_scale, out_dtype) for row in a], dim=0)
+
+
 # ======================================================================================
 # Prefill (M>1) W8A16 GEMM: fp8 weight read from HBM, upcast to bf16 in-register for the
 # tensor-core dot (fp8 e4m3 -> bf16 is lossless), per-row scale applied after accumulation.
