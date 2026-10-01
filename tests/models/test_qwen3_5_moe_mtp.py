@@ -21,12 +21,25 @@ def test_qwen35_mtp_is_fail_closed_until_state_parity():
     assert _safe_spec_mtp_depth(SimpleNamespace(model_type="qwen3_5_moe"), 0) == 0
 
 
-def test_qwen4_iq2s_iq4nl_mtp_is_fail_closed():
+def test_qwen4_iq2s_iq4nl_mtp_is_depth_capped_and_row_exact(monkeypatch):
+    import os
     from types import SimpleNamespace
 
-    assert _safe_spec_mtp_depth(
-        SimpleNamespace(model_type="qwen4_exp", gguf_expert_types=(22, 20)), 5
-    ) == 0
+    monkeypatch.delenv("FREETOKEN_ROW_INVARIANT_LINEAR", raising=False)
+    ad = SimpleNamespace(model_type="qwen4_exp", gguf_expert_types=(22, 20))
+    assert _safe_spec_mtp_depth(ad, 3) == 3
+    assert _safe_spec_mtp_depth(ad, 6) == 5
+    assert os.environ["FREETOKEN_ROW_INVARIANT_LINEAR"] == "1"
+
+
+def test_other_qwen4_models_keep_their_mtp_depth(monkeypatch):
+    import os
+    from types import SimpleNamespace
+
+    monkeypatch.delenv("FREETOKEN_ROW_INVARIANT_LINEAR", raising=False)
+    other = SimpleNamespace(model_type="qwen4_exp", gguf_expert_types=(12, 12))
+    assert _safe_spec_mtp_depth(other, 6) == 6
+    assert "FREETOKEN_ROW_INVARIANT_LINEAR" not in os.environ
 
 
 def test_standalone_mtp_sidecar_maps_to_model_state(tmp_path):

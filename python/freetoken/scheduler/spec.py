@@ -31,6 +31,13 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 SPEC_TIMING_ENV = "FREETOKEN_DEBUG_SPEC_TIMING"
+
+
+def _partial_spec_enabled() -> bool:
+    """Zero-replay commit for QSA targets (FREETOKEN_ENABLE_PARTIAL_SPEC=0 restores the replay)."""
+    return os.getenv("FREETOKEN_ENABLE_PARTIAL_SPEC", "1") == "1"
+
+
 MTP_ROTATE_ENV = "FREETOKEN_MTP_ROTATE"
 MTP_BATCHED_ENV = "FREETOKEN_MTP_BATCHED"
 
@@ -441,11 +448,7 @@ class SchedulerSpecMixin:
         scratch_base = getattr(kv, "_cmp_scratch_base", 0)
         kv._cmp_k_buffer[:, scratch_base + req.table_idx].copy_(snap_scratch)
         backend = getattr(self.engine, "attn_backend", None)
-        if (
-            keep_end is not None
-            and not pre_draft
-            and os.getenv("FREETOKEN_ENABLE_PARTIAL_SPEC", "0") == "1"
-        ):
+        if keep_end is not None and not pre_draft and _partial_spec_enabled():
             partial = getattr(backend, "rollback_spec_txn_partial", None)
             if partial is not None:
                 partial(req.table_idx, int(keep_end))
@@ -1062,7 +1065,7 @@ class SchedulerSpecMixin:
             not qsa_requires_replay
             or (
                 callable(getattr(backend, "rollback_spec_txn_partial", None))
-                and os.getenv("FREETOKEN_ENABLE_PARTIAL_SPEC", "0") == "1"
+                and _partial_spec_enabled()
             )
         )
         snap_slot = None

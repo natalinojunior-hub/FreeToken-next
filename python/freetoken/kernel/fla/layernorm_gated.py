@@ -11,6 +11,8 @@
 import contextlib
 from functools import lru_cache
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -144,7 +146,7 @@ _ROW_INVARIANT_MAX_ROWS = 1024
 
 
 def calc_rows_per_block(M: int, device: torch.device) -> int:
-    if M <= _ROW_INVARIANT_MAX_ROWS:
+    if M <= _ROW_INVARIANT_MAX_ROWS and os.environ.get("FREETOKEN_ROW_INVARIANT_NORM", "1") == "1":
         return 1
     sm_count = _get_sm_count(device)
     rows_per_block = triton.next_power_of_2(triton.cdiv(M, 2 * sm_count))

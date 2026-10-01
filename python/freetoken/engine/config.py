@@ -25,16 +25,15 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+_AD_MAX_PROVEN_MTP_DEPTH = 5
+
+
 def _safe_spec_mtp_depth(model_config, requested: int) -> int:
     """Disable only MTP paths whose deterministic token parity is unproven."""
     if requested > 0 and model_config.model_type == "qwen3_5_moe":
         logger.warning("qwen3_5_moe MTP is disabled until target/GDN state parity is proven")
         return 0
-    if (
-        requested > 0
-        and model_config.model_type == "qwen4_exp"
-        and os.getenv("FREETOKEN_ALLOW_UNPROVEN_AD_MTP") != "1"
-    ):
+    if requested > 0 and model_config.model_type == "qwen4_exp":
         from freetoken.models.gguf.dequant import GGML_IQ2_S, GGML_IQ4_NL
         from freetoken.moe.cpu_executor import dominant_gguf_pair
 
@@ -42,8 +41,15 @@ def _safe_spec_mtp_depth(model_config, requested: int) -> int:
             GGML_IQ2_S,
             GGML_IQ4_NL,
         ):
-            logger.warning("qwen4_exp IQ2_S/IQ4_NL MTP is disabled until token parity is proven")
-            return 0
+            # Token-parity with RAW is proven for k1-k5 only with a verify window that reduces
+            # row by row like decode (the commit that keeps the accepted rows' QSA writes is the default).
+            os.environ.setdefault("FREETOKEN_ROW_INVARIANT_LINEAR", "1")
+            if requested > _AD_MAX_PROVEN_MTP_DEPTH:
+                logger.warning(
+                    f"qwen4_exp IQ2_S/IQ4_NL MTP depth capped at {_AD_MAX_PROVEN_MTP_DEPTH} "
+                    "(deeper windows are not token-parity proven)"
+                )
+                return _AD_MAX_PROVEN_MTP_DEPTH
     return max(0, requested)
 
 

@@ -76,6 +76,33 @@ def _resolve_block_topk() -> Callable | None:
     return qsa_block_topk
 
 
+_TXN_TIMING = os.environ.get("FREETOKEN_DEBUG_QSA_TXN_TIMING", "0") == "1"
+_txn_acc: dict[str, list[float]] = {}
+
+
+def _txn_timed(fn):
+    """Host wall time per call of a transaction method (includes its blocking syncs)."""
+    if not _TXN_TIMING:
+        return fn
+
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            acc = _txn_acc.setdefault(fn.__name__, [0.0, 0])
+            acc[0] += time.perf_counter() - start
+            acc[1] += 1
+            if acc[1] % 64 == 0:
+                print(
+                    f"[qsa-txn-timing] {fn.__name__} mean {acc[0] / acc[1] * 1e3:.3f} ms "
+                    f"calls {acc[1]}",
+                    flush=True,
+                )
+
+    return wrapper
+
+
 @dataclass
 class QSASparseMetadata(BaseAttnMetadata):
     # fmt: off
@@ -173,6 +200,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             raise RuntimeError(f"QSA speculative transaction already active for table {table_idx}")
         self._spec_txns[table_idx] = {"cmp": {}, "kv": {}, "rope": {}}
 
+    @_txn_timed
     def commit_spec_txn(self, table_idx: int) -> None:
         """Drop a fully accepted journal before its table slot can be reused."""
         self._spec_txns.pop(int(table_idx), None)
@@ -180,6 +208,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
     def spec_txn_active(self, table_idx: int) -> bool:
         return int(table_idx) in self._spec_txns
 
+    @_txn_timed
     def prepare_spec_txn(
         self,
         table_idx: int,
@@ -221,10 +250,18 @@ class QSASparseAttnBackend(BaseAttnBackend):
             phys_live = torch.unique(self._physical_loc(out_loc[:live_count]).long())
         pool = self.kvcache._pool
         device_tokens = int(self.kvcache.num_device_pages) * self.page_size
+        # Layer-independent row sets: computed once (each mask / unique is a host sync).
+        dev = phys_live[phys_live < device_tokens]
+        host = phys_live[phys_live >= device_tokens] - device_tokens
+        closing = phys_all[phys_all % self.ratio == self.ratio - 1] // self.ratio
+        scratch = torch.tensor(
+            [self.kvcache.cmp_scratch_base + table_idx],
+            dtype=closing.dtype,
+            device=closing.device,
+        )
+        cmp_rows = torch.unique(torch.cat((closing, scratch)))
         for layer_id, slot in self._idx_slot.items():
             dense = pool._dense(layer_id)
-            dev = phys_live[phys_live < device_tokens]
-            host = phys_live[phys_live >= device_tokens] - device_tokens
             if getattr(pool, "compressed", False):
                 k_codes, k_norm = self.kvcache.k_slab(layer_id)
                 v_codes, v_norm = self.kvcache.v_slab(layer_id)
@@ -250,15 +287,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
                     )
             else:
                 self._txn_save_rows(table_idx, layer_id, phys_live)
-            closing = phys_all[phys_all % self.ratio == self.ratio - 1] // self.ratio
-            scratch = torch.tensor(
-                [self.kvcache.cmp_scratch_base + table_idx],
-                dtype=closing.dtype,
-                device=closing.device,
-            )
-            rows = torch.unique(torch.cat((closing, scratch)))
             slab = self.kvcache.cmp_k_cache(slot)
-            txn["bulk_cmp"].append((slot, rows, slab.index_select(0, rows)))
+            txn["bulk_cmp"].append((slot, cmp_rows, slab.index_select(0, cmp_rows)))
         rope = getattr(self.kvcache, "_rope_positions", None)
         if rope is not None:
             txn["bulk_rope"].append((phys_live, rope.index_select(0, phys_live)))
@@ -291,6 +321,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
                 hk[rows] = values[0]
                 hv[rows] = values[1]
 
+    @_txn_timed
     def snapshot_spec_preimage(
         self,
         table_idx: int,
@@ -306,6 +337,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             logical_positions=logical_positions,
         )
 
+    @_txn_timed
     def rollback_spec_txn_partial(self, table_idx: int, keep_end: int) -> None:
         """Rollback only rejected QSA writes; preserve verify state before ``keep_end``."""
         txn = self._spec_txns.pop(int(table_idx), None)
@@ -433,6 +465,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             if loc not in txn["rope"]:
                 txn["rope"][loc] = rope[loc].clone()
 
+    @_txn_timed
     def rollback_spec_txn(self, table_idx: int) -> None:
         txn = self._spec_txns.pop(int(table_idx), None)
         if txn is None:
@@ -717,7 +750,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             kv_norms=(k_norm, v_norm) if compressed else None,
             cent=self.kvcache.cent_tensor if compressed else None,
             page_size=self.page_size if compressed else None,
-            row_invariant=getattr(batch, "spec_logits_indices", None) is not None,
+            row_invariant=getattr(batch, "spec_logits_indices", None) is not None
+            and os.environ.get("FREETOKEN_ROW_INVARIANT_QSA", "1") == "1",
         )
         mark("attention")
         if compressed and is_rotated(book):
