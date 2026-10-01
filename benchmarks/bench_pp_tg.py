@@ -674,10 +674,24 @@ def wait_ready(origin: str, proc, log_path: str, timeout: float) -> None:
     t0 = time.monotonic()
     last_print = t0
     last_health_str = "connecting..."
+    stall_s = float(os.environ.get("FREETOKEN_BENCH_BOOT_STALL_S", "180"))
+    last_size, last_growth = -1, t0
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             die_with_log(f"server exited with code {proc.returncode} during startup", log_path)
         now = time.monotonic()
+        size = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+        if size != last_size:
+            last_size, last_growth = size, now
+        elif stall_s > 0 and now - last_growth >= stall_s:
+            # A booting server that logs nothing for minutes is hung (not slow): dump every
+            # thread's stack into the log (faulthandler on SIGABRT) and fail loudly.
+            os.killpg(proc.pid, signal.SIGABRT)
+            time.sleep(2.0)  # let the dumps reach the pump before the log is read back
+            die_with_log(
+                f"BOOT STALL: server log silent for {stall_s:.0f}s; thread stacks dumped above",
+                log_path,
+            )
         if now - last_print >= 5.0:
             last_print = now
             print(
@@ -852,6 +866,7 @@ def main(argv: list[str] | None = None) -> int:
     env = dict(os.environ)
     if any("--spec-mtp" in a for a in args.serve_args):
         env["FREETOKEN_DISABLE_OVERLAP_SCHEDULING"] = "1"
+    env.setdefault("PYTHONFAULTHANDLER", "1")
     with os.fdopen(fd, "wb") as log_f:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, env=env

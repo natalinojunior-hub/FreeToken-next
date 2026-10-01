@@ -12,9 +12,11 @@ dequantize *inside* the kernel -- no bf16 copy of the weight is ever materialize
 
 from __future__ import annotations
 
-import functools
 import atexit
+import functools
+import glob
 import json
+import logging
 import os
 import pathlib
 import shutil
@@ -106,6 +108,47 @@ def _c_compiler_for(cxx: str) -> str:
     return shutil.which(cc) or cc
 
 
+_BUILD_LOCK_STALE_S = 60.0
+_COMPILER_COMM = {
+    "ninja",
+    "nvcc",
+    "cicc",
+    "ptxas",
+    "cc1plus",
+    "cudafe++",
+    "fatbinary",
+    "gcc",
+    "g++",
+    "clang",
+}
+
+
+def _compiler_running() -> bool:
+    for comm in glob.glob("/proc/[0-9]*/comm"):
+        try:
+            with open(comm) as stream:
+                if stream.read().strip() in _COMPILER_COMM:
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def _clear_stale_build_lock(name: str) -> None:
+    """A builder killed mid-compile leaves ``lock`` behind and torch's FileBaton then waits on
+    it forever (a silent boot hang). Stale = older than a minute with no compiler running."""
+    from torch.utils.cpp_extension import _get_build_directory
+
+    lock = os.path.join(_get_build_directory(name, verbose=False), "lock")
+    try:
+        age = time.time() - os.path.getmtime(lock)
+    except OSError:
+        return
+    if age > _BUILD_LOCK_STALE_S and not _compiler_running():
+        os.remove(lock)
+        logging.getLogger(__name__).warning(f"removed stale JIT build lock {lock} ({age:.0f}s old)")
+
+
 @functools.cache
 def _module():
     from torch.utils.cpp_extension import load
@@ -127,6 +170,7 @@ def _module():
 
     # gguf_kernel.cu carries its own PYBIND11_MODULE (appended at the end), so a
     # plain `load` of the single source compiles + binds the ggml_* ops.
+    _clear_stale_build_lock("freetoken_gguf_kernels")
     return load(
         name="freetoken_gguf_kernels",
         sources=[str(_CSRC / "gguf_kernel.cu")],

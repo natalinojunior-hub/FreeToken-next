@@ -136,3 +136,21 @@ W6 (só `linear_state_pool`) = 108,2; W7 (`scheduler`/`adaptive_mtp`/`graph`) = 
   PP frio dos DOIS modelos (~1,3–1,6K tok/s: 2 blocos de 8192 com 0 em cache, ~6–7 s por bloco; hipótese não testada: o prefill transmite os experts por bloco, então bloco maior reduziria passagens) · fusão da convolução por linha do GDN.
 
 **Erro corrigido:** uma versão anterior afirmou que o PP frio do AD era 10× pior que o do ISTA. Era comparação de requisição fria com requisição em cache de prefixo (a varredura aquece o k0). O PP frio é igual nos dois.
+
+## 10. Travamento silencioso de boot (causa raiz, corrigida)
+
+- **Sintoma:** servidor parado após `Free memory before loading model`, GPU 0%, CPU ociosa, log mudo por minutos; 37 de 43 threads em `futex`,
+  uma thread em `nanosleep`; ~1 MB lido do disco. Apareceu em 3 execuções seguidas, nas árvores certificada e atual.
+- **Causa:** a pilha (faulthandler) mostrou `weight.py → qwen4_exp/gguf.py:_to_bf16 → kernel/gguf.py → torch.utils.cpp_extension._jit_compile →
+  torch/utils/file_baton.py:wait`. Um job meu foi interrompido no meio do build JIT de `freetoken_gguf_kernels` e deixou
+  `~/.cache/torch_extensions/py312_cu130/freetoken_gguf_kernels/lock`; o `FileBaton` do torch espera essa trava **sem limite**.
+- **Gatilho:** criar `git worktree` novo muda o caminho das fontes (`build.ninja`) e força recompilar a extensão; interromper nesse instante deixa a trava.
+- **Correção no motor:** `kernel/gguf.py::_clear_stale_build_lock` remove a trava se tiver > 60 s e não houver compilador rodando
+  (ninja/nvcc/cicc/ptxas/cc1plus...). Teste: `tests/kernels/test_gguf_jit_lock.py`. Verificado: trava plantada com 10 min foi removida no boot (log `removed stale JIT build lock`).
+- **Correção nas ferramentas:** `benchmarks/bench_pp_tg.wait_ready` detecta boot mudo (`FREETOKEN_BENCH_BOOT_STALL_S`, padrão 180 s), envia SIGABRT
+  ao grupo de processos e despeja as pilhas (servidor sobe com `PYTHONFAULTHANDLER=1`), e falha com `BOOT STALL`.
+- **Regras:** nunca interromper (SIGINT/SIGKILL) um boot durante o primeiro build JIT; para A/B entre árvores de trabalho use `TORCH_EXTENSIONS_DIR`
+  próprio por árvore; mate processos por PID (`pkill -f` com o nome do script mata o próprio shell); para parar um bench use SIGINT
+  (o `finally` encerra o servidor) e confirme com `tail --pid`, sem laço de espera.
+- **Armadilha de medição:** sem `--spec-mtp` o padrão do servidor é 6 (limitado a 5 no AD com o gate aberto), então "RAW" medido sem a flag
+  não é RAW puro. Para RAW use sempre `--serve-arg="--spec-mtp 0"`.

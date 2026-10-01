@@ -44,6 +44,7 @@ def main() -> int:
     env = dict(os.environ, FREETOKEN_RUNTIME_ENV_FILE=str(env_file))
     if any("--spec-mtp" in a for a in args.serve_args):
         env["FREETOKEN_DISABLE_OVERLAP_SCHEDULING"] = "1"
+    env.setdefault("PYTHONFAULTHANDLER", "1")
     cmd = bench.serve_cmd(args, port)
     results = []
     with os.fdopen(fd, "wb") as log_f:
