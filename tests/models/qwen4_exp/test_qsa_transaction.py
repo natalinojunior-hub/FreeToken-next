@@ -14,7 +14,9 @@ def test_qsa_transaction_restores_index_kv_and_rope_rows():
 
     layers, tokens, dim = 2, 16, 4
     pool = Pool()
-    pool._k_codes = torch.arange(layers * tokens * dim, dtype=torch.int8).reshape(layers, tokens, dim)
+    pool._k_codes = torch.arange(layers * tokens * dim, dtype=torch.int8).reshape(
+        layers, tokens, dim
+    )
     pool._k_norm = torch.arange(layers * tokens, dtype=torch.float32).reshape(layers, tokens)
     pool._v_codes = pool._k_codes.clone()
     pool._v_norm = pool._k_norm.clone()

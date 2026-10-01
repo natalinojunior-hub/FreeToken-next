@@ -515,8 +515,7 @@ class GraphRunner:
             graph_safe = getattr(backend, "spec_txn_graph_safe", None)
             reqs = getattr(batch, "padded_reqs", None) or batch.reqs
             if active is not None and any(
-                active(req.table_idx)
-                and (graph_safe is None or not graph_safe(req.table_idx))
+                active(req.table_idx) and (graph_safe is None or not graph_safe(req.table_idx))
                 for req in reqs
             ):
                 return False
