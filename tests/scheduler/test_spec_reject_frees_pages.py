@@ -518,8 +518,8 @@ def test_free_request_discards_recycled_uid_residual_and_row_map():
 def test_run_spec_step_k2_rejection_and_acceptance_positions():
     """Run the production k=2 scheduler path over deterministic CPU fakes."""
     cases = (
-        ("reject0", [71, 80, 90], 1, 4, 5, 1, 2, 1, True, 71),
-        ("reject1", [50, 81, 90], 2, 5, 6, 2, 2, 1, False, 81),
+        ("reject0", [71, 80, 90], 1, 4, 5, 1, 3, 1, True, 71),
+        ("reject1", [50, 81, 90], 2, 5, 6, 2, 3, 1, False, 81),
         ("all_accept", [50, 60, 90], 3, 6, 7, 0, 1, 1, False, 90),
     )
     for (
@@ -558,6 +558,7 @@ def test_run_spec_step_k2_rejection_and_acceptance_positions():
 
         class StatePool:
             def __init__(self):
+                self.spec_states = None
                 self.slot_value = torch.zeros(16, dtype=torch.int64)
                 self.slot_value[0] = 123
 
@@ -593,7 +594,7 @@ def test_run_spec_step_k2_rejection_and_acceptance_positions():
             _retain_mtp_ring=lambda _req: None,
             _spec_snapshot_slot=lambda _req: 9,
             _linear_slot=lambda _req: 0,
-            _restore_qsa_state=lambda _req: qsa_restores.append(name),
+            _restore_qsa_state=lambda _req, **_kwargs: qsa_restores.append(name),
             _restore_ple_state=lambda _req: ple_restores.append(name),
             _draft_step=None,
             _take_mtp_fill=lambda _req: None,

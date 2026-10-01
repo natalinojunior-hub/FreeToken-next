@@ -639,7 +639,9 @@ class Engine:
                     f"{self._pool_cls.__name__}"
                 )
             if config.kv_format not in ("auto", "fp8"):
-                raise NotImplementedError(f"--kv-tiering force needs auto/FP8 device KV; got {config.kv_format!r}")
+                raise NotImplementedError(
+                    f"--kv-tiering force needs auto/FP8 device KV; got {config.kv_format!r}"
+                )
             if config.tp_info.size != 1:
                 raise NotImplementedError(
                     "--kv-tiering force is not supported under tensor parallelism"
@@ -2118,7 +2120,10 @@ class Engine:
 
             # Persist only a plan that completed the normal in-situ validation.  The profile
             # loader requires two matching observations before skipping Phase D on a later boot.
-            if profile_key is not None and getattr(planner, "runtime_calibration", None) is not None:
+            if (
+                profile_key is not None
+                and getattr(planner, "runtime_calibration", None) is not None
+            ):
                 try:
                     from freetoken.tuning import vram_profile
 

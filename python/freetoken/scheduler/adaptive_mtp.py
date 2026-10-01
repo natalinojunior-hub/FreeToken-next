@@ -128,7 +128,6 @@ class AdaptiveMtpController:
             raise ValueError("safe_max_k must be a non-negative integer")
         self.safe_max_k = safe_max_k
         self._runtime_max_k = safe_max_k
-        self._force_depth = _forced_depth_or_none(safe_max_k)
         # A depth learned by a previous serve under the SAME hardware+model+build+config
         # fingerprint (tuning.mtp_profile). Warm-starts the controller so it skips the
         # calibration probe. Ignored when a measurement force-depth is pinned (force wins) or
@@ -162,6 +161,10 @@ class AdaptiveMtpController:
         self._depth_audit_samples = 0
         self._depth_audit_inflight = False
         self._depth_audited: set[int] = set()
+
+    @property
+    def _force_depth(self) -> int | None:
+        return _forced_depth_or_none(self.safe_max_k)
 
     @property
     def selected_depth(self) -> int:

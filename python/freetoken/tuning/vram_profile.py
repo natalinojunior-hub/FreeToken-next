@@ -176,8 +176,7 @@ def load_calibration(
         if len(samples) < 2:
             samples = [{name: int(calibration[name]) for name in fields}]
         result = {
-            name: sorted(sample[name] for sample in samples)[len(samples) // 2]
-            for name in fields
+            name: sorted(sample[name] for sample in samples)[len(samples) // 2] for name in fields
         }
     except (KeyError, TypeError, ValueError):
         return None

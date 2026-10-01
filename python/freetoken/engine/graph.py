@@ -509,6 +509,17 @@ class GraphRunner:
         )
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
+        backend = getattr(get_global_ctx(), "attn_backend", None)
+        if backend is not None and batch.reqs:
+            active = getattr(backend, "spec_txn_active", None)
+            graph_safe = getattr(backend, "spec_txn_graph_safe", None)
+            reqs = getattr(batch, "padded_reqs", None) or batch.reqs
+            if active is not None and any(
+                active(req.table_idx)
+                and (graph_safe is None or not graph_safe(req.table_idx))
+                for req in reqs
+            ):
+                return False
         check = getattr(self, "kv_replay_check", None)
         if check is not None and not check(batch):
             return False

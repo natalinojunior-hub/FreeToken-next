@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, List
@@ -29,7 +30,11 @@ def _safe_spec_mtp_depth(model_config, requested: int) -> int:
     if requested > 0 and model_config.model_type == "qwen3_5_moe":
         logger.warning("qwen3_5_moe MTP is disabled until target/GDN state parity is proven")
         return 0
-    if requested > 0 and model_config.model_type == "qwen4_exp":
+    if (
+        requested > 0
+        and model_config.model_type == "qwen4_exp"
+        and os.getenv("FREETOKEN_ALLOW_UNPROVEN_AD_MTP") != "1"
+    ):
         from freetoken.models.gguf.dequant import GGML_IQ2_S, GGML_IQ4_NL
         from freetoken.moe.cpu_executor import dominant_gguf_pair
 
@@ -207,7 +212,9 @@ class EngineConfig:
             # Keep the normalized value object for the family parser.  HF's
             # strict setter rejects this internal type, so bypass validation
             # only on this private, pre-parse copy.
-            object.__setattr__(hf_config, "vision_config", read_mmproj_vision_config(self.mm.mmproj_path))
+            object.__setattr__(
+                hf_config, "vision_config", read_mmproj_vision_config(self.mm.mmproj_path)
+            )
         spec = self.model_spec
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)

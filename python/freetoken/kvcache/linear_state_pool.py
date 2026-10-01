@@ -356,15 +356,14 @@ def state_pool_bytes(config, num_slots: int | None = None) -> int:
 
 
 def spec_state_steps(config) -> int:
-    """Verify rows the zero-replay MTP buffers hold: k + 1 for a native-NextN model served
-    with --spec-mtp k (its verify runs the fused GDN recurrence), else 0 (no buffers)."""
+    """Rows needed by a verify window, including deferred prefix rows (up to ``2*k+2``)."""
     k = getattr(config, "spec_mtp", 0)
     model = config.model_config
     row_commit = (
         getattr(model, "mtp_row_state_commit", False)
         and os.getenv("FREETOKEN_MTP_ROW_COMMIT", "1") == "1"
     )
-    return k + 1 if k > 0 and (getattr(model, "native_mtp_layers", 0) or row_commit) else 0
+    return 2 * k + 2 if k > 0 and (getattr(model, "native_mtp_layers", 0) or row_commit) else 0
 
 
 def spec_state_bytes(config) -> int:

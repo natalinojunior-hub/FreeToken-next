@@ -77,8 +77,6 @@ def test_force_fp8_host_tiering_selects_plain_mha():
     assert resolve_pool_class(mc, "fp8", host_tiering=True) is MHAKVCache
 
 
-
-
 def _generic_config(num_page_override=None):
     mc = _model_config((_spec("full", AttnType.FULL),))
     mc.linear_attention_group = lambda: None

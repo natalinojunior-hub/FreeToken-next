@@ -203,9 +203,7 @@ def test_unknown_book_and_bad_layer_ids_refuse():
 def test_turbo_host_tier_is_fail_closed():
     """Turbo FULL remains device-only until a measured staging backend exists."""
     with pytest.raises(TypeError, match="host_pages"):
-        TurboMHAKVCache(
-            HEADS, 4, HEAD_DIM, 8, PAGE, torch.bfloat16, DEVICE, host_pages=1
-        )
+        TurboMHAKVCache(HEADS, 4, HEAD_DIM, 8, PAGE, torch.bfloat16, DEVICE, host_pages=1)
 
 
 def test_layer_ids_remap_storage_slabs():

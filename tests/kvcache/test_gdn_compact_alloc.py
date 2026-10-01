@@ -37,7 +37,7 @@ def _config(steps: int):
         linear_attention_group=lambda: group,
     )
     config = SimpleNamespace(
-        spec_mtp=steps - 1,
+        spec_mtp=(steps - 2) // 2,
         model_config=model,
         tp_info=SimpleNamespace(size=1),
         dtype=torch.bfloat16,
@@ -49,7 +49,7 @@ def _nbytes(tensor: torch.Tensor) -> int:
     return tensor.numel() * tensor.element_size()
 
 
-@pytest.mark.parametrize("steps", [3, 5])
+@pytest.mark.parametrize("steps", [4, 6])
 def test_compact_spec_buffer_allocation_matches_byte_estimate(monkeypatch, steps):
     monkeypatch.setenv("FREETOKEN_MTP_COMPACT_STATE", "1")
     monkeypatch.setenv("FREETOKEN_MTP_ROW_COMMIT", "1")

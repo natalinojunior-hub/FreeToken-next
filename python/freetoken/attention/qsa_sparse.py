@@ -161,6 +161,339 @@ class QSASparseAttnBackend(BaseAttnBackend):
         # static addressing for the spec-verify graph (stage_verify), keyed by window length
         self._verify: dict = {}
         self.capture_bs: List[int] = []
+        # Speculative QSA writes are transactional.  The scheduler already journals the
+        # linear state and pending ring; this journal covers the persistent index/KV slabs
+        # that a group-closing verify can otherwise overwrite with rejected draft tokens.
+        self._spec_txns: dict[int, dict] = {}
+        self._spec_preimages: dict[int, dict] = {}
+
+    def begin_spec_txn(self, table_idx: int) -> None:
+        table_idx = int(table_idx)
+        if table_idx in self._spec_txns:
+            raise RuntimeError(f"QSA speculative transaction already active for table {table_idx}")
+        self._spec_txns[table_idx] = {"cmp": {}, "kv": {}, "rope": {}}
+
+    def commit_spec_txn(self, table_idx: int) -> None:
+        """Drop a fully accepted journal before its table slot can be reused."""
+        self._spec_txns.pop(int(table_idx), None)
+
+    def spec_txn_active(self, table_idx: int) -> bool:
+        return int(table_idx) in self._spec_txns
+
+    def prepare_spec_txn(
+        self,
+        table_idx: int,
+        out_loc: torch.Tensor,
+        live_count: int | None = None,
+        *,
+        activate: bool = True,
+        logical_positions: torch.Tensor | None = None,
+    ) -> None:
+        """Pre-journal the verify write-set with vectorized device copies."""
+        table_idx = int(table_idx)
+        if activate:
+            self.begin_spec_txn(table_idx)
+            txn = self._spec_txns[table_idx]
+            preimage = self._spec_preimages.pop(table_idx, None)
+            if preimage is not None:
+                self._restore_bulk(preimage)
+                self._spec_txns[table_idx] = preimage
+                return
+        else:
+            txn = {"cmp": {}, "kv": {}, "rope": {}}
+        txn["bulk_kv"], txn["bulk_cmp"], txn["bulk_rope"] = [], [], []
+        physical = self._physical_loc(out_loc).long()
+        phys_all = torch.unique(physical)
+        if logical_positions is None:
+            logical_positions = torch.arange(out_loc.numel(), device=out_loc.device)
+        logical_positions = logical_positions.to(device=out_loc.device, dtype=torch.long)
+        cmp_logical: dict[int, int] = {}
+        for phys, logical in zip(physical.tolist(), logical_positions.tolist()):
+            if phys % self.ratio == self.ratio - 1:
+                row = phys // self.ratio
+                cmp_logical[row] = min(cmp_logical.get(row, logical), logical)
+        txn["cmp_logical"] = cmp_logical
+        txn["cmp_scratch"] = int(self.kvcache.cmp_scratch_base + table_idx)
+        if live_count is None:
+            phys_live = phys_all
+        else:
+            live_count = max(0, min(int(live_count), int(out_loc.numel())))
+            phys_live = torch.unique(self._physical_loc(out_loc[:live_count]).long())
+        pool = self.kvcache._pool
+        device_tokens = int(self.kvcache.num_device_pages) * self.page_size
+        for layer_id, slot in self._idx_slot.items():
+            dense = pool._dense(layer_id)
+            dev = phys_live[phys_live < device_tokens]
+            host = phys_live[phys_live >= device_tokens] - device_tokens
+            if getattr(pool, "compressed", False):
+                k_codes, k_norm = self.kvcache.k_slab(layer_id)
+                v_codes, v_norm = self.kvcache.v_slab(layer_id)
+                if dev.numel():
+                    txn["bulk_kv"].append(
+                        (
+                            "device",
+                            dense,
+                            dev,
+                            k_codes.index_select(0, dev),
+                            k_norm.index_select(0, dev),
+                            v_codes.index_select(0, dev),
+                            v_norm.index_select(0, dev),
+                        )
+                    )
+                if host.numel() and self.kvcache.host_kv(layer_id) is not None:
+                    hk, hv = self.kvcache.host_kv(layer_id)
+                    idx = host.cpu()
+                    hk = hk.reshape(-1, *hk.shape[2:])
+                    hv = hv.reshape(-1, *hv.shape[2:])
+                    txn["bulk_kv"].append(
+                        ("host", dense, idx, hk.index_select(0, idx), hv.index_select(0, idx))
+                    )
+            else:
+                self._txn_save_rows(table_idx, layer_id, phys_live)
+            closing = phys_all[phys_all % self.ratio == self.ratio - 1] // self.ratio
+            scratch = torch.tensor(
+                [self.kvcache.cmp_scratch_base + table_idx],
+                dtype=closing.dtype,
+                device=closing.device,
+            )
+            rows = torch.unique(torch.cat((closing, scratch)))
+            slab = self.kvcache.cmp_k_cache(slot)
+            txn["bulk_cmp"].append((slot, rows, slab.index_select(0, rows)))
+        rope = getattr(self.kvcache, "_rope_positions", None)
+        if rope is not None:
+            txn["bulk_rope"].append((phys_live, rope.index_select(0, phys_live)))
+        txn["graph_safe"] = bool(pool.compressed)
+        if not activate:
+            self._spec_preimages[table_idx] = txn
+
+    def spec_txn_graph_safe(self, table_idx: int) -> bool:
+        txn = self._spec_txns.get(int(table_idx))
+        return bool(txn and txn.get("graph_safe"))
+
+    def _restore_bulk(self, txn: dict) -> None:
+        for slot, rows, values in txn.get("bulk_cmp", ()):
+            self.kvcache.cmp_k_cache(slot).index_copy_(0, rows, values)
+        rope = getattr(self.kvcache, "_rope_positions", None)
+        if rope is not None:
+            for rows, values in txn.get("bulk_rope", ()):
+                rope.index_copy_(0, rows, values)
+        pool = self.kvcache._pool
+        for entry in txn.get("bulk_kv", ()):
+            kind, dense, rows, *values = entry
+            if kind == "device":
+                pool._k_codes[dense].index_copy_(0, rows, values[0])
+                pool._k_norm[dense].index_copy_(0, rows, values[1])
+                pool._v_codes[dense].index_copy_(0, rows, values[2])
+                pool._v_norm[dense].index_copy_(0, rows, values[3])
+            else:
+                hk = self.kvcache._kv_host[0, dense].reshape(-1, *self.kvcache._kv_host.shape[4:])
+                hv = self.kvcache._kv_host[1, dense].reshape(-1, *self.kvcache._kv_host.shape[4:])
+                hk[rows] = values[0]
+                hv[rows] = values[1]
+
+    def snapshot_spec_preimage(
+        self,
+        table_idx: int,
+        out_loc: torch.Tensor,
+        live_count: int | None = None,
+        logical_positions: torch.Tensor | None = None,
+    ) -> None:
+        self.prepare_spec_txn(
+            table_idx,
+            out_loc,
+            live_count,
+            activate=False,
+            logical_positions=logical_positions,
+        )
+
+    def rollback_spec_txn_partial(self, table_idx: int, keep_end: int) -> None:
+        """Rollback only rejected QSA writes; preserve verify state before ``keep_end``."""
+        txn = self._spec_txns.pop(int(table_idx), None)
+        if txn is None:
+            return
+        cmp_logical = txn.get("cmp_logical", {})
+        scratch = int(txn.get("cmp_scratch", self.kvcache.cmp_scratch_base + table_idx))
+        for slot, rows, values in txn.get("bulk_cmp", ()):
+            restore = []
+            for i, row in enumerate(rows.tolist()):
+                logical = cmp_logical.get(int(row), keep_end)
+                if int(row) == scratch or logical >= keep_end:
+                    restore.append(i)
+            if restore:
+                idx = torch.tensor(restore, dtype=torch.long, device=rows.device)
+                self.kvcache.cmp_k_cache(slot).index_copy_(
+                    0, rows.index_select(0, idx), values.index_select(0, idx)
+                )
+        for (slot, row), value in txn.get("cmp", {}).items():
+            logical = cmp_logical.get(int(row), keep_end)
+            if int(row) == scratch or logical >= keep_end:
+                self.kvcache.cmp_k_cache(slot)[row].copy_(value)
+        # KV/RoPE rows before keep_end are the committed verify writes. Speculative rows
+        # after it are newly allocated and are reclaimed by free_spec_reject.
+
+    def _txn_save_rows(self, table_idx: int, layer_id: int, out_loc: torch.Tensor) -> None:
+        txn = self._spec_txns.get(int(table_idx))
+        if txn is None:
+            return
+        pool = self.kvcache._pool
+        dense = pool._dense(layer_id)
+        for loc in torch.unique(out_loc.detach()).tolist():
+            loc = int(loc)
+            key = (int(layer_id), loc)
+            if key in txn["kv"]:
+                continue
+            if getattr(pool, "compressed", False):
+                k_codes, k_norm = self.kvcache.k_slab(layer_id)
+                v_codes, v_norm = self.kvcache.v_slab(layer_id)
+                device_tokens = int(self.kvcache.num_device_pages) * self.page_size
+                if loc < device_tokens:
+                    txn["kv"][key] = (
+                        "device",
+                        int(layer_id),
+                        dense,
+                        loc,
+                        k_codes[loc].clone(),
+                        k_norm[loc].clone(),
+                        v_codes[loc].clone(),
+                        v_norm[loc].clone(),
+                    )
+                else:
+                    host = self.kvcache.host_turbo(layer_id)
+                    if host is None:
+                        host_kv = self.kvcache.host_kv(layer_id)
+                        if host_kv is None:
+                            continue
+                        hloc = loc - device_tokens
+                        hk = host_kv[0].reshape(-1, *host_kv[0].shape[2:])
+                        hv = host_kv[1].reshape(-1, *host_kv[1].shape[2:])
+                        txn["kv"][key] = (
+                            "host_fp8",
+                            int(layer_id),
+                            dense,
+                            hloc,
+                            hk[hloc].clone(),
+                            hv[hloc].clone(),
+                        )
+                    else:
+                        hloc = loc - device_tokens
+                        txn["kv"][key] = (
+                            "host_turbo",
+                            int(layer_id),
+                            dense,
+                            hloc,
+                            *(x[hloc].clone() for x in host),
+                        )
+            else:
+                device_tokens = int(self.kvcache.num_device_pages) * self.page_size
+                if loc >= device_tokens:
+                    host_kv = self.kvcache.host_kv(layer_id)
+                    if host_kv is None:
+                        continue
+                    hloc = loc - device_tokens
+                    hk = host_kv[0].reshape(-1, *host_kv[0].shape[2:])
+                    hv = host_kv[1].reshape(-1, *host_kv[1].shape[2:])
+                    txn["kv"][key] = (
+                        "bf16_host",
+                        int(layer_id),
+                        dense,
+                        hloc,
+                        hk[hloc].clone(),
+                        hv[hloc].clone(),
+                    )
+                    continue
+                k_page = self.kvcache.k_cache(layer_id)
+                v_page = self.kvcache.v_cache(layer_id)
+                page, offset = divmod(loc, self.page_size)
+                txn["kv"][key] = (
+                    "bf16_device",
+                    int(layer_id),
+                    dense,
+                    loc,
+                    k_page[page, offset].clone(),
+                    v_page[page, offset].clone(),
+                )
+
+    def _txn_save_cmp(self, table_idx: int, slot: int, rows: torch.Tensor) -> None:
+        txn = self._spec_txns.get(int(table_idx))
+        if txn is None:
+            return
+        slab = self.kvcache.cmp_k_cache(slot)
+        for row in torch.unique(rows[rows >= 0].detach()).tolist():
+            key = (int(slot), int(row))
+            if key not in txn["cmp"]:
+                txn["cmp"][key] = slab[int(row)].clone()
+
+    def _txn_save_rope(self, table_idx: int, out_loc: torch.Tensor) -> None:
+        txn = self._spec_txns.get(int(table_idx))
+        rope = getattr(self.kvcache, "_rope_positions", None)
+        if txn is None or rope is None:
+            return
+        for loc in torch.unique(out_loc.detach()).tolist():
+            loc = int(loc)
+            if loc not in txn["rope"]:
+                txn["rope"][loc] = rope[loc].clone()
+
+    def rollback_spec_txn(self, table_idx: int) -> None:
+        txn = self._spec_txns.pop(int(table_idx), None)
+        if txn is None:
+            return
+        for slot, rows, values in txn.get("bulk_cmp", ()):
+            self.kvcache.cmp_k_cache(slot).index_copy_(0, rows, values)
+        rope = getattr(self.kvcache, "_rope_positions", None)
+        if rope is not None:
+            for rows, values in txn.get("bulk_rope", ()):
+                rope.index_copy_(0, rows, values)
+        pool = self.kvcache._pool
+        for entry in txn.get("bulk_kv", ()):
+            kind, dense, rows, *values = entry
+            if kind == "device":
+                pool._k_codes[dense].index_copy_(0, rows, values[0])
+                pool._k_norm[dense].index_copy_(0, rows, values[1])
+                pool._v_codes[dense].index_copy_(0, rows, values[2])
+                pool._v_norm[dense].index_copy_(0, rows, values[3])
+            else:
+                hk = self.kvcache._kv_host[0, dense].reshape(-1, *self.kvcache._kv_host.shape[4:])
+                hv = self.kvcache._kv_host[1, dense].reshape(-1, *self.kvcache._kv_host.shape[4:])
+                # CPU Float8 tensors do not implement index_copy_; indexed assignment does.
+                hk[rows] = values[0]
+                hv[rows] = values[1]
+        for (slot, row), value in txn["cmp"].items():
+            self.kvcache.cmp_k_cache(slot)[row].copy_(value)
+        rope = getattr(self.kvcache, "_rope_positions", None)
+        if rope is not None:
+            for row, value in txn["rope"].items():
+                rope[row].copy_(value)
+        for value in txn["kv"].values():
+            kind, layer_id, dense, loc, *saved = value
+            pool = self.kvcache._pool
+            if kind == "device":
+                pool._k_codes[dense][loc].copy_(saved[0])
+                pool._k_norm[dense][loc].copy_(saved[1])
+                pool._v_codes[dense][loc].copy_(saved[2])
+                pool._v_norm[dense][loc].copy_(saved[3])
+            elif kind == "host_fp8":
+                hk = self.kvcache._kv_host[0, dense].reshape(-1, *self.kvcache._kv_host.shape[4:])
+                hv = self.kvcache._kv_host[1, dense].reshape(-1, *self.kvcache._kv_host.shape[4:])
+                hk[loc].copy_(saved[0])
+                hv[loc].copy_(saved[1])
+            elif kind == "host_turbo":
+                host = self.kvcache.host_turbo(layer_id)
+                for target, source in zip(host, saved):
+                    target[loc].copy_(source)
+            elif kind == "bf16_device":
+                k_page = self.kvcache.k_cache(layer_id)
+                v_page = self.kvcache.v_cache(layer_id)
+                page, offset = divmod(loc, self.page_size)
+                k_page[page, offset].copy_(saved[0])
+                v_page[page, offset].copy_(saved[1])
+            elif kind == "bf16_host":
+                host_kv = self.kvcache.host_kv(layer_id)
+                hk = host_kv[0].reshape(-1, *host_kv[0].shape[2:])
+                hv = host_kv[1].reshape(-1, *host_kv[1].shape[2:])
+                hk[loc].copy_(saved[0])
+                hv[loc].copy_(saved[1])
+            else:
+                raise RuntimeError(f"unknown QSA transaction KV kind: {kind}")
 
     @staticmethod
     def _qsa_group(config: ModelConfig):
@@ -384,6 +717,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             kv_norms=(k_norm, v_norm) if compressed else None,
             cent=self.kvcache.cent_tensor if compressed else None,
             page_size=self.page_size if compressed else None,
+            row_invariant=getattr(batch, "spec_logits_indices", None) is not None,
         )
         mark("attention")
         if compressed and is_rotated(book):
@@ -489,15 +823,37 @@ class QSASparseAttnBackend(BaseAttnBackend):
         new_forward = md.cmp_rows is None or slot <= md.last_slot
         if new_forward:
             md.phys_loc = self._physical_loc(batch.out_loc)
-        self.kvcache.store_kv(k, v, md.phys_loc, layer_id)
         if md.block_table is None:
             self._snapshot_decode(md, batch)
+        req_indices = None
+        legacy_txn = self._spec_txns and any(
+            not txn.get("graph_safe", False) for txn in self._spec_txns.values()
+        )
+        if legacy_txn:
+            req_indices = md.token_to_req
+            if req_indices is None:
+                raise RuntimeError("QSA speculative transaction requires token_to_req metadata")
+            reqs = getattr(batch, "padded_reqs", None) or batch.reqs
+            for req_index in torch.unique(req_indices.detach()).tolist():
+                mask = req_indices == int(req_index)
+                table_idx = reqs[int(req_index)].table_idx
+                if not self.spec_txn_graph_safe(table_idx):
+                    self._txn_save_rows(table_idx, layer_id, md.phys_loc[mask])
+                    self._txn_save_rope(table_idx, md.phys_loc[mask])
+        self.kvcache.store_kv(k, v, md.phys_loc, layer_id)
         if new_forward:
             # Capture and warmup share metadata, but their addresses must be replanned.
             self._plan_index_writes(md, batch)
             if stage_host:
                 self._plan_host_staging(md, k.shape[0])
         md.last_slot = slot
+        if req_indices is not None:
+            reqs = getattr(batch, "padded_reqs", None) or batch.reqs
+            for req_index in torch.unique(req_indices.detach()).tolist():
+                mask = req_indices == int(req_index)
+                table_idx = reqs[int(req_index)].table_idx
+                if not self.spec_txn_graph_safe(table_idx):
+                    self._txn_save_cmp(table_idx, slot, md.cmp_rows[mask])
         self._update_index_cache(index, md, slot)
         return md, slot
 

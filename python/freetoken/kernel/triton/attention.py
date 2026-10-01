@@ -290,13 +290,24 @@ def _decode_grouped_stage1_kernel(
             else:
                 k_mask = mask_n[None, :] & mask_d[:, None]
                 if HAS_HOST:
-                    k_dev = tl.load(k_ptr + slots[None, :] * stride_ks + k_base_offsets,
-                                    mask=k_mask & (slots[None, :] < NUM_DEVICE_SLOTS), other=0.0)
-                    k_host = tl.load(k_host_ptr + (slots[None, :] - NUM_DEVICE_SLOTS) * stride_khs + kv_head * stride_khhs + offs_d[:, None],
-                                     mask=k_mask & (slots[None, :] >= NUM_DEVICE_SLOTS), other=0.0)
+                    k_dev = tl.load(
+                        k_ptr + slots[None, :] * stride_ks + k_base_offsets,
+                        mask=k_mask & (slots[None, :] < NUM_DEVICE_SLOTS),
+                        other=0.0,
+                    )
+                    k_host = tl.load(
+                        k_host_ptr
+                        + (slots[None, :] - NUM_DEVICE_SLOTS) * stride_khs
+                        + kv_head * stride_khhs
+                        + offs_d[:, None],
+                        mask=k_mask & (slots[None, :] >= NUM_DEVICE_SLOTS),
+                        other=0.0,
+                    )
                     k = tl.where((slots[None, :] >= NUM_DEVICE_SLOTS), k_host, k_dev)
                 else:
-                    k = tl.load(k_ptr + slots[None, :] * stride_ks + k_base_offsets, mask=k_mask, other=0.0)
+                    k = tl.load(
+                        k_ptr + slots[None, :] * stride_ks + k_base_offsets, mask=k_mask, other=0.0
+                    )
             # Host KV may use a wider staging dtype (currently FP32) than the
             # query.  Keep the all-device path free of an unnecessary cast.
             if HAS_HOST:
@@ -323,13 +334,24 @@ def _decode_grouped_stage1_kernel(
             else:
                 v_mask = mask_n[:, None] & mask_dv[None, :]
                 if HAS_HOST:
-                    v_dev = tl.load(v_ptr + slots[:, None] * stride_vs + v_base_offsets,
-                                    mask=v_mask & (slots[:, None] < NUM_DEVICE_SLOTS), other=0.0)
-                    v_host = tl.load(v_host_ptr + (slots[:, None] - NUM_DEVICE_SLOTS) * stride_vhs + kv_head * stride_vhhs + offs_dv[None, :],
-                                     mask=v_mask & (slots[:, None] >= NUM_DEVICE_SLOTS), other=0.0)
+                    v_dev = tl.load(
+                        v_ptr + slots[:, None] * stride_vs + v_base_offsets,
+                        mask=v_mask & (slots[:, None] < NUM_DEVICE_SLOTS),
+                        other=0.0,
+                    )
+                    v_host = tl.load(
+                        v_host_ptr
+                        + (slots[:, None] - NUM_DEVICE_SLOTS) * stride_vhs
+                        + kv_head * stride_vhhs
+                        + offs_dv[None, :],
+                        mask=v_mask & (slots[:, None] >= NUM_DEVICE_SLOTS),
+                        other=0.0,
+                    )
                     v = tl.where((slots[:, None] >= NUM_DEVICE_SLOTS), v_host, v_dev)
                 else:
-                    v = tl.load(v_ptr + slots[:, None] * stride_vs + v_base_offsets, mask=v_mask, other=0.0)
+                    v = tl.load(
+                        v_ptr + slots[:, None] * stride_vs + v_base_offsets, mask=v_mask, other=0.0
+                    )
 
             m_new = tl.maximum(tl.max(scores, axis=1), m_i)
             alpha = tl.exp(m_i - m_new)
@@ -712,11 +734,26 @@ def _extend_attention_kernel(
             else:
                 k_mask = mask_n[None, :] & mask_d[:, None]
                 if HAS_HOST:
-                    k_dev = tl.load(k_ptr + slots[None, :] * stride_ks + kv_head * stride_kh + offs_d[:, None], mask=k_mask & (slots[None, :] < NUM_DEVICE_SLOTS), other=0.0)
-                    k_host = tl.load(k_host_ptr + (slots[None, :] - NUM_DEVICE_SLOTS) * stride_khs + kv_head * stride_kh + offs_d[:, None], mask=k_mask & (slots[None, :] >= NUM_DEVICE_SLOTS), other=0.0)
+                    k_dev = tl.load(
+                        k_ptr + slots[None, :] * stride_ks + kv_head * stride_kh + offs_d[:, None],
+                        mask=k_mask & (slots[None, :] < NUM_DEVICE_SLOTS),
+                        other=0.0,
+                    )
+                    k_host = tl.load(
+                        k_host_ptr
+                        + (slots[None, :] - NUM_DEVICE_SLOTS) * stride_khs
+                        + kv_head * stride_kh
+                        + offs_d[:, None],
+                        mask=k_mask & (slots[None, :] >= NUM_DEVICE_SLOTS),
+                        other=0.0,
+                    )
                     k = tl.where(slots[None, :] >= NUM_DEVICE_SLOTS, k_host, k_dev)
                 else:
-                    k = tl.load(k_ptr + slots[None, :] * stride_ks + kv_head * stride_kh + offs_d[:, None], mask=k_mask, other=0.0)
+                    k = tl.load(
+                        k_ptr + slots[None, :] * stride_ks + kv_head * stride_kh + offs_d[:, None],
+                        mask=k_mask,
+                        other=0.0,
+                    )
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
 
@@ -745,11 +782,26 @@ def _extend_attention_kernel(
             else:
                 v_mask = mask_n[:, None] & mask_dv[None, :]
                 if HAS_HOST:
-                    v_dev = tl.load(v_ptr + slots[:, None] * stride_vs + kv_head * stride_vh + offs_dv[None, :], mask=v_mask & (slots[:, None] < NUM_DEVICE_SLOTS), other=0.0)
-                    v_host = tl.load(v_host_ptr + (slots[:, None] - NUM_DEVICE_SLOTS) * stride_vhs + kv_head * stride_vh + offs_dv[None, :], mask=v_mask & (slots[:, None] >= NUM_DEVICE_SLOTS), other=0.0)
+                    v_dev = tl.load(
+                        v_ptr + slots[:, None] * stride_vs + kv_head * stride_vh + offs_dv[None, :],
+                        mask=v_mask & (slots[:, None] < NUM_DEVICE_SLOTS),
+                        other=0.0,
+                    )
+                    v_host = tl.load(
+                        v_host_ptr
+                        + (slots[:, None] - NUM_DEVICE_SLOTS) * stride_vhs
+                        + kv_head * stride_vh
+                        + offs_dv[None, :],
+                        mask=v_mask & (slots[:, None] >= NUM_DEVICE_SLOTS),
+                        other=0.0,
+                    )
                     v = tl.where(slots[:, None] >= NUM_DEVICE_SLOTS, v_host, v_dev)
                 else:
-                    v = tl.load(v_ptr + slots[:, None] * stride_vs + kv_head * stride_vh + offs_dv[None, :], mask=v_mask, other=0.0)
+                    v = tl.load(
+                        v_ptr + slots[:, None] * stride_vs + kv_head * stride_vh + offs_dv[None, :],
+                        mask=v_mask,
+                        other=0.0,
+                    )
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new

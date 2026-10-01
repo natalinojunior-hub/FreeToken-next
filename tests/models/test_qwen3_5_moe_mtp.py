@@ -21,7 +21,7 @@ def test_qwen35_mtp_is_fail_closed_until_state_parity():
     assert _safe_spec_mtp_depth(SimpleNamespace(model_type="qwen3_5_moe"), 0) == 0
 
 
-def test_qwen4_iq2s_iq4nl_mtp_is_fail_closed_until_token_parity():
+def test_qwen4_iq2s_iq4nl_mtp_is_fail_closed():
     from types import SimpleNamespace
 
     assert _safe_spec_mtp_depth(

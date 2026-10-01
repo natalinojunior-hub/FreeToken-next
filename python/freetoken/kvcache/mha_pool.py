@@ -109,6 +109,7 @@ class MHAKVCache(BaseKVCachePool):
     def host_tier_ram_bytes(cls, config, host_tokens: int, dtype=None) -> int:
         from freetoken.attention import AttnType
         from freetoken.utils import div_even
+
         total = 0
         for spec in config.model_config.kv_cache_group_specs():
             if spec.attn_type is not AttnType.FULL or getattr(spec, "is_swa", False):
@@ -116,9 +117,12 @@ class MHAKVCache(BaseKVCachePool):
             heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
             if dtype in ("turbo4", "turbo3"):
                 from freetoken.kernel.triton.turbo_kv import CODE_BYTES
+
                 per_head = (spec.head_dim // 128) * (CODE_BYTES[dtype] + 2)
             else:
-                itemsize = dtype.itemsize if isinstance(dtype, torch.dtype) else config.dtype.itemsize
+                itemsize = (
+                    dtype.itemsize if isinstance(dtype, torch.dtype) else config.dtype.itemsize
+                )
                 per_head = spec.head_dim * itemsize
             total += 2 * spec.num_layers * heads * per_head
         return total * host_tokens

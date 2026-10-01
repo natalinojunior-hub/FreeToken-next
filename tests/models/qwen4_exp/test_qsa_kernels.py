@@ -574,3 +574,47 @@ def test_capture_graph_provisions_the_block_topk_scratch():
     assert backend._scratch("topk_scratch", 2, width, dtype=torch.int32).data_ptr() == (
         static.data_ptr()
     )
+
+
+@requires_cuda
+@pytest.mark.parametrize("coded", [False, True])
+def test_qsa_row_invariant_matches_single_row_decode_bitwise(coded):
+    """A multi-row verify window must reduce each row exactly like a one-row decode call."""
+    from freetoken.kernel.triton.qsa.attend import qsa_sparse_paged_attention
+    from freetoken.kernel.triton.turbo_kv import CENTROIDS_4, CODE_BYTES, quantize
+
+    torch.manual_seed(7)
+    device, rows, kv_heads, q_heads, dim, pages, topk = torch.device("cuda"), 6, 2, 8, 128, 64, 2048
+    tokens = pages * PAGE_SIZE
+    k = torch.randn(tokens, kv_heads, dim, device=device, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q = torch.randn(rows, q_heads, dim, device=device, dtype=torch.bfloat16)
+    extra: dict = {}
+    if coded:
+        k_codes, k_norm = quantize(k.reshape(-1, dim), "turbo4")
+        v_codes, v_norm = quantize(v.reshape(-1, dim), "turbo4")
+        width = CODE_BYTES["turbo4"]
+        k_cache = k_codes.reshape(tokens, kv_heads, width)
+        v_cache = v_codes.reshape(tokens, kv_heads, width)
+        extra = dict(
+            kv_book="turbo4",
+            kv_norms=(k_norm.reshape(tokens, kv_heads, 1), v_norm.reshape(tokens, kv_heads, 1)),
+            cent=torch.tensor(CENTROIDS_4, dtype=torch.float32, device=device),
+            page_size=PAGE_SIZE,
+        )
+    else:
+        k_cache = k.reshape(pages, PAGE_SIZE, kv_heads, dim).contiguous()
+        v_cache = v.reshape(pages, PAGE_SIZE, kv_heads, dim).contiguous()
+    indices = torch.stack(
+        [torch.randperm(tokens - r, device=device)[:topk].sort().values for r in range(rows)]
+    ).to(torch.int32)
+    block_table = torch.arange(pages, dtype=torch.int32, device=device).view(1, -1)
+    zeros = torch.zeros(rows, dtype=torch.int32, device=device)
+    batched = qsa_sparse_paged_attention(
+        q, k_cache, v_cache, indices, block_table, zeros, row_invariant=True, **extra
+    )
+    for r in range(rows):
+        single = qsa_sparse_paged_attention(
+            q[r : r + 1], k_cache, v_cache, indices[r : r + 1], block_table, zeros[:1], **extra
+        )
+        assert torch.equal(batched[r : r + 1], single), r

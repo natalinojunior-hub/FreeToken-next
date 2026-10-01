@@ -53,6 +53,32 @@ _host_trace_totals = [0, 0.0, 0.0, 0.0]
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
 
+_runtime_env_mtime = 0.0
+
+
+def _apply_runtime_env(path: str) -> None:
+    """Measurement only (FREETOKEN_RUNTIME_ENV_FILE): re-apply a JSON env map when the file
+    changes, so one boot can test many flag settings. null removes a variable. Flags baked into
+    CUDA graphs at capture time are not affected; serve with --cuda-graph-max-bs 0 for those."""
+    global _runtime_env_mtime
+    try:
+        mtime = os.stat(path).st_mtime
+        if mtime == _runtime_env_mtime:
+            return
+        import json
+
+        with open(path, encoding="utf-8") as stream:
+            values = json.load(stream)
+    except (OSError, ValueError):
+        return
+    _runtime_env_mtime = mtime
+    for key, value in values.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = str(value)
+
+
 def _gib(n_bytes: int) -> str:
     return f"{n_bytes / (1 << 30):.2f} GiB"
 
@@ -499,6 +525,8 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             torch.cuda.profiler.start()
             self._profile_started = True
 
+        if os.environ.get("FREETOKEN_RUNTIME_ENV_FILE"):
+            _apply_runtime_env(os.environ["FREETOKEN_RUNTIME_ENV_FILE"])
         mtp_sample = self._begin_mtp_cycle() if getattr(self, "spec_mtp", 0) > 0 else None
         self._guard_vram_pressure()
         if getattr(self, "spec_mtp", 0) > 0 and self._spec_step_or_fail():
@@ -926,7 +954,9 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             if req.mamba_restore_src is not None:
                 pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
                 if pool.has_slot_state("mtp_residual"):
-                    residual = pool.slot_state("mtp_residual")[req.linear_slot_idx].unsqueeze(0).clone()
+                    residual = (
+                        pool.slot_state("mtp_residual")[req.linear_slot_idx].unsqueeze(0).clone()
+                    )
                     # Prefix hits restore the slot on the engine stream. Keep the model's
                     # scalar MTP seed in sync too; otherwise a recycled request can start
                     # its first draft from the previous request's residual.

@@ -120,7 +120,7 @@ def test_pool_row_commit_and_spec_state_byte_accounting(monkeypatch):
         linear_attention_group=lambda: group,
     )
     config = SimpleNamespace(
-        spec_mtp=steps - 1,
+        spec_mtp=(steps - 2) // 2,
         model_config=model_config,
         tp_info=SimpleNamespace(size=1),
         dtype=torch.bfloat16,
@@ -728,7 +728,7 @@ def test_run_spec_step_k4_commits_only_accepted_target_rows(accepted_drafts):
     assert token_pool[0, 8 : 8 + committed].tolist() == sampled[:committed]
     assert req.input_ids.tolist() == list(range(1, 9)) + sampled[:committed]
     assert (req.cached_len, req.device_len) == (keep, keep + 1)
-    assert row_writes == [(0, committed - 1)] if committed <= 4 else row_writes == []
+    assert row_writes == [(0, committed - 1)]
     free = set(cache.free_slots.tolist())
     assert set(allocated[committed:]).issubset(free)
     assert set(allocated[:committed]).isdisjoint(free)

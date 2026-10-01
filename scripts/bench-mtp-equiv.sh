@@ -66,7 +66,7 @@ run_arm() {
     TMPDIR=/models/desenvolvimento/tmp FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1 \
         .venv/bin/python benchmarks/bench_pp_tg.py \
         --model "$MODEL" --tokens "$TOKENS" --decode "$DECODE" \
-        --repeats 1 --warmups 0 --label "$label" --mem-ratio "$MEM_RATIO" $NO_GRAPH \
+        --repeats 1 --warmups 0 --label "$label" $NO_GRAPH \
         --serve-arg="--spec-mtp $k" "${serve_arg_flags[@]}" \
         --json "$json" > "$log" 2>&1 < /dev/null &
     pid=$!

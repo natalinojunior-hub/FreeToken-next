@@ -378,12 +378,16 @@ def qsa_sparse_paged_attention(
     kv_norms: tuple[torch.Tensor, torch.Tensor] | None = None,
     cent: torch.Tensor | None = None,
     page_size: int | None = None,
+    row_invariant: bool = False,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16 K/V caches.
 
     ``host_kv`` is the RAM tier: physical pages ``>= k_cache.shape[0]`` address it at
     ``page - k_cache.shape[0]``. It is pinned host memory read zero-copy, or a device staging
     copy of it; either way it must share the device slab's page layout.
+
+    ``row_invariant`` picks the tile/split profile as for a single decode row, so every row of a
+    multi-row spec-verify window reduces in the same order as RAW decode would.
     """
 
     coded = kv_book is not None
@@ -445,7 +449,7 @@ def qsa_sparse_paged_attention(
 
     group_size = q.shape[1] // kv_heads
     block_m = triton.next_power_of_2(group_size)
-    base_programs = q.shape[0] * kv_heads
+    base_programs = (1 if row_invariant else q.shape[0]) * kv_heads
     small_profile_limit = 8 if block_m <= 8 else 4
 
     # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
