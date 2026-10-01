@@ -400,8 +400,13 @@ class SchedulerSpecMixin:
         return snap_ring, snap_scratch
 
     def _restore_qsa_state(
-        self, req: Req, *, keep_start: int = 0, keep_count: int = 0,
-        pre_draft: bool = False, keep_end: int | None = None
+        self,
+        req: Req,
+        *,
+        keep_start: int = 0,
+        keep_count: int = 0,
+        pre_draft: bool = False,
+        keep_end: int | None = None,
     ) -> None:
         if not hasattr(self, "_spec_qsa_snapshots"):
             return
@@ -691,8 +696,10 @@ class SchedulerSpecMixin:
             getattr(self.engine, "attn_backend", None), "spec_txn_graph_safe", None
         )
         txn_graph_safe = graph_safe is not None and graph_safe(req.table_idx)
-        if runner is not None and n in runner.drafts and (
-            not self._qsa_txn_active(req) or txn_graph_safe
+        if (
+            runner is not None
+            and n in runner.drafts
+            and (not self._qsa_txn_active(req) or txn_graph_safe)
         ):
             if os.getenv(DRAFT_GRAPH_CHECK_ENV, "0") != "1":
                 return runner.replay_draft(db, residual, token)
@@ -704,8 +711,10 @@ class SchedulerSpecMixin:
 
             logits = mtp_draft_logits(model, r)
         out = (r, logits, torch.argmax(logits, dim=-1))
-        if runner is not None and n in runner.drafts and (
-            not self._qsa_txn_active(req) or txn_graph_safe
+        if (
+            runner is not None
+            and n in runner.drafts
+            and (not self._qsa_txn_active(req) or txn_graph_safe)
         ):
             bad = [i for i, (g, e) in enumerate(zip(got, out)) if not torch.equal(g, e)]
             if bad:
@@ -948,10 +957,10 @@ class SchedulerSpecMixin:
                 req.cached_len, req.device_len = keep_cached, keep_device
             else:
                 if pool.spec_states is not None:
-                    pool.commit_spec_row(
-                        self._linear_slot(req), (d - 1 - c0) + committed - 1
-                    )
-                commit_qsa = getattr(getattr(self.engine, "attn_backend", None), "commit_spec_txn", None)
+                    pool.commit_spec_row(self._linear_slot(req), (d - 1 - c0) + committed - 1)
+                commit_qsa = getattr(
+                    getattr(self.engine, "attn_backend", None), "commit_spec_txn", None
+                )
                 if commit_qsa is not None:
                     commit_qsa(req.table_idx)
             if last_res is not None and last_res.shape[0] >= offset + committed:
@@ -1189,9 +1198,7 @@ class SchedulerSpecMixin:
             if n < vb.input_ids.shape[0]:
                 if zero_replay:
                     pool.commit_spec_row(self._linear_slot(req), n - 1)
-                    self._restore_qsa_state(
-                        req, keep_start=c0, keep_count=n, keep_end=c0 + n
-                    )
+                    self._restore_qsa_state(req, keep_start=c0, keep_count=n, keep_end=c0 + n)
                 else:
                     if snap_slot is not None:
                         pool.copy_from(snap_slot, self._linear_slot(req))
@@ -1209,7 +1216,10 @@ class SchedulerSpecMixin:
             # target rejected part of the draft, request still live. A mid-window FINISH is
             # reclaimed inside _commit_spec_tokens itself, before table_idx is recycled.
             keep_cached, keep_device = spec_rollback_lengths(d, committed)
-            self._restore_qsa_state(req, pre_draft=True)
+            if not zero_replay:
+                # Zero-replay keeps the accepted rows' QSA writes (a closed compressed group,
+                # ring rows); its partial restore below must find the journal still open.
+                self._restore_qsa_state(req, pre_draft=True)
             self.cache_manager.free_spec_reject(req, keep_len=keep_device, alloc_len=d + k)
             req.cached_len = keep_cached
             req.device_len = keep_device
@@ -1245,7 +1255,9 @@ class SchedulerSpecMixin:
                 req.cached_len, req.device_len = keep_cached, keep_cached + 1
             elif pool.spec_states is not None:
                 pool.commit_spec_row(self._linear_slot(req), p + committed - 1)
-            commit_qsa = getattr(getattr(self.engine, "attn_backend", None), "commit_spec_txn", None)
+            commit_qsa = getattr(
+                getattr(self.engine, "attn_backend", None), "commit_spec_txn", None
+            )
             if commit_qsa is not None:
                 commit_qsa(req.table_idx)
 

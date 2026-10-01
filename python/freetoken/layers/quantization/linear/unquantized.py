@@ -43,6 +43,8 @@ def small_batch_linear(
     as before -- widening downward was measured at -19.3% (see campaign37 m1-regression note).
     """
     if x.dim() == 2 and 2 <= x.shape[0] <= 8:
+        if os.environ.get("FREETOKEN_ROW_INVARIANT_LINEAR") == "1":
+            return torch.cat([F.linear(row.unsqueeze(0), w, b) for row in x])
         if _SMALL_M_DISPATCH:
             if w.shape[0] < _SMALL_M_SPLITK_MAX_N:
                 return small_m_linear(x, w, b)  # split-K; internal F.linear fallback off-envelope

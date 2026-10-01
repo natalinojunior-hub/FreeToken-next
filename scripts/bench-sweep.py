@@ -74,13 +74,19 @@ def main() -> int:
                             "sha": row["output_sha1"],
                             "vram_gib": row["vram_gib"],
                             "rss_gib": row["server_rss_gib"],
+                            "text": row["output_text"],
                         }
                     )
                     ref = results[0]["sha"]
+                    ref_text, text = results[0]["text"], results[-1]["text"]
+                    first_diff = next(
+                        (i for i, (x, y) in enumerate(zip(ref_text, text)) if x != y),
+                        None if len(ref_text) == len(text) else min(len(ref_text), len(text)),
+                    )
                     print(
                         f"[sweep] {cfg['name']:<24} TG {row['decode_tok_s']:7.2f}  "
                         f"PP {row['prefill_tok_s']:7.1f}  sha {row['output_sha1']} "
-                        f"{'MATCH' if row['output_sha1'] == ref else 'DIVERGE'}",
+                        f"{'MATCH' if row['output_sha1'] == ref else f'DIVERGE@char{first_diff}'}",
                         flush=True,
                     )
         finally:

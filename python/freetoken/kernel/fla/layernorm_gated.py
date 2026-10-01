@@ -137,7 +137,15 @@ def _get_sm_count(device: torch.device) -> int:
     return props.multi_processor_count
 
 
+# Up to this many rows (a decode / MTP-verify window: <= 8 tokens x <= 128 heads) the rows per
+# block is pinned to 1, the value a single decode token gets, so a row reduces in the same
+# order whatever the window length (a different tile layout changes tl.sum rounding).
+_ROW_INVARIANT_MAX_ROWS = 1024
+
+
 def calc_rows_per_block(M: int, device: torch.device) -> int:
+    if M <= _ROW_INVARIANT_MAX_ROWS:
+        return 1
     sm_count = _get_sm_count(device)
     rows_per_block = triton.next_power_of_2(triton.cdiv(M, 2 * sm_count))
     rows_per_block = min(rows_per_block, MAX_ROWS_PER_BLOCK)

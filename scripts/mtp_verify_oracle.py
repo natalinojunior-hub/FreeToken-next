@@ -13,6 +13,29 @@ import sys
 from typing import Any
 
 
+def _index_report(cap: dict[str, dict[str, list[Any]]]) -> Any:
+    """Per-row comparison of selected QSA indices: same order, same set, or different set."""
+    import torch
+
+    if "indices" not in cap["verify"] or "indices" not in cap["raw"]:
+        return None
+    raw, got = torch.cat(cap["raw"]["indices"]), torch.cat(cap["verify"]["indices"])
+    if raw.shape != got.shape:
+        return {"shape": [list(raw.shape), list(got.shape)]}
+    rows = []
+    for r in range(raw.shape[0]):
+        a, b = raw[r], got[r]
+        a, b = a[a >= 0], b[b >= 0]
+        rows.append(
+            "same"
+            if a.shape == b.shape and torch.equal(a, b)
+            else "order"
+            if torch.equal(a.sort().values, b.sort().values)
+            else f"set:{len(set(a.tolist()) ^ set(b.tolist()))}"
+        )
+    return rows
+
+
 def check_verify(scheduler: Any, batch: Any, args: Any, forward: Any) -> Any:
     import torch
     from freetoken.attention.linear import build_fla_metadata
@@ -110,6 +133,36 @@ def check_verify(scheduler: Any, batch: Any, args: Any, forward: Any) -> Any:
     light = os.getenv("FREETOKEN_VERIFY_ORACLE_LIGHT") == "1"
     if not light:
         visit(model, "model")
+    mod_hooks: list[tuple[Any, str, Any]] = []
+
+    def wrap_method(obj: Any, attr: str, name: str) -> None:
+        original_method = getattr(obj, attr)
+
+        def wrapped_method(*inputs: Any, **kwargs: Any) -> Any:
+            for i, value in enumerate(inputs):
+                if isinstance(value, torch.Tensor):
+                    captured[mode].setdefault(f"mod.{name}.in{i}", []).append(value.cpu().clone())
+            result = original_method(*inputs, **kwargs)
+            for i, value in enumerate(result if isinstance(result, tuple) else (result,)):
+                if isinstance(value, torch.Tensor):
+                    captured[mode].setdefault(f"mod.{name}.out{i}", []).append(value.cpu().clone())
+            return result
+
+        mod_hooks.append((obj, attr, original_method))
+        setattr(obj, attr, wrapped_method)
+
+    if not light:
+        for li in range(int(os.getenv("FREETOKEN_VERIFY_ORACLE_MODULE_LAYERS", "4"))):
+            layer = model.layers.op_list[li]
+            if layer.ple is not None:
+                wrap_method(layer.ple, "forward", f"L{li}.ple")
+            wrap_method(layer.attn_hyper_connection, "mix", f"L{li}.attn_hc_mix")
+            mixer = layer.linear_attn if layer._is_linear else layer.self_attn
+            wrap_method(mixer, "forward", f"L{li}.mixer")
+            wrap_method(layer.attn_hyper_connection, "combine", f"L{li}.attn_hc_combine")
+            wrap_method(layer.mlp_hyper_connection, "mix", f"L{li}.mlp_hc_mix")
+            wrap_method(layer.mlp, "forward", f"L{li}.moe")
+            wrap_method(layer.mlp_hyper_connection, "combine", f"L{li}.mlp_hc_combine")
     qsa_layer = int(os.getenv("FREETOKEN_VERIFY_ORACLE_QSA_LAYER", "3"))
     backend = engine.attn_backend
     qsa_orig = (backend.qsa_forward, backend._select)
@@ -130,9 +183,26 @@ def check_verify(scheduler: Any, batch: Any, args: Any, forward: Any) -> Any:
                 qsa_cap[mode].setdefault(key, []).append(value.detach().cpu().clone())
         return out
 
+    import freetoken.kernel.triton.qsa as qsa_pkg
+
+    mqa_orig = qsa_pkg.qsa_mqa_paged
+
+    def mqa_wrap(*args: Any, **kwargs: Any) -> Any:
+        result = mqa_orig(*args, **kwargs)
+        if qsa_now["layer"] == qsa_layer:
+            for key, value in (
+                ("mqa_q", args[0]),
+                ("mqa_pages", args[1]),
+                ("mqa_logits", args[7]),
+                ("mqa_visible", args[8]),
+            ):
+                qsa_cap[mode].setdefault(key, []).append(value.detach().cpu().clone())
+        return result
+
     if not light:
         backend.qsa_forward = qsa_forward
         backend._select = qsa_select
+        qsa_pkg.qsa_mqa_paged = mqa_wrap
     raw_logits = []
     original_input_ids = req.input_ids
     # Row-wise replay advances beyond the prompt; PLE needs the complete token
@@ -190,8 +260,26 @@ def check_verify(scheduler: Any, batch: Any, args: Any, forward: Any) -> Any:
             )
             completed = True
             return out
+        first_mod = None
+        for name, values in captured["verify"].items():
+            if not name.startswith("mod."):
+                continue
+            raw_values = captured["raw"].get(name)
+            if raw_values is None:
+                continue
+            reference, got = torch.cat(raw_values), torch.cat(values)
+            if not torch.equal(reference, got):
+                first_mod = {
+                    "tensor": name,
+                    "max_abs": float((reference.float() - got.float()).abs().max()),
+                    "unequal": int((reference != got).sum()),
+                    "numel": reference.numel(),
+                }
+                break
         first = None
         for name, values in captured["verify"].items():
+            if name.startswith("mod."):
+                continue
             raw_values = captured["raw"].get(name)
             if raw_values is None:
                 continue
@@ -223,7 +311,35 @@ def check_verify(scheduler: Any, batch: Any, args: Any, forward: Any) -> Any:
                         for value, saved in zip(state, raw_state)
                     ],
                     "first_projection_difference": first,
+                    "first_module_difference": first_mod,
                     "qsa_layer": qsa_layer,
+                    "mqa_pages_equal": (
+                        None
+                        if "mqa_pages" not in qsa_cap["verify"]
+                        else bool(
+                            torch.equal(
+                                qsa_cap["raw"]["mqa_pages"][-1], qsa_cap["verify"]["mqa_pages"][-1]
+                            )
+                        )
+                    ),
+                    "qsa_indices_sets": (
+                        None
+                        if "indices" not in qsa_cap["verify"]
+                        else {
+                            "sorted_equal_rows": [
+                                bool(torch.equal(x.sort(-1).values, y.sort(-1).values))
+                                for x, y in zip(
+                                    torch.cat(qsa_cap["raw"]["indices"]),
+                                    torch.cat(qsa_cap["verify"]["indices"]),
+                                )
+                            ],
+                            "pad_counts": [
+                                torch.cat(qsa_cap[m]["indices"]).lt(0).sum(-1).tolist()
+                                for m in ("raw", "verify")
+                            ],
+                        }
+                    ),
+                    "qsa_indices": _index_report(qsa_cap),
                     "qsa_compare": {
                         key: (
                             None
@@ -243,7 +359,16 @@ def check_verify(scheduler: Any, batch: Any, args: Any, forward: Any) -> Any:
                                 ),
                             }
                         )
-                        for key in ("q", "k", "v", "indices", "out")
+                        for key in (
+                            "q",
+                            "k",
+                            "v",
+                            "mqa_q",
+                            "mqa_visible",
+                            "mqa_logits",
+                            "indices",
+                            "out",
+                        )
                     },
                     "fp8_rowwise_differences": fp8_rowwise_differences,
                 }
@@ -254,6 +379,7 @@ def check_verify(scheduler: Any, batch: Any, args: Any, forward: Any) -> Any:
         return out
     finally:
         backend.qsa_forward, backend._select = qsa_orig
+        qsa_pkg.qsa_mqa_paged = mqa_orig
         if not completed:
             for value, saved in zip(state, initial):
                 value.copy_(saved)
@@ -264,6 +390,8 @@ def check_verify(scheduler: Any, batch: Any, args: Any, forward: Any) -> Any:
         runner.max_graph_bs, runner.verify_graphs = graph_limit, graphs
         for op, original in hooks:
             op.forward = original
+        for obj, attr, original_method in mod_hooks:
+            setattr(obj, attr, original_method)
 
 
 def install() -> None:
@@ -367,6 +495,155 @@ def install() -> None:
         finally:
             self.engine.forward_batch = forward
 
+    def commit_step(self: Any) -> bool:
+        """Post-commit state parity: redo the committed rows one decode forward at a time from
+        the pre-cycle state and compare with the state the spec cycle actually left behind."""
+        import torch
+
+        reqs = list(self.decode_manager.running_reqs)
+        if len(reqs) != 1:
+            return original_step(self)
+        req = reqs[0]
+        engine, model = self.engine, self.engine.model.model
+        if not hasattr(self, "_qsa_rec"):
+            import freetoken.kernel.triton.qsa as qsa_pkg
+
+            rec: dict[str, Any] = {"on": False, "layer": -1, "data": {}}
+            self._qsa_rec = rec
+            backend = engine.attn_backend
+            orig_forward, orig_select, orig_mqa = (
+                backend.qsa_forward,
+                backend._select,
+                qsa_pkg.qsa_mqa_paged,
+            )
+
+            def put(key: str, value: Any) -> None:
+                rec["data"].setdefault((rec["layer"], key), value.detach().cpu().clone())
+
+            def f_forward(q: Any, k: Any, v: Any, index: Any, layer_id: int, b: Any) -> Any:
+                rec["layer"] = layer_id
+                out = orig_forward(q, k, v, index, layer_id, b)
+                if rec["on"]:
+                    for key, value in (("q", q), ("k", k), ("v", v), ("out", out)):
+                        put(key, value)
+                return out
+
+            def f_select(*args: Any, **kwargs: Any) -> Any:
+                indices = orig_select(*args, **kwargs)
+                if rec["on"]:
+                    put("indices", indices)
+                return indices
+
+            def f_mqa(*args: Any, **kwargs: Any) -> Any:
+                result = orig_mqa(*args, **kwargs)
+                if rec["on"]:
+                    put("pages", args[1])
+                    put("mqa_q", args[0])
+                return result
+
+            backend.qsa_forward, backend._select, qsa_pkg.qsa_mqa_paged = f_forward, f_select, f_mqa
+        c0, d0 = req.cached_len, req.device_len
+        state = self._verify_state(req)
+        n_lin = 2 + len(engine.linear_state_pool.slot_states)
+        s0 = [v.cpu().clone() for v in state]
+        rng = torch.cuda.get_rng_state(engine.device)
+        out = original_step(self)
+        if req not in self.decode_manager.running_reqs:
+            return out
+        self._commit_cycles = getattr(self, "_commit_cycles", 0) + 1
+        c1, d1 = req.cached_len, req.device_len
+        res1 = model._last_residual.clone()
+        s1 = [v.cpu().clone() for v in state]
+        for value, saved in zip(state, s0):
+            value.copy_(saved)
+        for row in range(c0, c1):
+            self._replay(req, row, 1)
+        raw = [v.cpu().clone() for v in state]
+        for value, saved in zip(state, s1):
+            value.copy_(saved)
+        req.cached_len, req.device_len = c1, d1
+        model._last_residual = res1
+        torch.cuda.set_rng_state(rng, engine.device)
+
+        def next_logits(source: list[Any]) -> Any:
+            for value, saved in zip(state, source):
+                value.copy_(saved)
+            self._qsa_rec["data"] = {}
+            self._qsa_rec["on"] = True
+            self._replay(req, c1, 1)
+            self._qsa_rec["on"] = False
+            got = engine.last_batch_logits.cpu().clone()
+            self._qsa_snap = self._qsa_rec["data"]
+            for value, saved in zip(state, s1):
+                value.copy_(saved)
+            req.cached_len, req.device_len = c1, d1
+            model._last_residual = res1
+            return got
+
+        logits_actual = next_logits(s1)
+        rec_actual = self._qsa_snap
+        logits_raw = next_logits(raw)
+        rec_raw = self._qsa_snap
+        first_qsa = None
+        for key in rec_raw:
+            if key in rec_actual and not torch.equal(rec_raw[key], rec_actual[key]):
+                first_qsa = {"layer": key[0], "tensor": key[1]}
+                if key[1] == "pages":
+                    flat_a = rec_actual[key].reshape(-1, rec_actual[key].shape[-1])
+                    flat_r = rec_raw[key].reshape(-1, rec_raw[key].shape[-1])
+                    rows_bad = (flat_a != flat_r).any(-1).nonzero().flatten().tolist()
+                    first_qsa["rows"] = rows_bad[:10]
+                    if rows_bad:
+                        ra, rr = flat_a[rows_bad[0]].float(), flat_r[rows_bad[0]].float()
+                        first_qsa["diff_max"] = round(float((ra - rr).abs().max()), 5)
+                        first_qsa["raw_absmax"] = round(float(rr.abs().max()), 5)
+                        first_qsa["rel_l2"] = round(float((ra - rr).norm() / rr.norm()), 5)
+                    first_qsa["n"] = len(rows_bad)
+                break
+        next_equal = bool(torch.equal(logits_actual, logits_raw))
+        next_max = float((logits_actual.float() - logits_raw.float()).abs().max())
+
+        def delta(a: Any, b: Any) -> float:
+            return float((a.float() - b.float()).abs().max()) if a.numel() else 0.0
+
+        kv = engine.kv_cache
+        ring = getattr(kv, "_pending_ring", None)
+        lin = [delta(a, b) for a, b in zip(s1[:n_lin], raw[:n_lin])]
+        layers = [
+            [li for li in range(a.shape[0]) if not torch.equal(a[li], b[li])][:10]
+            for a, b in zip(s1[:2], raw[:2])
+        ]
+        other = [
+            (i, round(delta(a, b), 4), int((a != b).sum()))
+            for i, (a, b) in enumerate(zip(s1[n_lin:], raw[n_lin:]), start=n_lin)
+            if not torch.equal(a, b)
+        ][:12]
+        print(
+            "[oracle-commit] "
+            + json.dumps(
+                {
+                    "cycle": self._commit_cycles,
+                    "c0": c0,
+                    "d0": d0,
+                    "c1": c1,
+                    "d1": d1,
+                    "lin_delta": lin,
+                    "layers": layers,
+                    "other": other,
+                    "next_equal": next_equal,
+                    "first_qsa": first_qsa,
+                    "next_max": next_max,
+                    "ok": next_equal and not any(lin),
+                }
+            ),
+            flush=True,
+        )
+        return out
+
+    if os.getenv("FREETOKEN_VERIFY_ORACLE_COMMIT") == "1":
+        commit_step._raw_oracle = True
+        SchedulerSpecMixin.run_spec_step = commit_step
+        return
     step._raw_oracle = True
     SchedulerSpecMixin.run_spec_step = step
 
