@@ -37,3 +37,4 @@
 - Mudar flag em runtime sem efeito -> valor baked na captura do CUDA Graph -> definir no boot; só flags lidas em Python por ciclo trocam em runtime (`bench-sweep.py`).
 - Evidência vinda de monitor/tarefa que não lancei -> não é evidência; ler o log real. Parar cada monitor ao receber o resultado (`TaskStop` só aceita `task_id`; parâmetro extra cancela o lote inteiro).
 - Aceitação MTP baixa no AD (24% no 5º rascunho contra 73% no ISTA) -> alvo IQ2_S pouco confiante (66% das rejeições com margem < 2) -> não é defeito do motor; não gastar tempo otimizando kernels para recuperar aceitação.
+- ISTA MTP 108 -> 98 TG depois de "cobrir mais casos" -> `spec_state_steps` 2k+2 (buffers do verify) sem benefício -> bissecção por commit e por arquivo (árvores mistas) achou o arquivo; voltou a k+1. Superdimensionar buffers de caminho quente custa TG: só aumentar com matriz de SHA que exija.

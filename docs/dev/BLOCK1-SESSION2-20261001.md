@@ -9,9 +9,9 @@ Este documento é o registro de **por que** cada coisa foi (ou não) alterada. L
 | Item | Estado |
 |---|---|
 | Verify em lote == RAW (SHA) em k1–k5, graph on, 256 tokens, 3 repetições | **Sim** (SHA `235a97ef64b9`) |
-| TG AD (RAW 51,4): k1 58,1 · **k2 60,3** · k3 56,7 · k4 54,0 · k5 51,3 | k2 é o melhor (+17%) |
+| TG AD (RAW 51,4), 3 repetições, SHA igual ao RAW: k1 60,1 · **k2 61,9** · k3 58,1 · k4 55,0 · k5 52,2; auto 62,1–62,2 (1ª requisição 55,5 com calibração) | k2 é o melhor (+20%) |
 | k6 | **Diverge** (caractere 18) e fica lento → capado em 5 |
-| ISTA k5 (RAW 64,1) | ~97–98,8 TG; **o commit `4b27df2`/tag certificada dão 108,4** → regressão aberta (seção 6) |
+| ISTA k5 (RAW 64,1) | **104,4 TG** (era 98,5 antes da correção 6 abaixo); tag certificada e `4b27df2` dão 108,4; falta ~4 TG = custo da transação QSA |
 | Veredito geral | **NOT READY FOR BLOCK 2** (regressão ISTA, seleção automática de k, OOM de reserva) |
 
 ## 2. Causas raiz encontradas (todas confirmadas por experimento)
@@ -31,6 +31,7 @@ Este documento é o registro de **por que** cada coisa foi (ou não) alterada. L
    (`keep_end`) só rodava em `finish_state`. Correção: pular o rollback total quando `zero_replay`.
    Sintoma: ciclos com grupo fechando (posição 4m+3) dentro da janela mantida + rejeição → logits do próximo passo
    divergem (até 8,1). Prova: `FREETOKEN_VERIFY_ORACLE_COMMIT=1` (próximo passo funcional), 24/24 ciclos limpos depois.
+6. **`spec_state_steps` 2k+2 custava 10% do TG do ISTA (108 → 98) sem benefício**: bissecção por commit, depois por arquivo (árvores mistas W1..W7) isolou `kvcache/linear_state_pool.py`. A janela do verify tem exatamente k+1 linhas quando o commit não adia linhas (só o k1 adia, `SPEC_DEFER_MAX`). Voltou a `k+1` (+`SPEC_DEFER_MAX` se k==1). ISTA 98,5 → 104,4; AD +1,6 a +2 TG. Nunca superdimensionar buffers do verify "por segurança": comprova-se com matriz SHA, não com folga.
 5. **A transação QSA obrigava replay em todo modelo QSA** (`qsa_requires_replay`), derrubando o ISTA para 30–41 TG
    (abaixo do RAW). `FREETOKEN_ENABLE_PARTIAL_SPEC` agora vale `1` por padrão (`_partial_spec_enabled()` em `spec.py`);
    `=0` restaura o replay.

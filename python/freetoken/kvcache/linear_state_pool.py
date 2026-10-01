@@ -356,14 +356,22 @@ def state_pool_bytes(config, num_slots: int | None = None) -> int:
 
 
 def spec_state_steps(config) -> int:
-    """Rows needed by a verify window, including deferred prefix rows (up to ``2*k+2``)."""
+    """Verify rows the zero-replay MTP buffers hold: k + 1 for a native-NextN model served with
+    --spec-mtp k, plus the deferred prefix rows only k == 1 carries (else 0: no buffers).
+
+    Do not oversize: 2*k+2 rows measured -10% ISTA k5 TG (108 -> 98) with no benefit, since the
+    window is exactly k+1 rows whenever the commit does not defer replay rows."""
+    from freetoken.engine.graph import SPEC_DEFER_MAX
+
     k = getattr(config, "spec_mtp", 0)
     model = config.model_config
     row_commit = (
         getattr(model, "mtp_row_state_commit", False)
         and os.getenv("FREETOKEN_MTP_ROW_COMMIT", "1") == "1"
     )
-    return 2 * k + 2 if k > 0 and (getattr(model, "native_mtp_layers", 0) or row_commit) else 0
+    if k <= 0 or not (getattr(model, "native_mtp_layers", 0) or row_commit):
+        return 0
+    return k + 1 + (SPEC_DEFER_MAX if k == 1 else 0)
 
 
 def spec_state_bytes(config) -> int:

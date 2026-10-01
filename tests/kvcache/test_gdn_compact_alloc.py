@@ -37,7 +37,7 @@ def _config(steps: int):
         linear_attention_group=lambda: group,
     )
     config = SimpleNamespace(
-        spec_mtp=(steps - 2) // 2,
+        spec_mtp=steps - 1,
         model_config=model,
         tp_info=SimpleNamespace(size=1),
         dtype=torch.bfloat16,
