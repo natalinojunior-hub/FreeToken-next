@@ -133,4 +133,6 @@ W6 (só `linear_state_pool`) = 108,2; W7 (`scheduler`/`adaptive_mtp`/`graph`) = 
   Os dois modelos escalam igual: o AD não tem defeito próprio no motor. ~2/3 do custo extra é MoE, ~1/3 é mixer (GDN `_conv_decode`
   por linha + recorrência + QSA). Alvos: fundir o laço de convolução por linha do GDN; execução dos experts por linha.
 - Mapa de oportunidades fora da recuperação dos 108 TG: cabeça Q8_0 (+5% AD) · calibração do k automático (1ª requisição −12%) ·
-  PP frio do AD (~1,6K tok/s contra ~16K do ISTA, causa não investigada) · fusão da convolução por linha do GDN.
+  PP frio dos DOIS modelos (~1,3–1,6K tok/s: 2 blocos de 8192 com 0 em cache, ~6–7 s por bloco; hipótese não testada: o prefill transmite os experts por bloco, então bloco maior reduziria passagens) · fusão da convolução por linha do GDN.
+
+**Erro corrigido:** uma versão anterior afirmou que o PP frio do AD era 10× pior que o do ISTA. Era comparação de requisição fria com requisição em cache de prefixo (a varredura aquece o k0). O PP frio é igual nos dois.
