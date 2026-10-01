@@ -41,3 +41,5 @@
 - "PP do AD 10× pior que o do ISTA" -> comparei PP frio com PP em cache de prefixo (a varredura aquece o k0 antes) -> confirmar `#cached-token` do 1º prefill no log antes de comparar PP; o PP frio dos dois é ~1,3–1,6K tok/s.
 
 \n- Boot do servidor parado sem erro (GPU 0%, futex, log mudo) -> trava obsoleta do build JIT (`torch_extensions/.../lock`) deixada por um job interrompido; o FileBaton do torch espera sem limite -> guarda no carregador remove trava > 60 s sem compilador vivo; bench detecta boot mudo e despeja pilhas. Não interromper boot durante o primeiro build JIT; um `TORCH_EXTENSIONS_DIR` por worktree.\n- \"RAW\" medido sem `--spec-mtp` -> o padrão é 6 e liga MTP quando o gate está aberto -> medir RAW sempre com `--spec-mtp 0`.\n
+- Commit com patch de 872 MB -> `git add docs/dev` incluiu um zip de 680 MB já modificado na árvore suja -> adicionar só arquivos explícitos e conferir `git diff --cached --stat` antes de commitar; corrigido refazendo os commits locais com plumbing (backup em `refs/backup/pre-zip-fix`).
+

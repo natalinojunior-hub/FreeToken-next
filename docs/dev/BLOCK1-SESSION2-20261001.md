@@ -157,7 +157,9 @@ W6 (só `linear_state_pool`) = 108,2; W7 (`scheduler`/`adaptive_mtp`/`graph`) = 
 
 ## 11. Estado final desta sessão e próximos passos
 
-- Commits (próximos de `4b27df2`): 26a4344, e860b40, 056f33d, 4cf1c27, 363303f, 101b021, 39bc5d5, 2b97d3b. CI: formato e lint limpos, mypy 447 arquivos, **2768 testes**.
+- Commits desde `4b27df2`: 26a4344, e860b40, 056f33d, 422692a (buffers k+1), 95e14f8 (docs), f21780b (docs PP), 7024599 (trava JIT), 0376095 (formato), 88c3f65 (prompt).
+  Os 6 últimos foram refeitos sem o `docs/dev/campaign36-mtp-audit.zip` (680 MB) que entrou por engano em `git add docs/dev`; hashes antigos (4cf1c27, 363303f, 101b021, 39bc5d5, 2b97d3b, aeaedcb) só existem em `refs/backup/pre-zip-fix`.
+  Regra: nunca `git add <diretório>` com a árvore suja; listar arquivos explícitos e conferir `git diff --cached --stat`. CI: formato e lint limpos, mypy 447 arquivos, **2768 testes**.
 - Medido: AD k1–k5 == RAW (SHA 235a97ef64b9), k2 61,9 TG (cabeça Q8_0 opcional 63,1; RAW 52,9); ISTA k5 104,4 (tag 108,4).
 - **Abertos (não dar como resolvidos):** (1) RAW do AD: gate sem prova, execução atual instável 43–53; (2) ISTA −4 TG; (3) calibração do k automático.
 - Veredito: **NOT READY FOR BLOCK 2.** Prompt da próxima sessão: [`PROMPT-NEXT-SESSION-block1.md`](PROMPT-NEXT-SESSION-block1.md).
