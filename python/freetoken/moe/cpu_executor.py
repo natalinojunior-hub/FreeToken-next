@@ -77,6 +77,8 @@ _WFMT_IDS = {
     "ds_fp4": 3,
     "q4_0": 4,
     "q4_k": 5,
+    "q3_k": 16,
+    "q2_k": 17,
     "q6_k": 6,
     "iq3_s": 7,
     "iq4_xs": 8,
@@ -96,7 +98,9 @@ _WFMT_IDS = {
 # block_iq4_nl is 18 bytes / block_q8_0 is 34 bytes, both over 32 elements; block_q2_0 is
 # 18 bytes over 64 elements (fp16 d + 16 bytes of four-per-byte 2-bit quants).
 _GGUF_KQUANT_BLOCK = {
+    "q2_k": (256, 84),
     "q4_k": (256, 144),
+    "q3_k": (256, 110),
     "q6_k": (256, 210),
     "iq3_s": (256, 110),
     "iq4_xs": (256, 136),
@@ -119,6 +123,8 @@ _GGUF_KQUANT_BLOCK = {
 _GGML_TO_CPU_FMT = {
     2: "q4_0",
     8: "q8_0",
+    10: "q2_k",
+    11: "q3_k",
     12: "q4_k",
     14: "q6_k",
     20: "iq4_nl",

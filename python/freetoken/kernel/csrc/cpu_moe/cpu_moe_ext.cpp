@@ -1368,6 +1368,82 @@ float q6_k_dot_f32_scalar(const uint8_t* w, const bf16_t* x, int K) {
   return acc;
 }
 
+float q3_k_dot_f32_scalar(const uint8_t* w, const bf16_t* x, int K) {
+  // Q3_K: 256-element blocks, 110 bytes: hmask[32] | qs[64] | scales[12] | d(fp16).
+  // The packed scale words and element order mirror dequantize_block_q3_K in dequantize.cuh.
+  float acc = 0.0f;
+  const int nb = K / 256;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 110;
+    const uint8_t* hm = blk;
+    const uint8_t* qs = blk + 32;
+    const uint8_t* scales = blk + 96;
+    uint16_t dh;
+    std::memcpy(&dh, blk + 108, sizeof(uint16_t));
+    const float d = fp16_to_f32(dh);
+    const bf16_t* xb = x + (size_t)b * 256;
+    for (int n = 0; n < 2; ++n) {
+      for (int j = 0; j < 4; ++j) {
+        const int shift = 2 * j;
+        const uint8_t mask = (uint8_t)(1u << (4 * n + j));
+        for (int is0 = 0; is0 < 2; ++is0) {
+          const int is = 8 * n + 2 * j + is0;
+          int us;
+          if (is < 4) {
+            us = (scales[is] & 0x0F) | (((scales[is + 8] >> 0) & 3) << 4);
+          } else if (is < 8) {
+            us = (scales[is] & 0x0F) | (((scales[is + 4] >> 2) & 3) << 4);
+          } else if (is < 12) {
+            us = ((scales[is - 8] >> 4) & 0x0F) | (((scales[is] >> 4) & 3) << 4);
+          } else {
+            us = ((scales[is - 8] >> 4) & 0x0F) | (((scales[is - 4] >> 6) & 3) << 4);
+          }
+          const float dl = d * (float)(us - 32);
+          const int out = 128 * n + 32 * j + 16 * is0;
+          for (int l = 0; l < 16; ++l) {
+            const int lane = 16 * is0 + l;
+            const int q = (int)((qs[32 * n + lane] >> shift) & 3) - ((hm[lane] & mask) ? 0 : 4);
+            acc += (dl * (float)q) * bf16_to_f32(xb[out + l]);
+          }
+        }
+      }
+    }
+  }
+  return acc;
+}
+
+float q2_k_dot_f32_scalar(const uint8_t* w, const bf16_t* x, int K) {
+  // Q2_K: 256-element blocks, 84 bytes: scales[16] | qs[64] | dm(4).
+  float acc = 0.0f;
+  const int nb = K / 256;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 84;
+    const uint8_t* scales = blk;
+    const uint8_t* qs = blk + 16;
+    uint16_t dh_scale, dh_min;
+    std::memcpy(&dh_scale, blk + 80, sizeof(uint16_t));
+    std::memcpy(&dh_min, blk + 82, sizeof(uint16_t));
+    const float dall = fp16_to_f32(dh_scale);
+    const float dmin = fp16_to_f32(dh_min);
+    const bf16_t* xb = x + (size_t)b * 256;
+    for (int n = 0; n < 2; ++n) {
+      const int base = 128 * n;
+      for (int l = 0; l < 32; ++l) {
+        const uint8_t q = qs[32 * n + l];
+        const int is = 8 * n + l / 16;
+        for (int part = 0; part < 4; ++part) {
+          const int si = is + 2 * part;
+          const float d = dall * (float)(scales[si] & 0x0F);
+          const float m = dmin * (float)(scales[si] >> 4);
+          const int v = (q >> (2 * part)) & 3;
+          acc += (d * (float)v - m) * bf16_to_f32(xb[base + l + 32 * part]);
+        }
+      }
+    }
+  }
+  return acc;
+}
+
 // ------------------- IQ3_S, IQ4_XS, IQ4_NL, Q8_0 (mixed W4A16 GGUF routed-expert banks) ------
 // Scalar dequant-dot kernels, correctness-first (same convention as the Q4_K/Q6_K kernels
 // above: dequantize against bf16 activations, fp32 accumulate; AVX-512 is a follow-up, not
@@ -2211,7 +2287,8 @@ q4dot_fn iquant2_selector(int fmt_id) {
 
 enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4, WF_Q4_K = 5, WF_Q6_K = 6,
             WF_IQ3_S = 7, WF_IQ4_XS = 8, WF_IQ4_NL = 9, WF_Q8_0 = 10, WF_Q2_0 = 11,
-            WF_IQ2_XXS = 12, WF_IQ2_XS = 13, WF_IQ2_S = 14, WF_IQ3_XXS = 15 };
+            WF_IQ2_XXS = 12, WF_IQ2_XS = 13, WF_IQ2_S = 14, WF_IQ3_XXS = 15, WF_Q3_K = 16,
+            WF_Q2_K = 17 };
 
 // The four codebook i-quants above WF_Q2_0, contiguous so a dispatch can range-check them.
 constexpr int WF_IQUANT2_LO = WF_IQ2_XXS;
@@ -2226,7 +2303,7 @@ static_assert(WF_IQ2_XXS == 12 && WF_IQ2_XS == 13 && WF_IQ2_S == 14 && WF_IQ3_XX
 // branch of its own, and on the paths that index a row by the format's block geometry that is
 // not a clean throw -- it is a segfault after the worker threads already hold the pointer
 // table. Fail closed on the version instead of failing loudly on the hardware.
-constexpr int WF_MAX_SUPPORTED = WF_IQ3_XXS;
+constexpr int WF_MAX_SUPPORTED = WF_Q2_K;
 
 // Each ctor pointer arg is the address of a CPU int64 array of length
 // num_layers (one base address per layer, built by cpu_executor.py's
@@ -2458,6 +2535,8 @@ struct CpuMoeExecutor {
     auto kquant_geom = [](int f) -> std::pair<int, int> {  // (block elems, block bytes)
       switch (f) {
         case WF_Q4_K: return {256, 144};
+        case WF_Q2_K: return {256, 84};
+        case WF_Q3_K: return {256, 110};
         case WF_Q6_K: return {256, 210};
         case WF_IQ3_S: return {256, 110};
         case WF_IQ4_XS: return {256, 136};
@@ -2642,6 +2721,14 @@ struct CpuMoeExecutor {
       const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)row_bytes_l;
       return q4_k_dot_f32_scalar(w, x, H);  // W4A16: bf16 activations, K-quant dequant
     }
+    if (fmt_l == WF_Q2_K) {
+      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)row_bytes_l;
+      return q2_k_dot_f32_scalar(w, x, H);
+    }
+    if (fmt_l == WF_Q3_K) {
+      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)row_bytes_l;
+      return q3_k_dot_f32_scalar(w, x, H);
+    }
     if (fmt_l == WF_Q6_K) {
       const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)row_bytes_l;
       return q6_k_dot_f32_scalar(w, x, H);  // W4A16: bf16 activations, K-quant dequant
@@ -2683,7 +2770,7 @@ struct CpuMoeExecutor {
     TORCH_CHECK(fmt_l == WF_NVFP4 || fmt_l == WF_DSFP4,
                 "cpu_moe gemm1_dot: unhandled weight_format ", fmt_l,
                 " (handled: bf16=0, nvfp4=1, mxfp4=2, dsfp4=3, q4_0=4, q4_k=5, q6_k=6, "
-                "iq3_s=7, iq4_xs=8, iq4_nl=9, q8_0=10)");
+                "iq3_s=7, iq4_xs=8, iq4_nl=9, q8_0=10, q3_k=16, q2_k=17)");
     const size_t r = (size_t)e * (2 * I) + row;
     if (use_vnni)
       return nvi8dot(gu_packed_l + r * (size_t)(H / 2), gu_scale_l + r * (size_t)(H / 16),
@@ -2709,6 +2796,14 @@ struct CpuMoeExecutor {
     if (fmt_l == WF_Q4_K) {
       const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)row_bytes_l;
       return q4_k_dot_f32_scalar(w, g, I);  // W4A16: bf16 activations, K-quant dequant
+    }
+    if (fmt_l == WF_Q2_K) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)row_bytes_l;
+      return q2_k_dot_f32_scalar(w, g, I);
+    }
+    if (fmt_l == WF_Q3_K) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)row_bytes_l;
+      return q3_k_dot_f32_scalar(w, g, I);
     }
     if (fmt_l == WF_Q6_K) {
       const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)row_bytes_l;
@@ -3398,6 +3493,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("max_generic_act_id", []() { return static_cast<int>(ACT_SWIGLU_CLAMP); });
   // Companion to the activation probe above, for weight layouts: see WF_MAX_SUPPORTED.
   m.def("max_weight_format_id", []() { return WF_MAX_SUPPORTED; });
+
+  m.def("q2_k_dot_cpu", [](torch::Tensor w, torch::Tensor x) {
+    TORCH_CHECK(w.dtype() == torch::kUInt8 && w.is_contiguous(), "w must be contiguous uint8");
+    TORCH_CHECK(x.dtype() == torch::kBFloat16 && x.is_contiguous(), "x must be contiguous bf16");
+    TORCH_CHECK(w.numel() % 84 == 0 && x.numel() == (w.numel() / 84) * 256,
+                "Q2_K row shape mismatch");
+    return q2_k_dot_f32_scalar(w.data_ptr<uint8_t>(), reinterpret_cast<const bf16_t*>(x.data_ptr()),
+                               static_cast<int>(x.numel()));
+  }, py::arg("w"), py::arg("x"), py::call_guard<py::gil_scoped_release>());
+  m.def("q3_k_dot_cpu", [](torch::Tensor w, torch::Tensor x) {
+    TORCH_CHECK(w.dtype() == torch::kUInt8 && w.is_contiguous(), "w must be contiguous uint8");
+    TORCH_CHECK(x.dtype() == torch::kBFloat16 && x.is_contiguous(), "x must be contiguous bf16");
+    TORCH_CHECK(w.numel() % 110 == 0 && x.numel() == (w.numel() / 110) * 256,
+                "Q3_K row shape mismatch");
+    return q3_k_dot_f32_scalar(w.data_ptr<uint8_t>(), reinterpret_cast<const bf16_t*>(x.data_ptr()),
+                               static_cast<int>(x.numel()));
+  }, py::arg("w"), py::arg("x"), py::call_guard<py::gil_scoped_release>());
 
   // CPU-only single-row test/bench hooks for the IQ3_S/IQ4_XS/IQ4_NL/Q8_0 scalar dot
   // kernels (see the WF_IQ3_S..WF_Q8_0 block above). ``w`` is one packed row (raw block

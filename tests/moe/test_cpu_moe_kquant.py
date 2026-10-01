@@ -1,4 +1,4 @@
-"""CPU MoE executor -- native GGUF K-quant experts (Q4_K, Q6_K).
+"""CPU MoE executor -- native GGUF K-quant experts (Q3_K, Q4_K, Q6_K).
 
 Companion to test_cpu_moe_q4_0.py. Same contract: the CPU GEMV reads the *same* packed
 banks the GPU offload path streams and dequantizes a block inside the K-loop, so it is
@@ -32,8 +32,8 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 QK_K = 256
-_Q4_K_BYTES, _Q6_K_BYTES = 144, 210
-GGML_Q4_0, GGML_Q4_K, GGML_Q6_K = 2, 12, 14
+_Q2_K_BYTES, _Q3_K_BYTES, _Q4_K_BYTES, _Q6_K_BYTES = 84, 110, 144, 210
+GGML_Q2_K, GGML_Q3_K, GGML_Q4_0, GGML_Q4_K, GGML_Q6_K = 10, 11, 2, 12, 14
 
 
 def _fp16_bytes(vals: torch.Tensor) -> torch.Tensor:
@@ -55,6 +55,29 @@ def _make_q4_k_rows(S: int, OUT: int, K: int, gen) -> torch.Tensor:
     return torch.cat([dm, rest], dim=-1).reshape(S, OUT, nb * _Q4_K_BYTES).contiguous()
 
 
+def _make_q3_k_rows(S: int, OUT: int, K: int, gen) -> torch.Tensor:
+    """Random Q3_K blocks: hmask[32] | qs[64] | scales[12] | d(fp16)."""
+    nb = K // QK_K
+    body = torch.randint(0, 256, (S, OUT, nb, 108), dtype=torch.uint8, generator=gen)
+    d = 0.01 + 0.02 * torch.rand(S, OUT, nb, generator=gen)
+    return torch.cat([body, _fp16_bytes(d)], dim=-1).reshape(S, OUT, nb * _Q3_K_BYTES).contiguous()
+
+
+def _make_q2_k_rows(S: int, OUT: int, K: int, gen) -> torch.Tensor:
+    """Random Q2_K blocks: scales[16] | qs[64] | half2 dm."""
+    nb = K // QK_K
+    scales = torch.randint(0, 256, (S, OUT, nb, 16), dtype=torch.uint8, generator=gen)
+    qs = torch.randint(0, 256, (S, OUT, nb, 64), dtype=torch.uint8, generator=gen)
+    dm = torch.cat(
+        [
+            _fp16_bytes(0.01 + 0.02 * torch.rand(S, OUT, nb, generator=gen)),
+            _fp16_bytes(0.01 + 0.02 * torch.rand(S, OUT, nb, generator=gen)),
+        ],
+        dim=-1,
+    )
+    return torch.cat([scales, qs, dm], dim=-1).reshape(S, OUT, nb * _Q2_K_BYTES).contiguous()
+
+
 def _make_q6_k_rows(S: int, OUT: int, K: int, gen) -> torch.Tensor:
     """Random valid Q6_K rows: [S, OUT, K//256*210].
 
@@ -66,7 +89,12 @@ def _make_q6_k_rows(S: int, OUT: int, K: int, gen) -> torch.Tensor:
     return torch.cat([body, _fp16_bytes(d)], dim=-1).reshape(S, OUT, nb * _Q6_K_BYTES).contiguous()
 
 
-_MAKERS = {"q4_k": (_make_q4_k_rows, GGML_Q4_K), "q6_k": (_make_q6_k_rows, GGML_Q6_K)}
+_MAKERS = {
+    "q2_k": (_make_q2_k_rows, GGML_Q2_K),
+    "q3_k": (_make_q3_k_rows, GGML_Q3_K),
+    "q4_k": (_make_q4_k_rows, GGML_Q4_K),
+    "q6_k": (_make_q6_k_rows, GGML_Q6_K),
+}
 
 
 def _make_cache(fmt: str, L: int, E: int, H: int, I: int, seed: int = 0, *, as_gguf: bool = False):
@@ -101,6 +129,28 @@ def _dequant_bank(packed: torch.Tensor, ggml_type: int, K: int, dev) -> torch.Te
     from freetoken.kernel.gguf import ggml_dequantize
 
     S, OUT, row_bytes = packed.shape
+    if ggml_type == GGML_Q2_K:
+        # The vendored Q2_K CUDA materializer is not a stable oracle for arbitrary
+        # synthetic rows; use the block definition directly for this CPU-kernel test.
+        out = torch.empty(S, OUT, K, dtype=torch.float32)
+        raw = packed.cpu().numpy()
+        for s in range(S):
+            for o in range(OUT):
+                row = raw[s, o]
+                for b in range(K // QK_K):
+                    blk = row[b * 84 : (b + 1) * 84]
+                    d, m = torch.from_numpy(blk[80:84].copy()).view(torch.float16).tolist()
+                    scales, qs = blk[:16], blk[16:80]
+                    for n in range(2):
+                        for l in range(32):
+                            q = int(qs[32 * n + l])
+                            is_ = 8 * n + l // 16
+                            for part in range(4):
+                                sm = int(scales[is_ + 2 * part])
+                                out[s, o, b * 256 + 128 * n + l + 32 * part] = d * (sm & 0x0F) * (
+                                    (q >> (2 * part)) & 3
+                                ) - m * (sm >> 4)
+        return out.to(dev, dtype=torch.bfloat16)
     flat = ggml_dequantize(
         packed.reshape(-1, row_bytes).to(dev).contiguous(),
         ggml_type,
@@ -111,7 +161,7 @@ def _dequant_bank(packed: torch.Tensor, ggml_type: int, K: int, dev) -> torch.Te
     return flat.reshape(S, OUT, K)
 
 
-@pytest.mark.parametrize("fmt", ["q4_k", "q6_k"])
+@pytest.mark.parametrize("fmt", ["q2_k", "q3_k", "q4_k", "q6_k"])
 @pytest.mark.parametrize("bs", [1, 3, 8])
 def test_cpu_decode_kquant_matches_dequant_then_gpu(fmt, bs):
     """CPU inline-dequant K-quant GEMV vs. the CUDA dequant + bf16 GPU decode."""
@@ -150,7 +200,7 @@ def test_cpu_decode_kquant_matches_dequant_then_gpu(fmt, bs):
     assert rel < 5e-2, f"{fmt} bs={bs}: rel {rel} (cosine {cos})"
 
 
-@pytest.mark.parametrize("fmt", ["q4_k", "q6_k"])
+@pytest.mark.parametrize("fmt", ["q2_k", "q3_k", "q4_k", "q6_k"])
 def test_gguf_cache_resolves_to_the_cpu_kernel(fmt):
     """A checkpoint tagged quant_format 'gguf' must reach the same kernel.
 
@@ -211,6 +261,8 @@ class TestGgufFormatResolution:
     @pytest.mark.parametrize(
         "t,want",
         [
+            (GGML_Q2_K, "q2_k"),
+            (GGML_Q3_K, "q3_k"),
             (GGML_Q4_0, "q4_0"),
             (GGML_Q4_K, "q4_k"),
             (GGML_Q6_K, "q6_k"),

@@ -363,6 +363,8 @@ def test_max_weight_format_id_covers_new_formats():
     assert _WFMT_IDS["iq4_xs"] == 8
     assert _WFMT_IDS["iq4_nl"] == 9
     assert _WFMT_IDS["q8_0"] == 10
+    assert _cpu_moe.max_weight_format_id() >= _WFMT_IDS["q3_k"]
+    assert _cpu_moe.max_weight_format_id() >= _WFMT_IDS["q2_k"]
 
 
 def test_block_geometry_matches_ggml():
@@ -372,6 +374,8 @@ def test_block_geometry_matches_ggml():
     assert _GGUF_KQUANT_BLOCK["iq4_xs"] == (256, 136)
     assert _GGUF_KQUANT_BLOCK["iq4_nl"] == (32, 18)
     assert _GGUF_KQUANT_BLOCK["q8_0"] == (32, 34)
+    assert _GGUF_KQUANT_BLOCK["q3_k"] == (256, 110)
+    assert _GGUF_KQUANT_BLOCK["q2_k"] == (256, 84)
 
 
 def test_ggml_type_ids_resolve_to_cpu_formats():
@@ -381,6 +385,8 @@ def test_ggml_type_ids_resolve_to_cpu_formats():
     assert _GGML_TO_CPU_FMT[23] == "iq4_xs"
     assert _GGML_TO_CPU_FMT[20] == "iq4_nl"
     assert _GGML_TO_CPU_FMT[8] == "q8_0"
+    assert _GGML_TO_CPU_FMT[10] == "q2_k"
+    assert _GGML_TO_CPU_FMT[11] == "q3_k"
 
 
 def test_mixed_gate_up_down_types_resolve_to_independent_formats():
