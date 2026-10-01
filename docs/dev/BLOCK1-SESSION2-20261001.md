@@ -111,7 +111,26 @@ Estágios do ciclo (ms, AD): rascunho 4,7–8,0 · verify 24,2 (2 linhas) / 35,7
 | `_AD_MAX_PROVEN_MTP_DEPTH` | k>5 não provado | não subir sem matriz SHA |
 | `spec_state_steps` (2k+2) | buffers do verify cobrem janela com prefixo diferido | tests de orçamento de bytes dependem disso |
 
-## 8. Resultado da bissecção por grupo (atualizar)
+## 8. Resultado da bissecção por grupo
 
-(pendente: W4 = base W1 + `linear_state_pool`/`graph`/`scheduler`/`adaptive_mtp` revertidos; W5 = base W1 + norma/linear/attend/
-mha_pool/vram_profile/engine/config/kernel attention revertidos.)
+W4 (base W1 + `linear_state_pool`/`graph`/`scheduler`/`adaptive_mtp` revertidos) = 108,0; W5 (outros arquivos revertidos) = 99,9;
+W6 (só `linear_state_pool`) = 108,2; W7 (`scheduler`/`adaptive_mtp`/`graph`) = 98,8. **Único culpado: `spec_state_steps` 2k+2.**
+Árvores mistas: copiar `python/` da árvore atual e sobrescrever arquivos com `git show <commit>:path`; PYTHONPATH aponta para a cópia.
+
+## 9. Cabeça MTP e limites de profundidade (medidos)
+
+- A cabeça do AD (`...-AD-...-mtp.gguf`, sha256 `f521868a9e143718…`) é **byte a byte idêntica** à do ISTA e à do pfeifferj
+  (`cmp`). Logo a cabeça não explica a aceitação menor do AD (76–78% no 1º rascunho contra ~100%).
+- Cabeça candidata `unsloth/Qwen3.8-Flash-Next-GGUF` `MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf` (sha256 `cd87e5d1a4dadaee…`, 3,9 GB),
+  em `/models/heads/unsloth/MTP/`: mesmos 32 tensores e formas da atual, 17 com tipo de quantização de maior precisão, mais
+  `output.weight` e `token_embd.weight`. Uso: `FREETOKEN_MTP_PATH=<arquivo>`. No AD: k2 **63,0–63,3** (atual 60,1), k3 59,6 (54–59),
+  k5 52,8 (50,3); aceitação do 1º rascunho 83% (76%); **SHA igual ao RAW** em todas as rodadas. Ganho de ~5% no melhor k. Não é o
+  padrão (download externo de 3,9 GB).
+- A aceitação baixa do AD **ainda não é provada como limitação do modelo**: falta uma referência independente (o `llama-server` em
+  `/models/servers/llama-turbo-optimal/build/bin` valida k=1 contra o upstream; k≥2 não é certificado lá).
+- ISTA com profundidade maior: k5 103,8 · k6 91,2 · k7 89,3 (SHA = RAW). Cada linha extra custa 8–10 ms e a 6ª posição só rende ~0,7 token → **k5 é o ótimo**.
+- Custo por linha do verify (decode puro, razão k5/k0 por chamada de camada): ISTA mixer ×1,81 · MoE ×2,60; AD mixer ×1,72 · MoE ×2,68.
+  Os dois modelos escalam igual: o AD não tem defeito próprio no motor. ~2/3 do custo extra é MoE, ~1/3 é mixer (GDN `_conv_decode`
+  por linha + recorrência + QSA). Alvos: fundir o laço de convolução por linha do GDN; execução dos experts por linha.
+- Mapa de oportunidades fora da recuperação dos 108 TG: cabeça Q8_0 (+5% AD) · calibração do k automático (1ª requisição −12%) ·
+  PP frio do AD (~1,6K tok/s contra ~16K do ISTA, causa não investigada) · fusão da convolução por linha do GDN.
