@@ -154,3 +154,11 @@ W6 (só `linear_state_pool`) = 108,2; W7 (`scheduler`/`adaptive_mtp`/`graph`) = 
   (o `finally` encerra o servidor) e confirme com `tail --pid`, sem laço de espera.
 - **Armadilha de medição:** sem `--spec-mtp` o padrão do servidor é 6 (limitado a 5 no AD com o gate aberto), então "RAW" medido sem a flag
   não é RAW puro. Para RAW use sempre `--serve-arg="--spec-mtp 0"`.
+
+## 11. Estado final desta sessão e próximos passos
+
+- Commits (próximos de `4b27df2`): 26a4344, e860b40, 056f33d, 4cf1c27, 363303f, 101b021, 39bc5d5, 2b97d3b. CI: formato e lint limpos, mypy 447 arquivos, **2768 testes**.
+- Medido: AD k1–k5 == RAW (SHA 235a97ef64b9), k2 61,9 TG (cabeça Q8_0 opcional 63,1; RAW 52,9); ISTA k5 104,4 (tag 108,4).
+- **Abertos (não dar como resolvidos):** (1) RAW do AD: gate sem prova, execução atual instável 43–53; (2) ISTA −4 TG; (3) calibração do k automático.
+- Veredito: **NOT READY FOR BLOCK 2.** Prompt da próxima sessão: [`PROMPT-NEXT-SESSION-block1.md`](PROMPT-NEXT-SESSION-block1.md).
+- Lição de método: o `--spec-mtp` padrão é 6 e liga o MTP com o gate aberto; "RAW" medido sem `--spec-mtp 0` não é RAW.
