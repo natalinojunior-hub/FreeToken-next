@@ -501,6 +501,31 @@ def test_online_cost_hook_counts_committed_tokens_and_remaining_budget(monkeypat
     assert scheduler._mtp_distribution[0][:2] == [2, 4]
 
 
+def test_first_cycles_after_prefill_run_unobserved(monkeypatch):
+    """Expert-residency regrow right after prefill must not enter the depth economics."""
+    from freetoken.scheduler import spec
+    from freetoken.scheduler.adaptive_mtp import AdaptiveMtpController
+
+    monkeypatch.setattr(spec, "_SPEC_WARMUP_CYCLES", 2)
+    req = _req(0, prompt_len=4)
+    req.output_len = 0
+    req.device_len = 5
+    req.sampling_params = SamplingParams(max_tokens=64, temperature=0)
+    controller = AdaptiveMtpController(2)
+    scheduler = SimpleNamespace(
+        _mtp_controller=controller,
+        decode_manager=SimpleNamespace(running_reqs={req}),
+        engine=SimpleNamespace(moe_offload_cache=None, num_pages=32),
+        finished_reqs=set(),
+    )
+    for cycle in range(3):
+        sample = SchedulerSpecMixin._begin_mtp_cycle(scheduler)
+        req.append_host(torch.tensor([20 + cycle], dtype=torch.int32))
+        req.device_len += 1
+        SchedulerSpecMixin._finish_mtp_cycle(scheduler, sample)
+        assert controller.cost_summaries[0]["samples"] == max(0, cycle - 1)
+
+
 def test_free_request_discards_only_its_pending_draft_kv():
     req = _req(0, prompt_len=4)
     scheduler = SimpleNamespace(_spec_snapshot_slots={}, _mtp_kv_rows=(req.uid, 1, None, None))
