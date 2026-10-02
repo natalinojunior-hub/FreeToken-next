@@ -31,3 +31,25 @@ def test_row_exact_gemv_rows_equal_m1(monkeypatch, n, transposed):
         got = linear(x, pk, sc, g)
         want = torch.cat([linear(x[i : i + 1], pk, sc, g) for i in range(rows)])
         assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("input_scale", [None, 0.05], ids=["w8a16", "w8a8"])
+def test_row_exact_fp8_pertensor_rows_equal_m1(monkeypatch, input_scale):
+    from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
+
+    torch.manual_seed(4)
+    n, k = 1536, 2048
+    w = (torch.randn(n, k, device="cuda") * 0.5).to(torch.float8_e4m3fn)
+    ws = torch.rand(n, device="cuda") * 0.01 + 0.001
+    scale = None if input_scale is None else torch.tensor(input_scale, device="cuda")
+    monkeypatch.setenv("FREETOKEN_ROW_INVARIANT_LINEAR", "1")
+    for rows in (2, 5, 8):
+        x = torch.randn(rows, k, dtype=torch.bfloat16, device="cuda")
+        got = fp8_pertensor_linear(x, w, ws, input_scale=scale, uniform_scale=True)
+        want = torch.cat(
+            [
+                fp8_pertensor_linear(x[i : i + 1], w, ws, input_scale=scale, uniform_scale=True)
+                for i in range(rows)
+            ]
+        )
+        assert torch.equal(got, want)

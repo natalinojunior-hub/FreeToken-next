@@ -22,6 +22,8 @@ from __future__ import annotations
 import functools
 import re
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -435,6 +437,13 @@ def fp8_pertensor_linear(
     SGLang likewise run one scheme across all M on any GPU with FP8 tensor cores."""
     *lead, K = x.shape
     N = weight.shape[0]
+    M = x.numel() // K
+    if 2 <= M <= 8 and os.environ.get("FREETOKEN_ROW_INVARIANT_LINEAR") == "1":
+        # MTP verify rows: each row takes its own M==1 path, bit-identical to RAW decode
+        rows = x.reshape(M, K)
+        args = (weight, weight_scale, bias, input_scale, uniform_scale, scale_segments)
+        out = torch.cat([fp8_pertensor_linear(rows[i : i + 1], *args) for i in range(M)])
+        return out.reshape(*lead, N)
     w8a8 = input_scale is not None and e4m3_native()
     segments = None
     if w8a8 and not uniform_scale and not rowwise_scaled_mm_ok():

@@ -515,8 +515,8 @@ def install() -> None:
             self._qsa_rec = rec
             backend = engine.attn_backend
             orig_forward, orig_select, orig_mqa = (
-                backend.qsa_forward,
-                backend._select,
+                getattr(backend, "qsa_forward", None),
+                getattr(backend, "_select", None),
                 qsa_pkg.qsa_mqa_paged,
             )
 
@@ -544,7 +544,9 @@ def install() -> None:
                     put("mqa_q", args[0])
                 return result
 
-            backend.qsa_forward, backend._select, qsa_pkg.qsa_mqa_paged = f_forward, f_select, f_mqa
+            if hasattr(backend, "qsa_forward"):
+                backend.qsa_forward, backend._select = f_forward, f_select
+                qsa_pkg.qsa_mqa_paged = f_mqa
         c0, d0 = req.cached_len, req.device_len
         state = self._verify_state(req)
         n_lin = 2 + len(engine.linear_state_pool.slot_states)
