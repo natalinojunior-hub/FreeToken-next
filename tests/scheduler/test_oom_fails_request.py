@@ -101,6 +101,29 @@ def test_spec_oom_learns_driver_request_before_dropping_nontransactional_batch()
     assert errors[1][0] == ["active"]
 
 
+def test_spec_oom_before_commit_rolls_back_and_keeps_the_request(monkeypatch):
+    events = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    stub = SimpleNamespace(device=None, decode_manager=SimpleNamespace(running_reqs=["active"]))
+    stub.engine = SimpleNamespace(
+        note_decode_oom=lambda e: events.append("note"),
+        shrink_after_oom=lambda: events.append("shrink"),
+    )
+    stub._mtp_controller = SimpleNamespace(fallback_to_k0=lambda: events.append("k0"))
+
+    def step():
+        stub._spec_rollback = lambda: events.append("rollback")
+        raise torch.OutOfMemoryError("Tried to allocate 2.00 MiB")
+
+    stub.run_spec_step = step
+    stub._fail_oom_reqs = lambda reqs, error: events.append("failed")
+
+    assert Scheduler._spec_step_or_fail(stub) is False  # RAW decode runs this iteration
+    assert events == ["note", "rollback", "shrink", "k0"]
+    assert stub._spec_rollback is None and stub._mtp_cycle_observe is False
+
+
 def test_other_errors_still_raise():
     stub, *_ = _stub()
 

@@ -997,6 +997,7 @@ class SchedulerSpecMixin:
     def run_spec_step(self) -> bool:
         """Run one speculative decode step for the single eligible request. Returns True if
         it ran (the caller should skip its own _schedule_next_batch/_forward this iteration)."""
+        self._spec_rollback = None
         if batched_spec_enabled() and len(self._pick_spec_reqs()) > 1:
             return SchedulerSpecMixin._batched_spec_cycle(self)
         req = self._spec_eligible_req()
@@ -1084,6 +1085,23 @@ class SchedulerSpecMixin:
             pool.copy_from(self._linear_slot(req), snap_slot)
         residual_snapshot = model.model._last_residual[-1:].clone()
 
+        def rollback_cycle() -> None:
+            """OOM inside the cycle before anything was committed: undo the drafts (and a
+            snapshot-backed verify), return the window's pages, keep the request at [c0, d)."""
+            if snap_slot is not None:
+                pool.copy_from(snap_slot, self._linear_slot(req))
+            model.model._last_residual = residual_snapshot
+            self._restore_ple_state(req)
+            self._restore_qsa_state(req, pre_draft=True)
+            # only pages the window actually got: the OOM may precede its allocation
+            owned = getattr(req, "alloc_page_bound", 0) * self.cache_manager.page_size
+            if owned > d:
+                self.cache_manager.free_spec_reject(req, keep_len=d, alloc_len=owned)
+            req.cached_len, req.device_len = c0, d
+
+        # read by _spec_step_or_fail; every snapshot above is this cycle's own
+        self._spec_rollback = rollback_cycle
+
         fill = (
             None
             if os.getenv("FREETOKEN_DISABLE_MTP_FILL", "0") == "1"
@@ -1163,6 +1181,9 @@ class SchedulerSpecMixin:
         vb.input_ids = self.token_pool[fi.input_tuple]
         vb.spec_host_ids = [*req.input_ids[c0:d].tolist(), *drafts]
         mark("verify_prepare_batch")
+        if zero_replay:
+            # the verify advances the live linear slot in place; a mid-forward OOM is unrecoverable
+            self._spec_rollback = None
         if os.getenv(VERIFY_GRAPH_CHECK_ENV, "0") == "1" and (
             self.engine.graph_runner.can_use_cuda_graph(vb)
         ):
@@ -1170,6 +1191,7 @@ class SchedulerSpecMixin:
         else:
             out = self.engine.forward_batch(vb, fi.sample_args)
         out.copy_done_event.synchronize()
+        self._spec_rollback = None
         mark("verify_forward")
         # rows [0, p) re-feed deferred tokens whose successors are already committed
         sampled = out.next_tokens_cpu.tolist()[p:]
