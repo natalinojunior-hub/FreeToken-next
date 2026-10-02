@@ -561,6 +561,7 @@ def fp8_pertensor_linear(
     input_scale: torch.Tensor | None = None,
     uniform_scale: bool = False,
     scale_segments: list[tuple[int, int]] | None = None,
+    rows_exact: bool = False,
 ) -> torch.Tensor:
     """``y = x @ (weight_fp8 * weight_scale)^T``. ``weight`` [N, K] fp8-e4m3, ``weight_scale``
     [N] fp32 (per output row). ``scale_segments``: the fused parts' row ranges, precomputed at
@@ -575,8 +576,9 @@ def fp8_pertensor_linear(
     *lead, K = x.shape
     N = weight.shape[0]
     M = x.numel() // K
-    if row_invariant_rows(M):
-        # MTP verify rows: each row takes its own M==1 path, bit-identical to RAW decode
+    if row_invariant_rows(M) and not rows_exact:
+        # MTP verify rows: each row takes its own M==1 path, bit-identical to RAW decode.
+        # ``rows_exact``: the W8A8 GEMM was proven row-independent for this shape (below).
         rows = x.reshape(M, K)
         if not (input_scale is not None and e4m3_native()):
             out = _gemv_rows(rows, e4m3_kernel_view(weight), weight_scale, x.dtype)
@@ -665,3 +667,40 @@ def fp8_rowwise_matmul(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     a8, sa = rowwise_quant_fp8(x)
     w8, sw = rowwise_quant_fp8(weight)
     return torch._scaled_mm(a8, w8.t(), scale_a=sa, scale_b=sw.t(), out_dtype=x.dtype)
+
+
+_W8A8_ROWS_EXACT: dict[tuple, bool] = {}
+
+
+def w8a8_rows_exact(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: torch.Tensor | None,
+    uniform_scale: bool,
+    scale_segments: list[tuple[int, int]] | None,
+) -> bool:
+    """Whether one W8A8 GEMM over a 2..8-row verify window returns every row's M==1 bits for
+    this weight shape on this device. The library picks its kernel from the shape alone, so a
+    random-activation probe with the real weight decides it once per shape. Call outside graph
+    capture (layer finalize)."""
+    if input_scale is None or not e4m3_native() or weight.device.type != "cuda":
+        return False
+    key = (weight.device, tuple(weight.shape), uniform_scale, scale_segments is None)
+    exact = _W8A8_ROWS_EXACT.get(key)
+    if exact is None:
+        gen = torch.Generator(device=weight.device).manual_seed(0)
+        x = torch.randn(
+            8, weight.shape[1], generator=gen, device=weight.device, dtype=torch.bfloat16
+        )
+        args = (weight, weight_scale, None, input_scale, uniform_scale, scale_segments)
+        exact = all(
+            torch.equal(
+                fp8_pertensor_linear(x[:m], *args, rows_exact=True).view(torch.int16),
+                torch.cat([fp8_pertensor_linear(x[i : i + 1], *args) for i in range(m)]).view(
+                    torch.int16
+                ),
+            )
+            for m in range(2, 9)
+        )
+        _W8A8_ROWS_EXACT[key] = exact
+    return exact

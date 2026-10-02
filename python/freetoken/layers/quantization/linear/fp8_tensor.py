@@ -35,6 +35,7 @@ class TorchFp8TensorLinearKernel(LinearKernel):
     def finalize(self, layer: Any) -> None:
         from freetoken.kernel.triton.fp8_pertensor_linear import (
             rowwise_scaled_mm_ok,
+            w8a8_rows_exact,
             weight_scale_segments,
         )
 
@@ -45,6 +46,9 @@ class TorchFp8TensorLinearKernel(LinearKernel):
         layer._fp8_scale_segments = None if uniform else weight_scale_segments(scale)
         if not uniform:
             rowwise_scaled_mm_ok()
+        layer._fp8_rows_exact = w8a8_rows_exact(
+            layer.weight, scale, layer.input_scale, uniform, layer._fp8_scale_segments
+        )
 
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
         from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
@@ -57,6 +61,7 @@ class TorchFp8TensorLinearKernel(LinearKernel):
             layer.input_scale,
             layer._fp8_uniform_scale,
             scale_segments=layer._fp8_scale_segments,
+            rows_exact=getattr(layer, "_fp8_rows_exact", False),
         )
 
 

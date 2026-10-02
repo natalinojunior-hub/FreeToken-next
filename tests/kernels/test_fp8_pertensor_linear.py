@@ -215,3 +215,27 @@ def test_fused_layer_forward_on_a_side_stream_completes():
         timeout=300,
     )
     assert proc.returncode == 0, f"rc={proc.returncode}\n{proc.stdout}\n{proc.stderr[-2000:]}"
+
+
+@pytest.mark.skipif(not e4m3_native(), reason="torch._scaled_mm needs sm_89+")
+@pytest.mark.parametrize("part_rows", [[2048], [1024, 512, 512]])
+def test_w8a8_rows_exact_probe_gates_batched_verify(monkeypatch, part_rows: list[int]):
+    """A probed-exact shape serves the verify window in one GEMM with each row's M==1 bits."""
+    from freetoken.kernel.triton.fp8_pertensor_linear import (
+        fp8_pertensor_linear,
+        w8a8_rows_exact,
+        weight_scale_segments,
+    )
+
+    K = 1024
+    w8, scale = _quant_parts(part_rows, K, seed=7)
+    uniform = len(part_rows) == 1
+    segments = None if uniform else weight_scale_segments(scale)
+    input_scale = torch.tensor(0.02, device=DEV)
+    exact = w8a8_rows_exact(w8, scale, input_scale, uniform, segments)
+    monkeypatch.setenv("FREETOKEN_ROW_INVARIANT_LINEAR", "1")
+    x = torch.randn(6, K, device=DEV, dtype=torch.bfloat16)
+    args = (w8, scale, None, input_scale, uniform, segments)
+    rows = fp8_pertensor_linear(x, *args, rows_exact=exact)
+    single = torch.cat([fp8_pertensor_linear(x[i : i + 1], *args) for i in range(6)])
+    assert torch.equal(rows.view(torch.int16), single.view(torch.int16))
