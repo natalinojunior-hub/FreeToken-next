@@ -153,7 +153,10 @@ class CheckpointManager:
         cancel-during-spawn path)."""
         osproc.signal_group(child.pid, signal.SIGTERM)
         if not child.reaped.wait(timeout=self._grace_s):
-            osproc.signal_group(child.pid, signal.SIGKILL)
+            # SIGKILL is POSIX-only; the fallback hard-kills via Popen.kill() on Windows.
+            osproc.signal_group(child.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            if os.name == "nt" and child.poll() is None:
+                child.kill()
 
     def status(self) -> dict:
         with self._lock:

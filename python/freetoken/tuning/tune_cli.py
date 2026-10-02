@@ -21,6 +21,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -304,13 +305,17 @@ def run_candidate(
     finally:
         stop_poll = True
         if proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGINT)
+            if hasattr(os, "killpg"):  # POSIX: signal the whole session created at spawn
+                os.killpg(proc.pid, signal.SIGINT)
             for _ in range(30):
                 if proc.poll() is not None:
                     break
                 time.sleep(1)
             if proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGKILL)
+                if hasattr(os, "killpg"):
+                    os.killpg(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                else:
+                    proc.kill()  # Windows: no killpg/SIGKILL; TerminateProcess the direct child
         proc.wait(timeout=10)
         poller.join(timeout=5)
         log_file.close()
@@ -345,7 +350,8 @@ def main(argv: list[str] | None = None, prog: str = "ft tune") -> int:
     )
     p.add_argument(
         "--log-dir",
-        default=os.environ.get("TMPDIR", "/tmp"),
+        default=os.environ.get("TMPDIR")
+        or (tempfile.gettempdir() if os.name == "nt" else "/tmp"),
         help="dir for each candidate's ft serve log (default: $TMPDIR)",
     )
     p.add_argument(

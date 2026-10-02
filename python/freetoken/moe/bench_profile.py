@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 
 from freetoken.utils import init_logger
 
@@ -32,8 +33,11 @@ _QUANT_TO_BENCH_FORMAT = {
 
 
 def _cache_dir() -> str:
-    cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
-    return os.path.join(cache, "freetoken")
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "freetoken")
 
 
 def default_profile_path(gpu_uuid: str | None = None) -> str:

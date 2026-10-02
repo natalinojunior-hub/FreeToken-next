@@ -120,13 +120,13 @@ def signal_group(pid: int, sig: int) -> None:
     group is never able to make us nuke an innocent group."""
     pgid = proc_pgid(pid)
     try:
-        if pgid is not None and pgid == pid:
+        if pgid is not None and pgid == pid and hasattr(os, "killpg"):
             os.killpg(pgid, sig)
         else:
             os.kill(pid, sig)
     except ProcessLookupError:
         pass
-    except OSError:  # pragma: no cover - defensive
+    except (AttributeError, OSError):  # pragma: no cover - defensive (no killpg on Windows)
         pass
 
 

@@ -20,6 +20,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 
@@ -150,7 +151,9 @@ def measure_context_point(
         "--max-running-requests",
         "1",
     ]
-    log_dir = log_dir or os.environ.get("TMPDIR", "/tmp")
+    log_dir = log_dir or os.environ.get("TMPDIR") or (
+        tempfile.gettempdir() if os.name == "nt" else "/tmp"
+    )
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, f"ft-bench-context-{context}-{port}.log")
     log_file = open(log_path, "w")
@@ -184,13 +187,17 @@ def measure_context_point(
         pp = sorted(s["cold_pp"] for s in samples)[len(samples) // 2]
     finally:
         if proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGINT)
+            if hasattr(os, "killpg"):  # POSIX: signal the whole session created at spawn
+                os.killpg(proc.pid, signal.SIGINT)
             for _ in range(30):
                 if proc.poll() is not None:
                     break
                 time.sleep(1)
             if proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGKILL)
+                if hasattr(os, "killpg"):
+                    os.killpg(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                else:
+                    proc.kill()  # Windows: no killpg/SIGKILL; TerminateProcess the direct child
         proc.wait(timeout=10)
         log_file.close()
 

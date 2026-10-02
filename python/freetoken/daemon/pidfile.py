@@ -1,7 +1,8 @@
 """Single-instance lock + persisted serve state.
 
 ``SingleInstance`` is a flock-held pidfile: an advisory ``LOCK_EX | LOCK_NB`` on an fd we keep
-open for the daemon's whole life. flock (not a bare port-bind) avoids TIME_WAIT races and is
+open for the daemon's whole life (on native Windows, the same effect via ``msvcrt.locking`` on
+the same handle). flock (not a bare port-bind) avoids TIME_WAIT races and is
 released automatically if the daemon dies, so a crashed daemon never wedges its own restart.
 
 ``ServeStateStore`` persists ``{model, port, pid, args, starttime, logPath}`` as JSON on every
@@ -25,12 +26,20 @@ class SingleInstance:
         self._fd: int | None = None
 
     def acquire(self) -> None:
-        import fcntl  # POSIX-only; the daemon's reference platform is Linux/WSL
+        is_windows = os.name == "nt"
+        if not is_windows:
+            import fcntl  # POSIX-only; lazily imported so the module loads on Windows
 
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if is_windows:
+                import msvcrt
+
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # non-blocking, like LOCK_NB
+            else:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             os.close(fd)
             raise AlreadyRunning(f"another ft daemon holds {self.path}") from exc
@@ -42,7 +51,15 @@ class SingleInstance:
     def release(self) -> None:
         if self._fd is not None:
             try:
-                os.close(self._fd)  # closing drops the flock
+                if os.name == "nt":
+                    import msvcrt
+
+                    os.lseek(self._fd, 0, os.SEEK_SET)
+                    msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+            try:
+                os.close(self._fd)  # closing drops the flock / lock is released with the handle
             except OSError:
                 pass
             self._fd = None

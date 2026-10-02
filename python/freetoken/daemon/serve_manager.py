@@ -386,7 +386,10 @@ class ServeManager:
             if not child.reaped.is_set():
                 self._signal(child.pid, signal.SIGTERM)
                 if not child.reaped.wait(timeout=grace):
-                    self._signal(child.pid, signal.SIGKILL)
+                    # SIGKILL is POSIX-only; on Windows Popen.kill() (TerminateProcess) is hard.
+                    self._signal(child.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                    if os.name == "nt" and not child.reaped.is_set() and child.poll() is None:
+                        child.kill()
                     if not child.reaped.wait(timeout=self._reap_wait_s):
                         raise RuntimeError(f"serve pid={child.pid} did not exit after SIGKILL")
         except Exception:
