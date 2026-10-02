@@ -85,6 +85,22 @@ def test_batched_gemv_rows_matches_sequential_gemv_bitwise(M: int):
     assert torch.equal(batched, sequential)
 
 
+@pytest.mark.parametrize("M", [2, 3, 5, 6, 8])
+@pytest.mark.parametrize("N,K", [(8192, 2048), (2048, 4096), (12288, 2048), (48, 2048), (500, 777)])
+def test_row_invariant_linear_bitwise_equals_m1(monkeypatch, M: int, N: int, K: int):
+    """The verify-window linear returns, per row, the exact bits of the M==1 decode call."""
+    from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
+
+    w8, scale = _quant_parts([N], K, seed=N + K)
+    x = torch.randn(M, K, device=DEV, dtype=torch.bfloat16) * 3
+    bias = torch.randn(N, device=DEV, dtype=torch.bfloat16)
+    monkeypatch.setenv("FREETOKEN_ROW_INVARIANT_LINEAR", "1")
+    for b in (None, bias):
+        rows = fp8_pertensor_linear(x, w8, scale, b)
+        single = torch.cat([fp8_pertensor_linear(x[i : i + 1], w8, scale, b) for i in range(M)])
+        assert torch.equal(rows.view(torch.int16), single.view(torch.int16))
+
+
 @pytest.mark.skipif(not e4m3_native(), reason="torch._scaled_mm needs sm_89+")
 @pytest.mark.parametrize("M", [1, 2, 4, 16, 64])
 @pytest.mark.parametrize(

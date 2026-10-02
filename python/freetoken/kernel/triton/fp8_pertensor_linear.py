@@ -170,6 +170,33 @@ def _splitk_reduce_kernel(
     tl.store(out_ptr + offs, (acc * scale).to(OUT), mask=mask)
 
 
+@triton.jit
+def _splitk_reduce_rows_kernel(
+    part_ptr,
+    scale_ptr,
+    out_ptr,
+    N,
+    SPLIT_K: tl.constexpr,
+    stride_pm,
+    stride_pk,
+    stride_pn,
+    stride_om,
+    BLOCK: tl.constexpr,
+    OUT: tl.constexpr,
+):
+    """``_splitk_reduce_kernel`` with one grid row per activation row."""
+    row = tl.program_id(1)
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for k in tl.static_range(SPLIT_K):
+        acc += tl.load(
+            part_ptr + row * stride_pm + k * stride_pk + offs * stride_pn, mask=mask, other=0.0
+        )
+    scale = tl.load(scale_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    tl.store(out_ptr + row * stride_om + offs, (acc * scale).to(OUT), mask=mask)
+
+
 def _gemv(
     a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, out_dtype: torch.dtype
 ) -> torch.Tensor:
@@ -216,13 +243,123 @@ def _gemv(
     return out
 
 
+@triton.jit
+def _gemv_splitk_rows_kernel(
+    a_ptr,
+    w_ptr,
+    part_ptr,
+    N,
+    K,
+    n_kb,
+    kb_per,
+    stride_am,
+    stride_ak,
+    stride_wn,
+    stride_wk,
+    stride_pm,
+    stride_pk,
+    stride_pn,
+    M: tl.constexpr,
+    M_PAD: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """``_gemv_splitk_kernel`` for M rows sharing one weight-tile load. Each row's partial is
+    the same ``tl.sum`` over the same [BLOCK_N, BLOCK_K] tile, accumulated in the same order,
+    so every row is bit-identical to its M==1 launch while the weight is read once."""
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+    rows = tl.arange(0, M_PAD)
+    kb_start = pid_k * kb_per
+    acc = tl.zeros((M_PAD, BLOCK_N), dtype=tl.float32)
+    for i in range(kb_per):
+        kb = kb_start + i
+        if kb < n_kb:
+            offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < K
+            if e4m3_native_cx():
+                w = tl.load(
+                    w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
+                    mask=n_mask[:, None] & k_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+            else:
+                w = e4m3_u8_to_f32(
+                    tl.load(
+                        w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
+                        mask=n_mask[:, None] & k_mask[None, :],
+                        other=0,
+                    )
+                )
+            for r in tl.static_range(M):
+                a = tl.load(a_ptr + r * stride_am + offs_k * stride_ak, mask=k_mask, other=0.0).to(
+                    tl.float32
+                )
+                part = tl.sum(w * a[None, :], axis=1)
+                acc = tl.where(rows[:, None] == r, acc + part[None, :], acc)
+    tl.store(
+        part_ptr + rows[:, None] * stride_pm + pid_k * stride_pk + offs_n[None, :] * stride_pn,
+        acc,
+        mask=(rows[:, None] < M) & n_mask[None, :],
+    )
+
+
 def _gemv_rows(
     a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, out_dtype: torch.dtype
 ) -> torch.Tensor:
-    """Apply the exact M=1 GEMV contract to each decode row."""
+    """M rows, each bit-identical to its own M==1 :func:`_gemv` (same tiles, split-K and
+    reduction order), reading the weight once instead of M times."""
     if a.ndim != 2:
         raise ValueError(f"expected [M, K] activations, got {tuple(a.shape)}")
-    return torch.stack([_gemv(row, weight, weight_scale, out_dtype) for row in a], dim=0)
+    M = a.shape[0]
+    N, K = weight.shape
+    BLOCK_K = 128
+    n_kb = triton.cdiv(K, BLOCK_K)
+    BLOCK_N = 16
+    n_tiles = triton.cdiv(N, BLOCK_N)
+    split_k = max(1, min(1536 // n_tiles, n_kb))
+    split_k = 1 << (split_k.bit_length() - 1)
+    kb_per = triton.cdiv(n_kb, split_k)
+    part = torch.empty((M, split_k, N), dtype=torch.float32, device=a.device)
+    _gemv_splitk_rows_kernel[(n_tiles, split_k)](
+        a,
+        weight,
+        part,
+        N,
+        K,
+        n_kb,
+        kb_per,
+        a.stride(0),
+        a.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        part.stride(0),
+        part.stride(1),
+        part.stride(2),
+        M=M,
+        M_PAD=triton.next_power_of_2(M),
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=1,
+    )
+    out = torch.empty((M, N), dtype=out_dtype, device=a.device)
+    _splitk_reduce_rows_kernel[(triton.cdiv(N, 256), M)](
+        part,
+        weight_scale,
+        out,
+        N,
+        split_k,
+        part.stride(0),
+        part.stride(1),
+        part.stride(2),
+        out.stride(0),
+        BLOCK=256,
+        OUT=_TL_DTYPE[out_dtype if out_dtype in _TL_DTYPE else torch.bfloat16],
+        num_warps=2,
+    )
+    return out
 
 
 # ======================================================================================
@@ -441,6 +578,11 @@ def fp8_pertensor_linear(
     if row_invariant_rows(M):
         # MTP verify rows: each row takes its own M==1 path, bit-identical to RAW decode
         rows = x.reshape(M, K)
+        if not (input_scale is not None and e4m3_native()):
+            out = _gemv_rows(rows, e4m3_kernel_view(weight), weight_scale, x.dtype)
+            if bias is not None:
+                out = out + bias.to(out.dtype)
+            return out.reshape(*lead, N)
         args = (weight, weight_scale, bias, input_scale, uniform_scale, scale_segments)
         out = torch.cat([fp8_pertensor_linear(rows[i : i + 1], *args) for i in range(M)])
         return out.reshape(*lead, N)
