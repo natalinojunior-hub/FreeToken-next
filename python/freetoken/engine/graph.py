@@ -64,11 +64,49 @@ def mtp_draft_logits(model, residual: torch.Tensor) -> torch.Tensor:
     head = model.lm_head
     n = int(os.getenv(MTP_DRAFT_VOCAB_ENV, "65536"))
     qweight = getattr(head, "qweight", None)
-    if n <= 0 or qweight is None or qweight.dim() != 2 or n >= qweight.shape[0]:
-        return head.forward(hidden)
-    from freetoken.layers.gguf import fused_mul_mat_gguf
+    if n > 0 and qweight is not None and qweight.dim() == 2 and n < qweight.shape[0]:
+        from freetoken.layers.gguf import fused_mul_mat_gguf
 
-    return fused_mul_mat_gguf(hidden, qweight[:n], head._quant_type)
+        return fused_mul_mat_gguf(hidden, qweight[:n], head._quant_type)
+    draft_head = _draft_head_rows(head, n)
+    if draft_head is None:
+        return head.forward(hidden)
+    return head.quant_method.apply(draft_head, hidden)
+
+
+def _draft_head_rows(head, n: int):
+    """A row-sliced view of a per-output-row quantized (or plain) LM head, cached on the
+    head; ``None`` when the head's layout cannot be sliced by output row."""
+    cached = getattr(head, "_draft_head_rows", None)
+    if cached is not None and cached[0] == n:
+        return cached[1]
+    view = None
+    weight = getattr(head, "weight", None)
+    scale = getattr(head, "weight_scale", None)
+    if (
+        n > 0
+        and getattr(head, "tp_size", 1) == 1
+        and getattr(head, "tied_embedding", None) is None
+        and getattr(head, "quant_method", None) is not None
+        and isinstance(weight, torch.Tensor)
+        and weight.dim() == 2
+        and n < weight.shape[0]
+        and (scale is None or (scale.dim() == 1 and scale.shape[0] == weight.shape[0]))
+        and not any(hasattr(head, a) for a in ("weight_scale_2", "weight_global", "qweight"))
+    ):
+        from types import SimpleNamespace
+
+        segments = getattr(head, "_fp8_scale_segments", None)
+        if segments is not None:
+            segments = [(s, min(e, n)) for s, e in segments if s < n]
+        bias = getattr(head, "bias", None)
+        view = SimpleNamespace(**vars(head))
+        view.weight = weight[:n]
+        view.weight_scale = scale[:n] if scale is not None else None
+        view.bias = bias[:n] if isinstance(bias, torch.Tensor) else bias
+        view._fp8_scale_segments = segments
+    head._draft_head_rows = (n, view)
+    return view
 
 
 def verify_graph_tokens(spec_mtp: int) -> tuple[int, ...]:
