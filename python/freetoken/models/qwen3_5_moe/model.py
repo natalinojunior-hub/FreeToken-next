@@ -111,6 +111,8 @@ class Qwen3_5MTP(BaseOP):
     ``shared_head_norm``. ``forward`` returns that normed hidden, which both seeds the next
     draft step and feeds the shared LM head (``to_head`` is the identity)."""
 
+    prime_kv_without_experts = True
+
     def __init__(self, config: ModelConfig, layer_id: int, *, embedding: BaseOP) -> None:
         if config.mtp_layer_id != layer_id or layer_id != config.num_layers:
             raise ValueError("register the MTP layer with with_mtp_layer before construction")
@@ -133,11 +135,21 @@ class Qwen3_5MTP(BaseOP):
         self.shared_head_norm = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
 
     def forward(self, residual: torch.Tensor, next_ids: torch.Tensor, batch) -> torch.Tensor:
-        e = self.enorm.forward(self._embed_ref.forward(next_ids).to(residual.dtype))
-        x = self.eh_proj.forward(torch.cat([e, self.hnorm.forward(residual)], dim=-1))
+        x = self._prepare_hidden(residual, next_ids)
         x, res = self.layers.op_list[0].forward(x, None)
         x, _ = self.shared_head_norm.forward_add_residual(x, res)
         return x
+
+    def _prepare_hidden(self, residual: torch.Tensor, next_ids: torch.Tensor) -> torch.Tensor:
+        e = self.enorm.forward(self._embed_ref.forward(next_ids).to(residual.dtype))
+        return self.eh_proj.forward(torch.cat([e, self.hnorm.forward(residual)], dim=-1))
+
+    def prime_kv(self, residual: torch.Tensor, next_ids: torch.Tensor, batch) -> None:
+        """Store target-fed draft KV without unused attention outputs or expert work."""
+        layer = self.layers.op_list[0]
+        hidden = layer.input_layernorm.forward(self._prepare_hidden(residual, next_ids))
+        _, k, v, _ = layer.self_attn._project(hidden)
+        get_global_ctx().kv_cache.store_kv(k, v, batch.out_loc, layer.self_attn.layer_id)
 
     def to_head(self, residual: torch.Tensor) -> torch.Tensor:
         return residual

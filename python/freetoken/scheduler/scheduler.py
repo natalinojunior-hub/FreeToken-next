@@ -1370,16 +1370,36 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
                 note(e)
             mark_oom = getattr(self, "_mark_mtp_oom", None)
             depth = getattr(self, "_mtp_cycle_depth", 0)
-            rollback, self._spec_rollback = getattr(self, "_spec_rollback", None), None
+            rollback = getattr(self, "_spec_rollback", None)
             if rollback is not None:
-                # nothing committed yet: undo the cycle, shrink, and let RAW decode run now
+                # Restore allocations need headroom too; release experts before undoing writes.
                 torch.cuda.synchronize(self.device)
-                rollback()
                 cache = getattr(self.engine, "moe_offload_cache", None)
                 rows = getattr(cache, "resident_rows", None)
                 shrink = getattr(self.engine, "shrink_after_oom", None)
                 if shrink is not None:
                     shrink()
+                torch.cuda.empty_cache()
+                try:
+                    rollback()
+                except Exception as restore_error:  # noqa: BLE001 -- only OOM permits retry
+                    if not _is_oom(restore_error):
+                        raise
+                    if note is not None:
+                        note(restore_error)
+                    retry_rows = getattr(cache, "resident_rows", None)
+                    if shrink is None:
+                        raise
+                    shrink()
+                    torch.cuda.empty_cache()
+                    if (
+                        retry_rows is not None
+                        and getattr(cache, "resident_rows", None) == retry_rows
+                    ):
+                        raise
+                    # The preimage stays registered until this bounded retry succeeds.
+                    rollback()
+                self._spec_rollback = None
                 if rows is None or getattr(cache, "resident_rows", None) == rows:
                     # nothing left to give back: only a shallower depth can fit
                     if mark_oom is not None:
@@ -1387,7 +1407,14 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
                 # else the next cycle retries this depth inside the reserve just learned
                 # the RAW step that follows is not a sample of the refused depth
                 self._mtp_cycle_observe = False
-                torch.cuda.empty_cache()
+                running = getattr(getattr(self, "decode_manager", None), "running_reqs", ())
+                if any(
+                    getattr(req, "device_len", 0) - 1 > getattr(req, "cached_len", 0)
+                    for req in running
+                ):
+                    # A protected flush still owes target rows; plain decode cannot skip them.
+                    logger.warning(f"MTP replay OOM rolled back ({e}); replay will retry")
+                    return True
                 logger.warning(f"MTP cycle OOM rolled back ({e}); this step decodes RAW")
                 return False
             if mark_oom is not None:

@@ -560,16 +560,16 @@ class CacheManager:
         from freetoken.engine.spec import pages_to_free
 
         first, last = pages_to_free(keep_len, alloc_len, self.page_size)
-        # The returned range no longer belongs to the request -- drop the ownership
-        # high-water mark back to its start, or a later allocate_paged call would treat
-        # those now-freed pages as still owned and never re-allocate them for this row.
-        req.alloc_page_bound = first
         if last <= first:
+            req.alloc_page_bound = first
             return
         indices = self.page_table[req.table_idx, first * self.page_size : last * self.page_size]
         if self.swa_paged:
             self._free_swa(indices)
         self._free(indices)
+        # Publish the ownership change only after the free-list allocation succeeds.
+        # A failed return can then retry from the same ceiling without orphaning pages.
+        req.alloc_page_bound = first
 
     def _free_req_slots(self, req: Req, keep_live: bool = False) -> None:
         """Return a finished request's GDN pool slots: both ping-pong slots, plus the live slot

@@ -625,8 +625,15 @@ def test_mtp_fill_queue_merges_only_contiguous_rows_and_is_single_span():
     assert scheduler._mtp_kv_rows is None
 
 
-@pytest.mark.parametrize("accepted_drafts", range(5))
-def test_run_spec_step_k4_commits_only_accepted_target_rows(accepted_drafts):
+@pytest.mark.parametrize(
+    "accepted_drafts,oom_stage",
+    [(a, stage) for a in range(5) for stage in (None, "prepare", "forward", "synchronize")]
+    + [(a, "row_commit") for a in range(4)]
+    + [(a, "terminal_row_commit") for a in range(5)],
+)
+def test_run_spec_step_k4_commits_only_accepted_target_rows(
+    accepted_drafts, oom_stage, monkeypatch
+):
     """Exercise real k=4 acceptance, row commit, page rollback, and carry bookkeeping on CPU."""
     from freetoken.scheduler.table import TableManager
 
@@ -651,13 +658,45 @@ def test_run_spec_step_k4_commits_only_accepted_target_rows(accepted_drafts):
     sampled += [90] * (5 - len(sampled))
     row_writes = []
 
-    class Pool:
-        spec_states = torch.zeros((1, 5, 1), dtype=torch.int64)
+    monkeypatch.delenv("FREETOKEN_MTP_COMPACT_STATE", raising=False)
+    pool = LinearStatePool(
+        group=LinearGatedDeltaGroupConfig(
+            name="linear",
+            layer_ids=(0, 1),
+            num_key_heads=1,
+            num_value_heads=1,
+            key_head_dim=1,
+            value_head_dim=1,
+            conv_kernel_dim=3,
+            output_gate="silu",
+        ),
+        num_slots=3,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        tp_size=1,
+        spec_steps=5,
+        slot_states=(SlotStateSpec("sibling", (2,)),),
+    )
+    pool.conv_states[:, 1].fill_(13)
+    pool.recurrent_states[:, 1].fill_(17)
+    pool.slot_states["sibling"][:, 1].fill_(19)
+    initial_states = [
+        t[:, 1].clone()
+        for t in (
+            pool.conv_states,
+            pool.recurrent_states,
+            pool.slot_states["sibling"],
+        )
+    ]
+    original_commit_row = pool.commit_spec_row
 
-        def commit_spec_row(self, slot, row):
-            row_writes.append((slot, row))
+    def commit_row(slot, row):
+        row_writes.append((slot, row))
+        original_commit_row(slot, row)
+        if oom_stage in ("row_commit", "terminal_row_commit"):
+            injected_oom()
 
-    pool = Pool()
+    pool.commit_spec_row = commit_row
     model_state = SimpleNamespace(_last_residual=torch.zeros((1, 1)))
     model = SimpleNamespace(
         mtp=object(), model=model_state, config=SimpleNamespace(num_experts_per_tok=1)
@@ -678,8 +717,8 @@ def test_run_spec_step_k4_commits_only_accepted_target_rows(accepted_drafts):
         _snapshot_qsa_state=lambda _req: None,
         _snapshot_ple_state=lambda _req: None,
         _retain_mtp_ring=lambda _req: None,
-        _spec_snapshot_slot=lambda _req: 9,
-        _linear_slot=lambda _req: 0,
+        _spec_snapshot_slot=lambda _req: 2,
+        _linear_slot=lambda _req: 1,
         _restore_qsa_state=lambda _req, **_kwargs: None,
         _restore_ple_state=lambda _req: None,
         _draft_step=lambda _req, pos, residual, _token: (
@@ -695,10 +734,41 @@ def test_run_spec_step_k4_commits_only_accepted_target_rows(accepted_drafts):
         send_result=lambda _messages: None,
     )
     allocated = []
+    published = []
+    scheduler.send_result = published.extend
+    if oom_stage == "terminal_row_commit":
+        scheduler.eos_token_ids = {sampled[0]}
+        scheduler.decode_manager.remove_req = lambda _req: pytest.fail("premature removal")
+        scheduler._free_req_resources = lambda _req: pytest.fail("premature slot recycling")
+    elif oom_stage == "row_commit":
+        scheduler.toolcall_anchor_id = sampled[0]
+    initial_pages = page_table[0, :8].clone()
+    initial_free = set(cache.free_slots.tolist())
+    initial_history = req.input_ids.clone()
+    initial_anchor = req.toolcall_anchor_len
+    initial_residual = model_state._last_residual.clone()
+    carry = (req.uid, 2, torch.tensor([[23.0]]), torch.tensor([29]))
+    mapped_carry = (2, torch.tensor([[31.0]]), torch.tensor([37]))
+    if oom_stage is not None:
+        scheduler._mtp_kv_rows = carry
+        scheduler._mtp_kv_rows_map = {req.uid: mapped_carry, 99: (4, "other", "owner")}
+        scheduler._take_mtp_fill = lambda r: SchedulerSpecMixin._take_mtp_fill(scheduler, r)
+
+    def mutate_live_state():
+        pool.conv_states[0, 1].fill_(101)
+        pool.recurrent_states[1, 1].fill_(103)
+        pool.slot_states["sibling"][:, 1].fill_(107)
+        model_state._last_residual = torch.full((5, 1), 109.0)
+
+    def injected_oom():
+        raise torch.OutOfMemoryError("Tried to allocate 2.00 MiB")
 
     def prepare(batch):
         cache.allocate_paged([req])
         allocated[:] = page_table[0, 8:12].tolist()
+        if oom_stage == "prepare":
+            mutate_live_state()
+            injected_oom()
         batch.positions = torch.arange(7, 12, dtype=torch.int32)
         return SimpleNamespace(
             input_tuple=(torch.zeros(5, dtype=torch.long), torch.arange(7, 12)),
@@ -706,12 +776,20 @@ def test_run_spec_step_k4_commits_only_accepted_target_rows(accepted_drafts):
         )
 
     def forward(_batch, _sample_args):
-        pool.spec_states[0, :, 0] = torch.arange(5)
+        mutate_live_state()
+        pool.spec_states.copy_(torch.arange(5).view(1, 5, 1, 1, 1).expand_as(pool.spec_states))
+        pool.spec_conv_pre.zero_()
+        pool.spec_conv_in.fill_(7)
+        pool.spec_slot_states["sibling"].fill_(11)
         model_state._last_residual = torch.arange(5, dtype=torch.float32).view(5, 1)
+        if oom_stage == "forward":
+            injected_oom()
         return SimpleNamespace(
             next_tokens_cpu=torch.tensor(sampled),
             next_tokens_gpu=torch.tensor(sampled),
-            copy_done_event=SimpleNamespace(synchronize=lambda: None),
+            copy_done_event=SimpleNamespace(
+                synchronize=injected_oom if oom_stage == "synchronize" else lambda: None,
+            ),
         )
 
     scheduler._prepare_batch = prepare
@@ -721,6 +799,45 @@ def test_run_spec_step_k4_commits_only_accepted_target_rows(accepted_drafts):
     )
     scheduler.table_manager = TableManager(max_running_reqs=2, page_table=page_table)
 
+    if oom_stage is not None:
+        from freetoken.scheduler.scheduler import Scheduler
+
+        events = []
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda *_args: events.append("sync"))
+        monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty"))
+        scheduler.engine.note_decode_oom = lambda _e: events.append("note")
+        scheduler.engine.shrink_after_oom = lambda: events.append("shrink")
+        scheduler._mark_mtp_oom = lambda depth: events.append(("cap", depth))
+        scheduler._fail_oom_reqs = lambda *_args: pytest.fail("recoverable cycle dropped request")
+        scheduler.run_spec_step = lambda: SchedulerSpecMixin.run_spec_step(scheduler)
+        assert Scheduler._spec_step_or_fail(scheduler) is False
+        assert scheduler._spec_rollback is None and scheduler._mtp_cycle_observe is False
+        assert events == ["note", "sync", "shrink", "empty", ("cap", 4)]
+        if oom_stage == "row_commit":
+            assert row_writes == [(1, accepted_drafts)]
+        elif oom_stage == "terminal_row_commit":
+            assert row_writes == [(1, 0)]
+        else:
+            assert row_writes == []
+        for tensor, expected in zip(
+            (pool.conv_states, pool.recurrent_states, pool.slot_states["sibling"]),
+            initial_states,
+        ):
+            assert torch.equal(tensor[:, 1], expected)
+        assert torch.equal(model_state._last_residual, initial_residual)
+        assert scheduler._mtp_kv_rows is carry
+        assert scheduler._mtp_kv_rows_map[req.uid] is mapped_carry
+        assert scheduler._mtp_kv_rows_map[99] == (4, "other", "owner")
+        assert (req.cached_len, req.device_len, req.alloc_page_bound) == (7, 8, 8)
+        assert torch.equal(req.input_ids, initial_history)
+        assert req.toolcall_anchor_len == initial_anchor
+        assert req.table_idx == 0
+        assert published == []
+        assert torch.equal(page_table[0, :8], initial_pages)
+        assert set(cache.free_slots.tolist()) == initial_free
+        assert not scheduler.finished_reqs
+        return
+
     assert SchedulerSpecMixin.run_spec_step(scheduler)
 
     committed = accepted_drafts + 1  # each rejected draft contributes its correction token
@@ -729,7 +846,7 @@ def test_run_spec_step_k4_commits_only_accepted_target_rows(accepted_drafts):
     assert req.input_ids.tolist() == list(range(1, 9)) + sampled[:committed]
     assert (req.cached_len, req.device_len) == (keep, keep + 1)
     # a full accept keeps the state the verify already left in place: no row copy
-    assert row_writes == ([] if accepted_drafts == 4 else [(0, committed - 1)])
+    assert row_writes == ([] if accepted_drafts == 4 else [(1, committed - 1)])
     free = set(cache.free_slots.tolist())
     assert set(allocated[committed:]).issubset(free)
     assert set(allocated[:committed]).isdisjoint(free)

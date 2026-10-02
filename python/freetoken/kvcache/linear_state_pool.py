@@ -415,11 +415,12 @@ def _linear_pool_min_slots(config) -> int:
     """Floor on LinearStatePool slots that still runs: the non-evictable working set with a
     zero snapshot cache. Hybrid-radix needs 4 per running request (1 live + 2 ping-pong + 1
     committed snapshot locked through decode) + the padding sink; naive needs 1 per request +
-    padding. MTP without per-row state buffers also holds a rollback snapshot per request.
+    padding. Every MTP request also holds a rollback snapshot: a verify forward can
+    fail after advancing the live state, even when per-row commit buffers exist.
     Below this, admission or speculative snapshot allocation exhausts the pool, so runtime
     rebuilds and the memory planner must price the same floor."""
     mr = config.max_running_req
-    rollback = mr if getattr(config, "spec_mtp", 0) > 0 and not spec_state_steps(config) else 0
+    rollback = mr if getattr(config, "spec_mtp", 0) > 0 else 0
     if config.cache_type != "hybrid_radix":
         return mr + rollback + 1
     return 4 * mr + rollback + 1

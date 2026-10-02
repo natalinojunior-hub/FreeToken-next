@@ -246,9 +246,7 @@ def test_mtp_rollback_fits_after_non_evictable_slots_are_held(
     assert slots == _linear_pool_min_slots(config)
     pool = _pool(num_slots=slots)
     pool.alloc(working_slots)
-    # Native NextN records verify states in separate per-row buffers; other MTP paths
-    # must still allocate a rollback snapshot even with the prefix snapshot cache off.
-    assert pool.num_free_slots == (0 if native_layers else 1)
-    if not native_layers:
-        pool.alloc(1)
-        assert pool.num_free_slots == 0
+    # Per-row verify buffers cannot restore a partially advanced live slot after OOM.
+    assert pool.num_free_slots == 1
+    pool.alloc(1)
+    assert pool.num_free_slots == 0

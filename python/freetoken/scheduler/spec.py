@@ -137,11 +137,22 @@ class SchedulerSpecMixin:
         mtp = self.engine.model.mtp
         forward = mtp.forward
         chunk = DECODE_PATH_MAX_TOKENS
-        if hasattr(mtp, "prime_kv") and hasattr(self.engine.attn_backend, "store_qsa_kv"):
+        if hasattr(mtp, "prime_kv") and (
+            hasattr(self.engine.attn_backend, "store_qsa_kv")
+            or hasattr(getattr(self.engine, "kv_cache", None), "store_kv")
+        ):
             forward = mtp.prime_kv
+            if getattr(mtp, "prime_kv_without_experts", False) and not hasattr(
+                self.engine.attn_backend, "store_qsa_kv"
+            ):
+                # FULL priming only projects/stores KV; no draft expert staging is needed.
+                chunk = max(
+                    1,
+                    int(getattr(getattr(self, "config", None), "max_extend_tokens", chunk)),
+                )
         try:
-            # Draft-only expert banks have no full-prefill staging pool. Keep each warmup
-            # window on the fixed-size on-demand expert path, including on a cold prompt.
+            # Full-forward fallback stays on the bounded on-demand expert path; QSA
+            # priming keeps its qualified projection shapes.
             for offset in range(0, tok_window.numel(), chunk):
                 stop = min(offset + chunk, tok_window.numel())
                 lo, hi = start_pos + offset, start_pos + stop
@@ -578,6 +589,8 @@ class SchedulerSpecMixin:
         start_pos: int,
         spec_alloc_len: int,
         finish_state: Callable[[int], None] | None = None,
+        publish: Callable[[List[DetokenizeMsg]], None] | None = None,
+        defer_finish: List[Callable[[], None]] | None = None,
     ) -> int:
         """Append tokens one at a time, applying _process_last_data's per-token EOS/stop
         /length finish logic. ``start_pos`` is tokens[0]'s device-table position (== d in
@@ -642,21 +655,30 @@ class SchedulerSpecMixin:
                 if finished:
                     finished_now = True
                     break
-            self.send_result(reply)
             if finished_now:
                 keep_cached, keep_device = spec_rollback_lengths(start_pos, committed)
                 if finish_state is not None:
                     finish_state(committed)
-                if keep_cached < spec_alloc_len:
-                    self.cache_manager.free_spec_reject(
-                        req, keep_len=keep_cached, alloc_len=spec_alloc_len
-                    )
-                # The final output may correct a rejected input; never cache its draft KV.
-                # Reclaim from the same boundary, including a terminal page never donated.
-                req.cached_len, req.device_len = keep_cached, keep_device
-                self.decode_manager.remove_req(req)
-                self._free_req_resources(req)
-                self.finished_reqs.add(req)
+
+                def finalize_finish() -> None:
+                    if keep_cached < spec_alloc_len:
+                        self.cache_manager.free_spec_reject(
+                            req, keep_len=keep_cached, alloc_len=spec_alloc_len
+                        )
+                    # The final output may correct a rejected input; never cache draft KV.
+                    req.cached_len, req.device_len = keep_cached, keep_device
+                    self.decode_manager.remove_req(req)
+                    self._free_req_resources(req)
+                    self.finished_reqs.add(req)
+
+                if defer_finish is not None:
+                    defer_finish.append(finalize_finish)
+                else:
+                    # Finish state must be valid before publishing or donating its slots.
+                    if publish is not None:
+                        self._spec_rollback = None
+                    finalize_finish()
+            (publish if publish is not None else self.send_result)(reply)
         return committed
 
     @nvtx_annotate("MTPReplay", enabled=_PROFILE_DECODE)
@@ -687,8 +709,58 @@ class SchedulerSpecMixin:
         for req in list(self.decode_manager.running_reqs):
             end = req.device_len - 1
             if end > req.cached_len:
-                self._replay(req, req.cached_len, end - req.cached_len)
+                c0, d = req.cached_len, req.device_len
+                backend = getattr(self.engine, "attn_backend", None)
+                abort_qsa = getattr(backend, "abort_spec_txn", None)
+                self._spec_rollback = lambda: (
+                    abort_qsa(req.table_idx) if abort_qsa is not None else None
+                )
+                self._snapshot_qsa_state(req)
+                snapshot_qsa = getattr(backend, "snapshot_spec_preimage", None)
+                if snapshot_qsa is not None and not os.getenv("FREETOKEN_DISABLE_QSA_TXN"):
+                    snapshot_qsa(
+                        req.table_idx,
+                        self.engine.page_table[req.table_idx, c0:end],
+                        live_count=end - c0,
+                        logical_positions=torch.arange(c0, end, device=self.device),
+                    )
+                pool = self.engine.linear_state_pool
+                snap_slot = self._spec_snapshot_slot(req) if pool is not None else None
+                if snap_slot is not None:
+                    pool.copy_from(self._linear_slot(req), snap_slot)
+                residual_before = self.engine.model.model._last_residual
+                host_before = req.input_ids
+                qsa_preimage = getattr(backend, "_spec_preimages", {}).get(req.table_idx)
+
+                def rollback_flush() -> None:
+                    if snap_slot is not None:
+                        pool.copy_from(snap_slot, self._linear_slot(req))
+                    self._restore_qsa_state(req, pre_draft=True)
+                    if abort_qsa is not None:
+                        abort_qsa(req.table_idx)
+                    if qsa_preimage is not None:
+                        backend._restore_txn(qsa_preimage)
+                    self.engine.model.model._last_residual = residual_before
+                    req.cached_len, req.device_len = c0, d
+                    req.input_ids = host_before
+
+                self._spec_rollback = rollback_flush
+                prepare_qsa = getattr(backend, "prepare_spec_txn", None)
+                if prepare_qsa is not None and not os.getenv("FREETOKEN_DISABLE_QSA_TXN"):
+                    prepare_qsa(
+                        req.table_idx,
+                        self.engine.page_table[req.table_idx, c0:end],
+                        live_count=end - c0,
+                        logical_positions=torch.arange(c0, end, device=self.device),
+                    )
+                self._replay(req, c0, end - c0)
+                if self.device.type == "cuda":
+                    torch.cuda.current_stream(self.device).synchronize()
+                commit_qsa = getattr(backend, "commit_spec_txn", None)
+                if commit_qsa is not None:
+                    commit_qsa(req.table_idx)
                 req.cached_len, req.device_len = end, end + 1
+                self._spec_rollback = None
 
     @nvtx_annotate("MTPDraft", enabled=_PROFILE_DECODE)
     def _draft_step(
@@ -812,10 +884,45 @@ class SchedulerSpecMixin:
             return False
 
         chains: dict[int, dict] = {}
+        backend = getattr(self.engine, "attn_backend", None)
+        residual_before = getattr(model.model, "_last_residual", None)
+        residual_map_before = self._mtp_residual_by_uid.copy()
+        carry_map_before = self._mtp_kv_rows_map.copy()
+        carry_before = getattr(self, "_mtp_kv_rows", None)
+
+        def rollback_batch() -> None:
+            for req in reqs:
+                ctx = chains.get(req.uid)
+                if ctx is None:
+                    continue
+                if ctx["snap_slot"] is not None:
+                    pool.copy_from(ctx["snap_slot"], self._linear_slot(req))
+                self._restore_ple_state(req)
+                self._restore_qsa_state(req, pre_draft=True)
+                abort_qsa = getattr(backend, "abort_spec_txn", None)
+                if abort_qsa is not None:
+                    abort_qsa(req.table_idx)
+                # Rejection replay may already have consumed the backend journal.
+                if ctx.get("qsa_preimage") is not None:
+                    backend._restore_txn(ctx["qsa_preimage"])
+                owned = getattr(req, "alloc_page_bound", 0) * self.cache_manager.page_size
+                if owned > ctx["d"]:
+                    self.cache_manager.free_spec_reject(req, keep_len=ctx["d"], alloc_len=owned)
+                req.cached_len, req.device_len = ctx["c0"], ctx["d"]
+                req.input_ids = ctx["host_ids"]
+                req.toolcall_anchor_len = ctx["anchor"]
+            model.model._last_residual = residual_before
+            self._mtp_residual_by_uid.clear()
+            self._mtp_residual_by_uid.update(residual_map_before)
+            self._mtp_kv_rows_map.clear()
+            self._mtp_kv_rows_map.update(carry_map_before)
+            self._mtp_kv_rows = carry_before
+            self._mtp_cycle_observes = {req.uid: False for req in reqs}
+
+        self._spec_rollback = rollback_batch
+        self._mtp_cycle_depth = max(depths.values())
         for req in reqs:
             k = depths[req.uid]
-            if not k:
-                continue
             d = req.device_len
             c0 = req.cached_len
             snap_slot = None
@@ -833,6 +940,17 @@ class SchedulerSpecMixin:
                     logical_positions=torch.arange(c0, d + k, device=self.device),
                 )
             self._snapshot_ple_state(req)
+            chains[req.uid] = {
+                "d": d,
+                "c0": c0,
+                "drafts": [],
+                "snap_slot": snap_slot,
+                "host_ids": req.input_ids,
+                "anchor": req.toolcall_anchor_len,
+                "qsa_preimage": getattr(backend, "_spec_preimages", {}).get(req.table_idx),
+            }
+            if not k:
+                continue
             residual_snapshot = self._mtp_residual_by_uid.get(
                 req.uid, model.model._last_residual[-1:]
             ).clone()
@@ -866,7 +984,7 @@ class SchedulerSpecMixin:
                     live_count=d - c0,
                     logical_positions=torch.arange(c0, d + k, device=self.device),
                 )
-            chains[req.uid] = {"d": d, "c0": c0, "drafts": drafts, "snap_slot": snap_slot}
+            chains[req.uid]["drafts"] = drafts
 
         windows = []
         host_ids: list[int] = []
@@ -885,48 +1003,15 @@ class SchedulerSpecMixin:
         fi = self._prepare_batch(vb)
         vb.input_ids = self.token_pool[fi.input_tuple]
         vb.spec_host_ids = host_ids
-        try:
-            out = self.engine.forward_batch(vb, fi.sample_args)
-            out.copy_done_event.synchronize()
-        except torch.cuda.OutOfMemoryError as oom:
-            note = getattr(self.engine, "note_decode_oom", None)
-            if note is not None:
-                note(oom)
-            mark_oom = getattr(self, "_mark_mtp_oom", None)
-            if mark_oom is not None:
-                mark_oom(max((k for _, _, k, _ in windows), default=0))
-            if os.getenv("FREETOKEN_OOM_SNAPSHOT") and not getattr(self, "_oom_snap_done", False):
-                self._oom_snap_done = True
-                torch.cuda.memory._record_memory_history(max_entries=100000)
-                torch.cuda.memory._dump_snapshot(os.environ["FREETOKEN_OOM_SNAPSHOT"])
-            # A refused speculative window costs cycles, never requests: reclaim the
-            # uncommitted windows, force k0 everywhere so the raw batch runs next
-            # iteration, and let the VRAM pressure loop shrink what it needs to.
-            for req, d, k, ctx in windows:
-                c0 = ctx["c0"] if ctx else req.cached_len
-                if k > 0:
-                    self._restore_qsa_state(req, pre_draft=True)
-                    self.cache_manager.free_spec_reject(req, keep_len=d, alloc_len=d + k)
-                req.cached_len, req.device_len = c0, d
-                if ctx and ctx["snap_slot"] is not None:
-                    pool.copy_from(ctx["snap_slot"], self._linear_slot(req))
-            for req in reqs:
-                controller = SchedulerSpecMixin._controller_for(self, req)
-                if controller is not None:
-                    controller.fallback_to_k0()
-                    self._mtp_cycle_observes[req.uid] = False
-            torch.cuda.empty_cache()
-            import traceback
-
-            logger.error(
-                "batched spec verify OOM: windows rolled back, all streams k0\n"
-                + traceback.format_exc()
-            )
-            return False
+        out = self.engine.forward_batch(vb, fi.sample_args)
+        out.copy_done_event.synchronize()
         sampled_all = out.next_tokens_cpu.tolist()
 
         last_res = getattr(model.model, "_last_residual", None)
         finished: list[Req] = []
+        replies = []
+        deferred_finishes = []
+        live_commits = []
         offset = 0
         for req, d, k, ctx in windows:
             rows = k + 1
@@ -944,39 +1029,37 @@ class SchedulerSpecMixin:
                     f"d={d} c0={c0} off={offset} tot={vb.input_ids.shape[0]}"
                 )
 
-            def finish_state(count: int, req=req, c0=c0, snap_slot=snap_slot) -> None:
+            def finish_state(count: int, req=req, c0=c0, d=d, snap_slot=snap_slot) -> None:
                 if snap_slot is not None:
                     pool.copy_from(snap_slot, self._linear_slot(req))
                 self._restore_qsa_state(req, pre_draft=True)
-                if count > 0:
-                    self._replay(req, c0, count)
+                replay_count = d - 1 - c0 + count
+                if replay_count > 0:
+                    self._replay(req, c0, replay_count)
 
+            finish_count = len(deferred_finishes)
             committed = self._commit_spec_tokens(
-                req, accepted, start_pos=d, spec_alloc_len=d + k, finish_state=finish_state
+                req,
+                accepted,
+                start_pos=d,
+                spec_alloc_len=d + k,
+                finish_state=finish_state,
+                publish=replies.extend,
+                defer_finish=deferred_finishes,
             )
-            finished_now = committed < m or (committed == m and req in self.finished_reqs)
+            finished_now = len(deferred_finishes) > finish_count
             if finished_now:
-                self.free_spec_snapshot_slot(req)
                 finished.append(req)
                 offset += rows
                 continue
             if committed <= k:
                 keep_cached, keep_device = spec_rollback_lengths(d, committed)
                 self._restore_qsa_state(req, pre_draft=True)
-                self.cache_manager.free_spec_reject(req, keep_len=keep_device, alloc_len=d + k)
                 if snap_slot is not None:
                     pool.copy_from(snap_slot, self._linear_slot(req))
                 if keep_cached - c0 > 0:
                     self._replay(req, c0, keep_cached - c0)
                 req.cached_len, req.device_len = keep_cached, keep_device
-            else:
-                if pool.spec_states is not None:
-                    pool.commit_spec_row(self._linear_slot(req), (d - 1 - c0) + committed - 1)
-                commit_qsa = getattr(
-                    getattr(self.engine, "attn_backend", None), "commit_spec_txn", None
-                )
-                if commit_qsa is not None:
-                    commit_qsa(req.table_idx)
             if last_res is not None and last_res.shape[0] >= offset + committed:
                 if committed > 1:
                     self._mtp_kv_rows_map[req.uid] = (
@@ -987,11 +1070,25 @@ class SchedulerSpecMixin:
                 self._mtp_residual_by_uid[req.uid] = last_res[
                     offset + committed - 1 : offset + committed
                 ].clone()
+            live_commits.append((req, d, k, committed))
+            offset += rows
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        self._spec_rollback = None
+        for finalize in deferred_finishes:
+            finalize()
+        for req, d, k, committed in live_commits:
+            if committed <= k:
+                _, keep_device = spec_rollback_lengths(d, committed)
+                self.cache_manager.free_spec_reject(req, keep_len=keep_device, alloc_len=d + k)
+            commit_qsa = getattr(backend, "commit_spec_txn", None)
+            if commit_qsa is not None:
+                commit_qsa(req.table_idx)
             self.cache_manager.cache_req(req, finished=False)
             self.decode_manager.filter_reqs([req])
-            offset += rows
         if finished:
             self.decode_manager.filter_reqs(finished)
+        self.send_result(replies)
         return True
 
     @nvtx_annotate("MTPCycle", enabled=_PROFILE_DECODE)
@@ -1054,6 +1151,16 @@ class SchedulerSpecMixin:
         model = self.engine.model
         mtp = model.mtp
 
+        # Snapshot allocation can fail before any live state is touched. Discard
+        # its partial journal so the following RAW step cannot leave a stale preimage.
+        backend = getattr(self.engine, "attn_backend", None)
+
+        def rollback_snapshot_setup() -> None:
+            abort_qsa = getattr(backend, "abort_spec_txn", None)
+            if abort_qsa is not None:
+                abort_qsa(req.table_idx)
+
+        self._spec_rollback = rollback_snapshot_setup
         # Snapshot QSA pending ring and scratch cmp buffer before draft chain mutates them
         self._snapshot_qsa_state(req)
         backend = getattr(self.engine, "attn_backend", None)
@@ -1068,8 +1175,8 @@ class SchedulerSpecMixin:
         self._snapshot_ple_state(req)
         # ---- snapshot linear state before the draft chain mutates it ----
         pool = self.engine.linear_state_pool
-        # Zero-replay: the draft never touches the linear state (a full-attention NextN
-        # head) and the verify records every row's state, so no snapshot, no replay.
+        # Per-row states avoid rejection replay; a preimage is still required when
+        # allocation fails after verify has advanced only some of the live layers.
         qsa_requires_replay = callable(
             getattr(getattr(self.engine, "attn_backend", None), "prepare_spec_txn", None)
         )
@@ -1081,10 +1188,16 @@ class SchedulerSpecMixin:
             )
         )
         snap_slot = None
-        if pool is not None and not zero_replay:
+        if pool is not None:
             snap_slot = self._spec_snapshot_slot(req)
             pool.copy_from(self._linear_slot(req), snap_slot)
         residual_snapshot = model.model._last_residual[-1:].clone()
+        carry_snapshot = getattr(self, "_mtp_kv_rows", None)
+        carry_map = getattr(self, "_mtp_kv_rows_map", None)
+        request_carry = carry_map.get(req.uid) if carry_map is not None else None
+        host_snapshot = req.input_ids
+        anchor_snapshot = req.toolcall_anchor_len
+        qsa_preimage = getattr(backend, "_spec_preimages", {}).get(req.table_idx)
 
         def rollback_cycle() -> None:
             """OOM inside the cycle before anything was committed: undo the drafts (and a
@@ -1092,13 +1205,27 @@ class SchedulerSpecMixin:
             if snap_slot is not None:
                 pool.copy_from(snap_slot, self._linear_slot(req))
             model.model._last_residual = residual_snapshot
+            self._mtp_kv_rows = carry_snapshot
+            if carry_map is not None:
+                if request_carry is None:
+                    carry_map.pop(req.uid, None)
+                else:
+                    carry_map[req.uid] = request_carry
             self._restore_ple_state(req)
             self._restore_qsa_state(req, pre_draft=True)
+            abort_qsa = getattr(backend, "abort_spec_txn", None)
+            if abort_qsa is not None:
+                abort_qsa(req.table_idx)
+            # A rejection replay can consume the journal before a later allocation fails.
+            if qsa_preimage is not None:
+                backend._restore_txn(qsa_preimage)
             # only pages the window actually got: the OOM may precede its allocation
             owned = getattr(req, "alloc_page_bound", 0) * self.cache_manager.page_size
             if owned > d:
                 self.cache_manager.free_spec_reject(req, keep_len=d, alloc_len=owned)
             req.cached_len, req.device_len = c0, d
+            req.input_ids = host_snapshot
+            req.toolcall_anchor_len = anchor_snapshot
 
         # read by _spec_step_or_fail; every snapshot above is this cycle's own
         self._spec_rollback = rollback_cycle
@@ -1182,9 +1309,6 @@ class SchedulerSpecMixin:
         vb.input_ids = self.token_pool[fi.input_tuple]
         vb.spec_host_ids = [*req.input_ids[c0:d].tolist(), *drafts]
         mark("verify_prepare_batch")
-        if zero_replay:
-            # the verify advances the live linear slot in place; a mid-forward OOM is unrecoverable
-            self._spec_rollback = None
         if os.getenv(VERIFY_GRAPH_CHECK_ENV, "0") == "1" and (
             self.engine.graph_runner.can_use_cuda_graph(vb)
         ):
@@ -1192,7 +1316,6 @@ class SchedulerSpecMixin:
         else:
             out = self.engine.forward_batch(vb, fi.sample_args)
         out.copy_done_event.synchronize()
-        self._spec_rollback = None
         mark("verify_forward")
         # rows [0, p) re-feed deferred tokens whose successors are already committed
         sampled = out.next_tokens_cpu.tolist()[p:]
@@ -1240,9 +1363,17 @@ class SchedulerSpecMixin:
                         pool.copy_from(snap_slot, self._linear_slot(req))
                     self._restore_qsa_state(req, pre_draft=True)
                     self._replay(req, c0, n)
+            if self.device.type == "cuda":
+                torch.cuda.current_stream(self.device).synchronize()
 
+        pending_reply: List[DetokenizeMsg] = []
         committed = self._commit_spec_tokens(
-            req, accepted, start_pos=d, spec_alloc_len=d + k, finish_state=finish_state
+            req,
+            accepted,
+            start_pos=d,
+            spec_alloc_len=d + k,
+            finish_state=finish_state,
+            publish=pending_reply.extend,
         )
         finished = committed < m or (committed == m and req in self.finished_reqs)
         mark("commit")
@@ -1262,6 +1393,7 @@ class SchedulerSpecMixin:
         mark("free_spec_reject")
 
         if finished:
+            self.send_result(pending_reply)
             self.free_spec_snapshot_slot(req)
             # _commit_spec_tokens already removed and freed it (table_idx -1): filter_reqs([req])
             # would re-admit it whenever can_decode still holds (an EOS finish before
@@ -1289,12 +1421,6 @@ class SchedulerSpecMixin:
                 self._restore_qsa_state(req, pre_draft=True)
                 self._replay(req, c0, keep_cached - c0)
                 req.cached_len, req.device_len = keep_cached, keep_cached + 1
-            commit_qsa = getattr(
-                getattr(self.engine, "attn_backend", None), "commit_spec_txn", None
-            )
-            if commit_qsa is not None:
-                commit_qsa(req.table_idx)
-
         # Update _last_residual to last committed token for next draft chain
         # (verify_forward overwrites it; we need the residual of the last accepted token)
         last_res = getattr(model.model, "_last_residual", None)
@@ -1325,6 +1451,13 @@ class SchedulerSpecMixin:
                 )
                 req.cached_len, req.device_len = keep_cached, keep_device
                 mark("commit_spec_row")
+                if self.device.type == "cuda":
+                    torch.cuda.current_stream(self.device).synchronize()
+                commit_qsa = getattr(backend, "commit_spec_txn", None)
+                if commit_qsa is not None:
+                    commit_qsa(req.table_idx)
+                self._spec_rollback = None
+                self.send_result(pending_reply)
                 self.cache_manager.cache_req(req, finished=False)
                 self.decode_manager.filter_reqs([req])
                 return True
@@ -1349,6 +1482,13 @@ class SchedulerSpecMixin:
             req.device_len = keep_device
             mark("gdn_replay" if n > 0 else "deferred_replay")
 
+        if self.device.type == "cuda":
+            torch.cuda.current_stream(self.device).synchronize()
+        commit_qsa = getattr(backend, "commit_spec_txn", None)
+        if commit_qsa is not None:
+            commit_qsa(req.table_idx)
+        self._spec_rollback = None
+        self.send_result(pending_reply)
         self.cache_manager.cache_req(req, finished=False)
         mark("cache_req")
         self.decode_manager.filter_reqs([req])

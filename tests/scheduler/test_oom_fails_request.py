@@ -127,7 +127,7 @@ def test_spec_oom_before_commit_rolls_back_and_keeps_the_request(monkeypatch):
     stub._fail_oom_reqs = lambda reqs, error: events.append("failed")
 
     assert Scheduler._spec_step_or_fail(stub) is False  # RAW decode runs this iteration
-    assert events == ["note", "rollback", "shrink"]  # shrink freed rows: retry this depth
+    assert events == ["note", "shrink", "rollback"]  # free recovery headroom before undo
     assert stub._spec_rollback is None and stub._mtp_cycle_observe is False
 
 
@@ -172,3 +172,44 @@ def test_spec_oom_caps_depth_when_shrink_frees_nothing(monkeypatch):
     stub.run_spec_step = step
     assert Scheduler._spec_step_or_fail(stub) is False
     assert events == [2]
+
+
+@pytest.mark.parametrize("reclaim_on_retry", [False, True])
+def test_spec_rollback_oom_keeps_preimage_until_bounded_retry_completes(
+    monkeypatch, reclaim_on_retry
+):
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    cache = SimpleNamespace(resident_rows=10)
+    attempts, shrinks, noted = [], [], []
+    stub = SimpleNamespace(device=None, _mtp_cycle_depth=2)
+
+    def shrink():
+        shrinks.append(cache.resident_rows)
+        if len(shrinks) == 1 or reclaim_on_retry:
+            cache.resident_rows -= 2
+
+    def rollback():
+        assert stub._spec_rollback is rollback
+        assert cache.resident_rows < 10
+        attempts.append(cache.resident_rows)
+        if len(attempts) == 1:
+            raise torch.OutOfMemoryError("rollback allocation")
+
+    def step():
+        stub._spec_rollback = rollback
+        raise torch.OutOfMemoryError("verify allocation")
+
+    stub.run_spec_step = step
+    stub.engine = SimpleNamespace(
+        note_decode_oom=noted.append, shrink_after_oom=shrink, moe_offload_cache=cache
+    )
+    if reclaim_on_retry:
+        assert Scheduler._spec_step_or_fail(stub) is False
+        assert attempts == [8, 6] and stub._spec_rollback is None
+    else:
+        with pytest.raises(torch.OutOfMemoryError, match="rollback allocation"):
+            Scheduler._spec_step_or_fail(stub)
+        assert attempts == [8] and stub._spec_rollback is rollback
+    assert shrinks == [10, 8]
+    assert [str(error) for error in noted] == ["verify allocation", "rollback allocation"]

@@ -378,6 +378,13 @@ def test_flush_deferred_replays_feeds_every_pending_token_before_a_plain_decode(
     pending.cached_len, pending.device_len = 5, 7
     current.cached_len, current.device_len = 6, 7
     stub = SimpleNamespace(decode_manager=SimpleNamespace(running_reqs={pending, current}))
+    stub.device = torch.device("cpu")
+    stub.engine = SimpleNamespace(
+        linear_state_pool=None,
+        model=SimpleNamespace(model=SimpleNamespace(_last_residual=torch.zeros((1, 1)))),
+    )
+    stub._snapshot_qsa_state = lambda req: None
+    stub._restore_qsa_state = lambda req, **kwargs: None
     stub._replay = lambda req, start, n: replays.append((req.uid, start, n))
 
     SchedulerSpecMixin._flush_deferred_replays(stub)
