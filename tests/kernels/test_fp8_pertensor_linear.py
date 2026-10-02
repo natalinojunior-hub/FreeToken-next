@@ -85,7 +85,7 @@ def test_batched_gemv_rows_matches_sequential_gemv_bitwise(M: int):
     assert torch.equal(batched, sequential)
 
 
-@pytest.mark.parametrize("M", [2, 3, 5, 6, 8])
+@pytest.mark.parametrize("M", [2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("N,K", [(8192, 2048), (2048, 4096), (12288, 2048), (48, 2048), (500, 777)])
 def test_row_invariant_linear_bitwise_equals_m1(monkeypatch, M: int, N: int, K: int):
     """The verify-window linear returns, per row, the exact bits of the M==1 decode call."""
