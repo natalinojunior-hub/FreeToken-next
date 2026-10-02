@@ -313,6 +313,34 @@ def test_prefill_conv_matches_reference():
     assert torch.allclose(got_states, ref_states, rtol=1e-5, atol=1e-6)
 
 
+@requires_cuda
+def test_verify_conv_is_bit_identical_to_decode_steps():
+    """MTP verify (decode_exact) gives RAW decode's bits row by row; cuDNN conv1d alone does not."""
+    torch.manual_seed(14)
+    config = _config()
+    args = config.qwen4_args
+    layer = _make_layer(config, device="cuda", dtype=torch.bfloat16)
+    width, rows = args.ple_state_width, 6
+    for _ in range(50):
+        x = torch.randn(rows, width, device="cuda", dtype=torch.bfloat16)
+        states = torch.randn(1, width, args.ple_conv_state_len, device="cuda", dtype=torch.bfloat16)
+        verify_states = states.clone()
+        tokens = [list(range(3, 3 + rows))]
+        got = layer._short_conv(
+            x, _meta(tokens, [[EOS, EOS]], device="cuda"), verify_states, decode_exact=True
+        )
+        want = torch.cat(
+            [
+                layer._short_conv(
+                    x[i : i + 1], _meta([[3]], [[EOS, EOS]], device="cuda", decode=True), states
+                )
+                for i in range(rows)
+            ]
+        )
+        assert torch.equal(got, want)
+        assert torch.equal(verify_states, states)
+
+
 def test_fresh_slots_read_a_zero_state():
     """A request marked fresh ignores whatever the pool slot still holds."""
     torch.manual_seed(13)

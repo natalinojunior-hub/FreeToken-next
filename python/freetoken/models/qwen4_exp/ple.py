@@ -704,12 +704,13 @@ class PLELayer(BaseOP):
         if fla is not None and fla.track_boundary_row is not None:
             self._write_track_snapshot(states, x, fla)
         spec_out = None
-        if getattr(batch, "spec_logits_indices", None) is not None:
+        verify = getattr(batch, "spec_logits_indices", None) is not None
+        if verify:
             pool = get_global_ctx().linear_state_pool
             buffers = getattr(pool, "spec_slot_states", {})
             if PLE_CONV_STATE in buffers and x.shape[0] <= buffers[PLE_CONV_STATE].shape[1]:
                 spec_out = buffers[PLE_CONV_STATE][self.ple_index]
-        return gated + self._short_conv(x, meta, states, spec_out)
+        return gated + self._short_conv(x, meta, states, spec_out, decode_exact=verify)
 
     def _write_track_snapshot(self, states: torch.Tensor, x: torch.Tensor, fla) -> None:
         """Copy the conv history at the GDN track boundary into the same donatable slot, so a radix
@@ -743,11 +744,12 @@ class PLELayer(BaseOP):
         meta: PLEMetadata,
         states: torch.Tensor,
         spec_out: torch.Tensor | None = None,
+        decode_exact: bool = False,
     ) -> torch.Tensor:
         """silu of the dilated depthwise conv over [state | x], and roll the per-request state."""
         if meta.is_decode:
             return self._decode_conv(x, meta, states)
-        return self._prefill_conv(x, meta, states, spec_out)
+        return self._prefill_conv(x, meta, states, spec_out, decode_exact)
 
     def _decode_conv(
         self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor
@@ -769,11 +771,14 @@ class PLELayer(BaseOP):
         meta: PLEMetadata,
         states: torch.Tensor,
         spec_out: torch.Tensor | None = None,
+        decode_exact: bool = False,
     ) -> torch.Tensor:
         """One conv over every request packed as ``[state_0 | chunk_0 | state_1 | chunk_1 | ...]``.
 
         The blocks abut exactly, so each output window stays inside its own request: request i's
         first token reads history columns base_i .. base_i+state_len, which is its own state.
+        ``decode_exact`` (MTP verify) uses ``_decode_conv``'s fp32 tap sum instead of cuDNN, whose
+        rounding differs on rare elements and would let verify rows drift from RAW decode.
         """
         lens = list(meta.seq_lens)
         num_reqs, width = len(lens), x.shape[1]
@@ -788,14 +793,21 @@ class PLELayer(BaseOP):
             columns = out_index.unsqueeze(1) + 1 + torch.arange(self.state_len, device=x.device)
             spec_out[: x.shape[0]].copy_(history[:, columns].permute(1, 0, 2))
 
-        out = F.conv1d(
-            history.unsqueeze(0), self.conv1d.weight, groups=width, dilation=self.dilation
-        ).squeeze(0)
+        weight = self.conv1d.weight
+        if decode_exact:
+            taps = out_index.unsqueeze(1) + self.dilation * torch.arange(
+                weight.shape[-1], device=x.device
+            )
+            window = history[:, taps].permute(1, 0, 2).float().contiguous()
+            out = (window * weight.squeeze(1).float()).sum(-1).to(x.dtype)
+        else:
+            out = F.conv1d(history.unsqueeze(0), weight, groups=width, dilation=self.dilation)
+            out = out.squeeze(0).index_select(1, out_index).transpose(0, 1)
         new_state = history.index_select(1, next_state_index).view(width, num_reqs, self.state_len)
         states.index_copy_(
             0, meta.state_slots, new_state.permute(1, 0, 2).to(states.dtype).contiguous()
         )
-        return F.silu(out.index_select(1, out_index).transpose(0, 1))
+        return F.silu(out)
 
     def _prefill_indices(self, lens: List[int], device: torch.device):
         """Columns of the packed history: this forward's outputs, the state block, the next state block."""
