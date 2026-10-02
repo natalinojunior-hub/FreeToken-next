@@ -30,8 +30,11 @@ _AD_MAX_PROVEN_MTP_DEPTH = 5
 
 def _safe_spec_mtp_depth(model_config, requested: int) -> int:
     """Disable only MTP paths whose deterministic token parity is unproven."""
-    if requested > 0 and model_config.model_type == "qwen3_5_moe":
-        logger.warning("qwen3_5_moe MTP is disabled until target/GDN state parity is proven")
+    # the GGUF checkpoints of the same family report their llama.cpp arch, qwen35moe
+    if requested > 0 and model_config.model_type in ("qwen3_5_moe", "qwen35moe"):
+        logger.warning(
+            f"{model_config.model_type} MTP is disabled until target/GDN state parity is proven"
+        )
         return 0
     if requested > 0 and model_config.model_type == "qwen4_exp":
         from freetoken.models.gguf.dequant import GGML_IQ2_S, GGML_IQ4_NL
