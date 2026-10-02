@@ -205,6 +205,14 @@ class QSASparseAttnBackend(BaseAttnBackend):
     def commit_spec_txn(self, table_idx: int) -> None:
         """Drop a fully accepted journal before its table slot can be reused."""
         self._spec_txns.pop(int(table_idx), None)
+        getattr(self, "_spec_preimages", {}).pop(int(table_idx), None)
+
+    def abort_spec_txn(self, table_idx: int) -> None:
+        """Restore the pre-draft state even when verify never activated its journal."""
+        self.rollback_spec_txn(table_idx)
+        preimage = getattr(self, "_spec_preimages", {}).pop(int(table_idx), None)
+        if preimage is not None:
+            self._restore_txn(preimage)
 
     def spec_txn_active(self, table_idx: int) -> bool:
         return int(table_idx) in self._spec_txns
@@ -288,10 +296,11 @@ class QSASparseAttnBackend(BaseAttnBackend):
         if activate:
             self.begin_spec_txn(table_idx)
             txn = self._spec_txns[table_idx]
-            preimage = self._spec_preimages.pop(table_idx, None)
+            preimage = self._spec_preimages.get(table_idx)
             if preimage is not None:
-                self._restore_bulk(preimage)
                 self._spec_txns[table_idx] = preimage
+                self._spec_preimages.pop(table_idx)
+                self._restore_txn(preimage)
                 return
         else:
             txn = {"cmp": {}, "kv": {}, "rope": {}}
@@ -354,7 +363,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         txn["cmp_logical_t"] = cmp_logical_t
         for layer_id, slot in self._idx_slot.items():
             dense = pool._dense(layer_id)
-            self._txn_save_rows(table_idx, layer_id, phys_live)
+            self._txn_save_rows(table_idx, layer_id, phys_live, txn=txn)
             slab = self.kvcache.cmp_k_cache(slot)
             txn["bulk_cmp"].append((slot, cmp_rows, slab.index_select(0, cmp_rows)))
         rope = getattr(self.kvcache, "_rope_positions", None)
@@ -448,6 +457,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
         live_count: int | None = None,
         logical_positions: torch.Tensor | None = None,
     ) -> None:
+        if int(table_idx) in self._spec_preimages:
+            return
         self.prepare_spec_txn(
             table_idx,
             out_loc,
@@ -477,8 +488,11 @@ class QSASparseAttnBackend(BaseAttnBackend):
         # KV/RoPE rows before keep_end are the committed verify writes. Speculative rows
         # after it are newly allocated and are reclaimed by free_spec_reject.
 
-    def _txn_save_rows(self, table_idx: int, layer_id: int, out_loc: torch.Tensor) -> None:
-        txn = self._spec_txns.get(int(table_idx))
+    def _txn_save_rows(
+        self, table_idx: int, layer_id: int, out_loc: torch.Tensor, *, txn: dict | None = None
+    ) -> None:
+        if txn is None:
+            txn = self._spec_txns.get(int(table_idx))
         if txn is None:
             return
         pool = self.kvcache._pool
@@ -584,23 +598,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
         txn = self._spec_txns.pop(int(table_idx), None)
         if txn is None:
             return
-        self._restore_fast(txn)
-        for slot, rows, values in txn.get("bulk_cmp", ()):
-            self.kvcache.cmp_k_cache(slot).index_copy_(0, rows, values)
-        rope = getattr(self.kvcache, "_rope_positions", None)
-        if rope is not None:
-            for rows, values in txn.get("bulk_rope", ()):
-                rope.index_copy_(0, rows, values)
-        pool = self.kvcache._pool
-        for entry in txn.get("bulk_kv", ()):
-            kind, dense, rows, *values = entry
-            if kind == "device":
-                pool._k_codes[dense].index_copy_(0, rows, values[0])
-                pool._k_norm[dense].index_copy_(0, rows, values[1])
-                pool._v_codes[dense].index_copy_(0, rows, values[2])
-                pool._v_norm[dense].index_copy_(0, rows, values[3])
-            else:
-                self._restore_host(dense, rows, values)
+        self._restore_txn(txn)
+
+    def _restore_txn(self, txn: dict) -> None:
+        self._restore_bulk(txn)
         for (slot, row), value in txn["cmp"].items():
             self.kvcache.cmp_k_cache(slot)[row].copy_(value)
         rope = getattr(self.kvcache, "_rope_positions", None)

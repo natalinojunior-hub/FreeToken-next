@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from freetoken.attention.qsa_sparse import QSASparseAttnBackend
@@ -90,13 +91,101 @@ def test_qsa_transaction_restores_page_major_bf16_device_and_host_rows():
     assert torch.equal(pool._k, dev_before)
     assert torch.equal(host_k, host_before)
 
+    # A pre-draft journal has no active transaction yet, including its host KV rows.
+    backend._spec_preimages = {}
+    backend._idx_slot = {0: 0}
+    backend._physical_loc = lambda loc: loc
+    backend.ratio = 4
+    cache.cmp_scratch_base = 8
+    backend.snapshot_spec_preimage(3, torch.tensor([1, 9]))
+    pool._k[0, 0, 1].fill_(-3)
+    host_k[0, 0, 1].fill_(-4)
+    backend.abort_spec_txn(3)
+    assert torch.equal(pool._k, dev_before)
+    assert torch.equal(host_k, host_before)
+    assert not backend._spec_txns and not backend._spec_preimages
+
 
 def test_qsa_transaction_commit_clears_slot_for_reuse():
     backend = object.__new__(QSASparseAttnBackend)
     backend._spec_txns = {}
+    backend._spec_preimages = {4: {"cmp": {}, "kv": {}, "rope": {}}}
     backend.begin_spec_txn(4)
     backend.commit_spec_txn(4)
     assert not backend.spec_txn_active(4)
+    assert not backend._spec_preimages
     backend.begin_spec_txn(4)
     backend.commit_spec_txn(4)
     assert not backend.spec_txn_active(4)
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+@pytest.mark.parametrize("activate", [False, True])
+def test_qsa_abort_restores_first_pre_draft_preimage(compressed, activate):
+    """Draft and verify failures restore the same original KV/index/RoPE image."""
+    pool = SimpleNamespace(compressed=compressed, _dense=lambda layer: layer)
+    keys = torch.arange(16, dtype=torch.float32).view(1, 4, 4, 1, 1)
+    values = keys + 100
+    cmp = torch.arange(16, dtype=torch.float32).view(1, 16, 1)
+    rope = torch.arange(16, dtype=torch.int32).view(16, 1)
+    if compressed:
+        pool._k_codes = keys.view(1, 16, 1).clone()
+        pool._v_codes = values.view(1, 16, 1).clone()
+        pool._k_norm = torch.ones(1, 16)
+        pool._v_norm = torch.ones(1, 16)
+        state = (pool._k_codes, pool._v_codes, pool._k_norm, pool._v_norm, cmp, rope)
+    else:
+        state = (keys, values, cmp, rope)
+    backend = object.__new__(QSASparseAttnBackend)
+    backend._spec_txns = {}
+    backend._spec_preimages = {}
+    backend._idx_slot = {0: 0}
+    backend.page_size = backend.ratio = 4
+    backend._physical_loc = lambda loc: loc
+    backend._fast_layer_index = lambda device: (torch.tensor([0]), torch.tensor([0]))
+    backend.kvcache = SimpleNamespace(
+        _pool=pool,
+        num_device_pages=4,
+        cmp_scratch_base=8,
+        _cmp_k_buffer=cmp,
+        cmp_k_cache=lambda slot: cmp[slot],
+        k_cache=lambda layer: keys[layer],
+        v_cache=lambda layer: values[layer],
+        host_kv=lambda layer: None,
+        _rope_positions=rope,
+    )
+    before = tuple(t.clone() for t in state)
+    loc = torch.tensor([2, 3])
+    backend.snapshot_spec_preimage(0, loc)
+    first = backend._spec_preimages[0]
+    for t in state:
+        # Only journaled rows are allowed to change during a speculative window.
+        if t is cmp:
+            t[:, [0, 8]] = -1
+        elif t is rope:
+            t[loc] = -1
+        elif compressed:
+            t[:, loc] = -1
+        else:
+            t[:, 0, loc] = -1
+    backend.snapshot_spec_preimage(0, loc)
+    assert backend._spec_preimages[0] is first
+    if activate:
+        # Ordinary rollback between draft and verify must leave the preimage available.
+        backend.rollback_spec_txn(0)
+        assert backend._spec_preimages[0] is first
+        backend.prepare_spec_txn(0, loc)
+        assert all(torch.equal(t, expected) for t, expected in zip(state, before))
+        for t in state:
+            if t is cmp:
+                t[:, [0, 8]] = -2
+            elif t is rope:
+                t[loc] = -2
+            elif compressed:
+                t[:, loc] = -2
+            else:
+                t[:, 0, loc] = -2
+    backend.abort_spec_txn(0)
+    assert all(torch.equal(t, expected) for t, expected in zip(state, before))
+    assert not backend._spec_txns and not backend._spec_preimages
+    backend.abort_spec_txn(0)  # idempotent cleanup before table reuse
