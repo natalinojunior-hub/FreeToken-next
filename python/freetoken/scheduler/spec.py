@@ -148,6 +148,7 @@ class SchedulerSpecMixin:
                 req.cached_len, req.device_len = lo, hi
                 wb = Batch(reqs=[req], phase="prefill")
                 wb.padded_reqs = [req]
+                wb.mtp_fill = True
                 wb.positions = torch.arange(lo, hi, dtype=torch.int32, device=self.device)
                 if self._model_is_mrope:
                     wb.mrope_positions = _spec_mrope_positions(req, lo, hi, self.device)

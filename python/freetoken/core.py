@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Literal, Tuple
@@ -240,3 +242,13 @@ def set_global_ctx(ctx: Context):
 def get_global_ctx() -> Context:
     assert _GLOBAL_CTX is not None, "Global context is not set"
     return _GLOBAL_CTX
+
+
+def row_invariant_rows(rows: int) -> bool:
+    """``FREETOKEN_ROW_INVARIANT_LINEAR=1``: a 2..8-row MTP window must reduce each row like
+    M==1 decode. Draft-KV fill windows (``Batch.mtp_fill``) only shape draft proposals, never a
+    committed token, so they keep the batched kernels (a 16K prompt fills in 8-row windows)."""
+    if not 2 <= rows <= 8 or os.environ.get("FREETOKEN_ROW_INVARIANT_LINEAR") != "1":
+        return False
+    batch = _GLOBAL_CTX._batch if _GLOBAL_CTX is not None else None
+    return not getattr(batch, "mtp_fill", False)

@@ -22,12 +22,12 @@ from __future__ import annotations
 import functools
 import re
 
-import os
 
 import torch
 import triton
 import triton.language as tl
 
+from freetoken.core import row_invariant_rows
 from freetoken.kernel.triton.e4m3_compat import (
     e4m3_kernel_view,
     e4m3_native,
@@ -438,7 +438,7 @@ def fp8_pertensor_linear(
     *lead, K = x.shape
     N = weight.shape[0]
     M = x.numel() // K
-    if 2 <= M <= 8 and os.environ.get("FREETOKEN_ROW_INVARIANT_LINEAR") == "1":
+    if row_invariant_rows(M):
         # MTP verify rows: each row takes its own M==1 path, bit-identical to RAW decode
         rows = x.reshape(M, K)
         args = (weight, weight_scale, bias, input_scale, uniform_scale, scale_segments)

@@ -36,12 +36,11 @@ CUDA-graph safe on the decode paths: fixed shapes, no host sync.
 from __future__ import annotations
 
 
-import os
-
 import torch
 import triton
 import triton.language as tl
 
+from freetoken.core import row_invariant_rows
 from freetoken.kernel.triton.e4m3_compat import (
     e4m3_kernel_view,
     e4m3_native_cx,
@@ -965,7 +964,7 @@ def _linear_impl(
     *lead, K = x.shape
     N = packed_i32.shape[0]
     M = x.numel() // K
-    if M == 1 or (M <= 8 and os.environ.get("FREETOKEN_ROW_INVARIANT_LINEAR") == "1"):
+    if M == 1 or row_invariant_rows(M):
         # 2..8 rows (MTP verify) on the GEMV: each row bit-identical to its M==1 decode
         out = _gemv(x.reshape(M, K).contiguous(), packed_i32, scale, gscale, out_dtype, transposed)
         out = out.reshape(*lead, N)
