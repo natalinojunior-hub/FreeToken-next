@@ -26,16 +26,22 @@ logger = init_logger(__name__)
 
 
 _AD_MAX_PROVEN_MTP_DEPTH = 5
+_QWEN35_MAX_PROVEN_MTP_DEPTH = 5
 
 
 def _safe_spec_mtp_depth(model_config, requested: int) -> int:
     """Disable only MTP paths whose deterministic token parity is unproven."""
     # the GGUF checkpoints of the same family report their llama.cpp arch, qwen35moe
     if requested > 0 and model_config.model_type in ("qwen3_5_moe", "qwen35moe"):
-        logger.warning(
-            f"{model_config.model_type} MTP is disabled until target/GDN state parity is proven"
-        )
-        return 0
+        # Token parity with RAW is proven for k1-k5 (Qwen3.6-35B UD NVFP4, Ornith-1.5-35B NVFP4
+        # and GGUF, 16K prompts 0/3/7) only with verify rows reduced like M==1 decode.
+        os.environ.setdefault("FREETOKEN_ROW_INVARIANT_LINEAR", "1")
+        if requested > _QWEN35_MAX_PROVEN_MTP_DEPTH:
+            logger.warning(
+                f"{model_config.model_type} MTP depth capped at {_QWEN35_MAX_PROVEN_MTP_DEPTH} "
+                "(deeper windows are not token-parity proven)"
+            )
+            return _QWEN35_MAX_PROVEN_MTP_DEPTH
     if requested > 0 and model_config.model_type == "qwen4_exp":
         from freetoken.models.gguf.dequant import GGML_IQ2_S, GGML_IQ4_NL
         from freetoken.moe.cpu_executor import dominant_gguf_pair

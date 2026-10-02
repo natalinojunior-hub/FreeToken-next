@@ -13,13 +13,17 @@ from freetoken.models.qwen3_5_moe.mtp import (
 from freetoken.engine.config import _safe_spec_mtp_depth
 
 
-def test_qwen35_mtp_is_fail_closed_until_state_parity():
+def test_qwen35_mtp_is_depth_capped_and_row_exact(monkeypatch):
+    import os
     from types import SimpleNamespace
 
-    assert _safe_spec_mtp_depth(SimpleNamespace(model_type="qwen3_5_moe"), 6) == 0
-    assert _safe_spec_mtp_depth(SimpleNamespace(model_type="qwen35moe"), 6) == 0
+    monkeypatch.delenv("FREETOKEN_ROW_INVARIANT_LINEAR", raising=False)
+    for model_type in ("qwen3_5_moe", "qwen35moe"):
+        assert _safe_spec_mtp_depth(SimpleNamespace(model_type=model_type), 6) == 5
+        assert _safe_spec_mtp_depth(SimpleNamespace(model_type=model_type), 3) == 3
+        assert _safe_spec_mtp_depth(SimpleNamespace(model_type=model_type), 0) == 0
+    assert os.environ["FREETOKEN_ROW_INVARIANT_LINEAR"] == "1"
     assert _safe_spec_mtp_depth(SimpleNamespace(model_type="qwen4_exp"), 6) == 6
-    assert _safe_spec_mtp_depth(SimpleNamespace(model_type="qwen3_5_moe"), 0) == 0
 
 
 def test_qwen4_iq2s_iq4nl_mtp_is_depth_capped_and_row_exact(monkeypatch):
