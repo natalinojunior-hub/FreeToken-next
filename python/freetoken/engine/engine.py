@@ -969,6 +969,9 @@ class Engine:
         if self.linear_state_pool is not None:
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+        MemoryPlanner._clear_probe_residual(self.model)
+        torch.cuda.synchronize(self.device)
+        graph_allocated_before = int(torch.cuda.memory_allocated(self.device))
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
@@ -984,25 +987,55 @@ class Engine:
             mrope=config.model_config.model_is_mrope,
             verify_tokens=verify_graph_tokens(config.spec_mtp),
         )
+        torch.cuda.synchronize(self.device)
+        graph_retained = max(
+            0, int(torch.cuda.memory_allocated(self.device)) - graph_allocated_before
+        )
+        self._charge_graph_pool(graph_retained)
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
-        # Graph capture is the last consumer that allocates, so the account closes here: the
-        # runner's own buffers are measured, and the graph line keeps whichever is larger --
-        # the formula that funded the plan or the measurement that proves it.
-        measured_graph = tensor_bytes(self.graph_runner)
-        self.vram_ledger.charge(
-            "graph:pool",
-            max(measured_graph, self.vram_ledger.bytes_of("graph:pool")),
-            Kind.SEMI_PERSISTENT,
-            f"captured shapes {list(self.graph_runner.graph_bs_list)}, static inputs "
-            f"{mem_GB(measured_graph)} measured",
-        )
         self._calibrate_vram_ledger()
         self._restore_vram_headroom()
         # the idle guard may grow a shrunken expert cache back, never past the startup plan
         if self.moe_offload_cache is not None:
             self._expert_plan_slots = self.moe_offload_cache.resident_rows
+
+    def _charge_graph_pool(self, retained_bytes: int) -> None:
+        """Capture's retained allocator owners include private pools a tensor walk misses."""
+        measured_graph = tensor_bytes(self.graph_runner)
+        self.vram_ledger.charge(
+            "graph:pool",
+            max(0, retained_bytes, measured_graph),
+            Kind.SEMI_PERSISTENT,
+            f"captured shapes {list(self.graph_runner.graph_bs_list)}, retained allocator "
+            f"{mem_GB(retained_bytes)}, static inputs {mem_GB(measured_graph)} measured",
+        )
+
+    def _adopt_prefill_calibration(self, calibration, chunk: int) -> None:
+        """Replace overlapping text estimates with the validated allocation envelope."""
+        # The solve starts from driver_free, which excludes reusable allocator slack.
+        # The live guard/ledger start from allocated bytes and must price the raw envelope;
+        # the guard credits its current allocator slack once, just before a forward.
+        reserve = max(
+            calibration.transient_at(chunk) + calibration.baseline_allocator_slack,
+            calibration.graph_capture_peak,
+        )
+        self._prefill_transient_reserve = reserve
+        for name in (
+            "transient:autotune",
+            "transient:activations",
+            "transient:gdn-prefill",
+            "graph:capture-peak",
+            "reserve:fragmentation",
+        ):
+            self.vram_ledger.release(name)
+        self.vram_ledger.charge(
+            "transient:prefill-calibrated",
+            reserve,
+            Kind.TRANSIENT,
+            f"validated {chunk}-token allocation envelope; allocator slack credited live",
+        )
 
     def _fit_kv_ram_tier(self, config: EngineConfig) -> None:
         """Size the RAM tier against live RAM; auto tiering drops it (KV stays in VRAM) where
@@ -2146,7 +2179,7 @@ class Engine:
                     pass
 
             object.__setattr__(config, "moe_cache_size", plan.expert_slots)
-            self._prefill_transient_reserve = plan.transient_reserve
+            self._adopt_prefill_calibration(planner.runtime_calibration, plan.prefill_chunk)
             object.__setattr__(config, "moe_prefill_overlap", plan.prefill_overlap)
             if config.num_page_override is None:
                 object.__setattr__(config, "num_page_override", plan.kv_pages)
@@ -2489,8 +2522,10 @@ class Engine:
         aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
         # 4. Re-capture CUDA graphs against the new tensors (reset_capture above re-armed
         #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
+        MemoryPlanner._clear_probe_residual(self.model)
         gc.collect()
         free_min = self._sync_get_memory()[0]
+        graph_allocated_before = int(torch.cuda.memory_allocated(self.device))
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
@@ -2506,6 +2541,10 @@ class Engine:
             mrope=config.model_config.model_is_mrope,
             verify_tokens=verify_graph_tokens(config.spec_mtp),
             warm=False,
+        )
+        torch.cuda.synchronize(self.device)
+        self._charge_graph_pool(
+            max(0, int(torch.cuda.memory_allocated(self.device)) - graph_allocated_before)
         )
 
     @nvtx_annotate("TargetForward", enabled=os.getenv("FREETOKEN_PROFILE_DECODE", "0") == "1")
