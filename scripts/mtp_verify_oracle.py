@@ -165,7 +165,9 @@ def check_verify(scheduler: Any, batch: Any, args: Any, forward: Any) -> Any:
             wrap_method(layer.mlp_hyper_connection, "combine", f"L{li}.mlp_hc_combine")
     qsa_layer = int(os.getenv("FREETOKEN_VERIFY_ORACLE_QSA_LAYER", "3"))
     backend = engine.attn_backend
-    qsa_orig = (backend.qsa_forward, backend._select)
+    # models without QSA (e.g. qwen3_5_moe) have nothing to hook
+    has_qsa = hasattr(backend, "qsa_forward")
+    qsa_orig = (getattr(backend, "qsa_forward", None), getattr(backend, "_select", None))
     qsa_now = {"layer": -1}
     qsa_cap: dict[str, dict[str, list[torch.Tensor]]] = {"raw": {}, "verify": {}}
 
@@ -199,7 +201,7 @@ def check_verify(scheduler: Any, batch: Any, args: Any, forward: Any) -> Any:
                 qsa_cap[mode].setdefault(key, []).append(value.detach().cpu().clone())
         return result
 
-    if not light:
+    if not light and has_qsa:
         backend.qsa_forward = qsa_forward
         backend._select = qsa_select
         qsa_pkg.qsa_mqa_paged = mqa_wrap
@@ -378,7 +380,8 @@ def check_verify(scheduler: Any, batch: Any, args: Any, forward: Any) -> Any:
         completed = True
         return out
     finally:
-        backend.qsa_forward, backend._select = qsa_orig
+        if has_qsa:
+            backend.qsa_forward, backend._select = qsa_orig
         qsa_pkg.qsa_mqa_paged = mqa_orig
         if not completed:
             for value, saved in zip(state, initial):

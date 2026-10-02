@@ -36,6 +36,8 @@ CUDA-graph safe on the decode paths: fixed shapes, no host sync.
 from __future__ import annotations
 
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -170,12 +172,18 @@ def _nvfp4_gemv_kernel(
     stride_pkw,
     stride_sn,
     stride_sblk,
+    stride_am,
+    stride_om,
     BLOCK_N: tl.constexpr,
     BLOCK_KW: tl.constexpr,
     OUT: tl.constexpr,
     EVEN_K: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
+    # one activation row per program_id(1): identical arithmetic per row -> row-invariant
+    pid_m = tl.program_id(1).to(tl.int64)
+    a_ptr += pid_m * stride_am
+    out_ptr += pid_m * stride_om
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < N
 
@@ -251,6 +259,9 @@ def _nvfp4_gemv_splitk_kernel(
     stride_sblk,
     stride_partk,
     stride_partn,
+    stride_am,
+    stride_om,
+    stride_partm,
     BLOCK_N: tl.constexpr,
     BLOCK_KW: tl.constexpr,
     SPLIT_K: tl.constexpr,
@@ -264,6 +275,11 @@ def _nvfp4_gemv_splitk_kernel(
     acq_rel arrival atomic orders the partial stores), so no separate reduce launch."""
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
+    pid_m = tl.program_id(2).to(tl.int64)
+    a_ptr += pid_m * stride_am
+    out_ptr += pid_m * stride_om
+    part_ptr += pid_m * stride_partm
+    counter_ptr += pid_m * tl.num_programs(0)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < N
     offs_kw = tl.arange(0, BLOCK_KW)
@@ -336,15 +352,20 @@ def _gemv(
     out_dtype: torch.dtype,
     transposed: bool,
 ) -> torch.Tensor:
-    """M==1 W4A16 GEMV. ``a`` [K] compute-dtype; ``packed_i32`` logical [N, K//8] int32
+    """W4A16 GEMV. ``a`` [K] or [M, K] compute-dtype; ``packed_i32`` logical [N, K//8] int32
     (row-major or a K-major transposed view); ``scale`` logical [N, K//16] fp8; ``gscale``
     [N] fp16. Picks split-K so small ``N`` (shared expert) still fills the SMs; large ``N``
-    (lm_head) stays single-pass (split_k=1)."""
+    (lm_head) stays single-pass (split_k=1). The split depends on N and K only, and each of
+    the M rows runs the M==1 arithmetic, so every row is bit-identical to its own M==1 call
+    (MTP verify rows == RAW decode)."""
     out_tl = _TL_DTYPE[out_dtype if out_dtype in _TL_DTYPE else torch.bfloat16]
     N = packed_i32.shape[0]
     K = packed_i32.shape[1] * 8
     scale = e4m3_kernel_view(scale)
-    out = torch.empty(N, dtype=out_dtype, device=a.device)
+    rows = a.reshape(-1, K)
+    assert rows.stride(1) == 1, "GEMV activations need unit inner stride"
+    M = rows.shape[0]
+    out = torch.empty((M, N), dtype=out_dtype, device=a.device)
     block_kw = _GEMV_BLOCK_KW_T if transposed else _GEMV_BLOCK_KW_ROW
     sk_block_n = _GEMV_SPLITK_BLOCK_N_T if transposed else _GEMV_SPLITK_BLOCK_N_ROW
 
@@ -357,8 +378,8 @@ def _gemv(
 
     if split_k == 1:  # large N (lm_head): single-pass full-K, direct global-scaled write
         even = K % (block_kw * 8) == 0
-        _nvfp4_gemv_kernel[(triton.cdiv(N, _GEMV_BLOCK_N),)](
-            a,
+        _nvfp4_gemv_kernel[(triton.cdiv(N, _GEMV_BLOCK_N), M)](
+            rows,
             packed_i32,
             scale,
             gscale,
@@ -369,21 +390,23 @@ def _gemv(
             packed_i32.stride(1),
             scale.stride(0),
             scale.stride(1),
+            rows.stride(0),
+            out.stride(0),
             BLOCK_N=_GEMV_BLOCK_N,
             BLOCK_KW=block_kw,
             OUT=out_tl,
             EVEN_K=even,
             num_warps=_GEMV_WARPS,
         )
-        return out
+        return out.reshape(N) if a.dim() == 1 else out
 
     tiles_per = triton.cdiv(num_tiles, split_k)
     # Even iff every (tile_start + t) word tile is fully in range for every pid_k.
     even = (K % (_GEMV_SPLITK_BLOCK_KW * 8) == 0) and (num_tiles == tiles_per * split_k)
-    part = torch.empty((split_k, N), dtype=torch.float32, device=a.device)
-    counters = _splitk_counters(n_blocks_n, a.device)
-    _nvfp4_gemv_splitk_kernel[(n_blocks_n, split_k)](
-        a,
+    part = torch.empty((M, split_k, N), dtype=torch.float32, device=a.device)
+    counters = _splitk_counters(M * n_blocks_n, a.device)
+    _nvfp4_gemv_splitk_kernel[(n_blocks_n, split_k, M)](
+        rows,
         packed_i32,
         scale,
         gscale,
@@ -398,8 +421,11 @@ def _gemv(
         packed_i32.stride(1),
         scale.stride(0),
         scale.stride(1),
-        part.stride(0),
         part.stride(1),
+        part.stride(2),
+        rows.stride(0),
+        out.stride(0),
+        part.stride(0),
         BLOCK_N=sk_block_n,
         BLOCK_KW=_GEMV_SPLITK_BLOCK_KW,
         SPLIT_K=split_k,
@@ -407,7 +433,7 @@ def _gemv(
         EVEN_K=even,
         num_warps=_GEMV_WARPS,
     )
-    return out
+    return out.reshape(N) if a.dim() == 1 else out
 
 
 # ======================================================================================
@@ -938,10 +964,11 @@ def _linear_impl(
     """Shared dispatch on a logical ``[N, K//8]`` int32 weight view (either storage order)."""
     *lead, K = x.shape
     N = packed_i32.shape[0]
-    if x.numel() // K == 1:
-        out = _gemv(x.reshape(K), packed_i32, scale, gscale, out_dtype, transposed).reshape(
-            *lead, N
-        )
+    M = x.numel() // K
+    if M == 1 or (M <= 8 and os.environ.get("FREETOKEN_ROW_INVARIANT_LINEAR") == "1"):
+        # 2..8 rows (MTP verify) on the GEMV: each row bit-identical to its M==1 decode
+        out = _gemv(x.reshape(M, K).contiguous(), packed_i32, scale, gscale, out_dtype, transposed)
+        out = out.reshape(*lead, N)
     else:
         out = _gemm(
             x.reshape(-1, K).contiguous(), packed_i32, scale, gscale, out_dtype, transposed
