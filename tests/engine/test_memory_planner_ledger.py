@@ -257,3 +257,195 @@ def test_ram_tier_keeps_only_the_hot_floor_on_device():
     assert planner._device_kv_pages(config) == 3072
     short = SimpleNamespace(max_seq_len=4096, kv_reserve_tokens=8192)
     assert planner._device_kv_pages(short) == 64
+
+
+def test_prefill_prices_retained_growth_without_probe_allocator_slack(monkeypatch):
+    from types import SimpleNamespace
+
+    planner = MemoryPlanner.__new__(MemoryPlanner)
+    planner.device = torch.device("cpu")
+    planner._probe_kv_pool = object()
+    owner = SimpleNamespace(_last_residual=torch.zeros(16))
+    model = SimpleNamespace(model=owner)
+    state = {"allocated": 500 * MIB, "peak_reserved": 1000 * MIB}
+
+    def prefill(*_args):
+        assert owner._last_residual is None
+        owner._last_residual = torch.zeros(32)
+        state["allocated"] += 32 * MIB
+
+    planner._run_validation_prefill = prefill
+    planner._log_validation_ownership = lambda *_args: None
+    for name in ("synchronize", "empty_cache", "reset_peak_memory_stats"):
+        monkeypatch.setattr(torch.cuda, name, lambda *_args: None)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *_args: state["allocated"])
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *_args: 580 * MIB)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda *_args: state["peak_reserved"])
+    assert planner._measure_prefill_transient(model, _Cfg, 8192) == 500 * MIB
+
+
+def test_calibration_keeps_raw_samples_and_subtracts_live_baseline_slack_once():
+    from dataclasses import asdict, replace
+
+    raw = _calib(transient_lo=500 * MIB, transient_hi=1000 * MIB)
+    priced = replace(raw, baseline_allocator_slack=60 * MIB)
+    assert priced.transient_at(4096) == 440 * MIB
+    assert priced.transient_at(6144) == 690 * MIB
+    assert priced.transient_at(8192) == 940 * MIB
+    assert priced.transient_hi == 1000 * MIB
+    # Cache serialization retains raw samples; this process's slack is not reused.
+    cached = asdict(priced)
+    cached.pop("baseline_allocator_slack")
+    reloaded = replace(RuntimeCalibration(**cached), baseline_allocator_slack=40 * MIB)
+    assert reloaded.transient_at(8192) == 960 * MIB
+
+
+def test_probe_cleanup_releases_retained_residual_and_restores_context(monkeypatch):
+    from types import SimpleNamespace
+
+    import freetoken.engine.memory_planner as module
+
+    owner = SimpleNamespace(_last_residual=torch.zeros(32))
+    planner = MemoryPlanner.__new__(MemoryPlanner)
+    planner.device = torch.device("cpu")
+    planner._probe_model = SimpleNamespace(model=owner)
+    for attr in (
+        "_probe_graph_runner",
+        "_probe_attn_backend",
+        "_probe_linear_pool",
+        "_probe_expert_cache",
+        "_probe_kv_pool",
+    ):
+        setattr(planner, attr, object())
+    original_linear, original_backend = object(), object()
+    planner._orig_linear_state_pool = original_linear
+    planner._orig_attn_backend = original_backend
+    context = SimpleNamespace(linear_state_pool=object(), attn_backend=object())
+    monkeypatch.setattr("freetoken.core.get_global_ctx", lambda: context)
+    monkeypatch.setattr(module, "attach_offload_moe_cache", lambda *_args: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_args: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda *_args: None)
+    planner._cleanup_probe_artifacts()
+    assert owner._last_residual is None
+    assert planner._probe_model is None and planner._probe_kv_pool is None
+    assert context.linear_state_pool is original_linear
+    assert context.attn_backend is original_backend
+
+
+@pytest.mark.parametrize("fail_metadata", [False, True])
+def test_validation_restores_global_page_table_on_oom(monkeypatch, fail_metadata):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    original = torch.zeros((2, 4), dtype=torch.int32)
+    context = SimpleNamespace(page_table=original, forward_batch=lambda _batch: nullcontext())
+    monkeypatch.setattr("freetoken.core.get_global_ctx", lambda: context)
+    monkeypatch.setattr("freetoken.attention.linear.build_fla_metadata", lambda *_args: None)
+    planner = MemoryPlanner.__new__(MemoryPlanner)
+    planner.device = torch.device("cpu")
+    config = SimpleNamespace(
+        max_seq_len=4,
+        page_size=1,
+        max_running_req=1,
+        model_config=SimpleNamespace(model_is_mrope=False),
+    )
+
+    def fail():
+        assert context.page_table is not original
+        raise torch.cuda.OutOfMemoryError("injected")
+
+    if fail_metadata:
+        monkeypatch.setattr(torch, "arange", lambda *_args, **_kwargs: fail())
+    with pytest.raises(torch.cuda.OutOfMemoryError, match="injected"):
+        planner._run_validation_prefill(SimpleNamespace(forward=fail), config, 2, object())
+    assert context.page_table is original
+
+
+def test_phase_i_constructor_oom_restores_context_and_clears_probe_residual(monkeypatch):
+    from types import SimpleNamespace
+
+    original_linear, original_backend, original_kv = object(), object(), object()
+    context = SimpleNamespace(
+        linear_state_pool=original_linear, attn_backend=original_backend, kv_cache=original_kv
+    )
+    monkeypatch.setattr("freetoken.core.get_global_ctx", lambda: context)
+    planner = MemoryPlanner.__new__(MemoryPlanner)
+    planner.device = torch.device("cpu")
+    planner._log_validation_ownership = lambda *_args: None
+    for name in ("synchronize", "empty_cache", "reset_peak_memory_stats"):
+        monkeypatch.setattr(torch.cuda, name, lambda *_args: None)
+    owner = SimpleNamespace(_last_residual=torch.zeros(32))
+
+    def fail(*_args):
+        assert owner._last_residual is None
+        raise torch.cuda.OutOfMemoryError("constructor injected")
+
+    monkeypatch.setattr("freetoken.attention.create_attention_backend", fail)
+    valid, message = planner.phase_i_final_validation(
+        SimpleNamespace(attention_backend="triton", model_config=object()),
+        SimpleNamespace(model=owner),
+        object(),
+        object(),
+        object(),
+        8192,
+    )
+    assert not valid and "constructor injected" in message
+    assert context.linear_state_pool is original_linear
+    assert context.attn_backend is original_backend
+    assert context.kv_cache is original_kv
+    assert owner._last_residual is None
+
+
+@pytest.mark.parametrize("existing_table", [False, True])
+@pytest.mark.parametrize("capture_fails", [False, True])
+def test_graph_probe_scopes_its_page_table(monkeypatch, existing_table, capture_fails):
+    from types import SimpleNamespace
+
+    import freetoken.engine.memory_planner as module
+
+    original = torch.zeros((2, 8), dtype=torch.int32)
+    context = SimpleNamespace()
+    if existing_table:
+        context.page_table = original
+    monkeypatch.setattr("freetoken.core.get_global_ctx", lambda: context)
+    planner = MemoryPlanner.__new__(MemoryPlanner)
+    planner.device = torch.device("cpu")
+    planner._probe_kv_pool = object()
+    planner._probe_attn_backend = object()
+    planner._probe_expert_cache = object()
+    for name in ("synchronize", "empty_cache", "reset_peak_memory_stats"):
+        monkeypatch.setattr(torch.cuda, name, lambda *_args: None)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(module, "tensor_bytes", lambda _runner: 12)
+    monkeypatch.setattr(
+        module,
+        "take_physical_snapshot",
+        lambda _device: SimpleNamespace(
+            driver_free=1000, allocator_allocated=100, allocator_peak_allocated=140
+        ),
+    )
+
+    def capture(**_kwargs):
+        assert context.page_table is not original
+        assert context.page_table.shape == (2, 8)
+        assert context.page_table[1].tolist() == list(range(8))
+        if capture_fails:
+            raise RuntimeError("injected capture failure")
+        return object()
+
+    monkeypatch.setattr(module, "GraphRunner", capture)
+    config = SimpleNamespace(
+        cuda_graph_max_bs=1,
+        max_seq_len=7,
+        page_size=4,
+        max_running_req=1,
+        spec_mtp=0,
+        model_config=SimpleNamespace(vocab_size=10, model_is_mrope=False),
+    )
+    assert planner._measure_graph_capture(config, object()) == (
+        (0, 0) if capture_fails else (40, 12)
+    )
+    if existing_table:
+        assert context.page_table is original
+    else:
+        assert not hasattr(context, "page_table")

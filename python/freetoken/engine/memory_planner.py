@@ -239,15 +239,22 @@ class RuntimeCalibration:
     graph_capture_peak: int
     graph_pool_size: int
     non_pytorch_growth: int
+    # Raw samples stay cacheable; this live baseline is already outside driver_free.
+    baseline_allocator_slack: int = 0
 
     def transient_at(self, chunk: int) -> int:
         """Prefill transient at ``chunk`` (<= chunk_hi): linear between the two
         measured points; below chunk_lo the smaller measurement bounds it."""
         assert chunk <= self.chunk_hi, (chunk, self.chunk_hi)
         if chunk <= self.chunk_lo:
-            return self.transient_lo
+            return max(0, self.transient_lo - self.baseline_allocator_slack)
         slope = max(0, self.transient_hi - self.transient_lo) / (self.chunk_hi - self.chunk_lo)
-        return self.transient_lo + math.ceil(slope * (chunk - self.chunk_lo))
+        return max(
+            0,
+            self.transient_lo
+            + math.ceil(slope * (chunk - self.chunk_lo))
+            - self.baseline_allocator_slack,
+        )
 
 
 @dataclass(frozen=True)
@@ -649,19 +656,21 @@ class MemoryPlanner:
         everything already resident, to run the worst prefill step at ``chunk``
         (first chunk + context-final chunk, see _run_validation_prefill).
 
-        Measured in reserved (not allocated) bytes: reserved is what the driver
-        actually hands out, so allocator rounding/fragmentation is included
-        instead of guessed. Lazily-created persistent tensors are excluded
-        (they are priced once as ``lazy_persistent``)."""
+        The peak reservation is measured above allocated owners, not probe-pool
+        allocator slack that final pools cannot rely on. Retained chunk state is
+        runtime work, so start without the previous probe's residual and include
+        new retained growth. The live solve subtracts baseline slack once."""
+        self._clear_probe_residual(model)
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
-        pre_reserved = torch.cuda.memory_reserved(self.device)
         pre_alloc = torch.cuda.memory_allocated(self.device)
+        self._log_validation_ownership(f"before measured chunk={chunk}", model, "Phase D")
         self._run_validation_prefill(model, config, chunk, self._probe_kv_pool)
         torch.cuda.synchronize(self.device)
         kept = torch.cuda.memory_allocated(self.device) - pre_alloc
-        transient = torch.cuda.max_memory_reserved(self.device) - pre_reserved - kept
+        transient = torch.cuda.max_memory_reserved(self.device) - pre_alloc
+        self._log_validation_ownership(f"after measured chunk={chunk}", model, "Phase D")
         logger.info_rank0(
             f"  Prefill transient at chunk={chunk}: {mem_GB(transient)} (kept={mem_GB(kept)})"
         )
@@ -687,8 +696,13 @@ class MemoryPlanner:
         while True:
             c_lo = max(_MIN_CHUNK, c_hi // 2)
             try:
+                self._log_validation_ownership(f"before warm chunk={c_lo}", model, "Phase D")
                 self._run_validation_prefill(model, config, c_lo, self._probe_kv_pool)
                 lazy_persistent = torch.cuda.memory_allocated(self.device) - pre_alloc
+                residual = getattr(getattr(model, "model", None), "_last_residual", None)
+                if residual is not None:
+                    lazy_persistent -= residual.untyped_storage().nbytes()
+                self._log_validation_ownership(f"after warm chunk={c_lo}", model, "Phase D")
                 t_lo = self._measure_prefill_transient(model, config, c_lo)
                 t_hi = (
                     t_lo if c_hi == c_lo else self._measure_prefill_transient(model, config, c_hi)
@@ -790,13 +804,18 @@ class MemoryPlanner:
         if not config.cuda_graph_max_bs or config.cuda_graph_max_bs <= 0:
             return 0, 0
 
-        from freetoken.core import Req
+        from freetoken.core import Req, get_global_ctx
 
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
 
-        pre = take_physical_snapshot(self.device)
+        global_ctx = get_global_ctx()
+        original_page_table = getattr(global_ctx, "page_table", None)
+        original_pool_page_table = getattr(self._probe_kv_pool, "full_loc_map", None)
+        width = div_ceil(config.max_seq_len, config.page_size) * config.page_size
+        probe_page_table = torch.arange(width, dtype=torch.int32, device=self.device)
+        probe_page_table = probe_page_table.expand(config.max_running_req + 1, -1).contiguous()
 
         # Create minimal graph runner for measurement
         dummy_req = Req(
@@ -810,6 +829,11 @@ class MemoryPlanner:
         )
 
         try:
+            global_ctx.page_table = probe_page_table
+            if hasattr(self._probe_kv_pool, "attach_page_table"):
+                self._probe_kv_pool.attach_page_table(probe_page_table)
+            # The table is priced statically, independently of graph runtime owners.
+            pre = take_physical_snapshot(self.device)
             runner = GraphRunner(
                 stream=torch.cuda.current_stream(),
                 device=self.device,
@@ -829,6 +853,13 @@ class MemoryPlanner:
         except Exception as e:
             logger.warning_rank0(f"Graph capture measurement failed: {e}")
             return 0, 0
+        finally:
+            if original_pool_page_table is not None:
+                self._probe_kv_pool.attach_page_table(original_pool_page_table)
+            if original_page_table is not None:
+                global_ctx.page_table = original_page_table
+            elif hasattr(global_ctx, "page_table"):
+                delattr(global_ctx, "page_table")
 
         post = take_physical_snapshot(self.device)
         peak = post.allocator_peak_allocated - pre.allocator_allocated
@@ -1027,6 +1058,7 @@ class MemoryPlanner:
 
         if self._probe_model is not None:
             attach_offload_moe_cache(self._probe_model, None)
+            self._clear_probe_residual(self._probe_model)
 
         global_ctx = get_global_ctx()
         global_ctx.linear_state_pool = self._orig_linear_state_pool
@@ -1071,11 +1103,12 @@ class MemoryPlanner:
         """
         logger.info_rank0("Phase I: Final in-situ validation...")
 
+        self._clear_probe_residual(model)
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
 
-        pre_val = take_physical_snapshot(self.device)
+        self._log_validation_ownership("before backend", model)
 
         # Phase H's pools are validation-only (engine.py builds the real, permanent
         # kv_cache/linear_state_pool/attn_backend/offload cache after plan() returns),
@@ -1090,21 +1123,30 @@ class MemoryPlanner:
         orig_kv_cache = getattr(global_ctx, "kv_cache", None)
         global_ctx.linear_state_pool = linear_pool
         global_ctx.kv_cache = kv_pool
-        global_ctx.attn_backend = create_attention_backend(
-            config.attention_backend, config.model_config
-        )
         try:
             try:
+                global_ctx.attn_backend = create_attention_backend(
+                    config.attention_backend, config.model_config
+                )
+                self._log_validation_ownership("after backend", model)
+                pre_val = take_physical_snapshot(self.device)
                 # A single prefill can never exceed max_seq_len tokens regardless of
                 # the scheduler's chunk cap -- validating at prefill_chunk itself
                 # would overrun the KV page table when the requested context is
                 # smaller than the chunk (e.g. small-context smoke tests), which is
                 # not a real validation failure, just an oversized probe request.
                 validation_chunk = min(prefill_chunk, config.max_seq_len)
-                self._run_validation_prefill(model, config, validation_chunk, kv_pool)
+                self._run_validation_prefill(
+                    model, config, validation_chunk, kv_pool, log_ownership=True
+                )
 
                 torch.cuda.synchronize(self.device)
-                transient = torch.cuda.max_memory_reserved(self.device) - pre_val.allocator_reserved
+                transient = max(
+                    0,
+                    torch.cuda.max_memory_reserved(self.device)
+                    - pre_val.allocator_allocated
+                    - self.runtime_calibration.baseline_allocator_slack,
+                )
                 log_reconciliation(
                     "Phase I",
                     {"transient": self.runtime_calibration.transient_at(validation_chunk)},
@@ -1114,6 +1156,7 @@ class MemoryPlanner:
             except torch.cuda.OutOfMemoryError as e:
                 return False, f"Validation OOM: {e}"
         finally:
+            self._clear_probe_residual(model)
             global_ctx.linear_state_pool = orig_linear_state_pool
             global_ctx.attn_backend = orig_attn_backend
             if orig_kv_cache is not None:
@@ -1121,8 +1164,35 @@ class MemoryPlanner:
             elif hasattr(global_ctx, "kv_cache"):
                 delattr(global_ctx, "kv_cache")
 
+    @staticmethod
+    def _clear_probe_residual(model) -> None:
+        owner = getattr(model, "model", None)
+        if hasattr(owner, "_last_residual"):
+            owner._last_residual = None
+
+    def _log_validation_ownership(self, stage: str, model, phase: str = "Phase I") -> None:
+        """Observe owners without releasing allocator blocks or resetting peaks."""
+        torch.cuda.synchronize(self.device)
+        residual = getattr(getattr(model, "model", None), "_last_residual", None)
+        residual_bytes = residual.untyped_storage().nbytes() if residual is not None else 0
+        free, _ = torch.cuda.mem_get_info(self.device)
+        logger.info_rank0(
+            f"  [{phase} ownership] {stage}: "
+            f"allocated={torch.cuda.memory_allocated(self.device)} "
+            f"reserved={torch.cuda.memory_reserved(self.device)} free={free} "
+            f"peak_allocated={torch.cuda.max_memory_allocated(self.device)} "
+            f"peak_reserved={torch.cuda.max_memory_reserved(self.device)} "
+            f"residual_storage={residual_bytes} "
+            f"residual_shape={tuple(residual.shape) if residual is not None else ()}"
+        )
+
     def _run_validation_prefill(
-        self, model, config: EngineConfig, chunk_size: int, kv_pool: BaseKVCachePool
+        self,
+        model,
+        config: EngineConfig,
+        chunk_size: int,
+        kv_pool: BaseKVCachePool,
+        log_ownership: bool = False,
     ):
         """Run final validation as real serving would: one prefill forward per chunk,
         continuation chunks carrying the real GDN recurrent state forward.
@@ -1142,16 +1212,9 @@ class MemoryPlanner:
         validation_page_table = torch.zeros(
             config.max_running_req + 1, aligned_max_seq_len, dtype=torch.int32, device=self.device
         )
-        global_ctx.page_table = validation_page_table
-        if hasattr(kv_pool, "attach_page_table"):
-            kv_pool.attach_page_table(validation_page_table)
-
+        original_page_table = getattr(global_ctx, "page_table", None)
+        original_pool_page_table = getattr(kv_pool, "full_loc_map", None)
         table_idx = config.max_running_req
-        # Map the whole context to real KV slots up front so the final chunk's
-        # attention reads a full-context page table, exactly as a real prompt would.
-        validation_page_table[table_idx, : config.max_seq_len] = torch.arange(
-            config.max_seq_len, dtype=torch.int32, device=self.device
-        )
 
         def _run_chunk(cached_len: int, extend_len: int):
             device_len = cached_len + extend_len
@@ -1191,12 +1254,30 @@ class MemoryPlanner:
         # max_seq_len, carrying real GDN state (has_initial_state=True) and paying
         # the full-context attention/indexer workspace -- the worst prefill step
         # real serving can take, so probe and validation measure the same peak.
-        _run_chunk(cached_len=0, extend_len=chunk_size)
-        if config.max_seq_len > chunk_size:
-            tail = min(chunk_size, config.max_seq_len - chunk_size)
-            _run_chunk(cached_len=config.max_seq_len - tail, extend_len=tail)
-
-        torch.cuda.synchronize(self.device)
+        try:
+            global_ctx.page_table = validation_page_table
+            if hasattr(kv_pool, "attach_page_table"):
+                kv_pool.attach_page_table(validation_page_table)
+            # Map real slots up front so the final chunk reads the full context.
+            validation_page_table[table_idx, : config.max_seq_len] = torch.arange(
+                config.max_seq_len, dtype=torch.int32, device=self.device
+            )
+            _run_chunk(cached_len=0, extend_len=chunk_size)
+            if log_ownership:
+                self._log_validation_ownership("after initial chunk", model)
+            if config.max_seq_len > chunk_size:
+                tail = min(chunk_size, config.max_seq_len - chunk_size)
+                _run_chunk(cached_len=config.max_seq_len - tail, extend_len=tail)
+                if log_ownership:
+                    self._log_validation_ownership("after tail chunk", model)
+            torch.cuda.synchronize(self.device)
+        finally:
+            if original_pool_page_table is not None:
+                kv_pool.attach_page_table(original_pool_page_table)
+            if original_page_table is not None:
+                global_ctx.page_table = original_page_table
+            else:
+                delattr(global_ctx, "page_table")
 
     # ======================= Main Planning Entry Point =======================
 
@@ -1297,8 +1378,16 @@ class MemoryPlanner:
         # The budget is measured ONCE, after the probe scaffolding is gone: it
         # already reflects CUDA context, modules, lmem and every persistent
         # byte the probe left behind, so the ledger never re-subtracts them.
+        self._log_validation_ownership("before cleanup", model, "Probe")
         self._cleanup_probe_artifacts()
+        self._log_validation_ownership("after cleanup", model, "Probe")
         budget_snapshot = take_physical_snapshot(self.device)
+        self.runtime_calibration = dataclasses.replace(
+            self.runtime_calibration,
+            baseline_allocator_slack=max(
+                0, budget_snapshot.allocator_reserved - budget_snapshot.allocator_allocated
+            ),
+        )
         budget = budget_snapshot.driver_free
         # KV RAM tiering's device-side overhead (compressed index/rope rows + host_staging)
         # is not a pool the solve below ever builds, so take it off the top before solving
