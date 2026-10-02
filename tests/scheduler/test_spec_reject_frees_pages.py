@@ -464,6 +464,9 @@ def test_replay_window_preserves_inputs_and_bookkeeping():
 
 
 def test_online_cost_hook_counts_committed_tokens_and_remaining_budget(monkeypatch):
+    from freetoken.scheduler import spec as _spec
+
+    monkeypatch.setattr(_spec, "_SPEC_WARMUP_CYCLES", 0)
     from freetoken.scheduler.adaptive_mtp import AdaptiveMtpController
     from freetoken.scheduler import spec
 

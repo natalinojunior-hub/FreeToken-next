@@ -33,6 +33,12 @@ logger = init_logger(__name__)
 SPEC_TIMING_ENV = "FREETOKEN_DEBUG_SPEC_TIMING"
 
 
+# The first decode cycles after a prefill run while the expert cache regrows to decode
+# residency and its new slots fill by misses (~2x steady cycle cost measured); their timings
+# would bias the depth economics, so they run the planned depth unobserved.
+_SPEC_WARMUP_CYCLES = 16
+
+
 def _partial_spec_enabled() -> bool:
     """Zero-replay commit for QSA targets (FREETOKEN_ENABLE_PARTIAL_SPEC=0 restores the replay)."""
     return os.getenv("FREETOKEN_ENABLE_PARTIAL_SPEC", "1") == "1"
@@ -339,6 +345,15 @@ class SchedulerSpecMixin:
                 f"tok={committed} gap_ms={gap:.2f} obs={int(bool(observed))}",
                 flush=True,
             )
+        if observed and depth is not None:
+            # ponytail: fixed warm-up count; key it to the residency controller's regrow
+            # completion if a model's transient outlasts it.
+            seen = self.__dict__.setdefault("_mtp_warm_cycles", {})
+            if seen.get(req.uid, 0) < _SPEC_WARMUP_CYCLES:
+                if len(seen) > 64:
+                    seen.clear()
+                seen[req.uid] = seen.get(req.uid, 0) + 1
+                observed = False
         if observed and depth is not None:
             controller.observe(depth, elapsed, committed)
             # A calibration just converged -> persist the learned depth so the next serve of

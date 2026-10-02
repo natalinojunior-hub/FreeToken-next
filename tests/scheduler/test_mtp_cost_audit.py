@@ -42,6 +42,9 @@ def test_live_residency_boundary_keeps_learned_mtp_economics():
 
 
 def test_cost_audit_carries_tail_raw_sample_across_requests(monkeypatch):
+    from freetoken.scheduler import spec as _spec
+
+    monkeypatch.setattr(_spec, "_SPEC_WARMUP_CYCLES", 0)
     controller = AdaptiveMtpController(1, profiled_depth=1)
     saved = []
     scheduler = SimpleNamespace(
