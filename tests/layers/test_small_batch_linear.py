@@ -33,13 +33,25 @@ def test_cuda_dispatch_matches_fp32(n, k, m):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_m1_never_uses_small_band():
-    """M=1 (raw decode + MTP drafts) must stay on F.linear bit-exactly; widening the band down
-    to M=1 measured -19.3% TG."""
+@pytest.mark.parametrize("n,k", [(1, 2048), (64, 2048), (256, 2048), (512, 2560), (2048, 4096)])
+def test_m1_never_uses_small_band(n, k, monkeypatch):
+    """Decode and verify share a per-weight policy and are bitwise row-invariant."""
+    import freetoken.layers.quantization.linear.unquantized as uq
+
+    monkeypatch.setenv("FREETOKEN_ROW_INVARIANT_LINEAR", "1")
     g = torch.Generator(device="cuda").manual_seed(4)
-    w = torch.randn(512, 2560, device="cuda", dtype=torch.bfloat16, generator=g) * 0.02
-    x = torch.randn(1, 2560, device="cuda", dtype=torch.bfloat16, generator=g)
-    assert torch.equal(small_batch_linear(x, w), F.linear(x, w))
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16, generator=g) * 0.02
+    x = torch.randn(8, k, device="cuda", dtype=torch.bfloat16, generator=g)
+    b = torch.randn(n, device="cuda", dtype=torch.bfloat16, generator=g)
+    single = torch.cat([small_batch_linear(row.unsqueeze(0), w, b) for row in x])
+    expected = (
+        uq._bf16_gemv_rows(x, w) + b
+        if n == 1 or n > 256
+        else torch.cat([F.linear(row.unsqueeze(0), w, b) for row in x])
+    )
+    assert torch.equal(single, expected)
+    for m in range(2, 9):
+        assert torch.equal(small_batch_linear(x[:m], w, b), single[:m])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

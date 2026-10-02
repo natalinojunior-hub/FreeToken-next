@@ -115,6 +115,7 @@ def _gemv_splitk_kernel(
     stride_pn,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    W_BF16: tl.constexpr = False,
 ):
     """Each (pid_n, pid_k) computes the partial sum over ``kb_per`` BLOCK_K chunks for a
     BLOCK_N slice of outputs. ``kb_per`` ceil-tiles K so K only needs to be a multiple of
@@ -131,7 +132,7 @@ def _gemv_splitk_kernel(
             offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
             k_mask = offs_k < K
             a = tl.load(a_ptr + offs_k * stride_ak, mask=k_mask, other=0.0).to(tl.float32)
-            if e4m3_native_cx():
+            if W_BF16 or e4m3_native_cx():
                 w = tl.load(
                     w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
                     mask=n_mask[:, None] & k_mask[None, :],
@@ -225,6 +226,7 @@ def _gemv(
         part.stride(1),
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        W_BF16=weight.dtype == torch.bfloat16,
         num_warps=1,
     )
     out = torch.empty(N, dtype=out_dtype, device=a.device)
@@ -263,6 +265,7 @@ def _gemv_splitk_rows_kernel(
     M_PAD: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    W_BF16: tl.constexpr = False,
 ):
     """``_gemv_splitk_kernel`` for M rows sharing one weight-tile load. Each row's partial is
     the same ``tl.sum`` over the same [BLOCK_N, BLOCK_K] tile, accumulated in the same order,
@@ -279,7 +282,7 @@ def _gemv_splitk_rows_kernel(
         if kb < n_kb:
             offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
             k_mask = offs_k < K
-            if e4m3_native_cx():
+            if W_BF16 or e4m3_native_cx():
                 w = tl.load(
                     w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
                     mask=n_mask[:, None] & k_mask[None, :],
@@ -342,6 +345,7 @@ def _gemv_rows(
         M_PAD=triton.next_power_of_2(M),
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        W_BF16=weight.dtype == torch.bfloat16,
         num_warps=1,
     )
     out = torch.empty((M, N), dtype=out_dtype, device=a.device)

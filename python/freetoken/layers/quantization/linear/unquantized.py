@@ -23,26 +23,39 @@ _SMALL_M_DISPATCH = os.environ.get("FREETOKEN_SMALL_M_SPLITK", "1") != "0"
 _SMALL_M_SPLITK_MAX_N = 256
 
 
+_UNIT_SCALES: dict[tuple[int, torch.device], torch.Tensor] = {}
+
+
+def _bf16_gemv_rows(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    from ....kernel.triton.fp8_pertensor_linear import _gemv_rows
+
+    key = (w.shape[0], w.device)
+    ones = _UNIT_SCALES.get(key)
+    if ones is None:
+        ones = _UNIT_SCALES[key] = torch.ones(w.shape[0], dtype=torch.float32, device=w.device)
+    return _gemv_rows(x, w, ones, x.dtype)
+
+
 def small_batch_linear(
     x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None = None
 ) -> torch.Tensor:
-    """``F.linear`` for a 2-D activation; the 2..8-row band (MTP verify windows) is dispatched
-    per shape instead of through cuBLAS's tiled path.
+    """Small bf16 decode/verify rows use the same per-weight reduction policy.
 
-    The shipped ``w @ x.T`` (measured on sm_120, [48, 5120] bf16, 2-4 rows 34 us -> 10 us) is
-    pathological at the M=3 MTP verify size for every resident bf16 shape -- the decode census
-    shows it as the ``cutlass_75_*`` family at 24 us on the router gate, 6x off the DRAM ceiling.
-    Graph-replay microbench at M=3 picks the winner by N:
-
-    * ``N >= 256`` (router gate [512,2560], hc_up [10240,320], hc_down+inject [336,10240],
-      ple_key [10240,2560]): ``F.linear`` -- 2-6x faster than ``w @ x.T``, and faster than
-      split-K (cuBLAS tiles a wide N well; split-K's extra reduce loses).
-    * ``N < 256`` (ssm [48,2560], indexer k [128,2560]): ``small_m_linear`` split-K GEMV --
-      4-5x faster than ``w @ x.T``, and cuBLAS ``F.linear`` mis-tiles small-N here.
-
-    Only the 2..8 band changes; M=1 (raw decode and MTP drafts) stays on ``F.linear`` exactly
-    as before -- widening downward was measured at -19.3% (see campaign37 m1-regression note).
+    Graph replay favors cuBLAS at M=1 for 64/256-output gates (1.6/1.9 us versus
+    split-K's 1.9/2.2 us). Scalar gates and wider projections favor shared GEMV.
+    Verify windows use that same choice, keeping each row bitwise equal to M=1.
     """
+    if (
+        x.dim() == 2
+        and (x.shape[0] == 1 or row_invariant_rows(x.shape[0]))
+        and x.is_cuda
+        and x.dtype == w.dtype == torch.bfloat16
+        and (w.shape[0] == 1 or w.shape[0] > 256)
+    ):
+        # decode rows and MTP verify windows share one split-K GEMV: each verify row is
+        # bitwise its M==1 decode row while the weight tile is read once for the window
+        out = _bf16_gemv_rows(x, w)
+        return out + b if b is not None else out
     if x.dim() == 2 and 2 <= x.shape[0] <= 8:
         if row_invariant_rows(x.shape[0]):
             return torch.cat([F.linear(row.unsqueeze(0), w, b) for row in x])
