@@ -728,7 +728,8 @@ def test_run_spec_step_k4_commits_only_accepted_target_rows(accepted_drafts):
     assert token_pool[0, 8 : 8 + committed].tolist() == sampled[:committed]
     assert req.input_ids.tolist() == list(range(1, 9)) + sampled[:committed]
     assert (req.cached_len, req.device_len) == (keep, keep + 1)
-    assert row_writes == [(0, committed - 1)]
+    # a full accept keeps the state the verify already left in place: no row copy
+    assert row_writes == ([] if accepted_drafts == 4 else [(0, committed - 1)])
     free = set(cache.free_slots.tolist())
     assert set(allocated[committed:]).issubset(free)
     assert set(allocated[:committed]).isdisjoint(free)
