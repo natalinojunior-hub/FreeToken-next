@@ -184,6 +184,7 @@ def tokenize_worker(
                             num_mamba_slots=m.num_mamba_slots,
                             num_swa_pages=m.num_swa_pages,
                             mode=m.mode,
+                            runtime=m.runtime,
                         )
                     )
                 elif isinstance(m, CacheRebuildResultMsg):
@@ -196,6 +197,7 @@ def tokenize_worker(
                             mamba_slots=m.mamba_slots,
                             num_swa_pages=m.num_swa_pages,
                             error=m.error,
+                            runtime=m.runtime,
                         )
                     )
             n_control = sum(

@@ -280,6 +280,7 @@ class FrontendManager:
             "mamba_slots": msg.mamba_slots,
             "num_swa_pages": msg.num_swa_pages,
             "error": msg.error,
+            **({"runtime": msg.runtime} if getattr(msg, "runtime", None) is not None else {}),
         }
         fut = self.rebuild_futures.pop(msg.request_id, None)
         if fut is not None and not fut.done():
@@ -520,6 +521,7 @@ async def dispatch_rebuild(
     num_swa_pages: int | None = None,
     mode: str = "if_idle",
     timeout: float = 300.0,
+    runtime: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Send a cache-rebuild request to the scheduler and await its result, managing the
     maintenance gate. Returns the scheduler's result dict, or a synthesized
@@ -539,6 +541,7 @@ async def dispatch_rebuild(
                 num_mamba_slots=num_mamba_slots,
                 num_swa_pages=num_swa_pages,
                 mode=mode,
+                runtime=runtime,
             )
         )
     except Exception as e:  # noqa: BLE001
@@ -924,7 +927,15 @@ def _serve_and_run_shell(host: str, port: int) -> None:
     netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     origin = resolve_server_url(f"http://{netloc}").origin
 
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, access_log=False))
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            access_log=False,
+            proxy_headers=os.environ.get("FREETOKEN_DEBUG_RUNTIME") != "1",
+        )
+    )
     thread = threading.Thread(target=server.run, name="freetoken-uvicorn", daemon=True)
     thread.start()
     _install_shell_stop_handlers()
@@ -978,6 +989,10 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     # Create/validate FREETOKEN_API_LOG_DIR and start the writer thread up front, so a
     # bad path is reported at boot rather than silently on the first request.
     install_cors(app, config.cors_origins)
+    if os.environ.get("FREETOKEN_DEBUG_RUNTIME") == "1":
+        from .runtime import register_runtime_route
+
+        register_runtime_route(app, get_global_state, dispatch_rebuild)
     init_request_logging()
     # Hide the frequent health/stats/requests/cache-status polling of the desktop app (and of
     # the shell's status bar) from uvicorn's access log; non-polling access lines are
@@ -1067,4 +1082,6 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _serve_and_run_shell(host, port)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(
+        app, host=host, port=port, proxy_headers=os.environ.get("FREETOKEN_DEBUG_RUNTIME") != "1"
+    )

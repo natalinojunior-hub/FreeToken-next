@@ -1,10 +1,10 @@
-"""One boot, many configs: re-pin env flags between requests via FREETOKEN_RUNTIME_ENV_FILE.
+"""One boot, many configs: re-pin env flags through the debug runtime endpoint.
 
 Usage: python scripts/bench-sweep.py --sweep sweep.json [bench_pp_tg args, e.g. --model M
 --tokens 16384 --decode 256 --serve-arg="--spec-mtp 6"]
 sweep.json: [{"name": "k0", "env": {"FREETOKEN_MTP_FORCE_DEPTH": 0}}, ...]. The first entry is the
 SHA reference. A flag missing from a later entry is reset (removed) so entries stay independent.
-Only flags read at call time apply; graph-baked flags need --no-graph.
+Graph-baked flags require recapture=true; layout knobs require a reboot.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -37,11 +37,10 @@ def main() -> int:
     )
     tmp_dir = os.environ.get("TMPDIR", "/models/desenvolvimento/tmp")
     fd, log_path = tempfile.mkstemp(prefix="bench-sweep-", suffix=".log", dir=tmp_dir)
-    env_file = Path(tmp_dir) / f"sweep-env-{os.getpid()}.json"
-    env_file.write_text("{}")
     port = bench.free_port()
     origin = f"http://127.0.0.1:{port}"
-    env = dict(os.environ, FREETOKEN_RUNTIME_ENV_FILE=str(env_file))
+    env = dict(os.environ, FREETOKEN_DEBUG_RUNTIME="1")
+    env.pop("FREETOKEN_RUNTIME_ENV_FILE", None)
     if any("--spec-mtp" in a for a in args.serve_args):
         env["FREETOKEN_DISABLE_OVERLAP_SCHEDULING"] = "1"
     env.setdefault("PYTHONFAULTHANDLER", "1")
@@ -57,11 +56,18 @@ def main() -> int:
             bench.wait_ready(origin, proc, log_path, args.server_timeout)
             model_id = bench.get_json(f"{origin}/v1/models")["data"][0]["id"]
             active: set[str] = set()
-            for index, cfg in enumerate(configs):
+            for cfg in configs:
                 values = {key: None for key in active} | cfg.get("env", {})
                 active = set(cfg.get("env", {}))
-                env_file.write_text(json.dumps(values))
-                os.utime(env_file, (time.time() + index + 1, time.time() + index + 1))
+                req = urllib.request.Request(
+                    f"{origin}/v1/admin/runtime",
+                    data=json.dumps(
+                        {"env": values, "recapture_graphs": cfg.get("recapture", False)}
+                    ).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=300) as response:
+                    json.load(response)
                 for _ in range(cfg.get("warmups", 0)):
                     bench.stream_completion(origin, model_id, prompt, args, proc=proc)
                 for _ in range(cfg.get("repeats", 1)):
@@ -93,7 +99,6 @@ def main() -> int:
         finally:
             bench.stop_server(proc)
             pump.join(timeout=10)
-            env_file.unlink(missing_ok=True)
     if own.out:
         Path(own.out).write_text(json.dumps(results, indent=1))
     return 0

@@ -467,13 +467,16 @@ def tg_curve(stamps: list[float], window: int) -> list[float]:
     ]
 
 
-def one_run(origin: str, model_id: str, prompt: str, args: argparse.Namespace, proc) -> dict:
-    sampler = GpuSampler()
-    sampler.start()
+def one_run(
+    origin: str, model_id: str, prompt: str, args: argparse.Namespace, proc, *, monitor: bool = True
+) -> dict:
+    sampler = GpuSampler() if monitor else None
+    if sampler is not None:
+        sampler.start()
     t_send = time.perf_counter()
-    r = stream_completion(origin, model_id, prompt, args, proc=proc)
+    r = stream_completion(origin, model_id, prompt, args, proc=proc if monitor else None)
     stats = get_json(f"{origin}/v1/stats")
-    gpu = sampler.stop()
+    gpu = sampler.stop() if sampler is not None else {}
     stamps, usage = r["stamps"], r["usage"]
     if len(stamps) < 2:
         sys.exit(f"[bench] need >=2 token events, got {len(stamps)}")

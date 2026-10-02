@@ -89,6 +89,7 @@ class CacheRebuildMsg(BaseTokenizerMsg):
     num_mamba_slots: int | None = None
     num_swa_pages: int | None = None
     mode: str = "if_idle"
+    runtime: Dict[str, Any] | None = None
 
 
 @dataclass
@@ -101,6 +102,7 @@ class CacheRebuildResultMsg(BaseTokenizerMsg):
     mamba_slots: int = 0
     num_swa_pages: int = 0
     error: str | None = None
+    runtime: Dict[str, Any] | None = None
 
 
 @dataclass

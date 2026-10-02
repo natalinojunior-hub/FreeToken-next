@@ -925,7 +925,22 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             # v1 scope: only if_idle, single-rank, non-owned-KV. drain mode and TP rebuild
             # need the drain-gate / all-rank failure-agreement machinery (deferred), so we
             # reject them cleanly rather than ship hang-prone half-wired paths.
-            if not self.cache_manager.supports_runtime_rebuild:
+            if msg.runtime is not None:
+                if os.environ.get("FREETOKEN_DEBUG_RUNTIME") != "1":
+                    self._reply_rebuild(msg.request_id, "rejected", "debug runtime is disabled")
+                elif self.config.tp_info.size > 1:
+                    self._reply_rebuild(
+                        msg.request_id, "unsupported", "runtime controls require TP=1"
+                    )
+                elif (
+                    self._pending_rebuild is not None
+                    or self.prefill_manager.runnable
+                    or self.decode_manager.runnable
+                ):
+                    self._reply_rebuild(msg.request_id, "busy")
+                else:
+                    self._pending_rebuild = msg
+            elif not self.cache_manager.supports_runtime_rebuild:
                 self._reply_rebuild(
                     msg.request_id,
                     "unsupported",
@@ -1019,7 +1034,9 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         if hasattr(self, "free_spec_snapshot_slot"):
             self.free_spec_snapshot_slot(req)
 
-    def _reply_rebuild(self, request_id: str, status: str, error: str | None = None) -> None:
+    def _reply_rebuild(
+        self, request_id: str, status: str, error: str | None = None, runtime: dict | None = None
+    ) -> None:
         # Single source of truth with the rollback snapshot (_current_cache_geometry): mamba is
         # usable slots (padding sink excluded, matching the status-bar gauge), and num_swa_pages
         # reports 0 unless the model actually has a window pool.
@@ -1034,6 +1051,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
                     mamba_slots=geo["num_mamba_slots"] or 0,
                     num_swa_pages=geo["num_swa_pages"] or 0,
                     error=error,
+                    runtime=runtime,
                 )
             ]
         )
@@ -1057,6 +1075,15 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
         msg = self._pending_rebuild
         assert msg is not None
         self._pending_rebuild = None
+        if msg.runtime is not None:
+            from freetoken.server.runtime import apply_runtime
+
+            try:
+                result = apply_runtime(self, msg.runtime)
+            except Exception as e:  # recapture failure must keep admission closed
+                result = {"status": "failed", "error": repr(e)}
+            self._reply_rebuild(msg.request_id, result["status"], result.get("error"), result)
+            return
         requested = {
             "moe_cache_size": msg.moe_cache_size,
             "num_pages": msg.num_pages,

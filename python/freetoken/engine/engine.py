@@ -2553,9 +2553,23 @@ class Engine:
             self.linear_state_pool.rebuild(num_mamba_slots + 1)
         # 3. Refresh max_seq_len (+ generic page table) for the new token budget.
         self._refresh_seq_state(config)
-        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
         # 4. Re-capture CUDA graphs against the new tensors (reset_capture above re-armed
         #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
+        self._capture_runtime_graphs(prior_graph_bs)
+
+    def recapture_runtime_graphs(self) -> None:
+        """Debug-only, idle-only graph replacement; preserves all pool geometry."""
+        torch.cuda.synchronize(self.device)
+        prior_graph_bs = self.graph_runner.graph_bs_list
+        self.attn_backend.reset_capture()
+        self.graph_runner.destroy_cuda_graphs()
+        self._capture_runtime_graphs(prior_graph_bs)
+
+    def _capture_runtime_graphs(self, prior_graph_bs: List[int]) -> None:
+        import gc
+
+        config = self.config
+        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
         MemoryPlanner._clear_probe_residual(self.model)
         gc.collect()
         free_min = self._sync_get_memory()[0]
