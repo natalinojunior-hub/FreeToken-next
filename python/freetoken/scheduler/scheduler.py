@@ -101,6 +101,11 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             depth = getattr(self, "_mtp_cycle_depth", 0)
         if depth > 0:
             limit = max(0, int(depth) - 1)
+            if limit == 0 and not getattr(self, "_mtp_oom_at_k1", False):
+                # the OOM already grew the learned decode reserve: k1 gets one more chance
+                # before speculation is off for the process
+                self._mtp_oom_at_k1 = True
+                limit = 1
             current = getattr(self, "_mtp_unsafe_max_k", self.spec_mtp)
             self._mtp_unsafe_max_k = min(current, limit)
         self._mtp_profile_invalidated = True
@@ -181,14 +186,13 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             learned = vram_profile.load(self.engine._vram_profile_key)
             if learned > self.engine._decode_reserve_learned:
                 self.engine._decode_reserve_learned = learned
-        except Exception:  # noqa: BLE001 -- warm start must never block serving
-            pass
+        except Exception as e:  # noqa: BLE001 -- warm start must never block serving
+            logger.info_rank0(f"vram profile warm start skipped ({e!r})")
 
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
 
         self.engine = Engine(config)
-        self._seed_vram_learned()
 
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
@@ -272,6 +276,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
         self.config = config
+        self._seed_vram_learned()  # reads self.config: an earlier call silently never keyed
         self.spec_mtp = config.spec_mtp
         self._mtp_controller = None
         self._mtp_profile_key: str | None = None

@@ -1461,7 +1461,13 @@ class Engine:
             return 0
         units = {"GiB": 1 << 30, "MiB": 1 << 20, "KiB": 1 << 10, "B": 1}
         attempted = int(float(m.group(1)) * units[m.group(2)])
-        Engine._learn_decode_reserve(self, attempted)
+        # The refused block is only the last step of this decode phase's growth: learning it
+        # alone needs one OOM per block (a MTP cycle allocates several).
+        baseline = getattr(self, "_decode_allocator_baseline", None)
+        grown = 0
+        if baseline is not None:
+            grown = max(0, int(torch.cuda.memory_reserved(self.device)) - baseline)
+        Engine._learn_decode_reserve(self, attempted + grown)
         return attempted
 
     def _learn_decode_reserve(self, observed_bytes: int) -> None:

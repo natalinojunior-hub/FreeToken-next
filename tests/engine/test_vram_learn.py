@@ -21,6 +21,18 @@ def test_note_oom_folds_attempted_bytes_into_reserve():
     assert eng._decode_reserve_learned == attempted
 
 
+def test_note_oom_learns_decode_growth_plus_refused_block(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device=None: 130 * MIB)
+    eng = SimpleNamespace(
+        _decode_reserve_learned=0,
+        _vram_profile_key=None,
+        _decode_allocator_baseline=100 * MIB,
+        device=None,
+    )
+    assert Engine.note_decode_oom(eng, _oom("Tried to allocate 16.00 MiB")) == 16 * MIB
+    assert eng._decode_reserve_learned == 46 * MIB
+
+
 def test_note_oom_never_shrinks_and_ignores_unparseable():
     eng = SimpleNamespace(_decode_reserve_learned=100 * MIB, _vram_profile_key=None)
     assert Engine.note_decode_oom(eng, _oom("Tried to allocate 8.00 MiB")) == 8 * MIB

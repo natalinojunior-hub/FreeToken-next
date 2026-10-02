@@ -124,6 +124,17 @@ def test_spec_oom_before_commit_rolls_back_and_keeps_the_request(monkeypatch):
     assert stub._spec_rollback is None and stub._mtp_cycle_observe is False
 
 
+def test_first_k1_oom_keeps_k1_second_turns_speculation_off():
+    limits = []
+    controller = SimpleNamespace(limit_depth=limits.append, fallback_to_k0=lambda: None)
+    stub = SimpleNamespace(spec_mtp=5, _mtp_controller=controller, _mtp_controllers={})
+
+    Scheduler._mark_mtp_oom(stub, 3)
+    Scheduler._mark_mtp_oom(stub, 1)
+    Scheduler._mark_mtp_oom(stub, 1)
+    assert limits == [2, 1, 0]
+
+
 def test_other_errors_still_raise():
     stub, *_ = _stub()
 
