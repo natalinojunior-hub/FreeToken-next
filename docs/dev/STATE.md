@@ -49,3 +49,9 @@ NOT READY FOR LINUX PRODUCTION-HARDENING até fechar AD/NVFP4 MTP, matriz 16K, c
 - Verify em lote == RAW (SHA) em AD k1–k5; AD melhor k2 = 60,3 TG (RAW 51,4); k6 capado. Causas e regras: [`BLOCK1-SESSION2-20261001.md`](BLOCK1-SESSION2-20261001.md).
 - Aberto: ISTA k5 108,4 (tag) -> ~98 TG nesta árvore (bissecção por arquivo em andamento); seleção automática de k; OOM de reserva; cache de prefixo híbrido.
 
+
+## Block 1 AD — sessão 3 (2026-10-01)
+
+- RAW AD provado: 52,7–52,9 TG, cert == HEAD (4 boots pareados). ISTA k5 104,7 -> 106,3 (cert 108,3; SHA == RAW); resta ~2 TG de journal QSA.
+- Auto-k: sem mudança; 1ª requisição 58,6 contra 59,7; k1 escolhido (k2 61,9 é o melhor); `_PROBE_REPEATS=8` descartado.
+- Detalhe: `BLOCK1-SESSION2-20261001.md` seção 9. Veredito: NOT READY FOR BLOCK 2.

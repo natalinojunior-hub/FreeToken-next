@@ -164,3 +164,16 @@ W6 (só `linear_state_pool`) = 108,2; W7 (`scheduler`/`adaptive_mtp`/`graph`) = 
 - **Abertos (não dar como resolvidos):** (1) RAW do AD: gate sem prova, execução atual instável 43–53; (2) ISTA −4 TG; (3) calibração do k automático.
 - Veredito: **NOT READY FOR BLOCK 2.** Prompt da próxima sessão: [`PROMPT-NEXT-SESSION-block1.md`](PROMPT-NEXT-SESSION-block1.md).
 - Lição de método: o `--spec-mtp` padrão é 6 e liga o MTP com o gate aberto; "RAW" medido sem `--spec-mtp 0` não é RAW.
+
+## 9. Sessão 3 (2026-10-01): fechamento dos 3 pontos abertos
+
+Método: boots intercalados, árvore certificada (`ista-16k-certified-20260930`, worktree própria, `.so` copiados, `TORCH_EXTENSIONS_DIR` por árvore) contra HEAD, mesma hora, `--spec-mtp` explícito, 16K, 256 tokens. Dados: `final-closure-20261001/results/session3/`.
+
+1. **RAW do AD: provado.** `--spec-mtp 0`, 5 repetições por boot, 2 boots por árvore: cert 52,85 / 52,76; HEAD 52,87 / 52,73 (mín. 52,67). Sem oscilação 43–53 em nenhum boot. A oscilação 43–53 **não se reproduziu** em 4 boots limpos; causa não provada (hipóteses: jobs concorrentes na máquina; `Decode residency` alternando 3724↔4716 slots a cada requisição nos logs antigos). Se voltar, rode boot isolado com telemetria. Gate cumprido: RAW 52,7–52,9 estável, HEAD == cert.
+2. **ISTA k5: 104,7 → 106,3 TG (SHA `76a5508fd576` == RAW).** Cert 108,38 / 108,28; HEAD antes 104,67 / 105,76. Decomposição por flag (HEAD): `ROW_INVARIANT_QSA=0` +1,1 TG; `ROW_INVARIANT_NORM=0` 0; `DISABLE_QSA_TXN=1` +1,8 TG.
+   - Correção A: `FREETOKEN_ROW_INVARIANT_QSA` agora só liga por padrão com `FREETOKEN_ROW_INVARIANT_LINEAR=1` (AD). O perfil do QSA com linhas invariantes só foi necessário para o AD; ISTA mantém SHA == RAW sem ele.
+   - Correção B: `prepare_spec_txn` fazia 4 sincronizações com o host (`unique`/máscaras) por ciclo; agora 1 (`tolist` único e conjuntos montados no host). Tempo da transação por ciclo: prepare 0,65 → 0,35 ms, snapshot 1,0 → 0,58 ms.
+   - Resta ~2 TG (106,3 contra 108,3): custo residual da transação QSA (journal). **Alvo ≥107 não atingido.** Próximo passo: passar as posições de escrita já conhecidas no host (lista do scheduler) e eliminar a última sincronização.
+3. **Seleção automática de k: sem mudança de código.** Perfil limpo (`FREETOKEN_MTP_PROFILE=off`), `warmups 0`, 2 boots: 1ª requisição 58,6 / 58,6 TG, seguintes 59,7 (SHA == RAW). O número antigo "55,5 contra 62,0" não se reproduziu; a lacuna real é 1,9% na 1ª requisição e 3,7% contra o melhor k fixo (k2 = 61,9). Causa: a medição interna do controlador penaliza k2 (16,0 ms/token contra 14,7 do k1) enquanto a matriz externa mostra k2 3% melhor; é viés sistemático da sondagem intercalada, não ruído. **Testado e descartado:** `_PROBE_REPEATS` 4 → 8 (mesma escolha k1, 1ª requisição 58,2; sem ganho). Alvo: medir custo do verify por linha em vez de por profundidade intercalada (estimar TG(k) a partir da aceitação por posição + custo linear por linha). Não implementado.
+
+Veredito da sessão 3: **NOT READY FOR BLOCK 2** (ISTA 106,3 < 107, seleção automática não otimizada, OOM de reserva e cache de prefixo híbrido abertos).

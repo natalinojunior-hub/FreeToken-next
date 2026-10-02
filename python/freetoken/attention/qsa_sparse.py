@@ -232,34 +232,37 @@ class QSASparseAttnBackend(BaseAttnBackend):
             txn = {"cmp": {}, "kv": {}, "rope": {}}
         txn["bulk_kv"], txn["bulk_cmp"], txn["bulk_rope"] = [], [], []
         physical = self._physical_loc(out_loc).long()
-        phys_all = torch.unique(physical)
         if logical_positions is None:
             logical_positions = torch.arange(out_loc.numel(), device=out_loc.device)
         logical_positions = logical_positions.to(device=out_loc.device, dtype=torch.long)
+        # One host sync for the whole write set; every row set below is derived on the host.
+        phys_list, logical_list = torch.stack((physical, logical_positions)).tolist()
         cmp_logical: dict[int, int] = {}
-        for phys, logical in zip(physical.tolist(), logical_positions.tolist()):
+        for phys, logical in zip(phys_list, logical_list):
             if phys % self.ratio == self.ratio - 1:
                 row = phys // self.ratio
                 cmp_logical[row] = min(cmp_logical.get(row, logical), logical)
         txn["cmp_logical"] = cmp_logical
         txn["cmp_scratch"] = int(self.kvcache.cmp_scratch_base + table_idx)
+        phys_all_l = sorted(set(phys_list))
         if live_count is None:
-            phys_live = phys_all
+            phys_live_l = phys_all_l
         else:
-            live_count = max(0, min(int(live_count), int(out_loc.numel())))
-            phys_live = torch.unique(self._physical_loc(out_loc[:live_count]).long())
+            live_count = max(0, min(int(live_count), len(phys_list)))
+            phys_live_l = sorted(set(phys_list[:live_count]))
         pool = self.kvcache._pool
         device_tokens = int(self.kvcache.num_device_pages) * self.page_size
-        # Layer-independent row sets: computed once (each mask / unique is a host sync).
-        dev = phys_live[phys_live < device_tokens]
-        host = phys_live[phys_live >= device_tokens] - device_tokens
-        closing = phys_all[phys_all % self.ratio == self.ratio - 1] // self.ratio
-        scratch = torch.tensor(
-            [self.kvcache.cmp_scratch_base + table_idx],
-            dtype=closing.dtype,
-            device=closing.device,
+        dev_l = [p for p in phys_live_l if p < device_tokens]
+        host_l = [p - device_tokens for p in phys_live_l if p >= device_tokens]
+        cmp_rows_l = sorted(
+            {p // self.ratio for p in phys_all_l if p % self.ratio == self.ratio - 1}
+            | {int(self.kvcache.cmp_scratch_base + table_idx)}
         )
-        cmp_rows = torch.unique(torch.cat((closing, scratch)))
+        device = out_loc.device
+        phys_live = torch.tensor(phys_live_l, dtype=torch.long, device=device)
+        dev = torch.tensor(dev_l, dtype=torch.long, device=device)
+        host = torch.tensor(host_l, dtype=torch.long, device=device)
+        cmp_rows = torch.tensor(cmp_rows_l, dtype=torch.long, device=device)
         for layer_id, slot in self._idx_slot.items():
             dense = pool._dense(layer_id)
             if getattr(pool, "compressed", False):
@@ -751,7 +754,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
             cent=self.kvcache.cent_tensor if compressed else None,
             page_size=self.page_size if compressed else None,
             row_invariant=getattr(batch, "spec_logits_indices", None) is not None
-            and os.environ.get("FREETOKEN_ROW_INVARIANT_QSA", "1") == "1",
+            and os.environ.get(
+                "FREETOKEN_ROW_INVARIANT_QSA", os.environ.get("FREETOKEN_ROW_INVARIANT_LINEAR", "0")
+            )
+            == "1",
         )
         mark("attention")
         if compressed and is_rotated(book):
