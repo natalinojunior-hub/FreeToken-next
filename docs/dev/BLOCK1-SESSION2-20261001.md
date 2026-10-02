@@ -193,10 +193,12 @@ Custo do motor com k5 fixo: cert 106,8/108,4 × HEAD 104,5/106,5 (≈ −1,9 TG,
 `commit_spec_row` no aceite total: +1,1/0 TG; AD k0–k5 18/18 SHA == RAW. Com k2 fixo (prompt 7): HEAD 82,9 / cert 83,1 / HEAD sem
 transação 83,7 — a transação custa ~0,9% em k2.
 
-**Teto 6 (padrão) × teto 5:** com k5 fixo no prompt 0 o teto 6 dá 97,8 contra 106,2 — os rascunhos mudam (aceitação 5,24 × 5,67
-token/ciclo); `--kv-tiering off` com teto 5 reproduz exatamente o mesmo padrão (mesma 1ª divergência na posição 103). Não é leitura
-de memória não inicializada (buffers preenchidos com NaN: idêntico). Nos prompts 3/7 o teto 6 às vezes ganha (82,0 × 71,2): é
-sensibilidade numérica do rascunho ao layout, não perda sistemática. **Teto padrão mantido em 6.**
+**Teto 6 (padrão) × teto 5:** com k5 fixo no prompt 0 (único par com SHA igual) o teto 6 dá 97,8 contra 106,2 e, com k
+automático, 92,6 contra 102,2 — os rascunhos mudam (aceitação 5,24 × 5,67 token/ciclo); `--kv-tiering off` com teto 5 reproduz
+exatamente o mesmo padrão (mesma 1ª divergência na posição 103). Não é leitura de memória não inicializada (buffers com NaN:
+idêntico). Nos prompts 3/7 a **saída do ISTA muda com teto/layout** (p3 dc9d ≠ 262c, p7 700e ≠ 5f16; cert p3 = dc9d), então
+esses pares não são comparáveis e a paridade do ISTA só está provada no prompt 0 (comparação RAW × MTP entre boots também tem
+layout diferente). **Decisão sobre o teto padrão: indeterminada, sensível ao layout; mantido em 6 até haver pares com SHA igual.**
 
 **Paridade AD fora do prompt 0 (achado novo, pré-existente):** prompt 7 k1–k5 == RAW (k2 71,0 TG). Prompt 3: k1–k5 todos com o
 mesmo SHA `c250ac983c40` ≠ RAW `fc45c4e520d0`, 1º token divergente no índice 25 (`' at'` × `':'`), linha 0 do verify logo após
@@ -204,8 +206,10 @@ um aceite total k1. Igual na árvore `1bf00f3` completa (anterior à sessão) �
 `FREETOKEN_ENABLE_PARTIAL_SPEC=0` (commit com replay linha a linha) **== RAW** mas TG 27,5 × 51,9; `DISABLE_QSA_TXN=1` diverge igual;
 laço por linha no linear GGUF não muda. Oráculo de commit (`scripts/mtp_verify_oracle.py`, `FREETOKEN_VERIFY_ORACLE_COMMIT=1`,
 `FREETOKEN_DECODE_RESIDENCY=0`): 1 de 35 ciclos com estado ≠ RAW (ciclo 30, posições 16402→16404, janela que fecha um grupo
-comprimido 16403 % 4 == 3); camadas lineares 0–5 iguais, 6+ diferentes; dados QSA gravados iguais (`first_qsa: null`) → o desvio
-entra no MoE/PLE da camada 7 com 2 linhas. **Aberto:** tornar MoE/PLE do verify invariantes por linha (ou replay só nesse caso).
+comprimido 16403 % 4 == 3); camadas lineares 0–5 iguais, 6+ diferentes, e só nesse ciclo o KV do pool difere em ~10× mais
+elementos (2575 × ~256 nos ciclos bons) → o desvio nasce **dentro do verify, na camada 7** (atenção QSA comprimida ou seu
+MoE/PLE com 2 linhas). O gravador QSA do modo commit só cobre o passo seguinte, então não separa QSA de MoE/PLE.
+**Aberto:** localizar o módulo da camada 7 (oráculo por módulo no ciclo 30) e torná-lo invariante por linha, ou replay só nesse caso.
 O gate de paridade passa a exigir ≥ 3 prompts (`--prompt-offset 0 3 7`).
 
 **Seleção automática entre textos:** prompt 3 HEAD 87,1 × cert 84,3; prompt 7 HEAD 78,8/81,5/81,1 × cert 84,4 (k2 fixo HEAD
@@ -214,7 +218,8 @@ LRU de experts); não confirmado sem estatística de acerto do cache.
 
 **Controlador de VRAM (estudo):** prioridade do solver = contexto (KV) → maior chunk de prefill → experts. A reserva do prefill
 (~2 GiB a chunk 8192) **já é emprestada aos experts durante o decode** (`Decode residency` 4761 → 5884 slots e volta antes de cada
-prefill); por isso chunk 4096 (5218 slots) não deu ganho (102,9 TG). KV em RAM no ISTA 16K libera só ~110 MiB (~65 slots, 1,4%).
+prefill). Chunk 4096 (5218 slots) deu 102,9 × 106,6, mas com aceitação diferente (5,14 × 5,38 token/ciclo, mesmo SHA): o
+efeito dos slots extras **não foi medido** de forma isolada. KV em RAM no ISTA 16K libera só ~110 MiB (~65 slots, 1,4%).
 Defeitos achados: (1) o crescimento de residência deixa só 0,04 GiB livres — qualquer alocação extra no decode faz OOM;
 (2) OOM dentro do ciclo especulativo derruba a requisição (`_spec_step_or_fail` não tem rollback + nova tentativa, o forward
 normal tem); (3) a calibração de VRAM reaproveitada planejava chunk acima de `--max-prefill-length` (corrigido em `543f9e1`).
