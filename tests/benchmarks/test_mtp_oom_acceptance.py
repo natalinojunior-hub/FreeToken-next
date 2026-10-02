@@ -44,3 +44,32 @@ def test_fault_follows_write_fires_once_and_restores_method(stage, monkeypatch):
     assert event["injections"] == 1
     restore()
     assert getattr(owner, name) is write
+
+
+def test_metadata_fault_precedes_finished_staging_and_fires_once(monkeypatch):
+    path = Path(__file__).resolve().parents[2] / "scripts/mtp_oom_acceptance.py"
+    spec = importlib.util.spec_from_file_location("mtp_oom_acceptance", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    events = []
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda *_args: pytest.fail("not a GPU write fault")
+    )
+
+    def stage(req, *, finished):
+        events.append((req, finished))
+        return "staged"
+
+    cache = SimpleNamespace(_cache_req_impl=stage)
+    event, restore = module.install_fault(SimpleNamespace(), "metadata_commit", cache)
+    assert cache._cache_req_impl("live", finished=False) == "staged"
+    assert event["injections"] == 0
+    with pytest.raises(torch.OutOfMemoryError):
+        cache._cache_req_impl("terminal", finished=True)
+    assert events == [("live", False)]
+    assert event["injections"] == 1
+    assert cache._cache_req_impl("terminal", finished=True) == "staged"
+    assert events[-1] == ("terminal", True)
+    assert event["injections"] == 1
+    restore()
+    assert cache._cache_req_impl is stage

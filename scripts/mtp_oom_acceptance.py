@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare published RAW IDs with one-shot verify/row-commit OOM and a following request."""
+"""Compare RAW IDs with one-shot speculative/state/metadata OOM and a following request."""
 
 from __future__ import annotations
 
@@ -17,17 +17,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from benchmarks.bench_pp_tg import DEFAULT_CORPUS, build_prompt_text  # noqa: E402
 
 
-def install_fault(engine, stage):
-    """Raise once after real GPU writes, without changing scheduler recovery logic."""
+def install_fault(engine, stage, cache_manager=None):
+    """Raise once after GPU writes or before terminal metadata ownership transfer."""
     event = {"stage": stage, "injections": 0}
-    owner = engine if stage == "verify" else engine.linear_state_pool
-    attribute = "forward_batch" if stage == "verify" else "commit_spec_row"
+    metadata = stage == "metadata_commit"
+    owner = cache_manager if metadata else engine if stage == "verify" else engine.linear_state_pool
+    attribute = (
+        "_cache_req_impl"
+        if metadata
+        else "forward_batch"
+        if stage == "verify"
+        else "commit_spec_row"
+    )
     original = getattr(owner, attribute)
 
     def wrapped(*args, **kwargs):
+        eligible = (
+            kwargs.get("finished", False)
+            if metadata
+            else (stage != "verify" or args[0].spec_logits_indices is not None)
+        )
+        if metadata and eligible and event["injections"] == 0:
+            event["injections"] += 1
+            raise torch.OutOfMemoryError("Injected metadata OOM: Tried to allocate 2.00 MiB")
         result = original(*args, **kwargs)
-        eligible = stage != "verify" or args[0].spec_logits_indices is not None
-        if eligible and event["injections"] == 0:
+        if not metadata and eligible and event["injections"] == 0:
             torch.cuda.synchronize(engine.device)
             event["injections"] += 1
             raise torch.OutOfMemoryError("Injected acceptance OOM: Tried to allocate 2.00 MiB")
@@ -40,7 +54,9 @@ def install_fault(engine, stage):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--stage", choices=("raw", "verify", "row_commit"), required=True)
+    parser.add_argument(
+        "--stage", choices=("raw", "verify", "row_commit", "metadata_commit"), required=True
+    )
     parser.add_argument("--reference", help="RAW JSON artifact from this harness")
     parser.add_argument("--output", required=True)
     parser.add_argument("--tokens", type=int, default=16384)
@@ -51,7 +67,9 @@ def main():
     parser.add_argument("--attention-backend")
     parser.add_argument("--kv-format", choices=("auto", "bf16", "fp8", "turbo4", "turbo3"))
     parser.add_argument("--kv-ram-tier", dest="kv_tiering", choices=("off", "auto", "force"))
+    parser.add_argument("--kv-ram-dtype", choices=("auto", "bf16", "fp8"))
     parser.add_argument("--cache-type", choices=("naive", "radix", "hybrid_radix"))
+    parser.add_argument("--cuda-graph-max-bs", type=int)
     args = parser.parse_args()
     if args.stage != "raw" and not args.reference:
         parser.error("fault runs require --reference from a RAW run")
@@ -92,7 +110,14 @@ def main():
             spec_mtp=0 if args.stage == "raw" else args.depth,
             **{
                 name: getattr(args, name)
-                for name in ("attention_backend", "kv_format", "kv_tiering", "cache_type")
+                for name in (
+                    "attention_backend",
+                    "kv_format",
+                    "kv_tiering",
+                    "kv_ram_dtype",
+                    "cache_type",
+                    "cuda_graph_max_bs",
+                )
                 if getattr(args, name) is not None
             },
         )
@@ -105,6 +130,7 @@ def main():
                 "kv_ram_dtype",
                 "kv_ram_resolved_dtype",
                 "max_extend_tokens",
+                "cuda_graph_max_bs",
             )
         }
         report["resolved"].update(
@@ -129,7 +155,7 @@ def main():
         ids = llm.tokenizer.encode(prompt, add_special_tokens=False)
         assert len(ids) == args.tokens, (len(ids), args.tokens)
         if args.stage != "raw":
-            event, restore = install_fault(llm.engine, args.stage)
+            event, restore = install_fault(llm.engine, args.stage, llm.cache_manager)
             report["fault"] = event
         for index in range(2):
             published = []
