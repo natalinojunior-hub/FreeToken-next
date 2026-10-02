@@ -210,9 +210,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
     def abort_spec_txn(self, table_idx: int) -> None:
         """Restore the pre-draft state even when verify never activated its journal."""
         self.rollback_spec_txn(table_idx)
-        preimage = getattr(self, "_spec_preimages", {}).pop(int(table_idx), None)
+        preimage = getattr(self, "_spec_preimages", {}).get(int(table_idx))
         if preimage is not None:
             self._restore_txn(preimage)
+            self._spec_preimages.pop(int(table_idx), None)
 
     def spec_txn_active(self, table_idx: int) -> bool:
         return int(table_idx) in self._spec_txns
@@ -470,7 +471,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
     @_txn_timed
     def rollback_spec_txn_partial(self, table_idx: int, keep_end: int) -> None:
         """Rollback only rejected QSA writes; preserve verify state before ``keep_end``."""
-        txn = self._spec_txns.pop(int(table_idx), None)
+        txn = self._spec_txns.get(int(table_idx))
         if txn is None:
             return
         cmp_logical = txn.get("cmp_logical", {})
@@ -487,6 +488,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
                 self.kvcache.cmp_k_cache(slot)[row].copy_(value)
         # KV/RoPE rows before keep_end are the committed verify writes. Speculative rows
         # after it are newly allocated and are reclaimed by free_spec_reject.
+        self._spec_txns.pop(int(table_idx), None)
 
     def _txn_save_rows(
         self, table_idx: int, layer_id: int, out_loc: torch.Tensor, *, txn: dict | None = None
@@ -595,10 +597,11 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
     @_txn_timed
     def rollback_spec_txn(self, table_idx: int) -> None:
-        txn = self._spec_txns.pop(int(table_idx), None)
+        txn = self._spec_txns.get(int(table_idx))
         if txn is None:
             return
         self._restore_txn(txn)
+        self._spec_txns.pop(int(table_idx), None)
 
     def _restore_txn(self, txn: dict) -> None:
         self._restore_bulk(txn)

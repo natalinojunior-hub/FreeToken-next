@@ -189,3 +189,26 @@ def test_qsa_abort_restores_first_pre_draft_preimage(compressed, activate):
     assert all(torch.equal(t, expected) for t, expected in zip(state, before))
     assert not backend._spec_txns and not backend._spec_preimages
     backend.abort_spec_txn(0)  # idempotent cleanup before table reuse
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_qsa_restore_oom_preserves_journal_for_retry(active):
+    backend = object.__new__(QSASparseAttnBackend)
+    journal = {"cmp": {}, "kv": {}, "rope": {}}
+    backend._spec_txns = {0: journal} if active else {}
+    backend._spec_preimages = {} if active else {0: journal}
+    attempts = []
+
+    def restore(txn):
+        assert txn is journal
+        attempts.append(txn)
+        if len(attempts) == 1:
+            raise torch.OutOfMemoryError("restore injection")
+
+    backend._restore_txn = restore
+    with pytest.raises(torch.OutOfMemoryError, match="restore injection"):
+        backend.abort_spec_txn(0)
+    assert (backend._spec_txns if active else backend._spec_preimages)[0] is journal
+    backend.abort_spec_txn(0)
+    assert len(attempts) == 2
+    assert not backend._spec_txns and not backend._spec_preimages
