@@ -57,3 +57,12 @@ NOT READY FOR LINUX PRODUCTION-HARDENING até fechar AD/NVFP4 MTP, matriz 16K, c
 - Paridade AD: prompts 0 e 7 == RAW em k1–k5; **prompt 3 diverge (pré-existente, `1bf00f3` igual)** — o desvio nasce no verify, camada 7 (QSA ou MoE/PLE), numa janela que fecha grupo comprimido; replay linha a linha corrige mas custa 47% do TG. Paridade do ISTA provada só no prompt 0.
 - VRAM: reserva de prefill já é emprestada aos experts no decode; abertos: folga de 0,04 GiB no decode e OOM no ciclo especulativo derruba a requisição.
 - Detalhe: `BLOCK1-SESSION2-20261001.md` seções 9 e 12. Veredito: NOT READY FOR BLOCK 2.
+
+## Campanha de consolidação (2026-10-02) — HEAD `cb6b94f`
+
+- Paridade AD fechada: p0/p3/p7 × k1–k5 == RAW; causa era a conv curta do PLE no verify (cuDNN), não a camada 7 (`cf26a2f`).
+- Modelos oficiais agora: Qwen3.6-35B-A3B-UD-NVFP4-Fast, Ornith-1.5-35B-A3B NVFP4 e GGUF. MTP liberado nos três com linears invariantes por linha (18/18 SHA == RAW cada).
+- TG 16K (RAW → MTP): Qwen3.6 158 → 185–191 · Ornith NVFP4 124 → 148 · Ornith GGUF 152 → 191–196.
+- OOM antes do verify vira rollback; reserva de VRAM aprendida agora persiste. CI limpo: 2783 passed / 0 failed.
+- Próximo: Phase I do Qwen3.6+MTP (+194 MiB), OOM dentro do verify, PP com MTP (−30% NVFP4), perfil único/`--bench`, boot 5–10 s, Windows, certificação 16K formal.
+- Relatório: [`CAMPAIGN-CONSOLIDATION-20261002.md`](CAMPAIGN-CONSOLIDATION-20261002.md).
