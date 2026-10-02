@@ -167,8 +167,32 @@ _RAM_KILL_MARGIN = 0.10
 
 
 def _meminfo() -> dict[str, int]:
-    with open("/proc/meminfo") as f:
-        return {k: int(v.split()[0]) * 1024 for k, v in (line.split(":", 1) for line in f)}
+    try:
+        with open("/proc/meminfo") as f:
+            return {k: int(v.split()[0]) * 1024 for k, v in (line.split(":", 1) for line in f)}
+    except OSError:  # no /proc on Windows: GlobalMemoryStatusEx
+        import ctypes
+
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + [
+                (name, ctypes.c_ulonglong)
+                for name in (
+                    "ullTotalPhys",
+                    "ullAvailPhys",
+                    "ullTotalPageFile",
+                    "ullAvailPageFile",
+                    "ullTotalVirtual",
+                    "ullAvailVirtual",
+                    "ullAvailExtendedVirtual",
+                )
+            ]
+
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(status)
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        if not kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            raise
+        return {"MemTotal": status.ullTotalPhys, "MemAvailable": status.ullAvailPhys}
 
 
 # Narrowing ladder of the RAM tier: element-wise formats are read in place; turbo formats are

@@ -414,12 +414,14 @@ def read_file_into(
     if drop_cache:
         try:
             fd0 = os.open(path, os.O_RDONLY)
-            os.posix_fadvise(fd0, 0, 0, os.POSIX_FADV_DONTNEED)
+            if hasattr(os, "posix_fadvise"):  # absent on Windows
+                os.posix_fadvise(fd0, 0, 0, os.POSIX_FADV_DONTNEED)
             os.close(fd0)
         except OSError:
             pass
     mv = buf if isinstance(buf, memoryview) else memoryview(buf)
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    # no O_DIRECT on Windows -> plain buffered read
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_DIRECT", 0))
     offs = list(range(0, size, chunk))
 
     def rd(o):
@@ -473,11 +475,13 @@ def read_range_into(
     if drop_cache:
         try:
             fd0 = os.open(path, os.O_RDONLY)
-            os.posix_fadvise(fd0, file_offset, nbytes, os.POSIX_FADV_DONTNEED)
+            if hasattr(os, "posix_fadvise"):  # absent on Windows
+                os.posix_fadvise(fd0, file_offset, nbytes, os.POSIX_FADV_DONTNEED)
             os.close(fd0)
         except OSError:
             pass
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    # no O_DIRECT on Windows -> plain buffered read
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_DIRECT", 0))
     scratch = threading.local()
 
     def rd(i: int) -> None:

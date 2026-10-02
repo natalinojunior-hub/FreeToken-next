@@ -54,7 +54,8 @@ def _read_shard_odirect_parallel(path: str, workers: int, chunk: int) -> mmap.mm
     asize = ((size + _ODIRECT_BLK - 1) // _ODIRECT_BLK) * _ODIRECT_BLK
     buf = mmap.mmap(-1, asize)
     mv = memoryview(buf)
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    # no O_DIRECT on Windows -> plain buffered read
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_DIRECT", 0))
     offs = list(range(0, size, chunk))
 
     def rd(o):
@@ -118,7 +119,8 @@ def iter_expert_tensors_parallel(
                 if drop_cache:
                     try:
                         fd = os.open(path, os.O_RDONLY)
-                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                        if hasattr(os, "posix_fadvise"):  # absent on Windows
+                            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
                         os.close(fd)
                     except OSError:
                         pass
