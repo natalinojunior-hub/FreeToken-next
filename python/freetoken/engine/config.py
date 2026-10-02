@@ -248,8 +248,11 @@ class EngineConfig:
                 # otherwise displace ~900 target expert slots for 8 experts read per draft token.
                 scheme = getattr(quant, "scheme_for", None)
                 target = scheme("model.layers.0.mlp.experts") if scheme is not None else None
-                banked = getattr(target, "kind", None) == QuantKind.NVFP4 and (
-                    self.moe_strategy != "fused"
+                # only a registered draft layer (spec_mtp > 0) owns a bank
+                banked = (
+                    self.spec_mtp > 0
+                    and getattr(target, "kind", None) == QuantKind.NVFP4
+                    and self.moe_strategy != "fused"
                 )
                 model_config = replace(
                     model_config,
