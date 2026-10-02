@@ -112,6 +112,7 @@ def compute_key(
     kv_tiering: str = "off",
     kv_ram_tokens: int = 0,
     kv_reserve_tokens: int = 0,
+    include_source: bool = True,
 ) -> str:
     """The lookup key: everything that can change which depth wins.
 
@@ -126,7 +127,7 @@ def compute_key(
         "gpu_uuid": _gpu_uuid(),
         "model_id": _model_identity(model_path),
         "freetoken_version": __version__,
-        "calibration_source": _calibration_source_fingerprint(),
+        "calibration_source": _calibration_source_fingerprint() if include_source else "",
         "kv_format": kv_format,
         "ctx_bucket": _ceil_pow2(max(1, int(max_seq_len))),
         "spec_mtp_cap": int(spec_mtp_cap),
@@ -141,9 +142,13 @@ def compute_key(
     return hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()[:24]
 
 
-def key_from_config(config, effective_max_seq_len: int, spec_mtp_cap: int) -> str:
+def key_from_config(
+    config, effective_max_seq_len: int, spec_mtp_cap: int, *, include_source: bool = True
+) -> str:
     """Build the key from an ``EngineConfig`` after the engine resolver has run (so the
-    compact-state env and ``ENV.MAMBA_SSM_DTYPE`` already reflect the auto-enabled values)."""
+    compact-state env and ``ENV.MAMBA_SSM_DTYPE`` already reflect the auto-enabled values).
+    ``include_source=False`` drops the source-tree hash for profiles whose every use is
+    re-validated in place (field-level invalidation instead of any-commit invalidation)."""
     from freetoken.env import ENV
 
     return compute_key(
@@ -158,6 +163,7 @@ def key_from_config(config, effective_max_seq_len: int, spec_mtp_cap: int) -> st
         kv_tiering=str(getattr(config, "kv_tiering", "off")),
         kv_ram_tokens=int(getattr(config, "kv_ram_tokens", 0)),
         kv_reserve_tokens=int(getattr(config, "kv_reserve_tokens", 0)),
+        include_source=include_source,
     )
 
 

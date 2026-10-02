@@ -30,7 +30,9 @@ SCHEMA = "vram1"
 def compute_key(
     config, effective_max_seq_len: int, spec_mtp_cap: int, has_vision: bool, has_mtp_head: bool
 ) -> str:
-    base = key_from_config(config, effective_max_seq_len, spec_mtp_cap)
+    # No source hash: Phase I measures every cached calibration in place and re-solves on a
+    # mismatch, so an unrelated commit must not cost a full Phase D re-calibration.
+    base = key_from_config(config, effective_max_seq_len, spec_mtp_cap, include_source=False)
     # Attention backend changes transient workspace and graph geometry.  Keep it in the
     # fingerprint so a profile learned by Triton cannot silently warm-start another backend.
     attention = str(getattr(config, "attention_backend", ""))

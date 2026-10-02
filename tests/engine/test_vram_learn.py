@@ -59,6 +59,27 @@ def test_compute_key_distinguishes_vision_and_mtp_axes(monkeypatch):
     assert k == vram_profile.compute_key(cfg, 262144, 4, has_vision=True, has_mtp_head=False)
 
 
+def test_vram_key_survives_source_edits_mtp_depth_key_does_not(monkeypatch):
+    """Phase I re-validates cached calibrations, so a commit must not invalidate them; the
+    MTP depth profile still keys on the source tree (kernel changes move the best depth)."""
+    from freetoken.tuning import mtp_profile
+
+    cfg = SimpleNamespace(model_path="/nonexistent", attention_backend="triton")
+    monkeypatch.setattr(mtp_profile, "_gpu_uuid", lambda: "gpu")
+    monkeypatch.setattr(mtp_profile, "_model_identity", lambda path: "model")
+    keys = []
+    for source in ("aaaa", "bbbb"):
+        monkeypatch.setattr(mtp_profile, "_calibration_source_fingerprint", lambda s=source: s)
+        keys.append(
+            (
+                vram_profile.compute_key(cfg, 16384, 5, has_vision=False, has_mtp_head=True),
+                mtp_profile.key_from_config(cfg, 16384, 5),
+            )
+        )
+    assert keys[0][0] == keys[1][0]
+    assert keys[0][1] != keys[1][1]
+
+
 def test_scheduler_seed_warms_engine_from_profile(tmp_path, monkeypatch):
     monkeypatch.setattr(vram_profile, "key_from_config", lambda *a, **k: "base")
     monkeypatch.setattr(vram_profile, "_path", lambda key: str(tmp_path / f"{key}.json"))
