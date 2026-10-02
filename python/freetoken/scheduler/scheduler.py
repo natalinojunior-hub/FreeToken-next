@@ -222,6 +222,7 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             or getattr(self.engine.kv_cache, "sliding_window_size", None),
             host_pages=self.engine.host_pages,
         )
+        self.cache_manager.recover_oom = self._recover_cache_oom
         self.decode_manager = DecodeManager(config.page_size)
         self._bidirectional_mm = any(
             getattr(g, "bidirectional_mm_blocks", False)
@@ -974,6 +975,22 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
                         residual,
                     )
                 req.mamba_restore_src = None  # consumed: restore exactly once
+
+    def _recover_cache_oom(self, error: torch.OutOfMemoryError) -> bool:
+        """Fund a retry of metadata staging before it transfers request ownership."""
+        cache = getattr(self.engine, "moe_offload_cache", None)
+        before = getattr(cache, "resident_rows", None)
+        shrink = getattr(self.engine, "shrink_after_oom", None)
+        # Fixed backing would rebuild graph-bound state while this request is live.
+        if before is None or shrink is None or not getattr(cache, "_vmm_arenas", None):
+            return False
+        note = getattr(self.engine, "note_decode_oom", None)
+        if note is not None:
+            note(error)
+        torch.cuda.synchronize(self.device)
+        shrink()
+        torch.cuda.empty_cache()
+        return cache.resident_rows < before
 
     def _free_req_resources(self, req: Req) -> None:
         # Idempotent: an EOS-finished request can stay in running_reqs (output budget left), so an

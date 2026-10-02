@@ -301,6 +301,8 @@ class SWARadixCache:
         """Evict full KV by LRU over UNLOCKED LEAF nodes (an internal node's KV is a prefix
         dependency). Frees both pools for each evicted leaf; cascade-reclaims exposed swa-tombstone
         leaves' full KV. Mirrors sglang ``evict`` full pass."""
+        full_staged = torch.empty(self.full_evictable, dtype=self.empty.dtype, device=self.device)
+        swa_staged = torch.empty(self.swa_evictable, dtype=self.empty.dtype, device=self.device)
         leaves = [n for n in self._leaves() if n.ref_count == 0]
         heapq.heapify(leaves)
         kv, swa, freed = [], [], 0
@@ -320,15 +322,22 @@ class SWARadixCache:
             # been unlinked/freed by the cascade -- re-pushing it would double-free / KeyError).
             if parent.is_leaf() and parent.ref_count == 0 and not parent.is_root():
                 heapq.heappush(leaves, parent)
-        return SWAEvictResult(
-            torch.cat(kv) if kv else self.empty, torch.cat(swa) if swa else self.empty
-        )
+        full_result = full_staged[: sum(t.numel() for t in kv)]
+        swa_result = swa_staged[: sum(t.numel() for t in swa)]
+        for parts, output in ((kv, full_result), (swa, swa_result)):
+            offset = 0
+            for indices in parts:
+                output[offset : offset + indices.numel()].copy_(indices)
+                offset += indices.numel()
+        return SWAEvictResult(full_result, swa_result)
 
     def evict_swa(self, num_tokens: int) -> SWAEvictResult:
         """Evict swa KV by LRU over UNLOCKED, non-tombstone swa-bearing nodes -- internal nodes
         too. Internal (or full-locked) node -> TOMBSTONE in place (free swa, keep full KV +
         children). Free leaf -> free both pools, unlink, cascade. Mirrors sglang ``evict`` swa
         pass + the leaf-with-full-lock edge."""
+        full_staged = torch.empty(self.full_evictable, dtype=self.empty.dtype, device=self.device)
+        swa_staged = torch.empty(self.swa_evictable, dtype=self.empty.dtype, device=self.device)
         cands = [n for n in self._swa_nodes() if n.swa_ref_count == 0]
         heapq.heapify(cands)
         kv, swa, freed = [], [], 0
@@ -349,9 +358,14 @@ class SWARadixCache:
                 self.swa_evictable -= node.length
                 freed += node.length
                 node.swa_tombstone = True
-        return SWAEvictResult(
-            torch.cat(kv) if kv else self.empty, torch.cat(swa) if swa else self.empty
-        )
+        full_result = full_staged[: sum(t.numel() for t in kv)]
+        swa_result = swa_staged[: sum(t.numel() for t in swa)]
+        for parts, output in ((kv, full_result), (swa, swa_result)):
+            offset = 0
+            for indices in parts:
+                output[offset : offset + indices.numel()].copy_(indices)
+                offset += indices.numel()
+        return SWAEvictResult(full_result, swa_result)
 
     def trim_head_swa(self, input_ids: torch.Tensor, keep_from: int) -> torch.Tensor:
         """Tombstone the swa currency of the path strictly below ``keep_from`` (full KV stays),

@@ -90,7 +90,12 @@ class HybridRadixCache:
         return HybridMatch(self.empty, 0, None, self.root)
 
     def insert(
-        self, input_ids: torch.Tensor, kv_indices: torch.Tensor, mamba_value: int
+        self,
+        input_ids: torch.Tensor,
+        kv_indices: torch.Tensor,
+        mamba_value: int,
+        *,
+        kv_preimage: torch.Tensor | None = None,
     ) -> Tuple[int, bool]:
         """Insert the committed KV prefix and DONATE ``mamba_value`` at the (page-aligned) end
         boundary node. Returns (matched_prefix_len, mamba_exist). If the boundary node already
@@ -101,7 +106,12 @@ class HybridRadixCache:
         node, prefix_len = self._walk(input_ids)
         if prefix_len != insert_len:
             new_node = RadixTreeNode(self.key_fn)
-            new_node.set_key_value(input_ids[prefix_len:], kv_indices[prefix_len:].clone())
+            values = (
+                kv_indices[prefix_len:].clone()
+                if kv_preimage is None
+                else kv_preimage[prefix_len:insert_len]
+            )
+            new_node.set_key_value(input_ids[prefix_len:], values)
             new_node.set_parent(node)
             self.full_evictable += new_node.length
             node = new_node
@@ -151,6 +161,7 @@ class HybridRadixCache:
     def evict_full(self, num_tokens: int) -> EvictResult:
         """Evict KV tokens by LRU over UNLOCKED LEAF nodes (an internal node's KV is a prefix
         dependency for all descendants). Frees each evicted node's snapshot too."""
+        staged = torch.empty(self.full_evictable, dtype=self.empty.dtype, device=self.device)
         leaves = [n for n in self._leaves() if n.ref_count == 0]
         heapq.heapify(leaves)
         kv, mamba, freed = [], [], 0
@@ -166,13 +177,19 @@ class HybridRadixCache:
             freed += casc
             if parent.is_leaf() and parent.ref_count == 0 and not parent.is_root():
                 heapq.heappush(leaves, parent)
-        return EvictResult(torch.cat(kv) if kv else self.empty, mamba)
+        result = staged[: sum(t.numel() for t in kv)]
+        offset = 0
+        for indices in kv:
+            result[offset : offset + indices.numel()].copy_(indices)
+            offset += indices.numel()
+        return EvictResult(result, mamba)
 
     def evict_mamba(self, num: int) -> EvictResult:
         """Evict GDN snapshots by LRU over UNLOCKED snapshot-bearing nodes -- internal nodes
         too. Internal node -> TOMBSTONE (free the slot, keep KV + children). Leaf node -> free
         both KV and slot and unlink, then cascade-delete any KV-only tombstone leaves it exposes
         upward (so a leaf always carries a live snapshot -- mirrors sglang)."""
+        staged = torch.empty(self.full_evictable, dtype=self.empty.dtype, device=self.device)
         cands = [n for n in self._snapshot_nodes() if n.mamba_ref_count == 0]
         heapq.heapify(cands)
         kv, mamba, freed = [], [], 0
@@ -189,7 +206,12 @@ class HybridRadixCache:
             else:
                 self._free_node_mamba(node, mamba)  # tombstone internal (or locked-KV) node
                 freed += 1
-        return EvictResult(torch.cat(kv) if kv else self.empty, mamba)
+        result = staged[: sum(t.numel() for t in kv)]
+        offset = 0
+        for indices in kv:
+            result[offset : offset + indices.numel()].copy_(indices)
+            offset += indices.numel()
+        return EvictResult(result, mamba)
 
     @property
     def full_evictable_size(self) -> int:

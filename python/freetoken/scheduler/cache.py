@@ -75,6 +75,7 @@ class CacheManager:
         self.page_table = page_table
         self.page_size = page_size
         self.cache_type = type
+        self.recover_oom = None
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
@@ -160,22 +161,24 @@ class CacheManager:
         (evict_swa, internal -> tombstone in place / leaf -> free both pools), returning their swa
         slots to the pool and any deleted-leaf full KV to free_slots."""
         while self.swa_pool.swa_available_size() < n:
-            ev = self.prefix_cache.evict_swa(n - self.swa_pool.swa_available_size())
-            if ev.swa_indices.numel() == 0:
-                break
-            self.swa_pool.free_swa(ev.swa_indices)
-            if ev.kv_indices.numel():
-                self._free(ev.kv_indices)
+            with self.lazy_free_region():
+                ev = self.prefix_cache.evict_swa(n - self.swa_pool.swa_available_size())
+                if ev.swa_indices.numel() == 0:
+                    break
+                self._free_swa(ev.swa_indices)
+                if ev.kv_indices.numel():
+                    self._free(ev.kv_indices)
 
     def ensure_mamba_slots(self, n: int) -> None:
         """Free GDN state slots until >= ``n`` are available by tombstoning LRU tree snapshots
         (evict_mamba), returning their slots + any freed KV to the pools."""
         while self.linear_state_pool.num_free_slots < n:
-            er = self.prefix_cache.evict_mamba(n - self.linear_state_pool.num_free_slots)
-            if not er.mamba_slots:
-                break
-            self.linear_state_pool.free(er.mamba_slots)
-            self._free(er.kv_indices)
+            with self.lazy_free_region():
+                er = self.prefix_cache.evict_mamba(n - self.linear_state_pool.num_free_slots)
+                if not er.mamba_slots:
+                    break
+                self.linear_state_pool.free(er.mamba_slots)
+                self._free(er.kv_indices)
 
     def snapshot_toolcall_anchor(self, reqs: List[Req]) -> None:
         """Freeze each decoding request's GDN state at its tool-call anchor, into the ping-pong
@@ -320,6 +323,19 @@ class CacheManager:
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)
+        return self._metadata_retry(lambda: self._cache_req_impl(req, finished=finished))
+
+    def _metadata_retry(self, operation):
+        """Retry staged metadata allocation only when the scheduler reclaimed backing."""
+        while True:
+            try:
+                return operation()
+            except torch.OutOfMemoryError as error:
+                recover = getattr(self, "recover_oom", None)
+                if recover is None or not recover(error):
+                    raise
+
+    def _cache_req_impl(self, req: Req, *, finished: bool) -> None:
         if self.is_hybrid:
             return self._cache_req_hybrid(req, finished=finished)
         # ==================================== valid cache region ====================================
@@ -336,33 +352,39 @@ class CacheManager:
         page_indices = self.page_table[req.table_idx, : req.cached_len]
         old_handle = req.cache_handle
         insert_ids = req.input_ids[: req.cached_len]
+        # Stage every device allocation before publishing tree/page ownership changes.
+        matched = self.prefix_cache.match_prefix(insert_ids).cuda_handle
+        cached_len = matched.cached_len
+        canonical = matched.get_matched_indices() if cached_len > old_handle.cached_len else None
+        returned = [page_indices[old_handle.cached_len : cached_len]]
+        if finished:
+            insert_len = (
+                0 if self.cache_type == "naive" else align_down(req.cached_len, self.page_size)
+            )
+            returned.append(self._padded_tail(req, insert_len))
+        returned_indices = torch.cat(returned) if len(returned) > 1 else returned[0]
+        # lazy_free_region reserves its entire bounded backing before entering the region.
+        staged_free = None
+        if "_free" not in self.__dict__ and returned_indices.numel():
+            staged_free = torch.cat([self.free_slots, returned_indices[:: self.page_size]])
         cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
-        # unlock until all operations on handle is done
-        self.unlock(old_handle)
         # this part is already in the prefix cache, free it. A naive-SWA request (swa_paged, no
         # reuse) also returns the swa slots backing every full slot it frees; the out-of-window
         # ones were already freed by the decode driver (free_swa is idempotent over the sentinel).
         if self.swa_paged:
-            self._free_swa(page_indices[old_handle.cached_len : cached_len])
-        self._free(page_indices[old_handle.cached_len : cached_len])
-        if finished:  # this tail part should be freed
-            # cached_len < device_len is a standing invariant (the next, unallocated slot),
-            # not a speculative-verify artifact -- padding to device_len here would free a
-            # page never allocated to this request. A spec verify window's own surplus
-            # (the correction token's page, beyond this request's normal tail) is reclaimed
-            # by SchedulerSpecMixin itself before table_idx is recycled (see spec.py).
-            tail = self._padded_tail(req, new_handle.cached_len)
-            if self.swa_paged:
-                self._free_swa(tail)
-            self._free(tail)
-        else:  # keep the tail part, update the handle
+            self._free_swa(returned_indices)
+        if staged_free is not None:
+            self.free_slots = staged_free
+        elif "_free" in self.__dict__:
+            self._free(returned_indices)
+        self.unlock(old_handle)
+        if not finished:  # keep the tail part, update the handle
             # Re-point the deduped span at the tree's canonical pages: the request's own pages
             # for [old_handle.cached_len, cached_len) went back on the free list above, but the
             # attention backends read this row every step and the next allocation hands those
             # pages to someone else. [0, old_handle.cached_len) needs no rewrite -- it has been
             # locked since admission, so the row already equals canonical there.
             if cached_len > old_handle.cached_len:
-                canonical = new_handle.get_matched_indices()
                 self.page_table[req.table_idx, old_handle.cached_len : cached_len].copy_(
                     canonical[old_handle.cached_len : cached_len]
                 )
@@ -382,6 +404,36 @@ class CacheManager:
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
         if finished:
+            L = req.mamba_last_track_seqlen
+            frozen_len = (
+                L
+                if L is not None
+                and 0 < L <= req.cached_len
+                and align_down(L, self.page_size) == L
+                and req.mamba_ping_pong is not None
+                else 0
+            )
+            insert_len = align_down(req.cached_len, self.page_size)
+            live_len = insert_len if insert_len == req.cached_len and insert_len > 0 else 0
+            frozen_image = page_indices[:frozen_len].clone() if frozen_len else None
+            live_image = page_indices[:live_len].clone() if live_len else None
+            returned = []
+            free_upto = old_handle.cached_len
+            if frozen_len:
+                _, matched = self.prefix_cache._walk(req.input_ids[:frozen_len])
+                returned.append(page_indices[free_upto : max(free_upto, matched)])
+                free_upto = max(free_upto, frozen_len)
+            if live_len:
+                _, matched = self.prefix_cache._walk(req.input_ids[:live_len])
+                returned.append(page_indices[free_upto : max(free_upto, matched)])
+            else:
+                returned.append(page_indices[free_upto:])
+            returned_indices = torch.cat(returned) if len(returned) > 1 else returned[0]
+            staged_free = (
+                torch.cat([self.free_slots, returned_indices[:: self.page_size]])
+                if "_free" not in self.__dict__ and returned_indices.numel()
+                else None
+            )
             # A pending freeze (the tool-call anchor, or a prefill ×64 track the request
             # finished too early to chunk-commit) is a strictly shorter prefix than the live
             # donate below: insert it first and advance the dedup-free floor to its boundary
@@ -400,11 +452,10 @@ class CacheManager:
                 frozen_idx = 1 - req.mamba_next_track_idx
                 frozen = req.mamba_ping_pong[frozen_idx]
                 prefix_len, mamba_exist = self.prefix_cache.insert(
-                    req.input_ids[:L], page_indices[:L], frozen
+                    req.input_ids[:L], page_indices[:L], frozen, kv_preimage=frozen_image
                 )
                 pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
                 req.mamba_ping_pong = None
-                self._free(page_indices[free_upto : max(free_upto, prefix_len)])
                 free_upto = max(free_upto, L)
             # Donate the live slot (final full-sequence state). The live state is at cached_len;
             # only attach it when cached_len is itself the page-aligned node boundary (always for
@@ -415,14 +466,19 @@ class CacheManager:
             keep_live = False
             if insert_len == req.cached_len and insert_len > 0:
                 prefix_len, mamba_exist = self.prefix_cache.insert(
-                    req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx
+                    req.input_ids[:insert_len],
+                    page_indices[:insert_len],
+                    req.linear_slot_idx,
+                    kv_preimage=live_image,
                 )
                 self.unlock(old_handle)
-                self._free(page_indices[free_upto : max(free_upto, prefix_len)])
                 keep_live = not mamba_exist  # tree now owns linear_slot_idx
             else:
                 self.unlock(old_handle)
-                self._free(page_indices[free_upto:])
+            if staged_free is not None:
+                self.free_slots = staged_free
+            elif "_free" in self.__dict__:
+                self._free(returned_indices)
             self._free_req_slots(req, keep_live=keep_live)
             return
 
@@ -438,28 +494,51 @@ class CacheManager:
             return
         frozen_idx = 1 - req.mamba_next_track_idx  # the slot the forward just wrote
         frozen = req.mamba_ping_pong[frozen_idx]
-        prefix_len, mamba_exist = self.prefix_cache.insert(
-            req.input_ids[:L], page_indices[:L], frozen
+        node, prefix_len = self.prefix_cache._walk(req.input_ids[:L])
+        existing = prefix_len == L and node.mamba_value is not None
+        if not existing and not pool.num_free_slots:
+            # ponytail: postpone prefix donation under slot pressure; retry with a free slot.
+            return
+        kv_preimage = page_indices[:L].clone()
+        matched_indices = self.prefix_cache._collect_kv(node)
+        canonical = torch.cat([matched_indices, page_indices[prefix_len:L]])
+        returned_indices = page_indices[old_handle.cached_len : prefix_len]
+        staged_free = (
+            torch.cat([self.free_slots, returned_indices[:: self.page_size]])
+            if "_free" not in self.__dict__ and returned_indices.numel()
+            else None
         )
+        replacement = pool.alloc(1)[0] if not existing else None
+        try:
+            prefix_len, mamba_exist = self.prefix_cache.insert(
+                req.input_ids[:L], page_indices[:L], frozen, kv_preimage=kv_preimage
+            )
+        except BaseException:
+            # The replacement is reserved before insertion, but not yet request-owned.
+            if replacement is not None:
+                pool.free([replacement])
+            raise
         self.unlock(old_handle)
-        self._free(page_indices[old_handle.cached_len : prefix_len])
-        # Lock the committed snapshot node FIRST: the replacement-slot alloc below can trigger
-        # evict_mamba (via ensure_mamba_slots), which would otherwise reclaim this still-unlocked
-        # just-donated node -- freeing its KV pages under the still-decoding request.
-        m = self.prefix_cache.match_prefix(req.input_ids[:L])
+        if staged_free is not None:
+            self.free_slots = staged_free
+        elif "_free" in self.__dict__:
+            self._free(returned_indices)
+        # Attach and protect the donated node before returning to the scheduler.
+        node, _ = self.prefix_cache._walk(req.input_ids[:L])
         # Same re-point as the generic path: the dedup free above returned this request's own
         # pages for [old_handle.cached_len, prefix_len) while its row still named them.
         if prefix_len > old_handle.cached_len:
             self.page_table[req.table_idx, old_handle.cached_len : prefix_len].copy_(
-                m.kv_indices[old_handle.cached_len : prefix_len]
+                canonical[old_handle.cached_len : prefix_len]
             )
-        req.cache_handle = HybridCacheHandle(m.cached_len, m.node, m.kv_indices)
+        req.cache_handle = HybridCacheHandle(L, node, canonical)
         self.lock(req.cache_handle)
         if not mamba_exist:  # tree took `frozen`; replace it
-            self.ensure_mamba_slots(1)
             pp = list(req.mamba_ping_pong)
-            pp[frozen_idx] = pool.alloc(1)[0]
+            pp[frozen_idx] = replacement
             req.mamba_ping_pong = tuple(pp)
+        elif replacement is not None:
+            pool.free([replacement])
         req.mamba_last_track_seqlen = None
 
     def _cache_req_swa(self, req: Req, *, finished: bool) -> None:
@@ -643,38 +722,61 @@ class CacheManager:
 
     @contextmanager
     def lazy_free_region(self):
-        def lazy_free(indices: torch.Tensor) -> None:
-            # clone: callers pass page-table VIEWS, and the deferred concat below only reads them
-            # when the region exits. A commit that re-points the row in between (the dedup
-            # re-point, the SWA one) would otherwise rewrite the pending free list underneath us
-            # and return the tree's canonical pages instead of the request's duplicates.
-            lazy_free_list.append(indices[:: self.page_size].clone())
+        # Reserve the maximum free-list backing before callers mutate ownership.
+        # Region exit only publishes a view; it cannot fail allocating a concat.
+        staged = self._metadata_retry(
+            lambda: torch.empty(2 * self.num_pages, dtype=self.free_slots.dtype, device=self.device)
+        )
+        count = 0
+        previous_free = self.__dict__.get("_free")
 
-        lazy_free_list: List[torch.Tensor] = []
+        def lazy_free(indices: torch.Tensor) -> None:
+            nonlocal count
+            pages = indices[:: self.page_size]
+            end = count + pages.numel()
+            assert end + self.free_slots.numel() <= self.num_pages, (
+                "Free-list return exceeds pool capacity"
+            )
+            # Copy immediately: page-table views may be repointed before region exit.
+            staged[count:end].copy_(pages)
+            count = end
+
         try:
             self._free = lazy_free
             yield
         finally:
-            del self._free
-            self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
+            if previous_free is None:
+                del self._free
+            else:
+                self._free = previous_free
+            # The second half avoids overlapping copies when appending the returns.
+            # Allocations inside the region may have shortened the current free list.
+            current = self.free_slots.numel()
+            output = staged[self.num_pages :]
+            output[:current].copy_(self.free_slots)
+            output[current : current + count].copy_(staged[:count])
+            self.free_slots = output[: current + count]
 
     def _allocate(self, needed_pages: int) -> torch.Tensor:
         if needed_pages > (free_pages := len(self.free_slots)):
             need = (needed_pages - free_pages) * self.page_size
-            if self.is_swa:
-                # Evicting KV leaf nodes drops their swa slots too -> return both pools.
-                ev = self.prefix_cache.evict_full(need)
-                evicted = ev.kv_indices
-                self._free_swa(ev.swa_indices)
-            elif self.is_hybrid:
-                # Evicting KV leaf nodes drops their GDN snapshots too -> return both pools.
-                er = self.prefix_cache.evict_full(need)
-                evicted = er.kv_indices
-                if er.mamba_slots:
-                    self.linear_state_pool.free(er.mamba_slots)
+            if not self.is_swa:
+                with self.lazy_free_region():
+                    if self.is_hybrid:
+                        er = self.prefix_cache.evict_full(need)
+                        evicted = er.kv_indices
+                        if er.mamba_slots:
+                            self.linear_state_pool.free(er.mamba_slots)
+                    else:
+                        evicted = self.prefix_cache.evict(need)
+                    self._free(evicted)
             else:
-                evicted = self.prefix_cache.evict(need)
-            self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
+                # Evicting KV leaf nodes drops their swa slots too -> return both pools.
+                with self.lazy_free_region():
+                    ev = self.prefix_cache.evict_full(need)
+                    evicted = ev.kv_indices
+                    self._free_swa(ev.swa_indices)
+                    self._free(evicted)
             assert len(self.free_slots) >= needed_pages, "Eviction did not free enough space."
         if self._prefer_device_pages:
             self.free_slots, _ = torch.sort(self.free_slots)

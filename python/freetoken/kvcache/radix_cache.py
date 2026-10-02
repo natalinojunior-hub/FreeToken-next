@@ -179,6 +179,7 @@ class RadixPrefixCache(BasePrefixCache):
         assert size <= self.evictable_size, (
             f"Cannot evict {size}, only {self.evictable_size} is evictable"
         )
+        staged = torch.empty(self.evictable_size, dtype=self.empty_tensor.dtype, device=self.device)
 
         leave_nodes = self._collect_leave_nodes_for_evict()
         heapq.heapify(leave_nodes)
@@ -200,7 +201,12 @@ class RadixPrefixCache(BasePrefixCache):
             if parent.is_leaf() and parent.ref_count == 0:
                 heapq.heappush(leave_nodes, parent)
 
-        return torch.cat(evicted_indices)
+        result = staged[:evicted_size]
+        offset = 0
+        for indices in evicted_indices:
+            result[offset : offset + indices.numel()].copy_(indices)
+            offset += indices.numel()
+        return result
 
     def reset(self) -> None:
         raise NotImplementedError("RadixManager.reset is not implemented")
