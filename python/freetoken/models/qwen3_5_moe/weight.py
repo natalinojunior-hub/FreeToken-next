@@ -476,7 +476,24 @@ def iter_expert_pieces(
     chunk: int = 8 << 20,
 ):
     """Block-fp8 routed experts, one piece per expert: ``{gate, up, down}`` fp8 codes and their
-    ``_scale`` (block scale) companions, named as the checkpoint's dialect stores them. Other expert kinds use the generic readers."""
+    ``_scale`` (block scale) companions, named as the checkpoint's dialect stores them. NVFP4
+    experts with a banked BF16 MTP head chain the draft's experts, quantized, as the last bank.
+    Other expert kinds use the generic readers."""
+    if kind is QuantKind.NVFP4 and getattr(config, "mtp_expert_bank", False):
+        import itertools
+        from dataclasses import replace
+
+        from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
+
+        target = iter_nvfp4_expert_pieces(
+            model_path,
+            replace(config, mtp_expert_bank=False),
+            nvfp4_expert_spec(model_path, config),
+            parallel=bool(parallel),
+            workers=workers,
+            chunk=chunk,
+        )
+        return itertools.chain(target, _mtp_nvfp4_pieces(model_path, config))
     if kind is not QuantKind.FP8_BLOCK:
         return None
     if get_tp_info().size > 1:
@@ -524,6 +541,36 @@ def iter_expert_pieces(
             reader.close()
 
     return per_expert_pieces(_serial(), locate, tensors_per_expert=6)
+
+
+def _mtp_nvfp4_pieces(model_path: str, config, chunk_experts: int = 32):
+    """The checkpoint's BF16 MTP experts quantized to NVFP4 pieces for the last expert bank
+    (``num_moe_layers - 1``), on the GPU in expert chunks."""
+    from freetoken.models.nvfp4_banks import quantize_nvfp4
+
+    from .mtp import iter_hf_mtp_weights
+
+    stacked = {
+        name.rsplit(".", 1)[-1]: t
+        for name, t in iter_hf_mtp_weights(model_path, torch.device("cpu"))
+        if ".mlp.experts." in name
+    }
+    gate_up, down = stacked["gate_up_proj"], stacked["down_proj"]  # [E, 2I, H], [E, H, I]
+    bank = config.num_moe_layers - 1
+    inter = gate_up.shape[1] // 2
+    device = torch.device("cuda", torch.cuda.current_device())
+    for e0 in range(0, gate_up.shape[0], chunk_experts):
+        e1 = min(e0 + chunk_experts, gate_up.shape[0])
+        gu = gate_up[e0:e1].to(device)
+        piece = {}
+        for role, w in (("gate", gu[:, :inter]), ("up", gu[:, inter:]), ("down", down[e0:e1])):
+            codes, scale, glob = quantize_nvfp4(w.to(device))
+            piece[role], piece[f"{role}_scale"], piece[f"{role}_global"] = (
+                codes.cpu(),
+                scale.cpu(),
+                glob.cpu(),
+            )
+        yield bank, e0, e1, piece
 
 
 def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:

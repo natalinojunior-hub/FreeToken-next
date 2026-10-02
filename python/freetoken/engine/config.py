@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, List
 import torch
 from freetoken.distributed import DistributedInfo
 from freetoken.layers.quantization import set_quant_config
+from freetoken.layers.quantization.scheme import QuantKind
 from freetoken.mm.config import ENCODER_SECTIONS, MultimodalConfig
 from freetoken.models.register import (
     EncoderSpec,
@@ -242,7 +243,20 @@ class EngineConfig:
             from freetoken.models.qwen3_5_moe.mtp import has_hf_mtp_weights
 
             if has_hf_mtp_weights(self.model_path):
-                model_config = replace(model_config, native_mtp_layers=1, mtp_expert_resident=True)
+                # BF16 draft experts over NVFP4 target experts join the target's offload bank,
+                # quantized to its geometry at load: 256 resident BF16 experts (~1.5 GiB) would
+                # otherwise displace ~900 target expert slots for 8 experts read per draft token.
+                scheme = getattr(quant, "scheme_for", None)
+                target = scheme("model.layers.0.mlp.experts") if scheme is not None else None
+                banked = getattr(target, "kind", None) == QuantKind.NVFP4 and (
+                    self.moe_strategy != "fused"
+                )
+                model_config = replace(
+                    model_config,
+                    native_mtp_layers=1,
+                    mtp_expert_resident=not banked,
+                    mtp_expert_bank=banked,
+                )
         if self.spec_mtp > 0:
             mtp = getattr(getattr(model_config, "qwen4_args", None), "mtp", None)
             if (mtp is None or not mtp.enabled) and model_config.native_mtp_layers == 1:
@@ -258,7 +272,9 @@ class EngineConfig:
                     )
 
                     if is_hf_mtp_head(os.environ.get(MTP_PATH_ENV)):
-                        model_config = replace(model_config, mtp_expert_resident=True)
+                        model_config = replace(
+                            model_config, mtp_expert_resident=True, mtp_expert_bank=False
+                        )
                 if model_config.native_mtp_expert_types is not None:
                     model_config = replace(
                         model_config,

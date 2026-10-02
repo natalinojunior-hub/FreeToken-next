@@ -1106,7 +1106,17 @@ class Engine:
 
             spec = get_model_spec(config.model_config.architectures[0])
             iter_mtp = _load_attr(spec.module, "iter_mtp_weights")
-            weights = itertools.chain(weights, iter_mtp(config.model_path, self.device))
+            import inspect
+
+            banked = config.model_config.mtp_expert_bank
+            if banked and "experts" in inspect.signature(iter_mtp).parameters:
+                mtp_weights = iter_mtp(config.model_path, self.device, experts=False)
+            else:
+                mtp_weights = iter_mtp(config.model_path, self.device)
+            if banked:
+                # banked draft experts load with the target's expert banks, not as dense weights
+                mtp_weights = (kv for kv in mtp_weights if ".mlp.experts." not in kv[0])
+            weights = itertools.chain(weights, mtp_weights)
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).

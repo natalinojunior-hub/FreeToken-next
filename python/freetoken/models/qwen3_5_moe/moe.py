@@ -60,12 +60,17 @@ class Qwen3_5MoE(BaseOP):
     """
 
     def __init__(self, config: ModelConfig, layer_id: int | None = None, *, prefix: str = ""):
+        experts_prefix = f"{prefix}.experts"
+        if config.mtp_expert_bank and prefix.startswith("mtp."):
+            # the draft's BF16 experts are quantized into the target's expert bank at load,
+            # so they take the target experts' scheme (the checkpoint leaves mtp.* unquantized)
+            experts_prefix = "model.layers.0.mlp.experts"
         self.experts = make_moe_layer(
             config,
             layer_id=layer_id,
             renormalize=config.norm_topk_prob,
             quant_config=config.quant,
-            prefix=f"{prefix}.experts",
+            prefix=experts_prefix,
         )
         # routers stay bf16 whatever the checkpoint quantizes
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)

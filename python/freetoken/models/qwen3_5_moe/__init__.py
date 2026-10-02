@@ -16,7 +16,7 @@ from .gguf import iter_gguf_mtp_weights, parse_gguf_config, iter_gguf_weights
 from .mtp import MTP_PATH_ENV, has_hf_mtp_weights, is_hf_mtp_head, iter_hf_mtp_weights
 
 
-def iter_mtp_weights(model_path: str, device):
+def iter_mtp_weights(model_path: str, device, *, experts: bool = True):
     """Engine hook for an external safetensors head or in-file GGUF NextN block."""
     import os
 
@@ -24,7 +24,7 @@ def iter_mtp_weights(model_path: str, device):
     if external and external.endswith(".safetensors"):
         return iter_hf_mtp_weights(external, device)
     if has_hf_mtp_weights(model_path):
-        return iter_hf_mtp_weights(model_path, device)
+        return iter_hf_mtp_weights(model_path, device, experts=experts)
     return iter_gguf_mtp_weights(model_path, device)
 
 

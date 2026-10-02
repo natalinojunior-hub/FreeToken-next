@@ -143,4 +143,28 @@ def iter_nvfp4_expert_pieces(
     )
 
 
-__all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]
+# e2m1 magnitude code -> value boundaries (round to nearest; the sign is code bit 3)
+_E2M1_EDGES = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+
+
+def quantize_nvfp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``[..., N, K]`` weights -> ``(codes [..., N, K // 2] uint8, block scales [..., N, K // 16]
+    fp8-e4m3, global [..., 1] fp16)`` with ``w ~= e2m1 * scale * global`` (ModelOpt dequant
+    convention, low nibble first). The global is a power of two at or above ``amax / (6 * 448)``:
+    exact in fp16 even below its normal range, and every block scale stays within e4m3."""
+    x = w.float()
+    *lead, n, k = x.shape
+    amax = x.abs().amax(dim=(-2, -1), keepdim=True).clamp(min=2.0**-24 * 2688)
+    glob = torch.exp2(torch.ceil(torch.log2(amax / (6 * 448))))
+    blocks = x.reshape(*lead, n, k // 16, 16)
+    scale = (blocks.abs().amax(-1) / 6 / glob).to(torch.float8_e4m3fn)
+    step = scale.float().unsqueeze(-1) * glob.unsqueeze(-1)
+    q = torch.where(step > 0, blocks / step.clamp(min=torch.finfo(torch.float32).tiny), 0.0)
+    edges = torch.tensor(_E2M1_EDGES, device=x.device)
+    codes = torch.bucketize(q.abs().clamp(max=6.0), edges).to(torch.uint8)
+    codes = (codes | ((q < 0).to(torch.uint8) << 3)).reshape(*lead, n, k)
+    packed = codes[..., 0::2] | (codes[..., 1::2] << 4)
+    return packed, scale, glob.reshape(*lead, 1).to(torch.float16)
+
+
+__all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces", "quantize_nvfp4"]

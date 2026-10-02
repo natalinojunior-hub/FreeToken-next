@@ -101,8 +101,11 @@ def is_hf_mtp_head(path: str | None) -> bool:
         return False
 
 
-def iter_hf_mtp_weights(path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield sidecar or in-checkpoint MTP tensors in the model's state-dict layout."""
+def iter_hf_mtp_weights(
+    path: str, device: torch.device, *, experts: bool = True
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield sidecar or in-checkpoint MTP tensors in the model's state-dict layout; ``experts``
+    False skips the routed experts (they load into the target's expert bank instead)."""
     standalone = is_hf_mtp_head(path)
     if not standalone and not has_hf_mtp_weights(path):
         raise ValueError(f"not a supported standalone Qwen3.5-MoE MTP safetensors head: {path}")
@@ -143,12 +146,16 @@ def iter_hf_mtp_weights(path: str, device: torch.device) -> Iterator[tuple[str, 
     for file in source:
         with safetensors.safe_open(str(file), framework="pt", device=str(device)) as f:
             for key in f.keys():
-                if key in required or key in {
-                    "mtp.layers.0.mlp.experts.gate_up_proj",
-                    "mtp.layers.0.mlp.experts.down_proj",
-                }:
+                if key in required or (
+                    experts
+                    and key
+                    in {
+                        "mtp.layers.0.mlp.experts.gate_up_proj",
+                        "mtp.layers.0.mlp.experts.down_proj",
+                    }
+                ):
                     values[key] = f.get_tensor(key)
-                else:
+                elif experts:
                     match = _EXPERT_KEY.match(key)
                     if match:
                         expert_keys[(int(match[1]), match[2].removesuffix("_proj"))] = f.get_tensor(
