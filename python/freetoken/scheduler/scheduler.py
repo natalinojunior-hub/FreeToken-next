@@ -1369,26 +1369,29 @@ class Scheduler(SchedulerIOMixin, SchedulerSpecMixin):
             if note is not None:
                 note(e)
             mark_oom = getattr(self, "_mark_mtp_oom", None)
-            if mark_oom is not None:
-                mark_oom(getattr(self, "_mtp_cycle_depth", 0))
+            depth = getattr(self, "_mtp_cycle_depth", 0)
             rollback, self._spec_rollback = getattr(self, "_spec_rollback", None), None
             if rollback is not None:
                 # nothing committed yet: undo the cycle, shrink, and let RAW decode run now
                 torch.cuda.synchronize(self.device)
                 rollback()
+                cache = getattr(self.engine, "moe_offload_cache", None)
+                rows = getattr(cache, "resident_rows", None)
                 shrink = getattr(self.engine, "shrink_after_oom", None)
                 if shrink is not None:
                     shrink()
-                for controller in [getattr(self, "_mtp_controller", None)] + list(
-                    getattr(self, "_mtp_controllers", {}).values()
-                ):
-                    if controller is not None:
-                        controller.fallback_to_k0()
+                if rows is None or getattr(cache, "resident_rows", None) == rows:
+                    # nothing left to give back: only a shallower depth can fit
+                    if mark_oom is not None:
+                        mark_oom(depth)
+                # else the next cycle retries this depth inside the reserve just learned
                 # the RAW step that follows is not a sample of the refused depth
                 self._mtp_cycle_observe = False
                 torch.cuda.empty_cache()
                 logger.warning(f"MTP cycle OOM rolled back ({e}); this step decodes RAW")
                 return False
+            if mark_oom is not None:
+                mark_oom(depth)
             self._fail_oom_reqs(list(self.decode_manager.running_reqs), e)
             return True
 

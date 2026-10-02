@@ -110,7 +110,14 @@ def test_spec_oom_before_commit_rolls_back_and_keeps_the_request(monkeypatch):
         note_decode_oom=lambda e: events.append("note"),
         shrink_after_oom=lambda: events.append("shrink"),
     )
-    stub._mtp_controller = SimpleNamespace(fallback_to_k0=lambda: events.append("k0"))
+    cache = SimpleNamespace(resident_rows=10)
+    stub.engine.moe_offload_cache = cache
+    stub.engine.shrink_after_oom = lambda: (
+        events.append("shrink"),
+        setattr(cache, "resident_rows", 8),
+    )
+    stub._mark_mtp_oom = lambda depth: events.append(f"cap{depth}")
+    stub._mtp_cycle_depth = 2
 
     def step():
         stub._spec_rollback = lambda: events.append("rollback")
@@ -120,7 +127,7 @@ def test_spec_oom_before_commit_rolls_back_and_keeps_the_request(monkeypatch):
     stub._fail_oom_reqs = lambda reqs, error: events.append("failed")
 
     assert Scheduler._spec_step_or_fail(stub) is False  # RAW decode runs this iteration
-    assert events == ["note", "rollback", "shrink", "k0"]
+    assert events == ["note", "rollback", "shrink"]  # shrink freed rows: retry this depth
     assert stub._spec_rollback is None and stub._mtp_cycle_observe is False
 
 
@@ -144,3 +151,24 @@ def test_other_errors_still_raise():
     stub._forward = boom
     with pytest.raises(ValueError):
         Scheduler._forward_or_fail(stub, SimpleNamespace(batch=SimpleNamespace(reqs=[])))
+
+
+def test_spec_oom_caps_depth_when_shrink_frees_nothing(monkeypatch):
+    events = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    engine = SimpleNamespace(
+        note_decode_oom=lambda e: None,
+        shrink_after_oom=lambda: None,
+        moe_offload_cache=SimpleNamespace(resident_rows=10),
+    )
+    stub = SimpleNamespace(device=None, engine=engine, _mtp_cycle_depth=2)
+    stub._mark_mtp_oom = lambda depth: events.append(depth)
+
+    def step():
+        stub._spec_rollback = lambda: None
+        raise torch.OutOfMemoryError("Tried to allocate 2.00 MiB")
+
+    stub.run_spec_step = step
+    assert Scheduler._spec_step_or_fail(stub) is False
+    assert events == [2]
