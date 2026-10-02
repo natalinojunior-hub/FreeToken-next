@@ -185,6 +185,16 @@ def test_solve_shrinks_chunk_before_failing_expert_floor():
     assert chunk < 8192 and experts >= 512
 
 
+def test_solve_never_plans_a_chunk_above_the_configured_prefill_limit():
+    """A reused calibration measured up to 8192 must not plan 8192 for a 4096-limit serve."""
+
+    class _Cfg4K(_Cfg):
+        max_extend_tokens = 4096
+
+    chunk, _, _ = _planner().phase_fg_solve_chunk_and_experts(_Cfg4K, 8 * 1024 * MIB)
+    assert chunk == 4096
+
+
 def test_infeasible_reports_required_available_shortfall_and_owners():
     p = _planner()
     with pytest.raises(RuntimeError) as e:

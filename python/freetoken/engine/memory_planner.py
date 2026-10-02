@@ -909,8 +909,11 @@ class MemoryPlanner:
         def residual(chunk: int) -> int:
             return budget - sum(self.ledger(config, chunk, 0, required_pages).values())
 
+        # A reused calibration may have been measured with a larger prefill limit than this
+        # serve's --max-prefill-length; never plan a chunk the config will not run.
+        top = min(rc.chunk_hi, config.max_extend_tokens)
         candidates = sorted(
-            {c for c in (*_CHUNK_LADDER, rc.chunk_lo, rc.chunk_hi) if c <= rc.chunk_hi},
+            {c for c in (*_CHUNK_LADDER, rc.chunk_lo, top) if c <= top},
             reverse=True,
         )
         chunk = next((c for c in candidates if residual(c) >= min_bytes), None)
