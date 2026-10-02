@@ -53,5 +53,7 @@ NOT READY FOR LINUX PRODUCTION-HARDENING até fechar AD/NVFP4 MTP, matriz 16K, c
 ## Block 1 AD — sessão 3 (2026-10-01)
 
 - RAW AD provado: 52,7–52,9 TG, cert == HEAD (4 boots pareados). ISTA k5 104,7 -> 106,3 (cert 108,3; SHA == RAW); resta ~2 TG de journal QSA.
-- Auto-k: sem mudança; 1ª requisição 58,6 contra 59,7; k1 escolhido (k2 61,9 é o melhor); `_PROBE_REPEATS=8` descartado.
-- Detalhe: `BLOCK1-SESSION2-20261001.md` seção 9. Veredito: NOT READY FOR BLOCK 2.
+- Auto-k (sessão 3b, `bb02294`): AD escolhe k2 já na 1ª requisição (62,3–62,7, SHA == RAW); ISTA k5 107,2 em regime (era 96–98); empate resolve para o mais fundo.
+- Paridade AD: prompts 0 e 7 == RAW em k1–k5; **prompt 3 diverge (pré-existente, `1bf00f3` igual)** — estado pós-aceite-total no MoE/PLE da camada 7; replay linha a linha corrige mas custa 47% do TG.
+- VRAM: reserva de prefill já é emprestada aos experts no decode; abertos: folga de 0,04 GiB no decode e OOM no ciclo especulativo derruba a requisição.
+- Detalhe: `BLOCK1-SESSION2-20261001.md` seções 9 e 12. Veredito: NOT READY FOR BLOCK 2.

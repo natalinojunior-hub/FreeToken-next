@@ -177,3 +177,47 @@ Método: boots intercalados, árvore certificada (`ista-16k-certified-20260930`,
 3. **Seleção automática de k: sem mudança de código.** Perfil limpo (`FREETOKEN_MTP_PROFILE=off`), `warmups 0`, 2 boots: 1ª requisição 58,6 / 58,6 TG, seguintes 59,7 (SHA == RAW). O número antigo "55,5 contra 62,0" não se reproduziu; a lacuna real é 1,9% na 1ª requisição e 3,7% contra o melhor k fixo (k2 = 61,9). Causa: a medição interna do controlador penaliza k2 (16,0 ms/token contra 14,7 do k1) enquanto a matriz externa mostra k2 3% melhor; é viés sistemático da sondagem intercalada, não ruído. **Testado e descartado:** `_PROBE_REPEATS` 4 → 8 (mesma escolha k1, 1ª requisição 58,2; sem ganho). Alvo: medir custo do verify por linha em vez de por profundidade intercalada (estimar TG(k) a partir da aceitação por posição + custo linear por linha). Não implementado.
 
 Veredito da sessão 3: **NOT READY FOR BLOCK 2** (ISTA 106,3 < 107, seleção automática não otimizada, OOM de reserva e cache de prefixo híbrido abertos).
+
+## 12. Sessão 3b (2026-10-02): seleção de k, custo do motor, paridade fora do prompt 0
+
+Commits: `bb02294` (journal QSA em lote + k automático por aceitação agregada + sem cópia redundante no aceite total),
+`543f9e1` (planejador não planeja chunk acima de `--max-prefill-length`), `0ddf904` (`--prompt-offset` fora do corpus falha em vez de repetir o prompt 0).
+Dados brutos: `/models/desenvolvimento/tmp/rawab/` (`j_*`, `f_*`, `t_*`, `o*`, `h*`, `c*`, `k2_*`, `sweep_*`, `oracle_commit_p3.out`).
+
+**Ponto 2 (ISTA) — causa da queda 108 → 96–98 com k automático:** o controlador (regra "empate fica raso") escolhia k3 no
+ISTA porque a sondagem de aquecimento infla ciclos fundos (sobrecusto fixo ~11 ms/ciclo e poucas tentativas nas últimas
+posições). Árvores mistas: só `spec.py` revertido 108,30; HEAD 96,46 (k3). Correção: empate resolve para o **mais fundo**
+(`_deepest_clear_winner`, margem 0,97). Replay exato das sondagens gravadas: ISTA k5, AD k2. Resultado (k automático, prompt 0):
+ISTA 107,2–107,3 em regime (cert 108,4); AD 62,3–62,7 já na 1ª requisição, SHA == RAW.
+Custo do motor com k5 fixo: cert 106,8/108,4 × HEAD 104,5/106,5 (≈ −1,9 TG, ruído entre boots ±1). Sem a cópia redundante
+`commit_spec_row` no aceite total: +1,1/0 TG; AD k0–k5 18/18 SHA == RAW. Com k2 fixo (prompt 7): HEAD 82,9 / cert 83,1 / HEAD sem
+transação 83,7 — a transação custa ~0,9% em k2.
+
+**Teto 6 (padrão) × teto 5:** com k5 fixo no prompt 0 o teto 6 dá 97,8 contra 106,2 — os rascunhos mudam (aceitação 5,24 × 5,67
+token/ciclo); `--kv-tiering off` com teto 5 reproduz exatamente o mesmo padrão (mesma 1ª divergência na posição 103). Não é leitura
+de memória não inicializada (buffers preenchidos com NaN: idêntico). Nos prompts 3/7 o teto 6 às vezes ganha (82,0 × 71,2): é
+sensibilidade numérica do rascunho ao layout, não perda sistemática. **Teto padrão mantido em 6.**
+
+**Paridade AD fora do prompt 0 (achado novo, pré-existente):** prompt 7 k1–k5 == RAW (k2 71,0 TG). Prompt 3: k1–k5 todos com o
+mesmo SHA `c250ac983c40` ≠ RAW `fc45c4e520d0`, 1º token divergente no índice 25 (`' at'` × `':'`), linha 0 do verify logo após
+um aceite total k1. Igual na árvore `1bf00f3` completa (anterior à sessão) → não é regressão desta sessão. Classificação:
+`FREETOKEN_ENABLE_PARTIAL_SPEC=0` (commit com replay linha a linha) **== RAW** mas TG 27,5 × 51,9; `DISABLE_QSA_TXN=1` diverge igual;
+laço por linha no linear GGUF não muda. Oráculo de commit (`scripts/mtp_verify_oracle.py`, `FREETOKEN_VERIFY_ORACLE_COMMIT=1`,
+`FREETOKEN_DECODE_RESIDENCY=0`): 1 de 35 ciclos com estado ≠ RAW (ciclo 30, posições 16402→16404, janela que fecha um grupo
+comprimido 16403 % 4 == 3); camadas lineares 0–5 iguais, 6+ diferentes; dados QSA gravados iguais (`first_qsa: null`) → o desvio
+entra no MoE/PLE da camada 7 com 2 linhas. **Aberto:** tornar MoE/PLE do verify invariantes por linha (ou replay só nesse caso).
+O gate de paridade passa a exigir ≥ 3 prompts (`--prompt-offset 0 3 7`).
+
+**Seleção automática entre textos:** prompt 3 HEAD 87,1 × cert 84,3; prompt 7 HEAD 78,8/81,5/81,1 × cert 84,4 (k2 fixo HEAD
+82,8–82,9 estável). Na cert, os ciclos k2 em regime ficam ~3% mais rápidos depois da sondagem dela (provável histórico do cache
+LRU de experts); não confirmado sem estatística de acerto do cache.
+
+**Controlador de VRAM (estudo):** prioridade do solver = contexto (KV) → maior chunk de prefill → experts. A reserva do prefill
+(~2 GiB a chunk 8192) **já é emprestada aos experts durante o decode** (`Decode residency` 4761 → 5884 slots e volta antes de cada
+prefill); por isso chunk 4096 (5218 slots) não deu ganho (102,9 TG). KV em RAM no ISTA 16K libera só ~110 MiB (~65 slots, 1,4%).
+Defeitos achados: (1) o crescimento de residência deixa só 0,04 GiB livres — qualquer alocação extra no decode faz OOM;
+(2) OOM dentro do ciclo especulativo derruba a requisição (`_spec_step_or_fail` não tem rollback + nova tentativa, o forward
+normal tem); (3) a calibração de VRAM reaproveitada planejava chunk acima de `--max-prefill-length` (corrigido em `543f9e1`).
+
+Veredito sessão 3b: **NOT READY FOR BLOCK 2** — paridade AD falha no prompt 3 (pré-existente), ISTA k automático 107,2 < 108,4,
+OOM no ciclo especulativo e folga de 0,04 GiB abertos.

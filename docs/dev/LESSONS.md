@@ -47,3 +47,9 @@
 - RAW do AD "oscilando 43–53" -> causa não provada (hipóteses: jobs concorrentes, residência de decode); boots limpos pareados dão 52,7–52,9 em cert e HEAD -> não persiga oscilação sem boot isolado; confira o que rodava na máquina.
 - Auto-k pior que k fixo -> sondagem intercalada superestima o custo de k2 (16,0 contra 14,7 ms/token do k1); mais repetições (8) não corrigem -> não repetir; estimar por custo linear por linha de verify.
 - `cat/tail >> LESSONS.md` -> LESSONS.md e STATE.md na raiz são symlinks para docs/dev/; `tail f >> f` no mesmo arquivo cresceu a 970M linhas -> editar só docs/dev/ e nunca ler e anexar o mesmo arquivo.
+- "SHA == RAW em k1–k5" provado num só prompt -> o prompt 3 diverge (pré-existente) -> gate de paridade com ≥ 3 prompts (`--prompt-offset 0 3 7`).
+- `--prompt-offset 40000` mediu o prompt 0 de novo -> offset é em unidades de prompt e o fallback `or text` era silencioso -> corrigido para falhar (`0ddf904`).
+- ISTA k auto 96–98 contra 108 -> regra "empate fica raso" + sondagem que infla ciclos fundos -> empate resolve para o mais fundo; validar seleção com replay offline das sondagens gravadas antes da GPU.
+- Comparar TG de braços com SHA diferente como "sorte do texto" -> textos gerados diferentes não são comparáveis -> só pares com SHA igual.
+- Delegação ao opencode "vazia" -> em background o stdin nunca fecha e `opencode run` trava após "init"; e li o arquivo antes do fim -> `< /dev/null` e ler só após a notificação.
+- Arm com `TREE` alternativo falhou rc=127 -> árvore copiada não tem `.venv` -> usar sempre o python do venv principal com `PYTHONPATH` da árvore.
