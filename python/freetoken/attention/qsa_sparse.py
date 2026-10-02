@@ -78,6 +78,7 @@ def _resolve_block_topk() -> Callable | None:
 
 _TXN_TIMING = os.environ.get("FREETOKEN_DEBUG_QSA_TXN_TIMING", "0") == "1"
 _txn_acc: dict[str, list[float]] = {}
+_NEVER_KEPT = 1 << 62  # logical position of rows that rollback always restores
 
 
 def _txn_timed(fn):
@@ -208,6 +209,70 @@ class QSASparseAttnBackend(BaseAttnBackend):
     def spec_txn_active(self, table_idx: int) -> bool:
         return int(table_idx) in self._spec_txns
 
+    def _journal_compressed(self, txn, table_idx, physical, logical_positions, live, activate):
+        """Pre-journal for the compressed (turbo) pool, batched over layers, with no host sync
+        unless a write lands in the RAM tier. Positions are distinct, so rows never repeat; the
+        duplicate scratch rows of ``cmp_rows`` hold one preimage, so gather/scatter is exact."""
+        pool = self.kvcache._pool
+        device = physical.device
+        scratch = txn["cmp_scratch"]
+        closing = physical % self.ratio == self.ratio - 1
+        cmp_rows = torch.where(closing, physical // self.ratio, scratch)
+        txn["cmp_logical"] = {}
+        txn["cmp_logical_t"] = torch.where(closing, logical_positions, _NEVER_KEPT)
+        dense_t, slot_t = self._fast_layer_index(device)
+        phys_live = physical[:live]
+        dev, dev_mask = phys_live, None
+        host_l: list[int] = []
+        if getattr(self.kvcache, "page_map", None) is not None:
+            device_tokens = int(self.kvcache.num_device_pages) * self.page_size
+            dev_mask = phys_live < device_tokens
+            dev = torch.where(dev_mask, phys_live, 0)  # host rows read row 0, never restored
+            host_l = [p - device_tokens for p in phys_live.tolist() if p >= device_tokens]
+        buf = self.kvcache._cmp_k_buffer
+        txn["fast"] = {
+            "dev": dev,
+            "dev_mask": dev_mask,
+            "kv": tuple(
+                t[dense_t[:, None], dev]
+                for t in (pool._k_codes, pool._k_norm, pool._v_codes, pool._v_norm)
+            ),
+            "cmp_rows": cmp_rows,
+            "cmp": buf[slot_t[:, None], cmp_rows],
+        }
+        if host_l:
+            host_cpu = torch.tensor(host_l, dtype=torch.long)
+            kvh = getattr(self.kvcache, "_kv_host", None)
+            if kvh is not None:
+                dense_cpu = dense_t.cpu()[:, None]
+                hk = kvh[0].reshape(kvh.shape[1], -1, *kvh.shape[4:])
+                hv = kvh[1].reshape(kvh.shape[1], -1, *kvh.shape[4:])
+                txn["bulk_kv"].append(
+                    ("host", dense_cpu, host_cpu, hk[dense_cpu, host_cpu], hv[dense_cpu, host_cpu])
+                )
+            else:
+                for layer_id in self._idx_slot:
+                    host_kv = self.kvcache.host_kv(layer_id)
+                    if host_kv is None:
+                        continue
+                    hk = host_kv[0].reshape(-1, *host_kv[0].shape[2:])
+                    hv = host_kv[1].reshape(-1, *host_kv[1].shape[2:])
+                    txn["bulk_kv"].append(
+                        (
+                            "host",
+                            pool._dense(layer_id),
+                            host_cpu,
+                            hk.index_select(0, host_cpu),
+                            hv.index_select(0, host_cpu),
+                        )
+                    )
+        rope = getattr(self.kvcache, "_rope_positions", None)
+        if rope is not None:
+            txn["bulk_rope"].append((phys_live, rope.index_select(0, phys_live)))
+        txn["graph_safe"] = True
+        if not activate:
+            self._spec_preimages[table_idx] = txn
+
     @_txn_timed
     def prepare_spec_txn(
         self,
@@ -235,61 +300,61 @@ class QSASparseAttnBackend(BaseAttnBackend):
         if logical_positions is None:
             logical_positions = torch.arange(out_loc.numel(), device=out_loc.device)
         logical_positions = logical_positions.to(device=out_loc.device, dtype=torch.long)
-        # One host sync for the whole write set; every row set below is derived on the host.
-        phys_list, logical_list = torch.stack((physical, logical_positions)).tolist()
-        cmp_logical: dict[int, int] = {}
-        for phys, logical in zip(phys_list, logical_list):
-            if phys % self.ratio == self.ratio - 1:
-                row = phys // self.ratio
-                cmp_logical[row] = min(cmp_logical.get(row, logical), logical)
-        txn["cmp_logical"] = cmp_logical
-        txn["cmp_scratch"] = int(self.kvcache.cmp_scratch_base + table_idx)
-        phys_all_l = sorted(set(phys_list))
-        if live_count is None:
-            phys_live_l = phys_all_l
-        else:
-            live_count = max(0, min(int(live_count), len(phys_list)))
-            phys_live_l = sorted(set(phys_list[:live_count]))
-        pool = self.kvcache._pool
-        device_tokens = int(self.kvcache.num_device_pages) * self.page_size
-        dev_l = [p for p in phys_live_l if p < device_tokens]
-        host_l = [p - device_tokens for p in phys_live_l if p >= device_tokens]
-        cmp_rows_l = sorted(
-            {p // self.ratio for p in phys_all_l if p % self.ratio == self.ratio - 1}
-            | {int(self.kvcache.cmp_scratch_base + table_idx)}
-        )
         device = out_loc.device
-        phys_live = torch.tensor(phys_live_l, dtype=torch.long, device=device)
-        dev = torch.tensor(dev_l, dtype=torch.long, device=device)
-        host = torch.tensor(host_l, dtype=torch.long, device=device)
-        cmp_rows = torch.tensor(cmp_rows_l, dtype=torch.long, device=device)
+        pool = self.kvcache._pool
+        scratch = int(self.kvcache.cmp_scratch_base + table_idx)
+        txn["cmp_scratch"] = scratch
+        n = int(out_loc.numel())
+        live = n if live_count is None else max(0, min(int(live_count), n))
+        if getattr(pool, "compressed", False):
+            self._journal_compressed(txn, table_idx, physical, logical_positions, live, activate)
+            return
+        no_ram_tier = getattr(self.kvcache, "page_map", None) is None and all(
+            self.kvcache.host_kv(layer_id) is None for layer_id in self._idx_slot
+        )
+        if no_ram_tier:
+            # Every row is on device and positions are distinct, so the whole write set is
+            # derived on the device with no host sync; duplicate scratch rows hold the same
+            # preimage, so gather/scatter over them is exact.
+            closing = physical % self.ratio == self.ratio - 1
+            cmp_rows = torch.where(closing, physical // self.ratio, scratch)
+            cmp_logical_t = torch.where(closing, logical_positions, _NEVER_KEPT)
+            txn["cmp_logical"] = {}
+            phys_live = dev = physical[:live]
+            host = physical[:0]
+        else:
+            cmp_logical: dict[int, int] = {}
+            phys_list, logical_list = torch.stack((physical, logical_positions)).tolist()
+            for phys, logical in zip(phys_list, logical_list):
+                if phys % self.ratio == self.ratio - 1:
+                    row = phys // self.ratio
+                    cmp_logical[row] = min(cmp_logical.get(row, logical), logical)
+            txn["cmp_logical"] = cmp_logical
+            phys_all_l = sorted(set(phys_list))
+            phys_live_l = phys_all_l if live == n else sorted(set(phys_list[:live]))
+            device_tokens = int(self.kvcache.num_device_pages) * self.page_size
+            dev_l = [p for p in phys_live_l if p < device_tokens]
+            host_l = [p - device_tokens for p in phys_live_l if p >= device_tokens]
+            cmp_rows_l = sorted(
+                {p // self.ratio for p in phys_all_l if p % self.ratio == self.ratio - 1}
+                | {scratch}
+            )
+            phys_live = torch.tensor(phys_live_l, dtype=torch.long, device=device)
+            dev = torch.tensor(dev_l, dtype=torch.long, device=device)
+            host = torch.tensor(host_l, dtype=torch.long, device=device)
+            cmp_rows = torch.tensor(cmp_rows_l, dtype=torch.long, device=device)
+            cmp_logical_t = torch.tensor(
+                [
+                    cmp_logical.get(r, _NEVER_KEPT) if r != scratch else _NEVER_KEPT
+                    for r in cmp_rows_l
+                ],
+                dtype=torch.long,
+                device=device,
+            )
+        txn["cmp_logical_t"] = cmp_logical_t
         for layer_id, slot in self._idx_slot.items():
             dense = pool._dense(layer_id)
-            if getattr(pool, "compressed", False):
-                k_codes, k_norm = self.kvcache.k_slab(layer_id)
-                v_codes, v_norm = self.kvcache.v_slab(layer_id)
-                if dev.numel():
-                    txn["bulk_kv"].append(
-                        (
-                            "device",
-                            dense,
-                            dev,
-                            k_codes.index_select(0, dev),
-                            k_norm.index_select(0, dev),
-                            v_codes.index_select(0, dev),
-                            v_norm.index_select(0, dev),
-                        )
-                    )
-                if host.numel() and self.kvcache.host_kv(layer_id) is not None:
-                    hk, hv = self.kvcache.host_kv(layer_id)
-                    idx = host.cpu()
-                    hk = hk.reshape(-1, *hk.shape[2:])
-                    hv = hv.reshape(-1, *hv.shape[2:])
-                    txn["bulk_kv"].append(
-                        ("host", dense, idx, hk.index_select(0, idx), hv.index_select(0, idx))
-                    )
-            else:
-                self._txn_save_rows(table_idx, layer_id, phys_live)
+            self._txn_save_rows(table_idx, layer_id, phys_live)
             slab = self.kvcache.cmp_k_cache(slot)
             txn["bulk_cmp"].append((slot, cmp_rows, slab.index_select(0, cmp_rows)))
         rope = getattr(self.kvcache, "_rope_positions", None)
@@ -303,7 +368,61 @@ class QSASparseAttnBackend(BaseAttnBackend):
         txn = self._spec_txns.get(int(table_idx))
         return bool(txn and txn.get("graph_safe"))
 
+    def _restore_host(self, dense, rows, values) -> None:
+        kvh = self.kvcache._kv_host
+        if isinstance(dense, torch.Tensor):  # layer-batched entry: dense is [L, 1]
+            hk = kvh[0].reshape(kvh.shape[1], -1, *kvh.shape[4:])
+            hv = kvh[1].reshape(kvh.shape[1], -1, *kvh.shape[4:])
+            hk[dense, rows] = values[0]
+            hv[dense, rows] = values[1]
+            return
+        hk = kvh[0, dense].reshape(-1, *kvh.shape[4:])
+        hv = kvh[1, dense].reshape(-1, *kvh.shape[4:])
+        # CPU Float8 tensors do not implement index_copy_; indexed assignment does.
+        hk[rows] = values[0]
+        hv[rows] = values[1]
+
+    def _fast_layer_index(self, device):
+        cached = getattr(self, "_fast_layer_idx", None)
+        if cached is None:
+            pool = self.kvcache._pool
+            cached = (
+                torch.tensor(
+                    [pool._dense(l) for l in self._idx_slot], dtype=torch.long, device=device
+                ),
+                torch.tensor(list(self._idx_slot.values()), dtype=torch.long, device=device),
+            )
+            self._fast_layer_idx = cached
+        return cached
+
+    def _restore_fast(self, txn: dict, keep_end: int | None = None) -> None:
+        """Undo the layer-batched journal; with ``keep_end`` only compressed rows closed at or
+        after it (KV/RoPE rows are left to the caller's page reclaim)."""
+        fast = txn.get("fast")
+        if fast is None:
+            return
+        rows = fast["cmp_rows"]
+        dense_t, slot_t = self._fast_layer_index(rows.device)
+        buf = self.kvcache._cmp_k_buffer
+        saved = fast["cmp"]
+        if keep_end is not None:
+            mask = (txn["cmp_logical_t"] >= keep_end).view(1, -1, 1)
+            saved = torch.where(mask, saved, buf[slot_t[:, None], rows])
+        buf[slot_t[:, None], rows] = saved
+        if keep_end is not None:
+            return
+        pool = self.kvcache._pool
+        dev = fast["dev"]
+        mask = fast["dev_mask"]
+        for t, v in zip((pool._k_codes, pool._k_norm, pool._v_codes, pool._v_norm), fast["kv"]):
+            if mask is not None:
+                v = torch.where(
+                    mask.view(1, -1, *([1] * (v.dim() - 2))), v, t[dense_t[:, None], dev]
+                )
+            t[dense_t[:, None], dev] = v
+
     def _restore_bulk(self, txn: dict) -> None:
+        self._restore_fast(txn)
         for slot, rows, values in txn.get("bulk_cmp", ()):
             self.kvcache.cmp_k_cache(slot).index_copy_(0, rows, values)
         rope = getattr(self.kvcache, "_rope_positions", None)
@@ -319,10 +438,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
                 pool._v_codes[dense].index_copy_(0, rows, values[2])
                 pool._v_norm[dense].index_copy_(0, rows, values[3])
             else:
-                hk = self.kvcache._kv_host[0, dense].reshape(-1, *self.kvcache._kv_host.shape[4:])
-                hv = self.kvcache._kv_host[1, dense].reshape(-1, *self.kvcache._kv_host.shape[4:])
-                hk[rows] = values[0]
-                hv[rows] = values[1]
+                self._restore_host(dense, rows, values)
 
     @_txn_timed
     def snapshot_spec_preimage(
@@ -348,17 +464,12 @@ class QSASparseAttnBackend(BaseAttnBackend):
             return
         cmp_logical = txn.get("cmp_logical", {})
         scratch = int(txn.get("cmp_scratch", self.kvcache.cmp_scratch_base + table_idx))
+        restore = txn.get("cmp_logical_t")
+        self._restore_fast(txn, keep_end)
         for slot, rows, values in txn.get("bulk_cmp", ()):
-            restore = []
-            for i, row in enumerate(rows.tolist()):
-                logical = cmp_logical.get(int(row), keep_end)
-                if int(row) == scratch or logical >= keep_end:
-                    restore.append(i)
-            if restore:
-                idx = torch.tensor(restore, dtype=torch.long, device=rows.device)
-                self.kvcache.cmp_k_cache(slot).index_copy_(
-                    0, rows.index_select(0, idx), values.index_select(0, idx)
-                )
+            restore_mask = (restore >= keep_end).view(-1, *([1] * (values.dim() - 1)))
+            slab = self.kvcache.cmp_k_cache(slot)
+            slab.index_copy_(0, rows, torch.where(restore_mask, values, slab.index_select(0, rows)))
         for (slot, row), value in txn.get("cmp", {}).items():
             logical = cmp_logical.get(int(row), keep_end)
             if int(row) == scratch or logical >= keep_end:
@@ -473,6 +584,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         txn = self._spec_txns.pop(int(table_idx), None)
         if txn is None:
             return
+        self._restore_fast(txn)
         for slot, rows, values in txn.get("bulk_cmp", ()):
             self.kvcache.cmp_k_cache(slot).index_copy_(0, rows, values)
         rope = getattr(self.kvcache, "_rope_positions", None)
@@ -488,11 +600,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
                 pool._v_codes[dense].index_copy_(0, rows, values[2])
                 pool._v_norm[dense].index_copy_(0, rows, values[3])
             else:
-                hk = self.kvcache._kv_host[0, dense].reshape(-1, *self.kvcache._kv_host.shape[4:])
-                hv = self.kvcache._kv_host[1, dense].reshape(-1, *self.kvcache._kv_host.shape[4:])
-                # CPU Float8 tensors do not implement index_copy_; indexed assignment does.
-                hk[rows] = values[0]
-                hv[rows] = values[1]
+                self._restore_host(dense, rows, values)
         for (slot, row), value in txn["cmp"].items():
             self.kvcache.cmp_k_cache(slot)[row].copy_(value)
         rope = getattr(self.kvcache, "_rope_positions", None)

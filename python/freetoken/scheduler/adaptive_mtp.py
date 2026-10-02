@@ -113,6 +113,13 @@ _PROBE_REPEATS = 4
 # Cap for the amortized k=0 audit cadence (see observe(): doubles on each confirming audit).
 _MAX_BASELINE_INTERVAL = 4096
 _DEPTH_AUDIT_SAMPLES = 4
+# Draft positions need this many trials before their own acceptance rate is trusted; deeper
+# positions with fewer trials inherit the previous position's rate.
+_MODEL_MIN_TRIALS = 6
+# A model-ranked depth replaces the incumbent only when predicted at least this much cheaper.
+_MODEL_SWITCH_MARGIN = 0.98
+# ... and a shallower depth must be this much cheaper than a deeper one to be preferred.
+_MODEL_SHALLOWER_MARGIN = 0.97
 
 
 class AdaptiveMtpController:
@@ -216,6 +223,68 @@ class AdaptiveMtpController:
         self._depth_audit_inflight = False
         self._depth_audited.clear()
 
+    def _modeled_ready(self) -> bool:
+        acceptance = self._acceptance()
+        return all(
+            self._model_cost(depth, acceptance) is not None
+            for depth in range(1, self._runtime_max_k + 1)
+            if len(self._stats[depth].samples) >= _MIN_DEPTH_SAMPLES
+        ) and any(
+            len(self._stats[depth].samples) >= _MIN_DEPTH_SAMPLES
+            for depth in range(1, self._runtime_max_k + 1)
+        )
+
+    def _acceptance(self) -> tuple[list[int], list[int]]:
+        """Pooled per-position draft trials/accepts from every depth's samples: a cycle that
+        committed ``c`` tokens at depth ``d`` accepted ``c-1`` drafts and tested one more."""
+        tested = [0] * (self.safe_max_k + 2)
+        accepted = [0] * (self.safe_max_k + 2)
+        for depth in range(1, self.safe_max_k + 1):
+            for _, committed in self._stats[depth].samples:
+                accepted_n = min(committed - 1, depth)
+                for pos in range(1, min(accepted_n + 1, depth) + 1):
+                    tested[pos] += 1
+                    accepted[pos] += pos <= accepted_n
+        return tested, accepted
+
+    def _model_cost(self, depth: int, acceptance) -> tuple[float, float] | None:
+        """Predicted seconds/token = measured cycle time at ``depth`` over the expected tokens
+        per cycle from pooled acceptance. Depths probed on different text segments share every
+        position's acceptance, so segment luck in a handful of probe cycles averages out."""
+        samples = self._stats[depth].samples
+        if not samples:
+            return None
+        n = len(samples)
+        mean_s = sum(elapsed for elapsed, _ in samples) / n
+        spread = sqrt(sum((e - mean_s) ** 2 for e, _ in samples) / (n - 1)) if n > 1 else inf
+        rse = spread / sqrt(n) / mean_s
+        # median: a cold outlier cycle must not decide the ranking
+        cycle_s = sorted(elapsed for elapsed, _ in samples)[n // 2]
+        if depth == 0:
+            return cycle_s, rse
+        tested, accepted = acceptance
+        expected, reach, rate = 1.0, 1.0, None
+        for pos in range(1, depth + 1):
+            if tested[pos] >= _MODEL_MIN_TRIALS:
+                rate = (accepted[pos] + 0.5) / (tested[pos] + 1)
+            elif rate is None:
+                return None
+            reach *= rate
+            expected += reach
+        return cycle_s / expected, rse
+
+    @staticmethod
+    def _deepest_clear_winner(eligible: list[int], modeled) -> int:
+        """Descend from the deepest depth; a shallower depth must be at least
+        ``_MODEL_SHALLOWER_MARGIN`` cheaper than the one held. Ties stay deep: warm-up cycles
+        carry a fixed per-cycle overhead and few trials at the last positions, both of which
+        inflate deep depths' probe cost (ISTA: k3 probed 1% cheaper, k5 steady 8% faster)."""
+        chosen = eligible[-1]
+        for depth in reversed(eligible[:-1]):
+            if modeled[depth][0] < _MODEL_SHALLOWER_MARGIN * modeled[chosen][0]:
+                chosen = depth
+        return chosen
+
     def _best_depth(self) -> int:
         """Cheapest speculation depth, biased toward actually speculating.
 
@@ -249,6 +318,10 @@ class AdaptiveMtpController:
         # measured 106. campaign37's k0-lock fear is handled by the eligibility gate above
         # (2-sigma vs baseline), not by depth preference; the hysteresis in
         # _reselect_with_hysteresis keeps the incumbent on genuine 2% coin-flips.)
+        acceptance = self._acceptance()
+        modeled = {d: self._model_cost(d, acceptance) for d in eligible}
+        if all(cost is not None for cost in modeled.values()):
+            return self._deepest_clear_winner(eligible, modeled)
         cheapest = min(eligible, key=lambda d: self._stats[d].cost)
         return cheapest
 
@@ -418,6 +491,9 @@ class AdaptiveMtpController:
                     # that depth unless another positive depth clearly beats it; a short probe
                     # must not replace a good requested cap with a lower point estimate.
                     self._selected_depth = self.safe_max_k
+                    if self._modeled_ready():
+                        # Pooled acceptance ranks every probed depth; no incumbent to defend.
+                        self._selected_depth = self._best_depth() or self.safe_max_k
                     self._reselect_with_hysteresis()
                 if self._selected_depth == 0:
                     self.fallback_to_k0()
@@ -505,6 +581,17 @@ class AdaptiveMtpController:
         # the cheapest, so hysteresis now compares against the baseline only to detect a
         # genuinely unsafe current depth, and otherwise moves to the better positive depth.
         current_unsafe = current.cost - 2 * current.se > self._stats[0].cost + 2 * self._stats[0].se
+        if not current_unsafe:
+            acceptance = self._acceptance()
+            best_cost = self._model_cost(best, acceptance)
+            current_cost = self._model_cost(self._selected_depth, acceptance)
+            if best_cost is not None and current_cost is not None:
+                (best_s, best_rse), (current_s, current_rse) = best_cost, current_cost
+                if best_s < _MODEL_SWITCH_MARGIN * current_s and best_s * (
+                    1 + 2 * best_rse
+                ) < current_s * (1 - 2 * current_rse):
+                    self._selected_depth = best
+                return
         if current_unsafe or (candidate.cost + 2 * candidate.se < current.cost - 2 * current.se):
             self._selected_depth = best
 

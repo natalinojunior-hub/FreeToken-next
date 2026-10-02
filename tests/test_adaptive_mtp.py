@@ -3,7 +3,7 @@ import pytest
 from freetoken.scheduler.adaptive_mtp import AdaptiveMtpController
 
 
-def _calibrate(controller, uid="request-1", epoch="epoch-a", costs=None):
+def _calibrate(controller, uid="request-1", epoch="epoch-a", costs=None, full_accept=False):
     controller.begin_request(uid, epoch)
     costs = costs or {0: [0.010] * 8, 1: [0.008] * 4}
     while controller.probing:
@@ -11,7 +11,9 @@ def _calibrate(controller, uid="request-1", epoch="epoch-a", costs=None):
         samples = costs[depth]
         index = controller.cost_summaries[depth]["samples"]
         elapsed = samples[index] if index < len(samples) else samples[-1]
-        controller.observe(depth, elapsed, 1)
+        # full_accept: costs are seconds per token and each cycle commits every draft + 1
+        tokens = depth + 1 if full_accept else 1
+        controller.observe(depth, elapsed * tokens, tokens)
 
 
 def test_weighted_seconds_per_committed_token_not_mean_of_ratios():
@@ -271,8 +273,9 @@ def test_noisy_but_cheaper_depth_is_not_locked_out_on_noise():
     assert controller.selected_depth == 1
 
 
-def test_cold_calibration_keeps_requested_cap_when_candidate_win_is_uncertain():
-    """A short cold probe retains the requested cap unless a lower depth clearly wins."""
+def test_cold_calibration_stays_deep_on_a_near_tie_despite_a_cold_outlier():
+    """k4's one cold outlier cycle is ignored (median), and k3's ~1% edge over k4 is inside
+    the margin a shallower depth must clear, so the deeper k4 wins."""
     controller = AdaptiveMtpController(4)
     costs = {
         0: [0.0154] * 8,
@@ -285,7 +288,8 @@ def test_cold_calibration_keeps_requested_cap_when_candidate_win_is_uncertain():
     while controller.probing:
         depth = controller.next_depth()
         index = controller.cost_summaries[depth]["samples"]
-        controller.observe(depth, costs[depth][index], 1)
+        # costs are seconds per token; every draft is accepted, so a cycle commits depth + 1
+        controller.observe(depth, costs[depth][index] * (depth + 1), depth + 1)
     assert controller.selected_depth == 4
 
 
@@ -516,7 +520,7 @@ def test_cold_calibration_exposes_learned_depth_exactly_once():
     assert controller.consume_learned_depth() is None  # consumed once
 
 
-def test_cold_calibration_keeps_requested_cap_when_lower_depth_is_not_a_clear_win():
+def test_cold_calibration_prefers_the_cheaper_shallower_depth_over_the_requested_cap():
     controller = AdaptiveMtpController(5)
     costs = {
         0: [0.023] * 8,
@@ -526,9 +530,9 @@ def test_cold_calibration_keeps_requested_cap_when_lower_depth_is_not_a_clear_wi
         4: [0.012] * 4,
         5: [0.008, 0.009, 0.014, 0.018],
     }
-    _calibrate(controller, costs=costs)
-    assert controller.selected_depth == 5
-    assert controller.consume_learned_depth() == 5
+    _calibrate(controller, costs=costs, full_accept=True)
+    assert controller.selected_depth == 3
+    assert controller.consume_learned_depth() == 3
 
 
 def test_force_depth_overrides_profile_and_never_saves(monkeypatch):
@@ -580,3 +584,26 @@ def test_warm_start_small_cost_rise_does_not_invalidate():
     controller.begin_request("warm2", "epoch-a")
     assert not controller.probing  # small rise ignored -> still warm
     assert controller.next_depth() == 1
+
+
+def test_cold_calibration_ranks_depths_by_pooled_acceptance_not_probe_luck():
+    """AD-like profile (acceptance 78/57/40/33/24%, ~8 ms per verify row): k2 is the true
+    optimum even though 4-sample probes at k1/k3 draw lucky or unlucky accepted counts."""
+    cycle_s = {0: 0.0249, 1: 0.0285, 2: 0.0361, 3: 0.0460, 4: 0.0570, 5: 0.0640}
+    # accepted drafts per cycle, deterministic per probe pass (pass-dependent segment luck)
+    accepted = {
+        1: [1, 1, 0, 1],
+        2: [0, 2, 1, 0],
+        3: [1, 0, 3, 0],
+        4: [0, 1, 0, 2],
+        5: [1, 0, 2, 0],
+    }
+    controller = AdaptiveMtpController(5)
+    controller.begin_request("ad", "epoch-a")
+    seen = dict.fromkeys(range(6), 0)
+    while controller.probing:
+        depth = controller.next_depth()
+        committed = 1 if depth == 0 else accepted[depth][seen[depth] % 4] + 1
+        seen[depth] += 1
+        controller.observe(depth, cycle_s[depth], committed)
+    assert controller.selected_depth in (1, 2)

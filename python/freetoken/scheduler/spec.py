@@ -317,6 +317,16 @@ class SchedulerSpecMixin:
             if per_uid_observe
             else self._mtp_cycle_observe
         )
+        if os.environ.get("FREETOKEN_DEBUG_MTP_CYCLES") == "1":
+            now = time.perf_counter()
+            last = getattr(self, "_dbg_cycle_end", {}).get(req.uid)
+            self.__dict__.setdefault("_dbg_cycle_end", {})[req.uid] = now
+            gap = (started - last) * 1e3 if last is not None else -1.0
+            print(
+                f"[mtp-cycle] uid={req.uid} depth={depth} ms={elapsed * 1e3:.2f} "
+                f"tok={committed} gap_ms={gap:.2f} obs={int(bool(observed))}",
+                flush=True,
+            )
         if observed and depth is not None:
             controller.observe(depth, elapsed, committed)
             # A calibration just converged -> persist the learned depth so the next serve of
@@ -1256,8 +1266,6 @@ class SchedulerSpecMixin:
                 self._restore_qsa_state(req, pre_draft=True)
                 self._replay(req, c0, keep_cached - c0)
                 req.cached_len, req.device_len = keep_cached, keep_cached + 1
-            elif pool.spec_states is not None:
-                pool.commit_spec_row(self._linear_slot(req), p + committed - 1)
             commit_qsa = getattr(
                 getattr(self.engine, "attn_backend", None), "commit_spec_txn", None
             )
