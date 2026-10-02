@@ -85,7 +85,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="send --prompt-file verbatim instead of deriving a fixed token slice",
     )
     p.add_argument(
-        "--prompt-offset", type=int, default=0, help="token offset into the corpus slice"
+        "--prompt-offset",
+        type=int,
+        default=0,
+        help="corpus slice index, in units of --tokens (offset N starts N prompts in)",
     )
     p.add_argument("--gpu", default=None, help="UUID or nvidia-smi index, as ft serve --gpu")
     p.add_argument("--no-graph", action="store_true", help="eager decode instead of CUDA graph")
@@ -157,7 +160,7 @@ def build_prompt_text(model: str, path: str, tokens: int, offset: int) -> str:
     """
     text = Path(path).read_text(errors="replace")
     start = offset * tokens * CHARS_PER_TOKEN
-    chunk = text[start : start + tokens * CHARS_PER_TOKEN * 2] or text
+    chunk = text[start : start + tokens * CHARS_PER_TOKEN * 2]
     if not chunk.strip():
         sys.exit(f"[bench] corpus {path} exhausted at --prompt-offset {offset}")
     from freetoken.utils.hf import load_tokenizer
